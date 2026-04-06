@@ -1,0 +1,26 @@
+name: example-plugin
+version: 1.0.0
+description: Example Phase 3 plugin with a sample skill, hooks, and inline MCP server.
+enabled_by_default: true
+hooks:
+  - event: SessionStart
+    message: Example plugin observed a new session round.
+  - event: PostToolUse
+    message: Example plugin recorded a tool execution.
+  - event: SessionEnd
+    message: Example plugin saw the session round finish.
+mcp_servers:
+  - name: example-inline
+    transport: inline
+    enabled: true
+    requires_approval: false
+    tools:
+      - name: echo_context
+        description: Echo arguments back through the Phase 3 MCP bridge.
+        input_schema:
+          type: object
+          properties:
+            text:
+              type: string
+          required:
+            - text

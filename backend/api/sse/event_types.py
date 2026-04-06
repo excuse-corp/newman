@@ -1,0 +1,16 @@
+EVENT_TYPES = [
+    "session_created",
+    "assistant_delta",
+    "tool_call_started",
+    "tool_call_finished",
+    "tool_retry_scheduled",
+    "hook_triggered",
+    "plan_updated",
+    "tool_approval_request",
+    "tool_approval_resolved",
+    "tool_error_feedback",
+    "checkpoint_created",
+    "final_response",
+    "stream_completed",
+    "error",
+]

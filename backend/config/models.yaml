@@ -1,0 +1,7 @@
+providers:
+  mock:
+    model: "newman-dev"
+  openai_compatible:
+    endpoint: "https://api.openai.com/v1"
+  anthropic_compatible:
+    endpoint: "https://api.anthropic.com/v1"

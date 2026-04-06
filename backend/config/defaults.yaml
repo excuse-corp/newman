@@ -1,0 +1,64 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://localhost:5173"
+
+provider:
+  type: "mock"
+  model: "newman-dev"
+  endpoint: null
+  api_key: null
+  timeout: 60
+  max_tokens: 4096
+  temperature: 0.2
+
+runtime:
+  max_tool_depth: 20
+  context_compress_threshold: 0.8
+  context_critical_threshold: 0.92
+  tool_retry_attempts: 3
+  tool_retry_backoff_seconds: 1.0
+
+sandbox:
+  enabled: false
+  image: "newman-sandbox:latest"
+  cpu_limit: 1
+  memory_limit: "512m"
+  timeout: 30
+  output_limit_bytes: 10240
+
+approval:
+  level1_blacklist:
+    - "rm -rf /"
+    - "sudo"
+    - "su "
+    - "chmod 777 /"
+    - "chown root"
+  level2_patterns:
+    - "write_file_outside_workspace"
+    - "network_access_unlisted"
+    - "process_spawn"
+  timeout_seconds: 120
+
+channels:
+  feishu:
+    enabled: true
+    webhook_token: null
+  wecom:
+    enabled: true
+    webhook_token: null
+
+paths:
+  workspace: "."
+  data_dir: "backend_data"
+  sessions_dir: "backend_data/sessions"
+  memory_dir: "backend_data/memory"
+  audit_dir: "backend_data/audit"
+  knowledge_dir: "backend_data/knowledge"
+  plugins_dir: "plugins"
+  skills_dir: "skills"
+  mcp_dir: "backend_data/mcp"
+  scheduler_dir: "backend_data/scheduler"
+  channels_dir: "backend_data/channels"
