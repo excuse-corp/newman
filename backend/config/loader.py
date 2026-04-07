@@ -101,6 +101,8 @@ def _env_to_nested(defaults: dict[str, Any], dotenv_values: dict[str, str] | Non
             continue
         raw_path = key[len(CONFIG_ENV_PREFIX) :].lower()
         path = env_path_map.get(raw_path)
+        if path is None and raw_path.startswith("provider_"):
+            path = ("models", "primary", raw_path[len("provider_") :])
         if path is None and "__" in raw_path:
             path = tuple(part for part in raw_path.split("__") if part)
         if path is None:
@@ -144,6 +146,7 @@ def get_settings(project_root: str | None = None) -> AppConfig:
         settings.paths.memory_dir,
         settings.paths.audit_dir,
         settings.paths.knowledge_dir,
+        settings.paths.chroma_dir,
         settings.paths.plugins_dir,
         settings.paths.skills_dir,
         settings.paths.mcp_dir,

@@ -5,8 +5,12 @@ enabled_by_default: true
 hooks:
   - event: SessionStart
     message: Example plugin observed a new session round.
+  - event: PreToolUse
+    handler: hooks/echo_context.py
   - event: PostToolUse
     message: Example plugin recorded a tool execution.
+  - event: FileChanged
+    handler: hooks/echo_context.py
   - event: SessionEnd
     message: Example plugin saw the session round finish.
 mcp_servers:

@@ -18,10 +18,18 @@ type SessionMessage = {
   metadata: Record<string, unknown>;
 };
 
+type MessageAttachment = {
+  filename: string;
+  content_type: string;
+  path: string;
+  summary?: string;
+};
+
 type CheckpointRecord = {
   checkpoint_id: string;
   summary: string;
   created_at: string;
+  metadata?: Record<string, unknown>;
 };
 
 type PlanStepStatus = "pending" | "in_progress" | "completed";
@@ -72,6 +80,12 @@ type PluginRecord = {
   mcp_server_count: number;
 };
 
+type PluginLoadError = {
+  plugin_path: string;
+  plugin_name: string | null;
+  message: string;
+};
+
 type SkillRecord = {
   name: string;
   source: string;
@@ -115,7 +129,13 @@ type KnowledgeHit = {
   stored_path: string;
   snippet: string;
   score: number;
+  lexical_score: number;
+  vector_score: number;
+  rerank_score: number;
   line_number: number | null;
+  chunk_index: number | null;
+  page_number: number | null;
+  location_label: string | null;
 };
 
 type SchedulerTask = {
@@ -210,13 +230,20 @@ function buildEventSummary(item: TimelineItem) {
     case "tool_call_started":
       return `调用 ${String(data.tool ?? "")}`;
     case "tool_call_finished":
+      if (data.success === false) {
+        return `${String(data.tool ?? "")} · ${String(data.frontend_message ?? data.summary ?? "执行失败")}`;
+      }
       return `${String(data.tool ?? "")} · ${String(data.summary ?? "")}`;
     case "tool_error_feedback":
-      return `${String(data.tool ?? "")} 出错 · ${String(data.summary ?? "")}`;
+      return `${String(data.tool ?? "")} 出错 · ${String(data.frontend_message ?? data.summary ?? "")}`;
     case "tool_approval_request":
       return `审批等待 · ${String(data.tool ?? "")}`;
     case "checkpoint_created":
       return "创建了新的 checkpoint";
+    case "attachment_received":
+      return `收到 ${String(data.count ?? 0)} 个图片附件`;
+    case "attachment_processed":
+      return `完成 ${String(data.count ?? 0)} 个图片解析`;
     case "hook_triggered":
       return String(data.message ?? "触发插件 hook");
     case "plan_updated":
@@ -224,10 +251,23 @@ function buildEventSummary(item: TimelineItem) {
     case "final_response":
       return "本轮响应完成";
     case "error":
-      return String(data.message ?? "运行异常");
+      return `${String(data.code ?? "ERROR")} · ${String(data.message ?? "运行异常")}`;
     default:
       return item.event;
   }
+}
+
+function getMessageAttachments(message: SessionMessage): MessageAttachment[] {
+  const raw = message.metadata.attachments;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item): item is MessageAttachment => typeof item === "object" && item !== null && "filename" in item && "path" in item)
+    .map((item) => ({
+      filename: String(item.filename),
+      content_type: String(item.content_type ?? ""),
+      path: String(item.path),
+      summary: item.summary ? String(item.summary) : undefined
+    }));
 }
 
 async function apiGet<T>(path: string): Promise<T> {
@@ -266,6 +306,7 @@ function App() {
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
   const [selectedTimelineId, setSelectedTimelineId] = useState<string | null>(null);
   const [draftMessage, setDraftMessage] = useState("");
+  const [selectedImages, setSelectedImages] = useState<File[]>([]);
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [statusNote, setStatusNote] = useState("正在连接 Newman 工作台...");
@@ -274,6 +315,7 @@ function App() {
   const [memoryDraft, setMemoryDraft] = useState("");
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [plugins, setPlugins] = useState<PluginRecord[]>([]);
+  const [pluginErrors, setPluginErrors] = useState<PluginLoadError[]>([]);
   const [workspacePayload, setWorkspacePayload] = useState<FileDirPayload | FileContentPayload | null>(null);
   const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocument[]>([]);
   const [knowledgeQuery, setKnowledgeQuery] = useState("Phase 3");
@@ -284,6 +326,7 @@ function App() {
   const [readyInfo, setReadyInfo] = useState<ReadyInfo | null>(null);
   const [taskForm, setTaskForm] = useState({ name: "夜间回顾", cron: "0 21 * * *", prompt: "请根据今天的会话总结工作进展" });
   const [knowledgeImportPath, setKnowledgeImportPath] = useState("docs/Newman_API_v1.md");
+  const [knowledgeUploadFile, setKnowledgeUploadFile] = useState<File | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
 
   const selectedTimeline = timeline.find((item) => item.id === selectedTimelineId) ?? null;
@@ -405,21 +448,25 @@ function App() {
   async function sendMessage(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
     const content = draftMessage.trim();
-    if (!content || streaming) return;
+    const images = selectedImages;
+    if ((!content && images.length === 0) || streaming) return;
     try {
       setStatusNote("Newman 正在处理这条消息...");
       setDraftMessage("");
       setStreaming(true);
-      const sessionId = await ensureSession(content.slice(0, 20));
+      setSelectedImages([]);
+      const sessionId = await ensureSession(content.slice(0, 20) || "图片输入");
       const controller = new AbortController();
       streamAbortRef.current = controller;
+      const body = new FormData();
+      body.set("content", content);
+      for (const image of images) {
+        body.append("images", image);
+      }
 
       const response = await fetch(`/api/sessions/${sessionId}/messages`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ content }),
+        body,
         signal: controller.signal
       });
 
@@ -466,7 +513,10 @@ function App() {
             setPendingApproval(null);
           }
           if (eventType === "tool_error_feedback") {
-            setStatusNote(String(data.summary ?? "工具执行出现异常"));
+            setStatusNote(String(data.frontend_message ?? data.summary ?? "工具执行出现异常"));
+          }
+          if (eventType === "error") {
+            setStatusNote(String(data.message ?? "运行异常"));
           }
           if (eventType === "plan_updated") {
             const plan = (data.plan as SessionPlan | undefined) ?? null;
@@ -532,8 +582,9 @@ function App() {
   }
 
   async function refreshPlugins() {
-    const payload = await apiGet<{ plugins: PluginRecord[] }>("/api/plugins");
+    const payload = await apiGet<{ plugins: PluginRecord[]; errors?: PluginLoadError[] }>("/api/plugins");
     setPlugins(payload.plugins);
+    setPluginErrors(payload.errors ?? []);
   }
 
   async function togglePlugin(plugin: PluginRecord) {
@@ -559,6 +610,23 @@ function App() {
     setStatusNote("知识文档已导入。");
   }
 
+  async function uploadKnowledgeFile() {
+    if (!knowledgeUploadFile) return;
+    const body = new FormData();
+    body.set("file", knowledgeUploadFile);
+    const response = await fetch("/api/knowledge/documents/upload", {
+      method: "POST",
+      body
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error?.error?.message ?? `${response.status} ${response.statusText}`);
+    }
+    setKnowledgeUploadFile(null);
+    await refreshKnowledgeDocuments();
+    setStatusNote("知识文件已上传并导入。");
+  }
+
   async function searchKnowledge() {
     const payload = await apiSend<{ query: string; hits: KnowledgeHit[] }>("/api/knowledge/search", "POST", {
       query: knowledgeQuery,
@@ -581,7 +649,7 @@ function App() {
         prompt: taskForm.prompt
       },
       enabled: true,
-      max_retries: 0
+      max_retries: 5
     });
     await refreshSchedulerTasks();
     setStatusNote("调度任务已创建。");
@@ -620,6 +688,13 @@ function App() {
     await apiSend(`/api/sessions/${activeSessionId}/compress`, "POST");
     await loadSession(activeSessionId);
     setStatusNote("已手动创建 checkpoint。");
+  }
+
+  async function restoreCheckpoint() {
+    if (!activeSessionId) return;
+    await apiSend(`/api/sessions/${activeSessionId}/restore-checkpoint`, "POST");
+    await loadSession(activeSessionId);
+    setStatusNote("已从 checkpoint 恢复上下文。");
   }
 
   async function createSession() {
@@ -691,6 +766,14 @@ function App() {
             <button type="button" className="soft-button" onClick={() => void manualCompress()} disabled={!activeSessionId}>
               手动压缩
             </button>
+            <button
+              type="button"
+              className="soft-button"
+              onClick={() => void restoreCheckpoint()}
+              disabled={!activeSessionId || !sessionData?.checkpoint}
+            >
+              恢复 checkpoint
+            </button>
             <div className="context-meter">
               <span>Context</span>
               <strong>{contextUsage}%</strong>
@@ -727,6 +810,16 @@ function App() {
                       <span>{message.role.toUpperCase()}</span>
                       <time>{formatTime(message.created_at)}</time>
                     </header>
+                    {getMessageAttachments(message).length ? (
+                      <div className="attachment-list">
+                        {getMessageAttachments(message).map((attachment) => (
+                          <div key={`${message.id}-${attachment.path}`} className="attachment-item">
+                            <strong>{attachment.filename}</strong>
+                            <small>{attachment.summary || attachment.content_type}</small>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                     <pre>{message.content}</pre>
                   </article>
                 ))}
@@ -734,11 +827,37 @@ function App() {
             )}
 
             <form className="composer-bar" onSubmit={(event) => void sendMessage(event)}>
+              {selectedImages.length ? (
+                <div className="attachment-list composer-attachments">
+                  {selectedImages.map((file) => (
+                    <div key={`${file.name}-${file.size}`} className="attachment-item">
+                      <strong>{file.name}</strong>
+                      <small>{Math.round(file.size / 1024)} KB</small>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               <textarea
                 value={draftMessage}
                 onChange={(event) => setDraftMessage(event.target.value)}
-                placeholder="描述目标、限制条件，或者直接发 /tool 指令"
+                placeholder="描述目标、限制条件，或者附带图片一起发送"
               />
+              <div className="composer-actions">
+                <label className="soft-button file-picker">
+                  添加图片
+                  <input
+                    type="file"
+                    accept=".jpg,.jpeg,.png,image/jpeg,image/png"
+                    multiple
+                    onChange={(event) => setSelectedImages(Array.from(event.target.files ?? []))}
+                  />
+                </label>
+                {selectedImages.length ? (
+                  <button type="button" className="soft-button" onClick={() => setSelectedImages([])}>
+                    清空图片
+                  </button>
+                ) : null}
+              </div>
               <button type="submit" className="solid-button" disabled={streaming}>
                 {streaming ? "处理中..." : "发送"}
               </button>
@@ -874,6 +993,16 @@ function App() {
   function renderPluginsWorkspace() {
     return (
       <section className="cards-view">
+        {pluginErrors.map((error, index) => (
+          <article key={`${error.plugin_path}-${index}`} className="info-card plugin-card">
+            <div className="pill pill-orange">invalid</div>
+            <h3>{error.plugin_name ?? "plugin load error"}</h3>
+            <p>{error.message}</p>
+            <footer>
+              <code>{error.plugin_path}</code>
+            </footer>
+          </article>
+        ))}
         {plugins.map((plugin) => (
           <article key={plugin.name} className="info-card plugin-card">
             <div className={`pill ${plugin.enabled ? "pill-green" : "pill-orange"}`}>{plugin.enabled ? "enabled" : "disabled"}</div>
@@ -947,6 +1076,24 @@ function App() {
             </button>
           </div>
           <div className="inline-form">
+            <input
+              value={knowledgeUploadFile?.name ?? ""}
+              readOnly
+              placeholder="上传 PDF / Word / PPT / Excel / 图片"
+            />
+            <label className="soft-button file-picker">
+              选择文件
+              <input
+                type="file"
+                accept=".md,.txt,.json,.csv,.py,.yaml,.yml,.log,.pdf,.docx,.pptx,.xlsx,.jpg,.jpeg,.png"
+                onChange={(event) => setKnowledgeUploadFile(event.target.files?.[0] ?? null)}
+              />
+            </label>
+            <button type="button" className="solid-button" onClick={() => void uploadKnowledgeFile()} disabled={!knowledgeUploadFile}>
+              上传
+            </button>
+          </div>
+          <div className="inline-form">
             <input value={knowledgeQuery} onChange={(event) => setKnowledgeQuery(event.target.value)} placeholder="知识搜索" />
             <button type="button" className="solid-button" onClick={() => void searchKnowledge()}>
               Search
@@ -958,7 +1105,10 @@ function App() {
                 <strong>{hit.title}</strong>
                 <p>{hit.snippet}</p>
                 <small>
-                  score {hit.score} · line {hit.line_number ?? "-"}
+                  score {hit.score} · lexical {hit.lexical_score} · vector {hit.vector_score} · rerank {hit.rerank_score}
+                </small>
+                <small>
+                  {hit.location_label ?? `line ${hit.line_number ?? "-"}`} · chunk {hit.chunk_index ?? "-"} · {hit.stored_path}
                 </small>
               </div>
             ))}
@@ -1115,6 +1265,14 @@ function App() {
             <div className="drawer-scroll">
               <div className="pill pill-blue">{selectedTimeline.event}</div>
               <p className="drawer-summary">{buildEventSummary(selectedTimeline)}</p>
+              {selectedTimeline.data.error_code ? <p className="drawer-summary">错误码: {String(selectedTimeline.data.error_code)}</p> : null}
+              {selectedTimeline.data.risk_level ? <p className="drawer-summary">风险级别: {String(selectedTimeline.data.risk_level)}</p> : null}
+              {selectedTimeline.data.recovery_class ? (
+                <p className="drawer-summary">恢复类型: {String(selectedTimeline.data.recovery_class)}</p>
+              ) : null}
+              {selectedTimeline.data.recommended_next_step ? (
+                <p className="drawer-summary">建议下一步: {String(selectedTimeline.data.recommended_next_step)}</p>
+              ) : null}
               <pre className="json-surface">{JSON.stringify(selectedTimeline.data, null, 2)}</pre>
             </div>
           ) : sessionData ? (

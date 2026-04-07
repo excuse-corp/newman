@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timezone
-from uuid import uuid4
 
 from backend.scheduler.cron_parser import matches_cron, next_run
 from backend.scheduler.models import ScheduledTask, utc_now
@@ -58,21 +57,23 @@ class SchedulerEngine:
         task.status = "running"
         task.updated_at = utc_now()
         self.task_store.upsert(task)
-        try:
-            if task.action.type == "session_message":
-                if not task.action.session_id:
-                    raise ValueError("session_message 任务必须提供 session_id")
-                await self.runtime.handle_message(task.action.session_id, task.action.prompt, self._noop_emit)
-            else:
-                session, _ = self.runtime.thread_manager.create_or_restore(title=f"[Scheduled] {task.name}")
-                session.metadata["background"] = True
-                self.runtime.session_store.save(session)
-                await self.runtime.handle_message(session.session_id, task.action.prompt, self._noop_emit)
-            task.status = "completed"
-            task.last_error = ""
-        except Exception as exc:
-            task.status = "failed"
-            task.last_error = str(exc)
+        total_attempts = max(1, task.max_retries + 1)
+        last_error = ""
+
+        for attempt in range(1, total_attempts + 1):
+            try:
+                await self._run_task_action(task)
+                task.status = "completed"
+                task.last_error = ""
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt >= total_attempts:
+                    task.status = "failed"
+                    task.last_error = f"任务执行失败，已重试 {task.max_retries} 次: {last_error}"
+                    break
+                await asyncio.sleep(min(attempt, 5))
+
         task.last_run_at = utc_now()
         task.run_count += 1
         task.next_run_at = next_run(task.cron, datetime.now(timezone.utc)).isoformat()
@@ -80,6 +81,18 @@ class SchedulerEngine:
 
     async def _noop_emit(self, event: str, data: dict) -> None:
         return None
+
+    async def _run_task_action(self, task: ScheduledTask) -> None:
+        if task.action.type == "session_message":
+            if not task.action.session_id:
+                raise ValueError("session_message 任务必须提供 session_id")
+            await self.runtime.handle_message(task.action.session_id, task.action.prompt, self._noop_emit)
+            return
+
+        session, _ = self.runtime.thread_manager.create_or_restore(title=f"[Scheduled] {task.name}")
+        session.metadata["background"] = True
+        self.runtime.session_store.save(session)
+        await self.runtime.handle_message(session.session_id, task.action.prompt, self._noop_emit)
 
     def _with_next_run(self, task: ScheduledTask) -> ScheduledTask:
         task.next_run_at = next_run(task.cron, datetime.now(timezone.utc)).isoformat()

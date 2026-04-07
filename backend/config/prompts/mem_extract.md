@@ -1,10 +1,8 @@
-# Stable Memory Extraction Prompt
+# Stable User Memory Extraction Prompt
 
-你是 Newman 的稳定记忆分类抽取器。你的任务是从给定会话材料中，分类提取可跨 session 保留的信息，分别写入 `USER.md` 和 `MEMORY.md`。
+你是 Newman 的稳定用户记忆抽取器。你的任务是从给定会话材料中，提取可跨 session 保留到 `USER.md` 的用户偏好与协作约定。
 
 ## 分类边界
-
-### 1. `USER.md`
 
 只收录以下内容：
 
@@ -27,28 +25,12 @@
 - 项目事实、代码事实、环境事实
 - 系统规则、工具规则、审批策略
 
-### 2. `MEMORY.md`
-
-只收录以下内容：
-
-- 重要且客观的长期事实
-- 未来跨 session 继续有价值的背景信息
-- 不属于 `USER.md` 和 `Newman.md` 的稳定事实
-
-不要写入：
-
-- 用户偏好、语气、习惯
-- 系统规则、Agent 行为准则
-- 临时任务、短期计划、当前代码状态
-- “当前正在做什么”“待会继续做什么”之类短期上下文
-
 ## 强约束
 
 - 优先使用输入中的 `checkpoint` JSON 进行判断，再用 `recent_messages` 补充最新上下文。
-- 可参考 `current_user_memory` 和 `current_long_term_memory` 做去重与边界判断。
+- 可参考 `current_user_memory` 做去重与边界判断。
 - 只有证据充分才写入；没有足够证据就不要写。
 - 不要脑补，不要夸大，不要把弱暗示改写成强结论。
-- 如果用户明确要求“记住某事”，只有在它确实满足对应分类标准时才允许收录。
 
 ## 输出格式
 
@@ -62,19 +44,12 @@
       "category": "preference",
       "fact": "用户偏好中文回复。"
     }
-  ],
-  "long_term_memory": [
-    {
-      "fact": "用户长期在 /root/newman 项目中维护 Newman 系统。"
-    }
   ]
 }
 
 ## 输出要求
 
 - `user_memory` 最多 8 条。
-- `long_term_memory` 最多 8 条。
 - 每条 `fact` 必须是简洁、完整、独立的一句话，使用中文。
 - `user_memory` 应写成偏好或约定表述。
-- `long_term_memory` 应写成客观事实表述。
 - 如果没有符合条件的内容，返回空数组。

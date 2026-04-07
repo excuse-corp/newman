@@ -11,12 +11,19 @@ class CheckpointStore:
     def __init__(self, sessions_dir: Path):
         self.sessions_dir = sessions_dir
 
-    def save(self, session_id: str, summary: str, turn_range: list[int]) -> CheckpointRecord:
+    def save(
+        self,
+        session_id: str,
+        summary: str,
+        turn_range: list[int],
+        metadata: dict[str, object] | None = None,
+    ) -> CheckpointRecord:
         record = CheckpointRecord(
             session_id=session_id,
             checkpoint_id=uuid4().hex,
             summary=summary,
             turn_range=turn_range,
+            metadata=metadata or {},
         )
         self._path_for(session_id).write_text(
             json.dumps(record.model_dump(mode="json"), ensure_ascii=False, indent=2),

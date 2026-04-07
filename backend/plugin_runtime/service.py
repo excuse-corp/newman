@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterable
 
-from backend.plugin_runtime.models import LoadedPlugin, PluginRecord, SkillDescriptor
+from backend.plugin_runtime.models import LoadedPlugin, PluginLoadError, PluginRecord, SkillDescriptor
 from backend.plugin_runtime.plugin_loader import PluginLoader
 from backend.plugin_runtime.plugin_registry import PluginRegistry
+from backend.plugin_runtime.skill_parser import parse_skill_file
 
 
 class PluginService:
@@ -14,12 +16,21 @@ class PluginService:
         self.loader = PluginLoader(plugins_dir)
         self.registry = PluginRegistry(state_path)
         self._plugins: list[LoadedPlugin] = []
+        self._load_errors: list[PluginLoadError] = []
+        self._fingerprint = ""
         self.reload()
 
     def reload(self) -> None:
-        self._plugins = self.loader.scan()
+        self._plugins, self._load_errors = self.loader.scan()
+        self._fingerprint = self._compute_fingerprint()
+
+    def ensure_fresh(self) -> None:
+        current = self._compute_fingerprint()
+        if current != self._fingerprint:
+            self.reload()
 
     def list_plugins(self) -> list[PluginRecord]:
+        self.ensure_fresh()
         state = self.registry.load_state()
         items: list[PluginRecord] = []
         for plugin in self._plugins:
@@ -38,6 +49,10 @@ class PluginService:
             )
         return items
 
+    def list_load_errors(self) -> list[PluginLoadError]:
+        self.ensure_fresh()
+        return list(self._load_errors)
+
     def set_enabled(self, plugin_name: str, enabled: bool) -> PluginRecord:
         plugin = next((item for item in self.list_plugins() if item.name == plugin_name), None)
         if plugin is None:
@@ -49,10 +64,12 @@ class PluginService:
         return plugin
 
     def enabled_plugins(self) -> list[LoadedPlugin]:
+        self.ensure_fresh()
         enabled_names = {item.name for item in self.list_plugins() if item.enabled}
         return [plugin for plugin in self._plugins if plugin.manifest.name in enabled_names]
 
     def list_skills(self) -> list[SkillDescriptor]:
+        self.ensure_fresh()
         skills = self._standalone_skills()
         for plugin in self.enabled_plugins():
             skills.extend(plugin.skills)
@@ -60,19 +77,7 @@ class PluginService:
 
     def write_skills_snapshot(self, snapshot_path: Path) -> None:
         skills = self.list_skills()
-        lines = [
-            "# Skills Snapshot",
-            "",
-            "This file is generated from currently enabled plugins and workspace skills.",
-            "",
-        ]
-        if not skills:
-            lines.append("- No skills are currently enabled.")
-        else:
-            for skill in skills:
-                label = skill.name if not skill.plugin_name else f"{skill.name} ({skill.plugin_name})"
-                summary = f": {skill.summary}" if skill.summary else ""
-                lines.append(f"- {label} [{skill.source}]{summary}")
+        lines = _render_skills_snapshot(skills)
         snapshot_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def hook_messages(self, event: str) -> list[str]:
@@ -83,7 +88,17 @@ class PluginService:
                     messages.append(f"{plugin.manifest.name}: {hook.message}")
         return messages
 
+    def hooks_for(self, event: str) -> list[tuple[LoadedPlugin, object]]:
+        self.ensure_fresh()
+        hooks: list[tuple[LoadedPlugin, object]] = []
+        for plugin in self.enabled_plugins():
+            for hook in plugin.manifest.hooks:
+                if hook.event == event:
+                    hooks.append((plugin, hook))
+        return hooks
+
     def mcp_server_configs(self) -> list[dict]:
+        self.ensure_fresh()
         configs: list[dict] = []
         for plugin in self.enabled_plugins():
             configs.extend(plugin.manifest.mcp_servers)
@@ -97,18 +112,63 @@ class PluginService:
             skill_file = skill_dir / "SKILL.md"
             if not skill_file.exists():
                 continue
-            summary = ""
-            for line in skill_file.read_text(encoding="utf-8", errors="replace").splitlines():
-                text = line.strip()
-                if text and not text.startswith("#"):
-                    summary = text[:160]
-                    break
+            metadata = parse_skill_file(skill_file, skill_dir.name)
             skills.append(
                 SkillDescriptor(
-                    name=skill_dir.name,
+                    name=str(metadata["name"] or skill_dir.name),
                     source="workspace",
                     path=str(skill_file),
-                    summary=summary,
+                    description=str(metadata["description"] or ""),
+                    when_to_use=str(metadata["when_to_use"]) if metadata["when_to_use"] else None,
+                    summary=str(metadata["description"] or ""),
                 )
             )
         return skills
+
+    def _compute_fingerprint(self) -> str:
+        parts: list[str] = []
+        parts.extend(self._collect_paths(self.plugins_dir))
+        parts.extend(self._collect_paths(self.skills_dir))
+        return "|".join(parts)
+
+    def _collect_paths(self, root: Path) -> list[str]:
+        if not root.exists():
+            return [f"{root}:missing"]
+        collected: list[str] = []
+        for path in sorted(item for item in root.rglob("*") if item.is_file()):
+            try:
+                stat = path.stat()
+                collected.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
+            except FileNotFoundError:
+                continue
+        return collected or [f"{root}:empty"]
+
+
+def _render_skills_snapshot(skills: list[SkillDescriptor]) -> list[str]:
+    lines = [
+        "## Skills",
+        "A skill is a set of local instructions stored in a `SKILL.md` file. Below is the list of skills available in this session.",
+        "### Available skills",
+    ]
+    if not skills:
+        lines.append("- No skills are currently enabled.")
+    else:
+        for skill in skills:
+            label = skill.name if not skill.plugin_name else f"{skill.name} ({skill.plugin_name})"
+            description = skill.description or skill.summary or "No description."
+            entry = f"- {label}: {description} (file: {skill.path})"
+            if skill.when_to_use:
+                entry += f" | when_to_use: {skill.when_to_use}"
+            lines.append(entry)
+
+    lines.extend(
+        [
+            "### How to use skills",
+            "- Trigger rules: if the user names a skill, or the task clearly matches a skill description, you must use that skill for this turn.",
+            "- Progressive disclosure: do not preload skill bodies. First decide which single skill is most relevant, then read its `SKILL.md` with `read_file`.",
+            "- If the skill references sibling files such as `references/`, `templates/`, or `scripts/`, inspect only the files needed for the current task.",
+            "- Prefer using existing tools (`read_file`, `list_dir`, `search_files`, `write_file`, `edit_file`, `update_plan`, `terminal`) exactly as the skill instructs.",
+            "- Do not read multiple skills up front unless the user explicitly asks for a comparison.",
+        ]
+    )
+    return lines

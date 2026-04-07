@@ -9,14 +9,21 @@ router = APIRouter(prefix="/api/plugins", tags=["plugins"])
 @router.get("")
 async def list_plugins(request: Request):
     runtime = request.app.state.runtime
-    return {"plugins": [item.model_dump(mode="json") for item in runtime.plugin_service.list_plugins()]}
+    return {
+        "plugins": [item.model_dump(mode="json") for item in runtime.plugin_service.list_plugins()],
+        "errors": [item.model_dump(mode="json") for item in runtime.plugin_service.list_load_errors()],
+    }
 
 
 @router.post("/rescan")
 async def rescan_plugins(request: Request):
     runtime = request.app.state.runtime
     runtime.reload_ecosystem()
-    return {"reloaded": True, "plugins": [item.model_dump(mode="json") for item in runtime.plugin_service.list_plugins()]}
+    return {
+        "reloaded": True,
+        "plugins": [item.model_dump(mode="json") for item in runtime.plugin_service.list_plugins()],
+        "errors": [item.model_dump(mode="json") for item in runtime.plugin_service.list_load_errors()],
+    }
 
 
 @router.post("/{plugin_name}/enable")

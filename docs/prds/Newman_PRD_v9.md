@@ -149,7 +149,6 @@ Tool 是最底层原子执行能力，例如：
 - 读文件
 - 发网络请求
 - 执行 Shell 命令
-- 执行 Python 代码
 - 查询知识库
 
 特点：
@@ -226,7 +225,7 @@ MCP 用于接入外部能力提供者或本地服务。
 | 本地知识检索 | BM25 + Chroma + Reranker |
 | 关系与统计存储 | PostgreSQL |
 | 本地事实源 | File System |
-| 执行沙箱 | Docker |
+| 执行沙箱 | Linux 原生沙箱（bubblewrap，Phase 1），macOS / Windows 待做 |
 | 前端 | Next.js 14+ |
 
 ### 6.2 系统分层
@@ -765,7 +764,9 @@ frontend/
 ### 16.1 安全
 
 - 高危执行必须经过审批
-- Shell 和 Python 执行必须进入沙箱
+- Shell 执行必须进入沙箱
+- Linux 优先采用原生沙箱（bubblewrap）实现 `read-only` / `workspace-write` / `danger-full-access`
+- macOS / Windows 的原生沙箱适配列为待做，不在本阶段交付
 - 配置文件权限最小化
 - 日志脱敏
 

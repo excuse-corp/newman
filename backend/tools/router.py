@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from urllib.parse import urlparse
 
 from backend.config.schema import AppConfig
 from backend.tools.base import BaseTool
@@ -23,8 +22,4 @@ class ToolRouter:
             path = (self.settings.paths.workspace / raw).resolve() if not raw.is_absolute() else raw.resolve()
             if not any(path.is_relative_to(Path(base).resolve()) for base in tool.meta.allowed_paths):
                 checks.append("write_file_outside_workspace")
-        if tool.meta.allowed_domains and "url" in arguments:
-            host = urlparse(arguments["url"]).hostname or ""
-            if host not in set(tool.meta.allowed_domains):
-                checks.append("network_access_unlisted")
         return checks

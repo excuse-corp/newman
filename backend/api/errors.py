@@ -22,6 +22,7 @@ def api_error_response(
             "code": descriptor.code,
             "message": message,
             "severity": descriptor.severity,
+            "risk_level": descriptor.risk_level,
             "kind": kind,
         },
         "request_id": getattr(request.state, "request_id", None),

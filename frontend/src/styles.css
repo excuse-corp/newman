@@ -543,6 +543,29 @@ pre {
   padding: 14px 16px;
 }
 
+.attachment-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.attachment-item {
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.76);
+}
+
+.attachment-item strong,
+.attachment-item small {
+  display: block;
+}
+
+.attachment-item small {
+  margin-top: 4px;
+  color: var(--muted);
+}
+
 .message-card header {
   display: flex;
   align-items: center;
@@ -593,6 +616,29 @@ pre {
   min-height: 92px;
   padding: 14px 16px;
   resize: vertical;
+}
+
+.composer-attachments,
+.composer-actions {
+  grid-column: 1 / -1;
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.file-picker {
+  position: relative;
+  overflow: hidden;
+}
+
+.file-picker input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
 }
 
 .trace-pane .section-head,

@@ -36,6 +36,19 @@ class ProviderResponse:
     finish_reason: str = "stop"
 
 
+@dataclass
+class ProviderError(Exception):
+    provider: str
+    kind: str
+    message: str
+    retryable: bool = False
+    status_code: int | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        super().__init__(self.message)
+
+
 class BaseProvider(ABC):
     @abstractmethod
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, **kwargs: Any) -> ProviderResponse:

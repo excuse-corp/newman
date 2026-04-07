@@ -8,14 +8,12 @@ from backend.config.loader import get_settings
 MEMORY_FILES = {
     "newman": "Newman.md",
     "user": "USER.md",
-    "memory": "MEMORY.md",
     "skills": "SKILLS_SNAPSHOT.md",
 }
 
 MEMORY_TEMPLATES = {
     "newman": "newman_template.md",
     "user": "user_template.md",
-    "memory": "memory_template.md",
     "skills": "skills_snapshot_template.md",
 }
 
@@ -53,7 +51,6 @@ class StableContextLoader:
                 context["newman"],
                 context["user"],
                 context["skills"],
-                context["memory"],
                 f"## Tooling Overview\n{tools_overview}",
                 f"## Approval Policy\n{approval_policy}",
                 f"## Workspace\n{workspace_path}",

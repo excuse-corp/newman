@@ -1,7 +1,10 @@
-# Skills Snapshot Template
+## Skills
+A skill is a set of local instructions stored in a `SKILL.md` file.
 
-> This is a seed template.
-> It is copied to `backend_data/memory/SKILLS_SNAPSHOT.md` only when that file does not exist.
-> Runtime prompt assembly reads `backend_data/memory/SKILLS_SNAPSHOT.md`.
+### Available skills
+- No skills are currently enabled.
 
-This file summarizes which skills are currently visible to the agent.
+### How to use skills
+- If the user names a skill, or the task clearly matches one skill description, use that skill for this turn.
+- Do not preload all skill bodies. First decide which skill is relevant, then read its `SKILL.md` with `read_file`.
+- When a skill references nearby files such as `references/`, `templates/`, or `scripts/`, inspect only what you need.

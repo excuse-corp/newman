@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 from backend.providers.base import BaseProvider
+from backend.sessions.models import CheckpointRecord
 from backend.sessions.models import SessionRecord
 
 
-def summarize_messages(session: SessionRecord, preserve_recent: int = 4) -> str:
+def summarize_messages(
+    session: SessionRecord,
+    preserve_recent: int = 4,
+    checkpoint: CheckpointRecord | None = None,
+) -> str:
     head = session.messages[:-preserve_recent] if len(session.messages) > preserve_recent else session.messages
     if not head:
         return ""
     lines = []
+    if checkpoint and checkpoint.summary.strip():
+        lines.append(f"- checkpoint: {checkpoint.summary[:220].replace(chr(10), ' ')}")
     for message in head[-8:]:
         content = message.content.strip().replace("\n", " ")
         lines.append(f"- {message.role}: {content[:160]}")

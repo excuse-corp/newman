@@ -25,7 +25,7 @@ from backend.scheduler.scheduler_engine import SchedulerEngine
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="Newman API", version="0.5.0")
+    app = FastAPI(title="Newman API", version="0.6.0")
     app.state.settings = settings
     app.state.runtime = NewmanRuntime(settings)
     app.state.scheduler = SchedulerEngine(app.state.runtime.scheduler_store, app.state.runtime)
@@ -66,12 +66,20 @@ def create_app() -> FastAPI:
     @app.get("/healthz")
     async def healthz():
         runtime = app.state.runtime
-        knowledge_base = KnowledgeBaseService(settings.paths.knowledge_dir, settings.paths.workspace)
+        knowledge_base = KnowledgeBaseService(
+            settings.paths.knowledge_dir,
+            settings.paths.workspace,
+            settings.models,
+            settings.rag,
+            settings.paths.chroma_dir,
+        )
+        sandbox_health = runtime.exec_sandbox.health() if runtime.exec_sandbox else None
         return {
             "ok": True,
             "version": app.version,
             "provider": settings.provider.type,
             "sandbox_enabled": settings.sandbox.enabled,
+            "sandbox": sandbox_health.__dict__ if sandbox_health else None,
             "tools": [tool.meta.name for tool in runtime.registry.list_tools()],
             "knowledge_documents": len(knowledge_base.list_documents()),
             "plugins_enabled": len([item for item in runtime.plugin_service.list_plugins() if item.enabled]),

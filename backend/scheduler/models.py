@@ -22,7 +22,7 @@ class ScheduledTask(BaseModel):
     cron: str
     action: TaskAction
     enabled: bool = True
-    max_retries: int = 0
+    max_retries: int = 5
     status: Literal["pending", "running", "completed", "failed", "disabled"] = "pending"
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)

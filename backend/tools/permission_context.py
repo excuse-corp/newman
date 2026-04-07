@@ -5,10 +5,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class PermissionContext:
-    allow_rules: set[str] = field(default_factory=set)
     deny_rules: set[str] = field(default_factory=set)
-    ask_rules: set[str] = field(default_factory=set)
-    additional_working_directories: set[str] = field(default_factory=set)
 
     def can_expose(self, tool_name: str) -> bool:
         return tool_name not in self.deny_rules

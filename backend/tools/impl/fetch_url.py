@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
@@ -10,7 +9,7 @@ from backend.tools.result import ToolExecutionResult
 
 
 class FetchUrlTool(BaseTool):
-    def __init__(self, allowed_domains: list[str] | None = None):
+    def __init__(self):
         self.meta = ToolMeta(
             name="fetch_url",
             description="Fetch a URL over HTTP(S).",
@@ -22,21 +21,10 @@ class FetchUrlTool(BaseTool):
             risk_level="medium",
             requires_approval=False,
             timeout_seconds=20,
-            allowed_domains=allowed_domains or [],
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:
         url = arguments["url"]
-        hostname = urlparse(url).hostname or ""
-        if self.meta.allowed_domains and hostname not in set(self.meta.allowed_domains):
-            return ToolExecutionResult(
-                False,
-                self.meta.name,
-                "fetch",
-                "permission_error",
-                summary=f"域名未在白名单内: {hostname}",
-                retryable=False,
-            )
         try:
             async with httpx.AsyncClient(timeout=self.meta.timeout_seconds) as client:
                 response = await client.get(url)

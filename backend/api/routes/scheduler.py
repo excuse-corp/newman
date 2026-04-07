@@ -18,7 +18,7 @@ class CreateTaskRequest(BaseModel):
     cron: str = Field(..., min_length=1)
     action: TaskAction
     enabled: bool = True
-    max_retries: int = Field(default=0, ge=0, le=5)
+    max_retries: int = Field(default=5, ge=0, le=5)
 
 
 @router.get("/tasks")

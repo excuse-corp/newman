@@ -16,7 +16,6 @@ class ToolMeta:
     requires_approval: bool
     timeout_seconds: int
     allowed_paths: list[str] | None = None
-    allowed_domains: list[str] | None = None
 
 
 class BaseTool(ABC):

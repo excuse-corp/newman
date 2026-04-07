@@ -15,7 +15,6 @@ MEMORY_FILE_MAP = {
     "newman": "Newman.md",
     "user": "USER.md",
     "skills": "SKILLS_SNAPSHOT.md",
-    "memory": "MEMORY.md",
 }
 
 

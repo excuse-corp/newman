@@ -10,9 +10,12 @@ Action: {{ action }}
 Category: {{ category }}
 Error code: {{ error_code }}
 Severity: {{ severity }}
+Risk level: {{ risk_level }}
+Recovery class: {{ recovery_class }}
 Exit code: {{ exit_code }}
 Retryable: {{ retryable }}
 Attempt: {{ attempt_count }}
+Frontend message: {{ frontend_message }}
 
 ## 失败摘要
 

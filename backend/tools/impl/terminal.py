@@ -2,24 +2,24 @@ from __future__ import annotations
 
 from typing import Any
 
-from backend.sandbox.docker_sandbox import DockerSandbox
+from backend.sandbox.native_sandbox import NativeSandbox
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.result import ToolExecutionResult
 
 
 class TerminalTool(BaseTool):
-    def __init__(self, sandbox: DockerSandbox):
+    def __init__(self, sandbox: NativeSandbox):
         self.sandbox = sandbox
         self.meta = ToolMeta(
             name="terminal",
-            description="Execute a shell command inside the sandbox.",
+            description="Execute a shell command inside the native sandbox.",
             input_schema={
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
                 "required": ["command"],
             },
             risk_level="high",
-            requires_approval=True,
+            requires_approval=False,
             timeout_seconds=sandbox.limits.timeout_seconds,
         )
 

@@ -6,7 +6,7 @@
 
 ## 一、模块目标
 
-实现 5 个核心工具、统一工具注册表、工具路由与治理层，包括两级审批机制和 Permission Context。
+实现 5 个核心工具、统一工具注册表、工具路由与治理层，包括两级审批机制和精简版 Permission Context。
 
 ---
 
@@ -14,12 +14,12 @@
 
 ### ✅ 包含
 
-- Tool 基类与元数据规范（name, description, input_schema, risk_level, requires_approval, timeout_seconds, allowed_paths/domains）
+- Tool 基类与元数据规范（name, description, input_schema, risk_level, requires_approval, timeout_seconds, allowed_paths）
 - ToolRegistry（统一注册表）
 - ToolRouter（匹配、静态检查、分发）
 - ToolOrchestrator（审批、超时、重试、审计、终止控制）
 - 两级审批机制（Level 1 静默拦截 + Level 2 人在回路）
-- Permission Context（allow / deny / ask 规则）
+- Permission Context（仅 deny 规则）
 - 当前核心 Tool：read_file, fetch_url, terminal, search_knowledge_base
 - ToolExecutionResult 统一结构
 
@@ -32,7 +32,7 @@
 
 ## 三、前置依赖
 
-- M05 Sandbox（terminal 需要沙箱）
+- M05 Sandbox（terminal 需要 Linux 原生沙箱）
 
 ---
 
@@ -70,15 +70,14 @@ class ToolMeta:
     requires_approval: bool
     timeout_seconds: int
     allowed_paths: list[str] | None = None
-    allowed_domains: list[str] | None = None
 ```
 
 ### 两级审批
 
 | 级别 | 触发条件 | 处理方式 |
 |------|----------|----------|
-| Level 1 静默拦截 | 命中黑名单、明显越权路径、危险命令 | 不弹窗，直接返回结构化拒绝 |
-| Level 2 人在回路 | 高风险命令、写入非工作区、白名单外网络、require_approval=true | 暂停执行，推送审批事件，等待用户确认 |
+| Level 1 静默拦截 | 命中黑名单、明确危险命令 | 不弹窗，直接返回结构化拒绝 |
+| Level 2 人在回路 | 高风险命令、写入非工作区、进程拉起、终端写操作或未知命令、require_approval=true | 暂停执行，推送审批事件，等待用户确认 |
 
 ### ToolExecutionResult
 
@@ -114,6 +113,8 @@ class ToolExecutionResult:
 ## 七、技术备注
 
 - read_file 需支持文本和二进制文件，有大小限制
-- fetch_url 需支持 allowed_domains 白名单过滤
+- fetch_url 默认不要求域名白名单过滤；如后续业务需要，可通过工具元数据扩展约束
 - terminal 必须通过 Sandbox 执行
+- terminal 参考 Codex：Linux 沙箱内明显只读命令可自动放行；危险命令先走前置审批，再决定是否进入人工审批
+- Phase 1 仅实现 Linux 原生沙箱（bubblewrap），macOS / Windows 标记为待做
 - search_knowledge_base 为 RAG 模块提供的工具接口壳，实际检索逻辑在 M07

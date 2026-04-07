@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
-from backend.config.schema import ProviderConfig
+from backend.config.schema import ModelConfig
 from backend.providers.anthropic_compatible import AnthropicCompatibleProvider
 from backend.providers.base import BaseProvider, ProviderChunk, ProviderResponse, TokenUsage, ToolCall
 from backend.providers.openai_compatible import OpenAICompatibleProvider
@@ -17,7 +17,7 @@ class MockProvider(BaseProvider):
             tool_output = str(last_message.get("content", "")).strip()
             return ProviderResponse(
                 content=f"[mock] 工具执行完成，结果摘要如下：{tool_output[:240]}",
-                usage=TokenUsage(input_tokens=estimate_message_tokens(messages)),
+                usage=TokenUsage(input_tokens=estimate_message_tokens(messages, model="mock")),
                 model="mock",
                 finish_reason="stop",
             )
@@ -35,13 +35,16 @@ class MockProvider(BaseProvider):
             return ProviderResponse(
                 content="",
                 tool_calls=[ToolCall(id=f"tool_{uuid4().hex[:8]}", name=tool_name, arguments=arguments)],
-                usage=TokenUsage(input_tokens=estimate_message_tokens(messages)),
+                usage=TokenUsage(input_tokens=estimate_message_tokens(messages, model="mock")),
                 model="mock",
                 finish_reason="tool_calls",
             )
         return ProviderResponse(
             content=f"[mock] Newman 已收到你的消息：{text or '空输入'}",
-            usage=TokenUsage(input_tokens=estimate_message_tokens(messages), output_tokens=max(1, len(text) // 4)),
+            usage=TokenUsage(
+                input_tokens=estimate_message_tokens(messages, model="mock"),
+                output_tokens=max(1, len(text) // 4),
+            ),
             model="mock",
             finish_reason="stop",
         )
@@ -60,10 +63,10 @@ class MockProvider(BaseProvider):
         yield ProviderChunk(type="done", finish_reason=response.finish_reason)
 
     def estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
-        return estimate_message_tokens(messages)
+        return estimate_message_tokens(messages, model="mock")
 
 
-def build_provider(config: ProviderConfig) -> BaseProvider:
+def build_provider(config: ModelConfig) -> BaseProvider:
     if config.type == "mock":
         return MockProvider()
     if config.type == "openai_compatible":

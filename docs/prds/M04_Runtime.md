@@ -21,7 +21,7 @@
 - ErrorClassifier（错误分类）
 - FeedbackWriter（错误摘要生成）
 - ResultNormalizer（工具结果归一化写回 history）
-- 单轮最大工具调用深度控制（默认 20）
+- 单轮最大工具调用深度控制（默认 30）
 
 ### ❌ 不包含
 
@@ -82,43 +82,40 @@ ResultNormalizer → ErrorClassifier → FeedbackWriter
 
 ### SessionTask 持有
 
-- 当前 Thread history
-- 当前 Agent 配置
-- 当前可用工具集合
-- 当前可用 Skills 子集
+- 当前 Thread / Session 数据
 - 审批上下文
-- SSE 推送队列
 - 工具调用计数器
 
 ### Prompt 三层模型
 
 | 层 | 内容 | 规则 |
 |----|------|------|
-| Stable Context | Newman.md, USER.md, SKILLS_SNAPSHOT.md, MEMORY.md, 工具列表, 审批策略 | 永不压缩、永不截断、每轮重新装载 |
+| Stable Context | Newman.md, USER.md, SKILLS_SNAPSHOT.md, 工具列表, 审批策略 | 永不压缩、永不截断、每轮重新装载 |
 | Working History | user / assistant / tool_call / tool_result 消息 | 主要压缩对象 |
 | Checkpoint Summary | 结构化摘要 | 上下文超限时替换旧 Working History |
 
 ### RunLoop 约束
 
-- 单轮最大工具调用深度默认 20
+- 单轮最大工具调用深度默认 30
 - 工具结果必须归一化后再写回 history
-- 所有可恢复错误必须写回 history
+- 所有工具错误与 Provider 可恢复错误都必须以反馈形式写回 history
 - 只有致命错误才中断当前回合
+- 工具调用深度超限时，不直接空中断，而是基于已有上下文优雅降级收口
 
 ---
 
 ## 六、验收标准
 
 1. 完整链路：用户输入 → Prompt 拼接 → LLM 调用 → 工具执行 → 结果归一化 → 响应输出
-2. 可恢复错误自动回灌给模型继续处理
+2. 工具错误与 Provider 可恢复错误自动回灌给模型继续处理
 3. 致命错误终止当前回合并返回结构化错误
-4. 工具调用深度超限时优雅降级（返回当前已有结果 + 提示）
+4. 工具调用深度超限时优雅降级（返回当前已有结果 + 提示用户可输入“继续”）
 5. 会话恢复后能从 Checkpoint 继续
 
 ---
 
 ## 七、技术备注
 
-- RunLoop 使用 LangGraph 的 StateGraph 实现状态机
+- 当前 RunLoop 使用手写循环而非 LangGraph StateGraph
 - SessionTask 生命周期与单次 API 请求绑定
 - 所有状态变更通过 SSE 事件推送给前端

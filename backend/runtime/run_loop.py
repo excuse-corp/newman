@@ -14,6 +14,8 @@ from backend.memory.compressor import estimate_pressure, summarize_messages
 from backend.memory.memory_extract import MemoryExtractor
 from backend.memory.stable_context import StableContextLoader
 from backend.plugin_runtime.service import PluginService
+from backend.providers.base import ProviderError, ProviderResponse
+from backend.providers.multimodal import MultimodalAnalyzer
 from backend.providers.factory import build_provider
 from backend.rag.service import KnowledgeBaseService
 from backend.runtime.feedback_writer import FeedbackWriter
@@ -39,7 +41,8 @@ from backend.tools.orchestrator import ToolOrchestrator
 from backend.tools.permission_context import PermissionContext
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import ToolRouter
-from backend.sandbox.docker_sandbox import DockerSandbox
+from backend.tools.result import ToolExecutionResult
+from backend.sandbox.native_sandbox import NativeSandbox
 from backend.sandbox.resource_limits import ResourceLimits
 
 
@@ -50,6 +53,7 @@ class NewmanRuntime:
     def __init__(self, settings: AppConfig):
         self.settings = settings
         self.provider = build_provider(settings.provider)
+        self.multimodal_analyzer = MultimodalAnalyzer(settings.models.multimodal)
         self.session_store = SessionStore(settings.paths.sessions_dir)
         self.thread_manager = ThreadManager(self.session_store)
         self.checkpoints = CheckpointStore(settings.paths.sessions_dir)
@@ -59,7 +63,6 @@ class NewmanRuntime:
             self.session_store,
             self.checkpoints,
             settings.paths.memory_dir / "USER.md",
-            settings.paths.memory_dir / "MEMORY.md",
             settings.paths.workspace / "backend" / "config" / "prompts" / "mem_extract.md",
         )
         self._background_tasks: set[asyncio.Task] = set()
@@ -79,6 +82,7 @@ class NewmanRuntime:
         self.registry = ToolRegistry()
         self.router = ToolRouter(self.registry, settings)
         self.orchestrator = ToolOrchestrator(settings, self.approvals)
+        self.exec_sandbox: NativeSandbox | None = None
         self.reload_ecosystem()
 
     def reload_ecosystem(self) -> None:
@@ -96,9 +100,9 @@ class NewmanRuntime:
                 "source_session_id": None,
                 "reason": "no_previous_session",
             }
-        return self.schedule_memory_extraction(previous.session_id, "new_session_created")
+        return self.schedule_user_memory_extraction(previous.session_id, "new_session_created")
 
-    def schedule_memory_extraction(self, session_id: str, trigger: str) -> dict[str, object]:
+    def schedule_user_memory_extraction(self, session_id: str, trigger: str) -> dict[str, object]:
         if self.settings.provider.type == "mock":
             return {
                 "scheduled": False,
@@ -124,13 +128,18 @@ class NewmanRuntime:
 
     def _build_registry(self, workspace: Path) -> ToolRegistry:
         limits = ResourceLimits(
-            cpu_limit=self.settings.sandbox.cpu_limit,
-            memory_limit=self.settings.sandbox.memory_limit,
             timeout_seconds=self.settings.sandbox.timeout,
             output_limit_bytes=self.settings.sandbox.output_limit_bytes,
         )
-        sandbox = DockerSandbox(workspace=workspace, limits=limits, enabled=self.settings.sandbox.enabled)
-        knowledge_base = KnowledgeBaseService(self.settings.paths.knowledge_dir, workspace)
+        sandbox = NativeSandbox(workspace=workspace, limits=limits, config=self.settings.sandbox)
+        self.exec_sandbox = sandbox
+        knowledge_base = KnowledgeBaseService(
+            self.settings.paths.knowledge_dir,
+            workspace,
+            self.settings.models,
+            self.settings.rag,
+            self.settings.paths.chroma_dir,
+        )
         registry = ToolRegistry()
         registry.register(ReadFileTool(workspace))
         registry.register(ListDirectoryTool(workspace))
@@ -159,15 +168,21 @@ class NewmanRuntime:
             registry.register(tool)
         return registry
 
-    async def handle_message(self, session_id: str, content: str, emit: EventEmitter) -> None:
-        session = self.session_store.get(session_id)
-        user_message = SessionMessage(id=uuid4().hex, role="user", content=content)
-        session.messages.append(user_message)
-        self.session_store.save(session)
+    async def handle_message(
+        self,
+        session_id: str,
+        content: str,
+        emit: EventEmitter,
+        user_metadata: dict[str, object] | None = None,
+    ) -> None:
+        self.reload_ecosystem()
+        user_message = SessionMessage(id=uuid4().hex, role="user", content=content, metadata=user_metadata or {})
+        session = self.session_store.append_message(session_id, user_message)
         await self._emit_hooks("SessionStart", emit, session_id=session.session_id, content=content)
 
         task = SessionTask(session=session, permission_context=PermissionContext())
         await self._maybe_checkpoint(task, emit)
+        provider_feedback_attempted = False
 
         for _ in range(self.settings.runtime.max_tool_depth):
             self.skill_registry.sync_snapshot()
@@ -178,16 +193,31 @@ class NewmanRuntime:
                 self.checkpoints.get(task.session.session_id),
             )
 
-            response = await self.provider.chat(
-                assembled,
-                tools=self.registry.tools_for_provider(task.permission_context),
-            )
+            try:
+                response = await self._stream_provider_response(
+                    assembled,
+                    self.registry.tools_for_provider(task.permission_context),
+                    emit,
+                )
+            except ProviderError as exc:
+                result = self._provider_error_result(exc)
+                await self._record_failure_feedback(task, result, emit)
+                if exc.retryable and result.recovery_class == "recoverable" and not provider_feedback_attempted:
+                    provider_feedback_attempted = True
+                    continue
+                await self._emit_fatal_error(
+                    task,
+                    emit,
+                    result,
+                    finish_reason="provider_error",
+                    extra={"provider": exc.provider, "status_code": exc.status_code},
+                )
+                return
 
             if not response.tool_calls:
                 assistant_message = SessionMessage(id=uuid4().hex, role="assistant", content=response.content)
                 task.session.messages.append(assistant_message)
                 self.session_store.save(task.session)
-                await emit("assistant_delta", {"content": response.content, "model": response.model})
                 await emit(
                     "final_response",
                     {
@@ -197,7 +227,7 @@ class NewmanRuntime:
                     },
                 )
                 if self.memory_extractor.looks_like_explicit_persistence_signal(content):
-                    self.schedule_memory_extraction(task.session.session_id, "explicit_user_request")
+                    self.schedule_user_memory_extraction(task.session.session_id, "explicit_user_request")
                 await self._emit_hooks(
                     "SessionEnd",
                     emit,
@@ -239,6 +269,12 @@ class NewmanRuntime:
                             "tool": result.tool,
                             "category": result.category,
                             "success": result.success,
+                            "error_code": result.error_code,
+                            "severity": result.severity,
+                            "risk_level": result.risk_level,
+                            "recovery_class": result.recovery_class,
+                            "frontend_message": result.frontend_message,
+                            "recommended_next_step": result.recommended_next_step,
                         },
                     )
                 )
@@ -252,6 +288,10 @@ class NewmanRuntime:
                         "category": result.category,
                         "error_code": result.error_code,
                         "severity": result.severity,
+                        "risk_level": result.risk_level,
+                        "recovery_class": result.recovery_class,
+                        "frontend_message": result.frontend_message,
+                        "recommended_next_step": result.recommended_next_step,
                         "summary": result.summary,
                         "duration_ms": result.duration_ms,
                         "attempt_count": result.attempt_count,
@@ -274,39 +314,217 @@ class NewmanRuntime:
                     success=result.success,
                     category=result.category,
                 )
+                if result.success and result.tool in {"write_file", "edit_file"}:
+                    changed_path = result.metadata.get("path")
+                    if isinstance(changed_path, str) and changed_path:
+                        await self._emit_hooks(
+                            "FileChanged",
+                            emit,
+                            session_id=task.session.session_id,
+                            tool=result.tool,
+                            path=changed_path,
+                        )
                 if not result.success:
-                    await emit(
-                        "tool_error_feedback",
-                        {
-                            "tool": result.tool,
-                            "category": result.category,
-                            "error_code": result.error_code,
-                            "severity": result.severity,
-                            "summary": result.summary,
-                            "retryable": result.retryable,
-                            "attempt_count": result.attempt_count,
-                        },
-                    )
-                    feedback = self.feedback_writer.build(result)
-                    task.session.messages.append(
-                        SessionMessage(id=uuid4().hex, role="system", content=feedback, metadata={"type": "tool_error_feedback"})
-                    )
-                    self.session_store.save(task.session)
+                    await self._record_failure_feedback(task, result, emit)
+                    if result.recovery_class == "fatal":
+                        await self._emit_fatal_error(
+                            task,
+                            emit,
+                            result,
+                            finish_reason="fatal_tool_error",
+                        )
+                        return
 
             if task.tool_depth >= self.settings.runtime.max_tool_depth:
-                await emit(
-                    "error",
-                    {
-                        "code": "RUNTIME_MAX_TOOL_DEPTH",
-                        "message": "工具调用深度达到上限",
-                    },
-                )
+                await self._finalize_tool_limit(task, emit)
                 return
 
         await emit("error", {"code": "RUNTIME_EXIT", "message": "RunLoop 未能正常完成"})
 
+    async def _stream_provider_response(
+        self,
+        assembled: list[dict[str, object]],
+        tools: list[dict[str, object]],
+        emit: EventEmitter,
+    ) -> ProviderResponse:
+        content_parts: list[str] = []
+        tool_calls = []
+        finish_reason = "stop"
+        async for chunk in self.provider.chat_stream(assembled, tools=tools):
+            if chunk.type == "text" and chunk.delta:
+                content_parts.append(chunk.delta)
+                await emit(
+                    "assistant_delta",
+                    {
+                        "content": "".join(content_parts),
+                        "model": self.settings.provider.model,
+                    },
+                )
+            elif chunk.type == "tool_call" and chunk.tool_call:
+                tool_calls.append(chunk.tool_call)
+            elif chunk.type == "done":
+                finish_reason = chunk.finish_reason or finish_reason
+        return ProviderResponse(
+            content="".join(content_parts),
+            tool_calls=tool_calls,
+            model=self.settings.provider.model,
+            finish_reason=finish_reason,
+        )
+
+    async def _record_failure_feedback(
+        self,
+        task: SessionTask,
+        result: ToolExecutionResult,
+        emit: EventEmitter,
+    ) -> None:
+        await emit(
+            "tool_error_feedback",
+            {
+                "tool": result.tool,
+                "category": result.category,
+                "error_code": result.error_code,
+                "severity": result.severity,
+                "risk_level": result.risk_level,
+                "recovery_class": result.recovery_class,
+                "frontend_message": result.frontend_message,
+                "summary": result.summary,
+                "retryable": result.retryable,
+                "attempt_count": result.attempt_count,
+                "recommended_next_step": result.recommended_next_step,
+            },
+        )
+        feedback = self.feedback_writer.build(result)
+        task.session.messages.append(
+            SessionMessage(
+                id=uuid4().hex,
+                role="system",
+                content=feedback,
+                metadata={
+                    "type": "tool_error_feedback",
+                    "error_code": result.error_code,
+                    "severity": result.severity,
+                    "risk_level": result.risk_level,
+                    "recovery_class": result.recovery_class,
+                    "frontend_message": result.frontend_message,
+                    "recommended_next_step": result.recommended_next_step,
+                },
+            )
+        )
+        self.session_store.save(task.session)
+
+    async def _finalize_tool_limit(self, task: SessionTask, emit: EventEmitter) -> None:
+        limit = self.settings.runtime.max_tool_depth
+        instruction = (
+            f"你已达到当前回合的工具调用上限（{limit} 次）。"
+            "禁止继续调用任何工具。请仅基于现有上下文、已有工具结果和 checkpoint 摘要，"
+            "给出一个阶段性结论，并明确告诉用户：如果要继续深入处理，请直接输入“继续”。"
+        )
+        task.session.messages.append(
+            SessionMessage(
+                id=uuid4().hex,
+                role="system",
+                content=instruction,
+                metadata={"type": "tool_limit_guard"},
+            )
+        )
+        self.session_store.save(task.session)
+
+        assembled = self.prompt_assembler.assemble(
+            task.session,
+            self.registry.describe(),
+            json.dumps(self.settings.approval.model_dump(mode="json"), ensure_ascii=False),
+            self.checkpoints.get(task.session.session_id),
+        )
+        try:
+            response = await self._stream_provider_response(assembled, [], emit)
+            final_content = response.content.strip()
+        except ProviderError:
+            final_content = (
+                f"已达到当前回合的工具调用上限（{limit} 次）。"
+                "我先基于已经完成的检查和工具结果停在这里。"
+                "如果你要我继续往下处理，请直接输入“继续”。"
+            )
+
+        if not final_content:
+            final_content = (
+                f"已达到当前回合的工具调用上限（{limit} 次）。"
+                "我先基于已经完成的检查和工具结果停在这里。"
+                "如果你要我继续往下处理，请直接输入“继续”。"
+            )
+
+        assistant_message = SessionMessage(id=uuid4().hex, role="assistant", content=final_content)
+        task.session.messages.append(assistant_message)
+        self.session_store.save(task.session)
+        await emit(
+            "final_response",
+            {
+                "session_id": task.session.session_id,
+                "content": final_content,
+                "finish_reason": "tool_limit_reached",
+            },
+        )
+        await self._emit_hooks(
+            "SessionEnd",
+            emit,
+            session_id=task.session.session_id,
+            finish_reason="tool_limit_reached",
+        )
+
+    def _provider_error_result(self, error: ProviderError) -> ToolExecutionResult:
+        result = ToolExecutionResult(
+            success=False,
+            tool=f"provider:{error.provider}",
+            action="chat",
+            category=error.kind,
+            summary=error.message,
+            stderr=json.dumps(
+                {
+                    "provider": error.provider,
+                    "kind": error.kind,
+                    "status_code": error.status_code,
+                    "details": error.details,
+                },
+                ensure_ascii=False,
+            ),
+            retryable=error.retryable,
+        )
+        return normalize_result(result)
+
+    async def _emit_fatal_error(
+        self,
+        task: SessionTask,
+        emit: EventEmitter,
+        result: ToolExecutionResult,
+        *,
+        finish_reason: str,
+        extra: dict[str, object] | None = None,
+    ) -> None:
+        payload = {
+            "code": result.error_code,
+            "message": result.frontend_message or result.summary,
+            "summary": result.summary,
+            "tool": result.tool,
+            "category": result.category,
+            "severity": result.severity,
+            "risk_level": result.risk_level,
+            "recovery_class": result.recovery_class,
+            "retryable": result.retryable,
+            "recommended_next_step": result.recommended_next_step,
+        }
+        if extra:
+            payload.update(extra)
+        await emit("error", payload)
+        await self._emit_hooks(
+            "SessionEnd",
+            emit,
+            session_id=task.session.session_id,
+            finish_reason=finish_reason,
+        )
+
     async def _emit_hooks(self, event: str, emit: EventEmitter, **data) -> None:
         for message in self.hook_manager.messages_for(event):
+            await emit("hook_triggered", {"event": event, "message": message, "context": data})
+        for message in await self.hook_manager.handler_messages_for(event, data):
             await emit("hook_triggered", {"event": event, "message": message, "context": data})
 
     async def _maybe_checkpoint(self, task: SessionTask, emit: EventEmitter) -> None:
@@ -319,18 +537,34 @@ class NewmanRuntime:
         pressure = estimate_pressure(self.provider, assembled)
         if pressure < self.settings.runtime.context_compress_threshold:
             return
-        summary = summarize_messages(task.session)
+        critical = pressure >= self.settings.runtime.context_critical_threshold
+        preserve_recent = 2 if critical else 4
+        original_count = len(task.session.messages)
+        checkpoint = self.checkpoints.get(task.session.session_id)
+        summary = summarize_messages(task.session, checkpoint=checkpoint)
         if not summary:
             return
-        preserve_recent = 4
         task.session.messages = task.session.messages[-preserve_recent:]
+        task.session.metadata["checkpoint_active"] = True
         self.session_store.save(task.session)
-        checkpoint = self.checkpoints.save(task.session.session_id, summary, [0, max(0, len(task.session.messages) - preserve_recent)])
+        checkpoint = self.checkpoints.save(
+            task.session.session_id,
+            summary,
+            [0, max(0, original_count - preserve_recent)],
+            metadata={
+                "preserve_recent": preserve_recent,
+                "compression_level": "critical" if critical else "normal",
+                "original_message_count": original_count,
+            },
+        )
+        task.session.metadata["checkpoint_restore_hint"] = checkpoint.checkpoint_id
+        self.session_store.save(task.session)
         await emit(
             "checkpoint_created",
             {
                 "session_id": task.session.session_id,
                 "checkpoint_id": checkpoint.checkpoint_id,
                 "summary": checkpoint.summary,
+                "compression_level": checkpoint.metadata.get("compression_level", "normal"),
             },
         )

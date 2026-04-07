@@ -80,9 +80,12 @@ runtime:
 
 sandbox:
   enabled: true
-  cpu_limit: 1
-  memory_limit: "512m"
+  backend: "linux_bwrap"
+  mode: "workspace-write"
+  network_access: false
+  writable_roots: []
   timeout: 30
+  output_limit_bytes: 10240
 
 approval:
   level1_blacklist:
@@ -90,7 +93,9 @@ approval:
     - "sudo"
   level2_patterns:
     - "write_file_outside_workspace"
-    - "network_access_unlisted"
+    - "process_spawn"
+    - "terminal_mutation_or_unknown"
+    - "danger_full_access_terminal"
 ```
 
 ### 环境变量覆盖规则
@@ -119,3 +124,4 @@ NEWMAN_RUNTIME_MAX_TOOL_DEPTH=30
 - 使用 Pydantic v2 进行 Schema 验证
 - 配置文件监控可后续扩展（watchdog），但 MVP 不实现热更新
 - Prompt 模板使用 Jinja2 或简单变量替换
+- Phase 1 沙箱配置只要求 Linux 生效；macOS / Windows 保留配置项但执行层暂不实现

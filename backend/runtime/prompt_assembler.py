@@ -12,7 +12,11 @@ class PromptAssembler:
     def assemble(self, session: SessionRecord, tools_overview: str, approval_policy: str, checkpoint: CheckpointRecord | None) -> list[dict]:
         stable_context = self.stable_context_loader.build(tools_overview, approval_policy, self.workspace_path)
         messages = [{"role": "system", "content": stable_context}]
-        if checkpoint:
+        has_restored_checkpoint = any(
+            item.role == "system" and item.metadata.get("type") == "checkpoint_restore"
+            for item in session.messages
+        )
+        if checkpoint and not has_restored_checkpoint:
             messages.append({"role": "system", "content": f"## Checkpoint Summary\n{checkpoint.summary}"})
         for item in session.messages:
             messages.append({"role": item.role, "content": item.content})

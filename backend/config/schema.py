@@ -12,18 +12,27 @@ class ServerConfig(BaseModel):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
 
 
-class ProviderConfig(BaseModel):
+class ModelConfig(BaseModel):
     type: Literal["mock", "openai_compatible", "anthropic_compatible"] = "mock"
     model: str = "newman-dev"
     endpoint: str | None = None
     api_key: str | None = None
+    context_window: int | None = None
+    embedding_dimension: int | None = None
     timeout: int = 60
     max_tokens: int = 4096
     temperature: float = 0.2
 
 
+class ModelsConfig(BaseModel):
+    primary: ModelConfig = Field(default_factory=ModelConfig)
+    multimodal: ModelConfig = Field(default_factory=ModelConfig)
+    embedding: ModelConfig = Field(default_factory=ModelConfig)
+    reranker: ModelConfig = Field(default_factory=ModelConfig)
+
+
 class RuntimeConfig(BaseModel):
-    max_tool_depth: int = 20
+    max_tool_depth: int = 30
     context_compress_threshold: float = 0.8
     context_critical_threshold: float = 0.92
     tool_retry_attempts: int = 3
@@ -31,10 +40,11 @@ class RuntimeConfig(BaseModel):
 
 
 class SandboxConfig(BaseModel):
-    enabled: bool = False
-    image: str = "newman-sandbox:latest"
-    cpu_limit: float = 1.0
-    memory_limit: str = "512m"
+    enabled: bool = True
+    backend: Literal["linux_bwrap"] = "linux_bwrap"
+    mode: Literal["read-only", "workspace-write", "danger-full-access"] = "workspace-write"
+    network_access: bool = False
+    writable_roots: list[str] = Field(default_factory=list)
     timeout: int = 30
     output_limit_bytes: int = 10_240
 
@@ -42,9 +52,22 @@ class SandboxConfig(BaseModel):
 class ApprovalConfig(BaseModel):
     level1_blacklist: list[str] = Field(default_factory=lambda: ["rm -rf /", "sudo", "su ", "chmod 777 /", "chown root"])
     level2_patterns: list[str] = Field(
-        default_factory=lambda: ["write_file_outside_workspace", "network_access_unlisted", "process_spawn"]
+        default_factory=lambda: [
+            "write_file_outside_workspace",
+            "process_spawn",
+            "terminal_mutation_or_unknown",
+            "danger_full_access_terminal",
+        ]
     )
     timeout_seconds: int = 120
+
+
+class RagConfig(BaseModel):
+    postgres_dsn: str = "postgresql://postgres@127.0.0.1:54329/newman"
+    chroma_collection: str = "knowledge_chunks"
+    lexical_candidate_count: int = 24
+    vector_candidate_count: int = 24
+    hybrid_candidate_count: int = 32
 
 
 class PathsConfig(BaseModel):
@@ -54,6 +77,7 @@ class PathsConfig(BaseModel):
     memory_dir: Path = Path("backend_data/memory")
     audit_dir: Path = Path("backend_data/audit")
     knowledge_dir: Path = Path("backend_data/knowledge")
+    chroma_dir: Path = Path("backend_data/chroma")
     plugins_dir: Path = Path("plugins")
     skills_dir: Path = Path("skills")
     mcp_dir: Path = Path("backend_data/mcp")
@@ -73,13 +97,31 @@ class ChannelsConfig(BaseModel):
 
 class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
-    provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    rag: RagConfig = Field(default_factory=RagConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
 
+    @property
+    def provider(self) -> ModelConfig:
+        return self.models.primary
+
     @classmethod
     def model_validate_merged(cls, data: dict[str, Any]) -> "AppConfig":
-        return cls.model_validate(data)
+        payload = dict(data)
+        legacy_provider = payload.pop("provider", None)
+        models = payload.get("models")
+        if not isinstance(models, dict):
+            models = {}
+
+        if isinstance(legacy_provider, dict):
+            primary = models.get("primary")
+            if not isinstance(primary, dict):
+                primary = {}
+            models["primary"] = {**legacy_provider, **primary}
+
+        payload["models"] = models
+        return cls.model_validate(payload)

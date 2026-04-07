@@ -7,6 +7,7 @@ from typing import Awaitable, Callable
 from backend.config.schema import AppConfig
 from backend.runtime.retry_policy import RetryPolicy
 from backend.tools.approval import ApprovalManager
+from backend.tools.approval_policy import ApprovalPolicy
 from backend.tools.base import BaseTool
 from backend.tools.result import ToolExecutionResult
 
@@ -19,6 +20,7 @@ class ToolOrchestrator:
         self.settings = settings
         self.approvals = approvals
         self.retry_policy = RetryPolicy(settings.runtime)
+        self.approval_policy = ApprovalPolicy(settings)
 
     async def execute(
         self,
@@ -28,14 +30,24 @@ class ToolOrchestrator:
         emit: EventEmitter,
         extra_reasons: list[str] | None = None,
     ) -> ToolExecutionResult:
-        reasons = list(extra_reasons or [])
-        requires_approval = tool.meta.requires_approval or bool(reasons)
-        if requires_approval:
+        decision = self.approval_policy.evaluate(tool, arguments, extra_reasons)
+        if decision.action == "deny":
+            return ToolExecutionResult(
+                success=False,
+                tool=tool.meta.name,
+                action="approval",
+                category="permission_error",
+                summary=decision.summary or "命中前置审批拒绝规则",
+                retryable=False,
+                metadata={"approval_stage": "preflight", "reasons": decision.reasons},
+            )
+
+        if decision.action == "ask":
             request = self.approvals.create(
                 session_id=session_id,
                 tool_name=tool.meta.name,
                 arguments=arguments,
-                reason=", ".join(reasons) or "requires_approval",
+                reason=", ".join(decision.reasons) or "requires_approval",
             )
             await emit(
                 "tool_approval_request",
@@ -44,6 +56,7 @@ class ToolOrchestrator:
                     "tool": tool.meta.name,
                     "arguments": arguments,
                     "reason": request.reason,
+                    "summary": decision.summary,
                     "timeout_seconds": self.settings.approval.timeout_seconds,
                 },
             )

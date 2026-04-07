@@ -77,15 +77,6 @@ SYSTEM_RULE_PATTERNS = [
     r"newman 规则",
 ]
 USER_MEMORY_FORBIDDEN_PATTERNS = EPHEMERAL_PATTERNS + SYSTEM_RULE_PATTERNS
-LONG_TERM_MEMORY_FORBIDDEN_PATTERNS = EPHEMERAL_PATTERNS + [
-    r"偏好",
-    r"喜欢",
-    r"习惯",
-    r"语气",
-    r"风格",
-    r"称呼",
-    r"回复方式",
-] + SYSTEM_RULE_PATTERNS
 
 
 class MemoryExtractor:
@@ -96,7 +87,6 @@ class MemoryExtractor:
         session_store: SessionStore,
         checkpoints: CheckpointStore,
         user_path: Path,
-        memory_path: Path,
         prompt_path: Path,
     ):
         self.provider = provider
@@ -111,14 +101,6 @@ class MemoryExtractor:
             block_end="<!-- END AUTO USER MEMORY -->",
             section_title="## User Memory",
             description="仅记录跨 session 稳定成立的用户偏好、沟通方式和长期协作约定，不记录一次性任务或项目事实。",
-        )
-        self.long_term_spec = MemoryFileSpec(
-            path=memory_path,
-            header="# MEMORY.md",
-            block_begin="<!-- BEGIN AUTO MEMORY -->",
-            block_end="<!-- END AUTO MEMORY -->",
-            section_title="## Long-term Memory",
-            description="仅记录跨 session 仍有价值的客观事实，不记录偏好、系统规则或临时任务。",
         )
         self._write_lock = asyncio.Lock()
 
@@ -170,7 +152,6 @@ class MemoryExtractor:
                     "extraction_last_at": utc_now(),
                     "extraction_last_trigger": trigger,
                     "extraction_last_user_count": 0,
-                    "extraction_last_long_term_count": 0,
                     "extraction_last_status": "skipped_short_session",
                 },
                 touch_updated_at=False,
@@ -198,9 +179,9 @@ class MemoryExtractor:
             ],
             temperature=0,
         )
-        user_items, long_term_items = self._parse_extraction_result(response.content)
-        added_user_items, added_long_term_items = await self._merge_updates(user_items, long_term_items)
-        status = "updated" if added_user_items or added_long_term_items else "no_new_fact"
+        user_items = self._parse_extraction_result(response.content)
+        added_user_items = await self._merge_updates(user_items)
+        status = "updated" if added_user_items else "no_new_fact"
         self.session_store.update_metadata(
             session_id,
             {
@@ -208,7 +189,6 @@ class MemoryExtractor:
                 "extraction_last_at": utc_now(),
                 "extraction_last_trigger": trigger,
                 "extraction_last_user_count": len(added_user_items),
-                "extraction_last_long_term_count": len(added_long_term_items),
                 "extraction_last_status": status,
             },
             touch_updated_at=False,
@@ -219,7 +199,6 @@ class MemoryExtractor:
             "source_session_id": session_id,
             "trigger": trigger,
             "user_memory": added_user_items,
-            "long_term_memory": added_long_term_items,
         }
 
     def _has_extractable_context(
@@ -264,7 +243,6 @@ class MemoryExtractor:
             },
             "checkpoint": checkpoint.model_dump(mode="json") if checkpoint else None,
             "current_user_memory": self.user_spec.path.read_text(encoding="utf-8") if self.user_spec.path.exists() else "",
-            "current_long_term_memory": self.long_term_spec.path.read_text(encoding="utf-8") if self.long_term_spec.path.exists() else "",
             "recent_messages": [
                 {
                     "role": message.role,
@@ -280,15 +258,12 @@ class MemoryExtractor:
         prefixes = ("memory_", "extraction_")
         return {key: value for key, value in metadata.items() if not key.startswith(prefixes)}
 
-    def _parse_extraction_result(self, content: str) -> tuple[list[str], list[str]]:
+    def _parse_extraction_result(self, content: str) -> list[str]:
         payload = self._parse_json_payload(content)
         if not isinstance(payload, dict):
-            return [], []
+            return []
         user_items = self._parse_item_list(payload.get("user_memory"), USER_MEMORY_FORBIDDEN_PATTERNS)
-        long_term_items = self._parse_item_list(payload.get("long_term_memory"), LONG_TERM_MEMORY_FORBIDDEN_PATTERNS)
-        if not long_term_items:
-            long_term_items = self._parse_item_list(payload.get("facts"), LONG_TERM_MEMORY_FORBIDDEN_PATTERNS)
-        return user_items, long_term_items
+        return user_items
 
     def _parse_item_list(self, raw_items: Any, forbidden_patterns: list[str]) -> list[str]:
         if not isinstance(raw_items, list):
@@ -328,14 +303,12 @@ class MemoryExtractor:
                 return loaded
         return {}
 
-    async def _merge_updates(self, user_items: list[str], long_term_items: list[str]) -> tuple[list[str], list[str]]:
-        if not user_items and not long_term_items:
-            return [], []
+    async def _merge_updates(self, user_items: list[str]) -> list[str]:
+        if not user_items:
+            return []
 
         async with self._write_lock:
-            added_user_items = self._merge_file(self.user_spec, user_items)
-            added_long_term_items = self._merge_file(self.long_term_spec, long_term_items)
-            return added_user_items, added_long_term_items
+            return self._merge_file(self.user_spec, user_items)
 
     def _merge_file(self, spec: MemoryFileSpec, new_items: list[str]) -> list[str]:
         original = spec.path.read_text(encoding="utf-8") if spec.path.exists() else f"{spec.header}\n"
