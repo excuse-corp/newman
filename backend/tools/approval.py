@@ -53,6 +53,13 @@ class ApprovalManager:
             raise FileNotFoundError(f"Approval request not found: {approval_request_id}")
         return request
 
+    def find_for_session(self, session_id: str) -> ApprovalRequest | None:
+        matches = [request for request in self._pending.values() if request.session_id == session_id]
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item.created_at, reverse=True)
+        return matches[0]
+
     async def wait(self, approval_request_id: str, timeout_seconds: int) -> bool:
         request = self.get(approval_request_id)
         if request.future is None:

@@ -28,7 +28,7 @@
 ### Base URL
 
 ```text
-http://localhost:8000
+http://localhost:8005
 ```
 
 ### 推荐启动方式
@@ -41,7 +41,7 @@ uvicorn backend.main:app --reload
 
 本地默认依赖：
 
-- PostgreSQL: `127.0.0.1:54329`
+- PostgreSQL: `127.0.0.1:65437`
 - Database: `newman`
 - Chroma 持久化目录: `backend_data/chroma/`
 - 知识文档与解析产物目录: `backend_data/knowledge/`
@@ -326,6 +326,29 @@ text/event-stream
 
 `DELETE /api/sessions/{session_id}`
 
+## 3.4A 重命名会话
+
+`PATCH /api/sessions/{session_id}`
+
+请求体：
+
+```json
+{
+  "title": "新的会话标题"
+}
+```
+
+响应示例：
+
+```json
+{
+  "updated": true,
+  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "title": "新的会话标题",
+  "updated_at": "2026-04-08T08:10:00+00:00"
+}
+```
+
 ## 3.5 手动压缩会话
 
 `POST /api/sessions/{session_id}/compress`
@@ -459,6 +482,35 @@ text/event-stream
 
 ## 5.1 审批通过
 
+`GET /api/sessions/{session_id}/pending-approval`
+
+响应示例：
+
+```json
+{
+  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "pending": {
+    "approval_request_id": "apr_xxx",
+    "tool": "terminal",
+    "arguments": {
+      "command": "echo hi > /tmp/x"
+    },
+    "reason": "terminal_mutation_or_unknown",
+    "timeout_seconds": 120,
+    "remaining_seconds": 78
+  }
+}
+```
+
+若当前没有待审批请求：
+
+```json
+{
+  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "pending": null
+}
+```
+
 `POST /api/sessions/{session_id}/approve`
 
 ## 5.2 审批拒绝
@@ -506,6 +558,14 @@ text/event-stream
     "user": {
       "path": "/root/newman/backend_data/memory/USER.md",
       "content": "# USER.md\n\n<!-- BEGIN AUTO USER MEMORY -->\n## User Memory\n仅记录跨 session 稳定成立的用户偏好、沟通方式和长期协作约定，不记录一次性任务或项目事实。\n\n- 暂无条目\n<!-- END AUTO USER MEMORY -->"
+    },
+    "memory": {
+      "path": "/root/newman/backend_data/memory/MEMORY.md",
+      "content": "# MEMORY.md\n\n长期记忆内容 ..."
+    },
+    "skills": {
+      "path": "/root/newman/backend_data/memory/SKILLS_SNAPSHOT.md",
+      "content": "# SKILLS_SNAPSHOT.md\n\n当前可用 skill 快照 ..."
     }
   }
 }
@@ -519,6 +579,7 @@ text/event-stream
 
 - `newman`
 - `user`
+- `memory`
 - `skills`
 
 请求体：
@@ -952,6 +1013,12 @@ multipart/form-data
 - `stream_completed`
 - `error`
 
+### 与前端 PRD 对齐说明
+
+- `session_created` 已实现，但只出现在 `POST /api/sessions/stream` 的 SSE 中，不会出现在 `POST /api/sessions/{session_id}/messages` 的消息流里。
+- 前端当前应以 `final_response` 作为“本轮回答结束”的主信号；`assistant_done` 还未单独实现。
+- `memory_updated` 还未实现为 SSE 事件。前端若要看到最新 Memory 内容，当前应通过 `GET /api/workspace/memory` 主动刷新。
+
 说明：
 
 - `tool_approval_request` 只会在通过前置审批后、需要用户人工确认时触发。
@@ -1223,3 +1290,14 @@ fatal 错误事件示例：
 - MCP 目前是 bridge 基线，不是完整官方 MCP 协议栈
 - Scheduler 当前使用内置 cron 解析与轮询执行
 - Channels 当前返回标准化 webhook 响应，尚未接入真实飞书/企微发送端
+
+## 十五、前端联调待办
+
+以下是已知但尚未在当前 API / 前端联调中完全闭环的项：
+
+- `assistant_done` SSE 事件未实现，当前以前端消费 `final_response` 代替
+- `memory_updated` SSE 事件未实现，当前 Memory 仍以 REST 刷新为主
+- Evidence Drawer 的 `Trace / Tool IO / 引用` 三标签结构尚未定稿，当前前端右侧仍以摘要 + Raw JSON 为主
+- 刷新页面后，前端现已能恢复当前会话、工作区页、栏宽、最近选中的 trace，并尽量恢复待审批请求和最近一次可见的流式回答内容
+- 当前仍不支持真正的 SSE 断点续传；如果浏览器刷新时网络流被中断，页面只能恢复“最后一次可见状态”，不能继续复用原连接
+- 移动端工作台只保证可读和不崩布局，右侧抽屉滑层与输入栏吸附仍为待办

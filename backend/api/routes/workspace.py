@@ -14,6 +14,7 @@ router = APIRouter(prefix="/api/workspace", tags=["workspace"])
 MEMORY_FILE_MAP = {
     "newman": "Newman.md",
     "user": "USER.md",
+    "memory": "MEMORY.md",
     "skills": "SKILLS_SNAPSHOT.md",
 }
 

@@ -345,7 +345,8 @@ P1 可增加：
 
 ### 交互要求
 
-- 30 秒超时自动拒绝
+- 倒计时以 SSE `tool_approval_request.data.timeout_seconds` 为准
+- 当前后端默认审批超时为 120 秒，超时后由后端自动拒绝
 - 用户做出选择后，前端立刻更新工具状态
 - 被拒绝后，Conversation 中应出现明确可见的系统反馈
 
@@ -362,6 +363,7 @@ P1 可增加：
 - 查看 `Newman.md`
 - 查看 `USER.md`
 - 查看 `MEMORY.md`
+- 查看 `SKILLS_SNAPSHOT.md`
 - 展示最近一次记忆更新时间
 
 ### P1 范围
@@ -537,18 +539,30 @@ MVP 移动端策略：
 
 ## 10.1 必须支持的 SSE 事件
 
-- `session_created`
 - `assistant_delta`
-- `assistant_done`
 - `tool_call_started`
 - `tool_call_finished`
+- `tool_retry_scheduled`
 - `tool_approval_request`
 - `tool_approval_resolved`
 - `tool_error_feedback`
 - `checkpoint_created`
-- `memory_updated`
 - `final_response`
 - `error`
+
+当前前端还应兼容以下已实现事件：
+
+- `attachment_received`
+- `attachment_processed`
+- `hook_triggered`
+- `plan_updated`
+- `stream_completed`
+
+补充说明：
+
+- `session_created` 已由 `POST /api/sessions/stream` 提供，但当前主消息流不依赖它
+- `assistant_done` 暂未单独实现，现阶段以 `final_response` 作为“回答结束”信号
+- `memory_updated` 暂未实现为 SSE，Memory 页当前通过 REST 刷新
 
 ## 10.2 前端事件处理原则
 
@@ -560,10 +574,12 @@ MVP 移动端策略：
 
 - 新建会话
 - 获取会话列表
+- 重命名会话
 - 删除会话
 - 发送消息
 - 提交审批结果
 - 手动触发压缩
+- 恢复 checkpoint
 - 获取插件列表
 - 更新插件启停
 
@@ -721,5 +737,17 @@ Newman 前端的核心不是“把 AI 结果展示出来”，而是把一次 Ag
 - 风险可感知
 - 证据可到达
 - 长时间使用不疲劳
+
+---
+
+## 十六、当前待办
+
+以下需求已明确保留为待办，暂不在本轮强行固化：
+
+- Evidence Drawer 的右侧信息架构还需继续细化，`Trace / Tool IO / 引用` 的具体字段和交互暂未定稿
+- Memory / Skills / Files 三个工作区的深度产品化仍是待办，当前先保持基础可用
+- 移动端工作台的抽屉滑层、输入栏吸附与更完整适配仍是待办
+- 刷新页面后的连续性已补齐基础恢复：当前会话、工作区页、栏宽、最近选中的 trace、待审批请求，以及最近一次可见的流式回答内容
+- 更完整的 SSE 断点续传仍是后续专项待办；当前只能恢复“最后一次可见状态”，不能把原流继续接上
 
 这也是 Newman 与普通 AI 对话产品在前端层面的根本区别。

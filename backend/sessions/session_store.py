@@ -91,5 +91,11 @@ class SessionStore:
         self.save(session, touch_updated_at=touch_updated_at)
         return session
 
+    def rename(self, session_id: str, title: str) -> SessionRecord:
+        session = self.get(session_id)
+        session.title = title.strip() or session.title
+        self.save(session)
+        return session
+
     def _path_for(self, session_id: str) -> Path:
         return self.sessions_dir / f"{session_id}.json"

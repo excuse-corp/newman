@@ -64,7 +64,7 @@ config/
 # defaults.yaml
 server:
   host: "0.0.0.0"
-  port: 8000
+  port: 8005
 
 provider:
   type: "openai_compatible"

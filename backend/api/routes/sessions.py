@@ -17,6 +17,10 @@ class CreateSessionRequest(BaseModel):
     title: str | None = None
 
 
+class UpdateSessionRequest(BaseModel):
+    title: str
+
+
 @router.post("")
 async def create_session(payload: CreateSessionRequest, request: Request):
     runtime = request.app.state.runtime
@@ -141,3 +145,15 @@ async def delete_session(session_id: str, request: Request):
     runtime = request.app.state.runtime
     runtime.thread_manager.delete(session_id)
     return {"deleted": True, "session_id": session_id}
+
+
+@router.patch("/{session_id}")
+async def update_session(session_id: str, payload: UpdateSessionRequest, request: Request):
+    runtime = request.app.state.runtime
+    session = runtime.session_store.rename(session_id, payload.title)
+    return {
+        "updated": True,
+        "session_id": session.session_id,
+        "title": session.title,
+        "updated_at": session.updated_at,
+    }

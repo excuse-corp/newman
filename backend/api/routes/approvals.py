@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from time import time
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
@@ -9,6 +11,28 @@ router = APIRouter(prefix="/api/sessions", tags=["approvals"])
 
 class ApprovalActionRequest(BaseModel):
     approval_request_id: str
+
+
+@router.get("/{session_id}/pending-approval")
+async def get_pending_approval(session_id: str, request: Request):
+    runtime = request.app.state.runtime
+    approval = runtime.approvals.find_for_session(session_id)
+    if approval is None:
+        return {"session_id": session_id, "pending": None}
+    timeout_seconds = runtime.settings.approval.timeout_seconds
+    elapsed = max(0, int(time() - approval.created_at))
+    remaining = max(0, timeout_seconds - elapsed)
+    return {
+        "session_id": session_id,
+        "pending": {
+            "approval_request_id": approval.approval_request_id,
+            "tool": approval.tool_name,
+            "arguments": approval.arguments,
+            "reason": approval.reason,
+            "timeout_seconds": timeout_seconds,
+            "remaining_seconds": remaining,
+        },
+    }
 
 
 @router.post("/{session_id}/approve")
