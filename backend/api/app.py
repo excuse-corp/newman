@@ -17,7 +17,7 @@ from backend.api.routes.sessions import router as sessions_router
 from backend.api.routes.skills import router as skills_router
 from backend.api.routes.workspace import router as workspace_router
 from backend.channels.service import ChannelService
-from backend.config.loader import get_settings
+from backend.config.loader import get_settings, log_settings_report
 from backend.rag.service import KnowledgeBaseService
 from backend.runtime.run_loop import NewmanRuntime
 from backend.scheduler.scheduler_engine import SchedulerEngine
@@ -25,6 +25,7 @@ from backend.scheduler.scheduler_engine import SchedulerEngine
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    log_settings_report()
     app = FastAPI(title="Newman API", version="0.6.0")
     app.state.settings = settings
     app.state.runtime = NewmanRuntime(settings)
@@ -62,6 +63,7 @@ def create_app() -> FastAPI:
     @app.on_event("shutdown")
     async def stop_scheduler() -> None:
         await app.state.scheduler.stop()
+        app.state.runtime.close()
 
     @app.get("/healthz")
     async def healthz():

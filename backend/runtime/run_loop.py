@@ -38,6 +38,7 @@ from backend.tools.impl.terminal import TerminalTool
 from backend.tools.impl.update_plan import UpdatePlanTool
 from backend.tools.impl.write_file import WriteFileTool
 from backend.tools.orchestrator import ToolOrchestrator
+from backend.tools.approval_policy import DEFAULT_TURN_APPROVAL_MODE, TurnApprovalMode
 from backend.tools.permission_context import PermissionContext
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import ToolRouter
@@ -85,11 +86,21 @@ class NewmanRuntime:
         self.exec_sandbox: NativeSandbox | None = None
         self.reload_ecosystem()
 
+    def close(self) -> None:
+        self.mcp_registry.close()
+
     def reload_ecosystem(self) -> None:
         self.plugin_service.reload()
         self.skill_registry.sync_snapshot()
         self.registry = self._build_registry(self.settings.paths.workspace)
         self.router = ToolRouter(self.registry, self.settings)
+
+    def _tools_overview(self) -> str:
+        overview = self.registry.describe()
+        resource_overview = self.mcp_registry.describe_resources()
+        if resource_overview:
+            overview = f"{overview}\n\n## MCP Resources\n{resource_overview}"
+        return overview
 
     def schedule_previous_session_extraction(self, exclude_session_id: str) -> dict[str, object]:
         previous = self.session_store.latest(exclude_session_ids={exclude_session_id}, require_messages=True)
@@ -174,6 +185,7 @@ class NewmanRuntime:
         content: str,
         emit: EventEmitter,
         user_metadata: dict[str, object] | None = None,
+        turn_approval_mode: TurnApprovalMode = DEFAULT_TURN_APPROVAL_MODE,
     ) -> None:
         self.reload_ecosystem()
         user_message = SessionMessage(id=uuid4().hex, role="user", content=content, metadata=user_metadata or {})
@@ -188,7 +200,7 @@ class NewmanRuntime:
             self.skill_registry.sync_snapshot()
             assembled = self.prompt_assembler.assemble(
                 task.session,
-                self.registry.describe(),
+                self._tools_overview(),
                 json.dumps(self.settings.approval.model_dump(mode="json"), ensure_ascii=False),
                 self.checkpoints.get(task.session.session_id),
             )
@@ -255,7 +267,14 @@ class NewmanRuntime:
                         "arguments": tool_call.arguments,
                     },
                 )
-                result = await self.orchestrator.execute(tool, tool_call.arguments, task.session.session_id, emit, extra_reasons)
+                result = await self.orchestrator.execute(
+                    tool,
+                    tool_call.arguments,
+                    task.session.session_id,
+                    emit,
+                    extra_reasons,
+                    turn_approval_mode=turn_approval_mode,
+                )
                 result = normalize_result(result)
                 metadata_updates = result.metadata.get("session_metadata_updates")
                 if isinstance(metadata_updates, dict):
@@ -431,7 +450,7 @@ class NewmanRuntime:
 
         assembled = self.prompt_assembler.assemble(
             task.session,
-            self.registry.describe(),
+            self._tools_overview(),
             json.dumps(self.settings.approval.model_dump(mode="json"), ensure_ascii=False),
             self.checkpoints.get(task.session.session_id),
         )
@@ -530,7 +549,7 @@ class NewmanRuntime:
     async def _maybe_checkpoint(self, task: SessionTask, emit: EventEmitter) -> None:
         assembled = self.prompt_assembler.assemble(
             task.session,
-            self.registry.describe(),
+            self._tools_overview(),
             json.dumps(self.settings.approval.model_dump(mode="json"), ensure_ascii=False),
             self.checkpoints.get(task.session.session_id),
         )

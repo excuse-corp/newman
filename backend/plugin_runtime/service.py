@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Iterable
 
@@ -74,6 +75,79 @@ class PluginService:
         for plugin in self.enabled_plugins():
             skills.extend(plugin.skills)
         return skills
+
+    def get_skill(self, skill_name: str) -> SkillDescriptor:
+        matches = [item for item in self.list_skills() if item.name == skill_name]
+        if not matches:
+            raise FileNotFoundError(f"Skill not found: {skill_name}")
+
+        workspace_matches = [item for item in matches if item.source == "workspace"]
+        if len(matches) == 1:
+            return matches[0]
+        if len(workspace_matches) == 1:
+            return workspace_matches[0]
+        raise ValueError(f"Skill 名称不唯一：{skill_name}")
+
+    def get_skill_by_path(self, skill_path: Path) -> SkillDescriptor:
+        resolved = skill_path.resolve()
+        matches = [item for item in self.list_skills() if Path(item.path).resolve() == resolved]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise FileNotFoundError(f"Skill not found: {resolved}")
+        raise ValueError(f"Skill 路径不唯一：{resolved}")
+
+    def get_workspace_skill(self, skill_name: str) -> SkillDescriptor:
+        workspace_matches = [item for item in self.list_skills() if item.name == skill_name and item.source == "workspace"]
+        if len(workspace_matches) == 1:
+            return workspace_matches[0]
+        if len(workspace_matches) > 1:
+            raise ValueError(f"Workspace skill 名称不唯一：{skill_name}")
+        if any(item.name == skill_name for item in self.list_skills()):
+            raise PermissionError(f"Skill 为只读，不能修改：{skill_name}")
+        raise FileNotFoundError(f"Skill not found: {skill_name}")
+
+    def read_skill_content(self, skill: SkillDescriptor) -> str:
+        return Path(skill.path).read_text(encoding="utf-8")
+
+    def import_workspace_skill(self, source_dir: Path) -> SkillDescriptor:
+        self.skills_dir.mkdir(parents=True, exist_ok=True)
+        source_dir = source_dir.resolve()
+        if not source_dir.exists() or not source_dir.is_dir():
+            raise FileNotFoundError(f"Skill directory not found: {source_dir}")
+        skill_file = source_dir / "SKILL.md"
+        if not skill_file.exists():
+            raise ValueError("Skill 目录缺少 SKILL.md")
+
+        metadata = parse_skill_file(skill_file, source_dir.name)
+        skill_name = str(metadata["name"] or source_dir.name)
+        existing_names = {item.name for item in self.list_skills()}
+        if skill_name in existing_names:
+            raise FileExistsError(f"Skill 已存在：{skill_name}")
+
+        target_dir = (self.skills_dir / source_dir.name).resolve()
+        if target_dir.exists():
+            raise FileExistsError(f"Skill 目录已存在：{target_dir.name}")
+        if source_dir == target_dir:
+            raise FileExistsError(f"Skill 已位于工作区：{source_dir.name}")
+
+        shutil.copytree(source_dir, target_dir)
+        self.reload()
+        return self.get_skill_by_path(target_dir / "SKILL.md")
+
+    def update_workspace_skill(self, skill_name: str, content: str) -> SkillDescriptor:
+        skill = self.get_workspace_skill(skill_name)
+        skill_path = Path(skill.path)
+        skill_path.write_text(content, encoding="utf-8")
+        self.reload()
+        return self.get_skill_by_path(skill_path)
+
+    def delete_workspace_skill(self, skill_name: str) -> SkillDescriptor:
+        skill = self.get_workspace_skill(skill_name)
+        skill_dir = Path(skill.path).parent
+        shutil.rmtree(skill_dir)
+        self.reload()
+        return skill
 
     def write_skills_snapshot(self, snapshot_path: Path) -> None:
         skills = self.list_skills()

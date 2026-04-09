@@ -125,3 +125,21 @@ NEWMAN_RUNTIME_MAX_TOOL_DEPTH=30
 - 配置文件监控可后续扩展（watchdog），但 MVP 不实现热更新
 - Prompt 模板使用 Jinja2 或简单变量替换
 - Phase 1 沙箱配置只要求 Linux 生效；macOS / Windows 保留配置项但执行层暂不实现
+
+---
+
+## 八、当前完成度说明
+
+截至当前版本，M14 已完成：
+
+- 默认配置、项目配置、用户配置、环境变量和 `.env` 加载
+- Pydantic v2 Schema 校验
+- 历史 `provider.*` 到 `models.primary.*` 的兼容映射
+- Prompt 模板独立存放于 `backend/config/prompts/`
+- 启动日志输出最终生效配置及来源摘要
+
+当前说明：
+
+- 配置优先级为 `environment > ~/.newman/config.yaml > ./newman.yaml > defaults.yaml`
+- `api_key` / `token` / `secret` / `password` 会在配置日志里自动脱敏
+- 当前不实现热更新，仍需重启服务使配置变更生效

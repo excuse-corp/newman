@@ -52,12 +52,41 @@ mcp/
 
 ```yaml
 mcp_servers:
-  - name: local-file-server
-    command: ["python", "-m", "mcp_file_server"]
-    args: ["--workspace", "./workspace"]
+  - name: local-inline
+    transport: inline
     requires_approval: false
+    tools:
+      - name: echo_text
+        description: Return inline MCP output
+        input_schema:
+          type: object
+          properties:
+            text:
+              type: string
+        risk_level: low
+    resources:
+      - uri: memory://inline/context
+        name: inline-context
+        description: Inline MCP resource
+        mime_type: text/markdown
+        content: "# hello"
+
+  - name: local-stdio
+    transport: stdio
+    command: ["python"]
+    args: ["-m", "demo_mcp_server"]
+    env:
+      DEMO_MODE: "1"
+    requires_approval: false
+
   - name: web-search
+    transport: http_json
     url: "http://localhost:8080/mcp"
+    requires_approval: true
+
+  - name: web-search-sse
+    transport: http_sse
+    url: "http://localhost:8081/mcp"
     requires_approval: true
 ```
 
@@ -81,6 +110,28 @@ tool_adapter 转换为 Newman Tool 格式
 - MCP 工具的 risk_level 和 requires_approval 由配置决定
 - MCP 工具的错误也走统一的 ErrorClassifier
 
+### 当前实现口径
+
+- 当前目标以“能注册、能调用、能审批、能报错”为准
+- `inline`、`http_json`、`stdio` 已是优先保证路径
+- `http_sse` 当前按“单次请求可调用”实现，不追求长连接会话复用
+- 当前不以“必须使用官方 MCP Python SDK”为交付前提
+- 当前 `stdio` 为 Newman 自定义 newline-delimited JSON bridge
+
+### 当前约定端点
+
+对于 `http_json` / `http_sse`，当前 bridge 约定：
+
+- `GET /tools`
+- `GET /resources`
+- `POST /invoke/{tool_name}`
+
+对于 `stdio`，当前 bridge 约定消息：
+
+- `tools.list`
+- `resources.list`
+- `tools.invoke`
+
 ---
 
 ## 六、验收标准
@@ -94,6 +145,26 @@ tool_adapter 转换为 Newman Tool 格式
 
 ## 七、技术备注
 
-- MCP Client 使用官方 Python SDK
-- 支持 stdio 和 HTTP/SSE 两种传输方式
+- 当前不强制使用官方 Python SDK，以稳定可调用为先
+- 支持 `inline`、`stdio`、`http_json`、`http_sse`
 - MCP Server 进程生命周期由 Newman 管理
+
+---
+
+## 八、当前完成度说明
+
+截至当前版本，M10 已完成：
+
+- MCP Server 配置管理
+- MCP 工具注册到 `ToolRegistry`
+- MCP 工具接入统一审批流程
+- `inline`、`http_json`、`stdio`、`http_sse` 四种 bridge 传输的最小可用实现
+- MCP 资源列表整理与运行时暴露
+- MCP 状态查询、删除、重连 API
+
+当前仍未完成：
+
+- 官方 MCP Python SDK 接入
+- 完整官方 stdio 协议对齐
+- 完整 SSE 长连接会话复用模型
+- MCP 前端管理界面

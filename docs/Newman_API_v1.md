@@ -322,6 +322,52 @@ text/event-stream
 - `session.metadata.plan` 与顶层 `plan` 字段内容相同，后者只是为了前端读取更直接。
 - 只有在模型调用 `update_plan` 工具后，`plan` 才会出现。
 
+## 3.3A 获取会话结构化事件历史
+
+`GET /api/sessions/{session_id}/events`
+
+查询参数：
+
+- `limit`: 可选，默认 `200`，返回最近 N 条结构化事件
+
+响应示例：
+
+```json
+{
+  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "events": [
+    {
+      "event": "tool_call_started",
+      "data": {
+        "tool": "read_file",
+        "arguments": {
+          "path": "/root/newman/README.md"
+        }
+      },
+      "request_id": "req_xxx",
+      "ts": 1741234567890
+    },
+    {
+      "event": "tool_call_finished",
+      "data": {
+        "tool": "read_file",
+        "success": true,
+        "summary": "文件已读取完成"
+      },
+      "request_id": "req_xxx",
+      "ts": 1741234567999
+    }
+  ]
+}
+```
+
+说明：
+
+- 该接口面向前端恢复 timeline / trace / 审批状态，返回结构化事件数组。
+- 数据源复用会话审计日志，但会过滤为 `event/data/request_id/ts` 结构。
+- 返回顺序与原始事件写入顺序一致。
+- 若当前会话没有审计日志，则返回空数组。
+
 ## 3.4 删除会话
 
 `DELETE /api/sessions/{session_id}`
@@ -425,7 +471,8 @@ text/event-stream
 
 ```json
 {
-  "content": "请帮我总结当前工作区的结构"
+  "content": "请帮我总结当前工作区的结构",
+  "approval_mode": "manual"
 }
 ```
 
@@ -433,6 +480,9 @@ text/event-stream
 
 - `content`: 文本内容，可为空
 - `images`: 可重复上传的图片字段，仅支持 `jpg/jpeg/png`
+- `approval_mode`: 可选，支持：
+  - `manual`：本轮每个命中 Level 2 的工具都需要点击确认
+  - `auto_approve_level2`：本轮命中的 Level 2 工具默认放行
 
 当上传图片时，后端会：
 
@@ -440,6 +490,13 @@ text/event-stream
 2. 调用 `models.multimodal` 做图片解析
 3. 将图片解析摘要拼接进本轮用户输入
 4. 把附件信息写入该条 user message 的 `metadata.attachments`
+
+审批模式说明：
+
+- `approval_mode` 会随本轮用户消息一起写入该条 user message 的 `metadata.approval_mode`
+- 后端按该次请求提交的值锁定本轮审批策略
+- 用户发送后即使在前端切换 UI 选项，也不会影响已经开始执行的这一轮
+- 未传 `approval_mode` 时，默认值为 `manual`
 
 响应类型：
 
@@ -513,9 +570,45 @@ text/event-stream
 
 `POST /api/sessions/{session_id}/approve`
 
+请求体：
+
+```json
+{
+  "approval_request_id": "apr_xxx"
+}
+```
+
+响应示例：
+
+```json
+{
+  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "approval_request_id": "apr_xxx",
+  "approved": true
+}
+```
+
 ## 5.2 审批拒绝
 
 `POST /api/sessions/{session_id}/reject`
+
+请求体：
+
+```json
+{
+  "approval_request_id": "apr_xxx"
+}
+```
+
+响应示例：
+
+```json
+{
+  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "approval_request_id": "apr_xxx",
+  "approved": false
+}
+```
 
 ---
 
@@ -536,6 +629,11 @@ text/event-stream
 }
 ```
 
+说明：
+
+- 这是调试接口，返回原始审计日志行，不保证适合前端直接恢复 timeline。
+- 前端恢复会话过程状态时，优先使用 `GET /api/sessions/{session_id}/events`。
+
 ---
 
 ## 七、工作区接口
@@ -550,26 +648,36 @@ text/event-stream
 
 ```json
 {
+  "latest_updated_at": "2026-04-09T09:00:00+00:00",
   "files": {
     "newman": {
       "path": "/root/newman/backend_data/memory/Newman.md",
-      "content": "# Newman System Prompt ..."
+      "content": "# Newman System Prompt ...",
+      "updated_at": "2026-04-09T08:55:00+00:00"
     },
     "user": {
       "path": "/root/newman/backend_data/memory/USER.md",
-      "content": "# USER.md\n\n<!-- BEGIN AUTO USER MEMORY -->\n## User Memory\n仅记录跨 session 稳定成立的用户偏好、沟通方式和长期协作约定，不记录一次性任务或项目事实。\n\n- 暂无条目\n<!-- END AUTO USER MEMORY -->"
+      "content": "# USER.md\n\n<!-- BEGIN AUTO USER MEMORY -->\n## User Memory\n仅记录跨 session 稳定成立的用户偏好、沟通方式和长期协作约定，不记录一次性任务或项目事实。\n\n- 暂无条目\n<!-- END AUTO USER MEMORY -->",
+      "updated_at": "2026-04-09T09:00:00+00:00"
     },
     "memory": {
       "path": "/root/newman/backend_data/memory/MEMORY.md",
-      "content": "# MEMORY.md\n\n长期记忆内容 ..."
+      "content": "# MEMORY.md\n\n长期记忆内容 ...",
+      "updated_at": "2026-04-09T08:30:00+00:00"
     },
     "skills": {
       "path": "/root/newman/backend_data/memory/SKILLS_SNAPSHOT.md",
-      "content": "# SKILLS_SNAPSHOT.md\n\n当前可用 skill 快照 ..."
+      "content": "# SKILLS_SNAPSHOT.md\n\n当前可用 skill 快照 ...",
+      "updated_at": "2026-04-09T08:40:00+00:00"
     }
   }
 }
 ```
+
+说明：
+
+- `latest_updated_at` 用于前端展示“最近一次记忆更新时间”。
+- 若某个 memory 文件尚不存在，则其 `content` 为空字符串，`updated_at` 为 `null`。
 
 ## 7.2 更新 Stable Memory 文件
 
@@ -587,6 +695,17 @@ text/event-stream
 ```json
 {
   "content": "# Updated memory"
+}
+```
+
+响应示例：
+
+```json
+{
+  "saved": true,
+  "memory_key": "memory",
+  "path": "/root/newman/backend_data/memory/MEMORY.md",
+  "updated_at": "2026-04-09T09:10:00+00:00"
 }
 ```
 
@@ -646,6 +765,32 @@ text/event-stream
 ## 8.2 列出知识文档
 
 `GET /api/knowledge/documents`
+
+响应示例：
+
+```json
+{
+  "documents": [
+    {
+      "document_id": "doc_xxx",
+      "title": "M07_RAG.md",
+      "source_path": "docs/prds/M07_RAG.md",
+      "stored_path": "/root/newman/backend_data/knowledge/doc_xxx_M07_RAG.md",
+      "size_bytes": 12456,
+      "content_type": "text/markdown",
+      "parser": "text",
+      "chunk_count": 12,
+      "page_count": null,
+      "imported_at": "2026-04-08T09:00:00+00:00"
+    }
+  ]
+}
+```
+
+说明：
+
+- Files Workspace 中的“最近上传或引用文件”“文档解析状态”可直接基于该接口返回的结构化字段渲染。
+- 若前端需要打开某个知识文件正文，可结合 `stored_path` 调用 `GET /api/workspace/files?path=...`。
 
 ## 8.3 上传知识文档
 
@@ -805,16 +950,308 @@ multipart/form-data
 - `backend_data/memory/USER.md` 会被后台稳定记忆抽取逻辑自动合并更新
 - 已启用插件中的 skill 会和工作区 `skills/` 下的 skill 合并进入同一个 snapshot
 - 插件启停或 skill 文件变更后，下一轮 prompt 会使用最新 snapshot
+- 当前列表只返回“当前可用”的 skill：workspace skill + 已启用 plugin skill
+
+## 9.6 获取 Skill 详情
+
+`GET /api/skills/{skill_name}`
+
+响应示例：
+
+```json
+{
+  "skill": {
+    "name": "writer",
+    "source": "workspace",
+    "plugin_name": null,
+    "path": "/root/newman/skills/writer/SKILL.md",
+    "description": "Write and refine deliverables.",
+    "when_to_use": null,
+    "summary": "Write and refine deliverables.",
+    "content": "---\nname: writer\ndescription: Write and refine deliverables.\n---\n\n## Workflow\n...",
+    "readonly": false,
+    "available": true,
+    "tool_dependencies": ["read_file", "write_file"],
+    "usage_limits_summary": "- Do not modify unrelated files. - Only change what is required.",
+    "directory_path": "/root/newman/skills/writer"
+  }
+}
+```
+
+字段说明：
+
+- `readonly = true` 表示该 skill 来自 plugin 或其他只读来源，不能通过管理接口修改
+- `tool_dependencies` 为根据 `SKILL.md` 内容提取出的工具依赖摘要
+- `usage_limits_summary` 为根据 `SKILL.md` 中的约束/限制段落提取出的简要说明
+
+## 9.7 导入 Workspace Skill
+
+`POST /api/skills/import`
+
+请求体：
+
+```json
+{
+  "source_path": "imports/reviewer"
+}
+```
+
+说明：
+
+- `source_path` 只允许为 workspace 内部的 skill 文件夹路径
+- 目标文件夹内必须包含 `SKILL.md`
+- 导入行为会把整个 skill 文件夹复制到工作区 `skills/` 目录下，并立即刷新 snapshot
+
+响应示例：
+
+```json
+{
+  "skill": {
+    "name": "reviewer",
+    "source": "workspace",
+    "plugin_name": null,
+    "path": "/root/newman/skills/reviewer/SKILL.md",
+    "description": "Review a change.",
+    "when_to_use": null,
+    "summary": "Review a change.",
+    "content": "---\nname: reviewer\ndescription: Review a change.\n---\n\nReview things carefully.\n",
+    "readonly": false,
+    "available": true,
+    "tool_dependencies": [],
+    "usage_limits_summary": "",
+    "directory_path": "/root/newman/skills/reviewer"
+  }
+}
+```
+
+## 9.8 更新 Workspace Skill
+
+`PUT /api/skills/{skill_name}`
+
+请求体：
+
+```json
+{
+  "content": "# Updated Skill\n\nUse `search_files` first."
+}
+```
+
+说明：
+
+- 只允许更新 workspace skill 的 `SKILL.md`
+- 若目标 skill 为 plugin skill 或其他只读来源，接口会返回冲突错误
+
+## 9.9 删除 Workspace Skill
+
+`DELETE /api/skills/{skill_name}`
+
+响应示例：
+
+```json
+{
+  "deleted": true,
+  "skill_name": "reviewer"
+}
+```
+
+说明：
+
+- 只允许删除 workspace skill
+- plugin skill 或其他只读来源不能通过该接口删除
 
 ---
 
 ## 十、MCP 接口
 
-当前实现是 Phase 3/4 的 bridge 基线，不是完整官方 MCP 协议栈。
+当前实现已经支持 `inline`、`http_json`、`http_sse`、`stdio` 四种 bridge 传输，并把 MCP 工具注册进统一 `ToolRegistry`。MCP 资源也会被整理进运行时工具概览，供模型侧感知。
+
+当前仍未完成的部分：
+- 还没有接入官方 MCP Python SDK
+- `stdio` 采用的是 Newman 当前自定义的 newline-delimited JSON bridge，不是完整官方 MCP stdio 协议
+- `http_sse` 当前实现为兼容型 SSE 响应解析，不是长连接会话复用模型
+- 还没有单独的前端 MCP 管理页
+
+### 10.0 MCP Server 配置字段
+
+```json
+{
+  "name": "my-stdio-server",
+  "transport": "stdio",
+  "command": ["python"],
+  "args": ["-m", "demo_mcp_server"],
+  "env": {
+    "DEMO_MODE": "1"
+  },
+  "url": null,
+  "enabled": true,
+  "requires_approval": true,
+  "timeout_seconds": 20,
+  "headers": {},
+  "tools": [],
+  "resources": []
+}
+```
+
+字段说明：
+
+- `transport`
+  - `inline`：工具与资源直接写在配置里
+  - `http_json`：通过 HTTP JSON 拉取 `/tools`、`/resources`，并调用 `/invoke/{tool}`
+  - `http_sse`：通过 HTTP/SSE 响应解析同样的 `/tools`、`/resources`、`/invoke/{tool}`
+  - `stdio`：启动本地子进程，使用 newline-delimited JSON bridge 交互
+- `command + args`
+  - 仅 `stdio` 需要
+- `url`
+  - `http_json` / `http_sse` 需要
+- `requires_approval`
+  - 该 MCP Server 下所有工具默认是否进入统一审批流程
+- `tools`
+  - `inline` 模式可直接内嵌工具清单
+- `resources`
+  - `inline` 模式可直接内嵌资源清单
+
+最小可用样例：
+
+`inline`
+
+```json
+{
+  "name": "inline-demo",
+  "transport": "inline",
+  "enabled": true,
+  "requires_approval": false,
+  "tools": [
+    {
+      "name": "echo_text",
+      "description": "Return inline MCP output",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "risk_level": "low"
+    }
+  ],
+  "resources": [
+    {
+      "uri": "memory://inline/context",
+      "name": "inline-context",
+      "description": "Inline MCP resource",
+      "mime_type": "text/markdown",
+      "content": "# hello"
+    }
+  ]
+}
+```
+
+`http_json`
+
+```json
+{
+  "name": "remote-http-json",
+  "transport": "http_json",
+  "url": "http://127.0.0.1:9000/mcp",
+  "enabled": true,
+  "requires_approval": true,
+  "timeout_seconds": 20,
+  "headers": {
+    "Authorization": "Bearer demo-token"
+  }
+}
+```
+
+`stdio`
+
+```json
+{
+  "name": "local-stdio",
+  "transport": "stdio",
+  "command": ["python"],
+  "args": ["-m", "demo_mcp_server"],
+  "env": {
+    "DEMO_MODE": "1"
+  },
+  "enabled": true,
+  "requires_approval": false
+}
+```
+
+`http_sse`
+
+```json
+{
+  "name": "remote-http-sse",
+  "transport": "http_sse",
+  "url": "http://127.0.0.1:9100/mcp",
+  "enabled": true,
+  "requires_approval": true,
+  "timeout_seconds": 20
+}
+```
 
 ## 10.1 获取 MCP Server 列表与状态
 
 `GET /api/mcp/servers`
+
+响应示例：
+
+```json
+{
+  "servers": [
+    {
+      "name": "my-inline",
+      "transport": "inline",
+      "url": null,
+      "command": [],
+      "args": [],
+      "env": {},
+      "enabled": true,
+      "requires_approval": false,
+      "timeout_seconds": 20,
+      "headers": {},
+      "tools": [
+        {
+          "name": "echo_text",
+          "description": "Return inline MCP output",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            }
+          },
+          "risk_level": "low"
+        }
+      ],
+      "resources": [
+        {
+          "uri": "memory://inline/context",
+          "name": "inline-context",
+          "description": "Inline MCP resource",
+          "mime_type": "text/markdown",
+          "content": "# hello"
+        }
+      ]
+    }
+  ],
+  "statuses": [
+    {
+      "name": "my-inline",
+      "transport": "inline",
+      "enabled": true,
+      "tool_count": 1,
+      "resource_count": 1,
+      "status": "connected",
+      "detail": "",
+      "last_checked_at": "2026-04-08T09:00:00+00:00"
+    }
+  ]
+}
+```
 
 ## 10.2 创建或更新 MCP Server
 
@@ -826,6 +1263,10 @@ multipart/form-data
 {
   "name": "my-inline",
   "transport": "inline",
+  "command": [],
+  "args": [],
+  "env": {},
+  "url": null,
   "enabled": true,
   "requires_approval": false,
   "timeout_seconds": 20,
@@ -845,9 +1286,132 @@ multipart/form-data
       },
       "risk_level": "low"
     }
+  ],
+  "resources": [
+    {
+      "uri": "memory://inline/context",
+      "name": "inline-context",
+      "description": "Inline MCP resource",
+      "mime_type": "text/markdown",
+      "content": "# hello"
+    }
   ]
 }
 ```
+
+响应示例：
+
+```json
+{
+  "server": {
+    "name": "my-inline",
+    "transport": "inline",
+    "url": null,
+    "command": [],
+    "args": [],
+    "env": {},
+    "enabled": true,
+    "requires_approval": false,
+    "timeout_seconds": 20,
+    "headers": {},
+    "tools": [],
+    "resources": []
+  },
+  "status": {
+    "name": "my-inline",
+    "transport": "inline",
+    "enabled": true,
+    "tool_count": 0,
+    "resource_count": 0,
+    "status": "connected",
+    "detail": "",
+    "last_checked_at": "2026-04-08T09:00:00+00:00"
+  }
+}
+```
+
+## 10.3 删除 MCP Server
+
+`DELETE /api/mcp/servers/{server_name}`
+
+响应示例：
+
+```json
+{
+  "deleted": true,
+  "server_name": "my-inline"
+}
+```
+
+## 10.4 重连 MCP Server
+
+`POST /api/mcp/servers/{server_name}/reconnect`
+
+响应示例：
+
+```json
+{
+  "server_name": "my-inline",
+  "status": {
+    "name": "my-inline",
+    "transport": "inline",
+    "enabled": true,
+    "tool_count": 1,
+    "resource_count": 1,
+    "status": "connected",
+    "detail": "",
+    "last_checked_at": "2026-04-08T09:00:00+00:00"
+  }
+}
+```
+
+## 10.5 获取 MCP 资源列表
+
+`GET /api/mcp/resources`
+
+响应示例：
+
+```json
+{
+  "resources": [
+    {
+      "server_name": "my-inline",
+      "transport": "inline",
+      "uri": "memory://inline/context",
+      "name": "inline-context",
+      "description": "Inline MCP resource",
+      "mime_type": "text/markdown",
+      "content": "# hello"
+    }
+  ],
+  "statuses": [
+    {
+      "name": "my-inline",
+      "transport": "inline",
+      "enabled": true,
+      "tool_count": 1,
+      "resource_count": 1,
+      "status": "connected",
+      "detail": "",
+      "last_checked_at": "2026-04-08T09:00:00+00:00"
+    }
+  ]
+}
+```
+
+说明：
+
+- MCP 工具会统一注册为 `mcp__{server_name}__{tool_name}`
+- `risk_level` 和 `requires_approval` 会进入统一 ToolRouter / Approval 流程
+- MCP 资源当前通过运行时工具概览暴露给模型，不单独作为前端 UI 区块展示
+- `http_json` / `http_sse` 默认约定以下端点：
+  - `GET /tools`
+  - `GET /resources`
+  - `POST /invoke/{tool_name}`
+- `stdio` 当前约定 newline-delimited JSON bridge：
+  - `tools.list`
+  - `resources.list`
+  - `tools.invoke`
 
 ---
 
@@ -857,7 +1421,57 @@ multipart/form-data
 
 `GET /api/scheduler/tasks`
 
-## 11.2 创建任务
+响应示例：
+
+```json
+{
+  "tasks": [
+    {
+      "task_id": "daily-report",
+      "name": "日报生成",
+      "cron": "0 18 * * 1-5",
+      "action": {
+        "type": "session_message",
+        "prompt": "请根据今天的工作记录生成日报",
+        "session_id": "session-123"
+      },
+      "enabled": true,
+      "max_retries": 2,
+      "status": "pending",
+      "created_at": "2026-04-08T09:00:00+00:00",
+      "updated_at": "2026-04-08T09:00:00+00:00",
+      "last_run_at": null,
+      "next_run_at": "2026-04-08T18:00:00+00:00",
+      "last_error": "",
+      "run_count": 0
+    }
+  ]
+}
+```
+
+## 11.2 获取调度告警
+
+`GET /api/scheduler/alerts`
+
+响应示例：
+
+```json
+{
+  "alerts": [
+    {
+      "alert_id": "alt-001",
+      "task_id": "daily-report",
+      "task_name": "日报生成",
+      "severity": "error",
+      "message": "任务执行失败，已重试 2 次: session_message 任务必须提供 session_id",
+      "created_at": "2026-04-08T09:10:00+00:00",
+      "acknowledged": false
+    }
+  ]
+}
+```
+
+## 11.3 创建任务
 
 `POST /api/scheduler/tasks`
 
@@ -876,23 +1490,28 @@ multipart/form-data
 }
 ```
 
-## 11.3 启用任务
+## 11.4 启用任务
 
 `POST /api/scheduler/tasks/{task_id}/enable`
 
-## 11.4 禁用任务
+## 11.5 禁用任务
 
 `POST /api/scheduler/tasks/{task_id}/disable`
 
-## 11.5 立即执行任务
+## 11.6 立即执行任务
 
 `POST /api/scheduler/tasks/{task_id}/run`
+
+## 11.7 删除任务
+
+`DELETE /api/scheduler/tasks/{task_id}`
 
 说明：
 
 - 当前实现使用内置轮询引擎，不依赖 APScheduler
 - 支持 `session_message` 和 `background_task`
 - 任务配置保存在 `backend_data/scheduler/tasks.json`
+- 调度失败会写入 `backend_data/scheduler/alerts.json`
 
 ---
 
@@ -1027,6 +1646,8 @@ multipart/form-data
 - `tool_call_finished`、`tool_error_feedback` 和 fatal `error` 事件会携带结构化错误恢复字段：
   `error_code`、`severity`、`risk_level`、`recovery_class`、`frontend_message`、`recommended_next_step`
 - 所有 SSE 事件当前都会附带 `request_id`，便于和 HTTP 请求、审计日志做关联。
+- 消息流中的审计日志现在也按同一结构保存为完整事件包：`event`、`data`、`ts`、`request_id`
+- `GET /api/sessions/{session_id}/events` 会基于这些结构化审计事件返回前端可恢复的 timeline 数据
 
 ### 事件示例
 

@@ -28,6 +28,12 @@ async def list_tasks(request: Request):
     return {"tasks": [item.model_dump(mode="json") for item in runtime.scheduler_store.list_tasks()]}
 
 
+@router.get("/alerts")
+async def list_scheduler_alerts(request: Request):
+    alerts = request.app.state.scheduler.alert_store.list_alerts()
+    return {"alerts": [item.model_dump(mode="json") for item in alerts]}
+
+
 @router.post("/tasks")
 async def create_task(payload: CreateTaskRequest, request: Request):
     runtime = request.app.state.runtime
@@ -69,3 +75,11 @@ async def disable_task(task_id: str, request: Request):
 async def run_task_now(task_id: str, request: Request):
     task = await request.app.state.scheduler.run_now(task_id)
     return {"task": task.model_dump(mode="json")}
+
+
+@router.delete("/tasks/{task_id}")
+async def delete_task(task_id: str, request: Request):
+    runtime = request.app.state.runtime
+    runtime.scheduler_store.delete(task_id)
+    request.app.state.scheduler.refresh_schedule()
+    return {"deleted": True, "task_id": task_id}

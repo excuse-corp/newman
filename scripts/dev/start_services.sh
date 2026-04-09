@@ -60,13 +60,13 @@ BACKEND_COMMAND=$(cat <<EOF
 source "${CONDA_SH}" && \
 conda activate "${ENV_NAME}" && \
 cd "${ROOT_DIR}" && \
-uvicorn backend.main:app --host "${BACKEND_HOST}" --port "${BACKEND_PORT}"
+exec uvicorn backend.main:app --host "${BACKEND_HOST}" --port "${BACKEND_PORT}"
 EOF
 )
 
 FRONTEND_COMMAND=$(cat <<EOF
 cd "${ROOT_DIR}/frontend" && \
-npm run dev -- --host "${FRONTEND_HOST}" --port "${FRONTEND_PORT}" --strictPort
+exec node ./node_modules/vite/bin/vite.js --host "${FRONTEND_HOST}" --port "${FRONTEND_PORT}" --strictPort
 EOF
 )
 

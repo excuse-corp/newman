@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Request
@@ -27,13 +28,18 @@ class UpdateMemoryRequest(BaseModel):
 async def get_memory_workspace(request: Request):
     settings = request.app.state.settings
     files = {}
+    latest_updated_at: str | None = None
     for key, name in MEMORY_FILE_MAP.items():
         path = settings.paths.memory_dir / name
+        updated_at = _path_updated_at(path)
+        if updated_at and (latest_updated_at is None or updated_at > latest_updated_at):
+            latest_updated_at = updated_at
         files[key] = {
             "path": str(path),
             "content": path.read_text(encoding="utf-8") if path.exists() else "",
+            "updated_at": updated_at,
         }
-    return {"files": files}
+    return {"files": files, "latest_updated_at": latest_updated_at}
 
 
 @router.put("/memory/{memory_key}")
@@ -44,7 +50,12 @@ async def update_memory_file(memory_key: str, payload: UpdateMemoryRequest, requ
         raise FileNotFoundError(f"Memory file not found: {memory_key}")
     path = settings.paths.memory_dir / file_name
     path.write_text(payload.content, encoding="utf-8")
-    return {"saved": True, "memory_key": memory_key, "path": str(path)}
+    return {
+        "saved": True,
+        "memory_key": memory_key,
+        "path": str(path),
+        "updated_at": _path_updated_at(path),
+    }
 
 
 @router.get("/files")
@@ -71,3 +82,9 @@ async def list_workspace_files(request: Request, path: str = "."):
             }
         )
     return {"path": str(target), "type": "dir", "entries": items}
+
+
+def _path_updated_at(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()

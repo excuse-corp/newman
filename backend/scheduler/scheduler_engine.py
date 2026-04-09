@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timezone
+from uuid import uuid4
 
+from backend.scheduler.alert_store import SchedulerAlert, SchedulerAlertStore
 from backend.scheduler.cron_parser import matches_cron, next_run
 from backend.scheduler.models import ScheduledTask, utc_now
 from backend.scheduler.task_store import TaskStore
@@ -13,6 +15,7 @@ class SchedulerEngine:
     def __init__(self, task_store: TaskStore, runtime):
         self.task_store = task_store
         self.runtime = runtime
+        self.alert_store = SchedulerAlertStore(runtime.settings.paths.scheduler_dir / "alerts.json")
         self._worker: asyncio.Task | None = None
         self._running = False
 
@@ -71,6 +74,14 @@ class SchedulerEngine:
                 if attempt >= total_attempts:
                     task.status = "failed"
                     task.last_error = f"任务执行失败，已重试 {task.max_retries} 次: {last_error}"
+                    self.alert_store.append(
+                        SchedulerAlert(
+                            alert_id=uuid4().hex,
+                            task_id=task.task_id,
+                            task_name=task.name,
+                            message=task.last_error,
+                        )
+                    )
                     break
                 await asyncio.sleep(min(attempt, 5))
 

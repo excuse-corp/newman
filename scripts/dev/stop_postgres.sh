@@ -28,4 +28,9 @@ run_as_pg_user() {
   fi
 }
 
-run_as_pg_user "'${PG_CTL_BIN}' -D '${PG_DATA_DIR}' stop -m fast"
+if run_as_pg_user "'${PG_CTL_BIN}' -D '${PG_DATA_DIR}' status >/dev/null 2>&1"; then
+  run_as_pg_user "'${PG_CTL_BIN}' -D '${PG_DATA_DIR}' stop -m fast"
+  echo "Stopped PostgreSQL"
+else
+  echo "PostgreSQL is not running"
+fi

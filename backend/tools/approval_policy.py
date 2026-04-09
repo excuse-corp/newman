@@ -8,6 +8,8 @@ from backend.tools.base import BaseTool
 
 
 ApprovalAction = Literal["allow", "ask", "deny"]
+TurnApprovalMode = Literal["manual", "auto_approve_level2"]
+DEFAULT_TURN_APPROVAL_MODE: TurnApprovalMode = "manual"
 
 SAFE_TERMINAL_PREFIXES = (
     "pwd",
@@ -169,3 +171,9 @@ class ApprovalPolicy:
     @staticmethod
     def _normalize(command: str) -> str:
         return " ".join(command.strip().lower().split())
+
+
+def normalize_turn_approval_mode(value: object) -> TurnApprovalMode:
+    if value == "auto_approve_level2":
+        return "auto_approve_level2"
+    return DEFAULT_TURN_APPROVAL_MODE

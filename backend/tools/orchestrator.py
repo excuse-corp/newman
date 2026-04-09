@@ -7,7 +7,12 @@ from typing import Awaitable, Callable
 from backend.config.schema import AppConfig
 from backend.runtime.retry_policy import RetryPolicy
 from backend.tools.approval import ApprovalManager
-from backend.tools.approval_policy import ApprovalPolicy
+from backend.tools.approval_policy import (
+    ApprovalDecision,
+    ApprovalPolicy,
+    DEFAULT_TURN_APPROVAL_MODE,
+    TurnApprovalMode,
+)
 from backend.tools.base import BaseTool
 from backend.tools.result import ToolExecutionResult
 
@@ -29,8 +34,15 @@ class ToolOrchestrator:
         session_id: str,
         emit: EventEmitter,
         extra_reasons: list[str] | None = None,
+        turn_approval_mode: TurnApprovalMode = DEFAULT_TURN_APPROVAL_MODE,
     ) -> ToolExecutionResult:
         decision = self.approval_policy.evaluate(tool, arguments, extra_reasons)
+        if decision.action == "ask" and turn_approval_mode == "auto_approve_level2":
+            decision = ApprovalDecision(
+                action="allow",
+                reasons=decision.reasons,
+                summary="本轮对话已启用 Level 2 默认通过",
+            )
         if decision.action == "deny":
             return ToolExecutionResult(
                 success=False,

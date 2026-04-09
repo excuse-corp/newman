@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,17 @@ from backend.config.schema import AppConfig
 
 
 CONFIG_ENV_PREFIX = "NEWMAN_"
+LOGGER = logging.getLogger("newman.config")
+DISPLAY_LOGGER = logging.getLogger("uvicorn.error")
+SENSITIVE_MARKERS = {"api_key", "token", "secret", "password"}
+_LAST_SETTINGS_REPORT: "ConfigLoadReport | None" = None
+
+
+@dataclass
+class ConfigLoadReport:
+    root: str
+    values: dict[str, Any]
+    sources: dict[str, str]
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -84,6 +97,57 @@ def _assign_nested(target: dict[str, Any], path: tuple[str, ...], value: Any) ->
     cursor[path[-1]] = value
 
 
+def _assign_source_map(target: dict[str, str], payload: dict[str, Any], source: str, prefix: tuple[str, ...] = ()) -> None:
+    for key, value in payload.items():
+        path = prefix + (str(key).lower(),)
+        if isinstance(value, dict):
+            _assign_source_map(target, value, source, path)
+        else:
+            target[".".join(path)] = source
+
+
+def _flatten_leaf_values(data: dict[str, Any], prefix: tuple[str, ...] = ()) -> dict[str, Any]:
+    items: dict[str, Any] = {}
+    for key, value in data.items():
+        path = prefix + (str(key).lower(),)
+        if isinstance(value, dict):
+            items.update(_flatten_leaf_values(value, path))
+        else:
+            items[".".join(path)] = value
+    return items
+
+
+def _mask_value(path: str, value: Any) -> Any:
+    if any(marker in path for marker in SENSITIVE_MARKERS):
+        if value in {None, ""}:
+            return value
+        return "***"
+    return value
+
+
+def _build_report(root: Path, merged: dict[str, Any], source_map: dict[str, str]) -> ConfigLoadReport:
+    values = {
+        path: _mask_value(path, value)
+        for path, value in sorted(_flatten_leaf_values(merged).items())
+    }
+    sources = {path: source_map.get(path, "unknown") for path in values}
+    return ConfigLoadReport(root=str(root), values=values, sources=sources)
+
+
+def _log_report(report: ConfigLoadReport) -> None:
+    lines = [
+        "Config loaded with source trace:",
+        *[
+            f"  {path} = {report.values[path]!r} ({report.sources[path]})"
+            for path in sorted(report.values)
+        ],
+    ]
+    message = "\n".join(lines)
+    LOGGER.info(message)
+    if DISPLAY_LOGGER is not LOGGER:
+        DISPLAY_LOGGER.info(message)
+
+
 def _build_env_path_map(defaults: dict[str, Any]) -> dict[str, tuple[str, ...]]:
     env_map: dict[str, tuple[str, ...]] = {}
     for path in _flatten_paths(defaults):
@@ -123,6 +187,7 @@ def _resolve_paths(config: AppConfig, project_root: Path) -> AppConfig:
 
 @lru_cache(maxsize=1)
 def get_settings(project_root: str | None = None) -> AppConfig:
+    global _LAST_SETTINGS_REPORT
     root = Path(project_root or Path(__file__).resolve().parents[2]).resolve()
     defaults_path = root / "backend" / "config" / "defaults.yaml"
     project_config_path = root / "newman.yaml"
@@ -130,15 +195,26 @@ def get_settings(project_root: str | None = None) -> AppConfig:
     project_dotenv_path = root / ".env"
     user_dotenv_path = Path.home() / ".newman" / ".env"
 
-    merged = _read_yaml(defaults_path)
-    merged = _deep_merge(merged, _read_yaml(project_config_path))
-    merged = _deep_merge(merged, _read_yaml(user_config_path))
+    defaults = _read_yaml(defaults_path)
+    project = _read_yaml(project_config_path)
+    user = _read_yaml(user_config_path)
     dotenv_values = _read_dotenv(project_dotenv_path)
     dotenv_values.update(_read_dotenv(user_dotenv_path))
-    merged = _deep_merge(merged, _env_to_nested(merged, dotenv_values))
+    merged = defaults
+    source_map: dict[str, str] = {}
+    _assign_source_map(source_map, defaults, "defaults.yaml")
+    merged = _deep_merge(merged, project)
+    _assign_source_map(source_map, project, "newman.yaml")
+    merged = _deep_merge(merged, user)
+    _assign_source_map(source_map, user, "~/.newman/config.yaml")
+    env_values = _env_to_nested(merged, dotenv_values)
+    merged = _deep_merge(merged, env_values)
+    _assign_source_map(source_map, env_values, "environment")
 
     settings = AppConfig.model_validate_merged(merged)
     settings = _resolve_paths(settings, root)
+    report = _build_report(root, settings.model_dump(mode="json"), source_map)
+    _LAST_SETTINGS_REPORT = report
 
     for path in [
         settings.paths.data_dir,
@@ -158,6 +234,22 @@ def get_settings(project_root: str | None = None) -> AppConfig:
     return settings
 
 
+def get_settings_report(project_root: str | None = None) -> ConfigLoadReport:
+    global _LAST_SETTINGS_REPORT
+    get_settings(project_root)
+    if _LAST_SETTINGS_REPORT is None:
+        raise RuntimeError("Settings report is unavailable")
+    return _LAST_SETTINGS_REPORT
+
+
+def log_settings_report(project_root: str | None = None) -> ConfigLoadReport:
+    report = get_settings_report(project_root)
+    _log_report(report)
+    return report
+
+
 def reload_settings(project_root: str | None = None) -> AppConfig:
+    global _LAST_SETTINGS_REPORT
     get_settings.cache_clear()
+    _LAST_SETTINGS_REPORT = None
     return get_settings(project_root)

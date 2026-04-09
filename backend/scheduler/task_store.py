@@ -33,3 +33,9 @@ class TaskStore:
             if task.task_id == task_id:
                 return task
         raise FileNotFoundError(f"Scheduler task not found: {task_id}")
+
+    def delete(self, task_id: str) -> None:
+        tasks = self.list_tasks()
+        if not any(task.task_id == task_id for task in tasks):
+            raise FileNotFoundError(f"Scheduler task not found: {task_id}")
+        self.save_tasks([task for task in tasks if task.task_id != task_id])

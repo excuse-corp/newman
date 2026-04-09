@@ -40,7 +40,7 @@ scheduler/
   task_store.py           # 任务定义与持久化
   cron_parser.py          # Cron 表达式解析
   scheduler_engine.py     # 调度引擎
-  event_injector.py       # 事件注入器
+  alert_store.py          # 失败告警持久化
 ```
 
 ---
@@ -49,16 +49,23 @@ scheduler/
 
 ### 任务定义
 
-```yaml
-tasks:
-  - id: daily-report
-    name: 日报生成
-    cron: "0 18 * * 1-5"
-    action:
-      type: session_message
-      prompt: "请根据今天的工作记录生成日报"
-    enabled: true
-    max_retries: 2
+```json
+{
+  "tasks": [
+    {
+      "task_id": "daily-report",
+      "name": "日报生成",
+      "cron": "0 18 * * 1-5",
+      "action": {
+        "type": "session_message",
+        "prompt": "请根据今天的工作记录生成日报",
+        "session_id": "session-123"
+      },
+      "enabled": true,
+      "max_retries": 2
+    }
+  ]
+}
 ```
 
 ### 调度流程
@@ -66,12 +73,12 @@ tasks:
 ```text
 SchedulerEngine 定期检查到期任务
   ↓
-EventInjector 生成事件
-  ↓
 方式 A：注入到指定会话（session_message）
 方式 B：创建新后台会话执行（background_task）
   ↓
 任务状态更新（pending → running → completed / failed）
+  ↓
+失败时写入告警记录（alerts.json）
 ```
 
 ### 任务状态
@@ -97,6 +104,27 @@ EventInjector 生成事件
 
 ## 七、技术备注
 
-- 使用 APScheduler 作为调度引擎
-- 任务定义存储在 `tasks.yaml` 文件中（文件即数据源）
+- 当前实现使用内置轮询调度引擎，不依赖 APScheduler
+- 任务定义存储在 `backend_data/scheduler/tasks.json`
+- 失败告警存储在 `backend_data/scheduler/alerts.json`
 - 后台任务创建的会话标记为 `background: true`
+
+---
+
+## 八、当前完成度说明
+
+截至当前版本，M11 已完成：
+
+- 任务定义与持久化
+- 5 段 Cron 表达式解析
+- `session_message` 与 `background_task` 两种执行方式
+- 任务状态追踪
+- 失败自动重试
+- 失败告警持久化与查询
+- 任务删除接口
+
+当前仍未完成：
+
+- APScheduler 接入
+- 独立 `event_injector.py` 模块
+- 分布式调度 / 工作流编排

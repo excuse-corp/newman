@@ -128,6 +128,12 @@ NEWMAN_SERVER_PORT=8005
 NEWMAN_RAG_POSTGRES_DSN=postgresql://postgres@127.0.0.1:65437/newman
 ```
 
+后端启动时会在日志里打印一份“最终生效配置 + 来源摘要”：
+
+- 会显示每个叶子配置项最终取值
+- 会标明来源是 `defaults.yaml`、`newman.yaml`、`~/.newman/config.yaml` 还是 `environment`
+- `api_key` / `token` / `secret` / `password` 这类敏感值会自动脱敏为 `***`
+
 模型配置现已拆为 4 个槽位：
 
 - `models.primary`：主 LLM，负责文本输出、工具调用等主链路

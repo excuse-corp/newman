@@ -9,7 +9,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import UploadFile
 
-from backend.api.sse.event_emitter import format_sse
+from backend.api.sse.event_emitter import build_event_payload, format_sse_payload
+from backend.tools.approval_policy import normalize_turn_approval_mode
 
 
 router = APIRouter(prefix="/api/sessions", tags=["messages"])
@@ -24,7 +25,7 @@ async def send_message(session_id: str, request: Request):
     runtime.session_store.get(session_id)
     request_id = getattr(request.state, "request_id", None)
 
-    content, uploads = await _parse_request_payload(request)
+    content, uploads, approval_mode = await _parse_request_payload(request)
     if not content.strip() and not uploads:
         raise ValueError("content 不能为空，或者至少上传一张图片")
 
@@ -36,10 +37,11 @@ async def send_message(session_id: str, request: Request):
         stream_failed = False
 
         async def emit(event: str, data: dict):
+            payload = build_event_payload(event, data, request_id=request_id)
             audit_path.parent.mkdir(parents=True, exist_ok=True)
             with audit_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"event": event, "data": data, "request_id": request_id}, ensure_ascii=False) + "\n")
-            await queue.put(format_sse(event, data, request_id=request_id))
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            await queue.put(format_sse_payload(payload))
 
         async def run_worker() -> None:
             nonlocal stream_failed
@@ -86,6 +88,7 @@ async def send_message(session_id: str, request: Request):
                         }
                         for item in saved_attachments
                     ],
+                    "approval_mode": approval_mode,
                     "original_content": content,
                 }
                 await runtime.handle_message(
@@ -93,6 +96,7 @@ async def send_message(session_id: str, request: Request):
                     prepared_content,
                     emit,
                     user_metadata=metadata,
+                    turn_approval_mode=approval_mode,
                 )
             except Exception as exc:
                 stream_failed = True
@@ -122,17 +126,19 @@ async def send_message(session_id: str, request: Request):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-async def _parse_request_payload(request: Request) -> tuple[str, list[UploadFile]]:
+async def _parse_request_payload(request: Request) -> tuple[str, list[UploadFile], str]:
     content_type = request.headers.get("content-type", "")
     if content_type.startswith("application/json"):
         body = await request.json()
         content = str(body.get("content", "")).strip()
-        return content, []
+        approval_mode = normalize_turn_approval_mode(body.get("approval_mode"))
+        return content, [], approval_mode
 
     form = await request.form()
     content = str(form.get("content", "")).strip()
     uploads = [item for item in form.getlist("images") if isinstance(item, UploadFile)]
-    return content, uploads
+    approval_mode = normalize_turn_approval_mode(form.get("approval_mode"))
+    return content, uploads, approval_mode
 
 
 async def _save_uploads(upload_dir: Path, uploads: list[UploadFile]) -> list[dict[str, str]]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -86,6 +87,34 @@ async def get_session(session_id: str, request: Request):
         "plan": session.metadata.get("plan"),
         "checkpoint": runtime.checkpoints.get(session_id),
     }
+
+
+@router.get("/{session_id}/events")
+async def get_session_events(session_id: str, request: Request, limit: int = 200):
+    if limit <= 0:
+        raise ValueError("limit 必须大于 0")
+
+    audit_path = request.app.state.settings.paths.audit_dir / f"{session_id}.log"
+    if not audit_path.exists():
+        return {"session_id": session_id, "events": []}
+
+    raw_lines = audit_path.read_text(encoding="utf-8").splitlines()
+    payloads: list[dict] = []
+    for line in raw_lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if "event" not in payload or "data" not in payload:
+            continue
+        payload.setdefault("ts", 0)
+        payloads.append(payload)
+
+    if limit:
+        payloads = payloads[-limit:]
+    return {"session_id": session_id, "events": payloads}
 
 
 @router.post("/{session_id}/compress")
