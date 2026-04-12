@@ -82,6 +82,7 @@ class OpenAICompatibleProvider(BaseProvider):
                             continue
                         choice = (data.get("choices") or [{}])[0]
                         delta = choice.get("delta") or {}
+                        usage = _parse_usage(data.get("usage", {})) if isinstance(data.get("usage"), dict) else None
                         if content := delta.get("content"):
                             yield ProviderChunk(type="text", delta=str(content), finish_reason=choice.get("finish_reason"))
                         for tool_call in delta.get("tool_calls", []) or []:
@@ -95,8 +96,8 @@ class OpenAICompatibleProvider(BaseProvider):
                             if function.get("arguments"):
                                 current["arguments"] += str(function["arguments"])
                         finish_reason = choice.get("finish_reason")
-                        if finish_reason:
-                            break
+                        if usage and usage.total_tokens > 0:
+                            yield ProviderChunk(type="usage", usage=usage, finish_reason=finish_reason)
         except httpx.TimeoutException as exc:
             raise ProviderError("openai_compatible", "timeout_error", "OpenAI-compatible streaming request timed out", True) from exc
         except httpx.HTTPStatusError as exc:
@@ -139,6 +140,8 @@ def _build_payload(
         "temperature": kwargs.get("temperature", config.temperature),
         "stream": stream,
     }
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
     if tools:
         payload["tools"] = tools
     return payload

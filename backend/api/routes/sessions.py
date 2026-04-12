@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from uuid import uuid4
 
 from backend.api.sse.event_emitter import format_sse
-from backend.memory.compressor import summarize_messages
+from backend.memory.compressor import (
+    build_checkpoint_metadata,
+    split_session_messages,
+    summarize_messages,
+)
 from backend.sessions.models import SessionMessage, SessionSummary
 
 
@@ -82,10 +87,39 @@ async def list_sessions(request: Request):
 async def get_session(session_id: str, request: Request):
     runtime = request.app.state.runtime
     session = runtime.session_store.get(session_id)
+    checkpoint = runtime.checkpoints.get(session_id)
     return {
         "session": session,
         "plan": session.metadata.get("plan"),
-        "checkpoint": runtime.checkpoints.get(session_id),
+        "checkpoint": checkpoint,
+        "context_usage": _build_context_usage(runtime, session, checkpoint),
+    }
+
+
+@router.get("/{session_id}/usage")
+async def get_session_usage(session_id: str, request: Request, limit: int = 100):
+    if limit <= 0:
+        raise ValueError("limit 必须大于 0")
+
+    runtime = request.app.state.runtime
+    runtime.session_store.get(session_id)
+    usage_store = getattr(runtime, "usage_store", None)
+    if usage_store is None:
+        return {"session_id": session_id, "records": [], "available": False}
+
+    try:
+        records = usage_store.list_session_records(session_id, limit=min(limit, 500))
+    except Exception as exc:
+        return {
+            "session_id": session_id,
+            "records": [],
+            "available": False,
+            "error": str(exc),
+        }
+    return {
+        "session_id": session_id,
+        "records": [record.model_dump(mode="json") for record in records],
+        "available": True,
     }
 
 
@@ -122,21 +156,38 @@ async def compress_session(session_id: str, request: Request):
     runtime = request.app.state.runtime
     session = runtime.session_store.get(session_id)
     checkpoint = runtime.checkpoints.get(session_id)
-    summary = summarize_messages(session, checkpoint=checkpoint)
-    if not summary:
-        return {"compressed": False, "reason": "nothing_to_compress"}
     preserved = 4
+    summary_result = await summarize_messages(
+        runtime.provider,
+        runtime.settings.provider,
+        runtime.settings.provider.type,
+        session,
+        preserve_recent=preserved,
+        checkpoint=checkpoint,
+        usage_store=getattr(runtime, "usage_store", None),
+        request_kind="manual_context_compaction",
+    )
+    if not summary_result:
+        return {"compressed": False, "reason": "nothing_to_compress"}
+    _, preserved_messages = split_session_messages(session, preserve_recent=preserved)
+    original_count = len(session.messages)
+    session.messages = preserved_messages
+    session.metadata["checkpoint_active"] = True
+    runtime.session_store.save(session)
     checkpoint = runtime.checkpoints.save(
         session_id,
-        summary,
-        [0, max(0, len(session.messages) - preserved)],
-        metadata={
-            "preserve_recent": preserved,
-            "compression_level": "manual",
-            "original_message_count": len(session.messages),
-        },
+        summary_result.summary,
+        [0, max(0, original_count - preserved)],
+        metadata=build_checkpoint_metadata(
+            summary_result,
+            preserve_recent=preserved,
+            compression_level="manual",
+            original_message_count=original_count,
+        ),
     )
-    return {"compressed": True, "checkpoint": checkpoint}
+    session.metadata["checkpoint_restore_hint"] = checkpoint.checkpoint_id
+    runtime.session_store.save(session)
+    return {"compressed": True, "checkpoint": checkpoint, "session": session}
 
 
 @router.post("/{session_id}/restore-checkpoint")
@@ -186,3 +237,51 @@ async def update_session(session_id: str, payload: UpdateSessionRequest, request
         "title": session.title,
         "updated_at": session.updated_at,
     }
+
+
+def _build_context_usage(runtime, session, checkpoint) -> dict[str, object]:
+    usage_store = getattr(runtime, "usage_store", None)
+    if usage_store is not None:
+        try:
+            latest_record = usage_store.latest_context_record(session.session_id)
+        except Exception:
+            latest_record = None
+        if latest_record and latest_record.total_tokens > 0:
+            context_window = latest_record.effective_context_window or latest_record.context_window
+            pressure = (latest_record.total_tokens / context_window) if context_window else None
+            return {
+                "estimated_tokens": latest_record.total_tokens,
+                "context_window": context_window,
+                "pressure": pressure,
+                "remaining_tokens": max((context_window or 0) - latest_record.total_tokens, 0) if context_window else None,
+                "source": "latest_request_usage",
+                "request_kind": latest_record.request_kind,
+                "recorded_at": latest_record.created_at,
+            }
+
+    context_window = runtime.settings.provider.effective_context_window or runtime.settings.provider.context_window
+    history_messages = _build_session_history_messages(session, checkpoint)
+    estimated_tokens = runtime.provider.estimate_tokens(history_messages)
+    pressure = (estimated_tokens / context_window) if context_window else None
+    return {
+        "estimated_tokens": estimated_tokens,
+        "context_window": context_window,
+        "pressure": pressure,
+        "remaining_tokens": max((context_window or 0) - estimated_tokens, 0) if context_window else None,
+        "source": "estimated_session_history",
+        "request_kind": None,
+        "recorded_at": None,
+    }
+
+
+def _build_session_history_messages(session, checkpoint) -> list[dict[str, object]]:
+    messages: list[dict[str, object]] = []
+    has_restored_checkpoint = any(
+        item.role == "system" and item.metadata.get("type") == "checkpoint_restore"
+        for item in session.messages
+    )
+    if checkpoint and not has_restored_checkpoint:
+        messages.append({"role": "system", "content": f"## Checkpoint Summary\n{checkpoint.summary}"})
+    for item in session.messages:
+        messages.append({"role": item.role, "content": item.content})
+    return messages

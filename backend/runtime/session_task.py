@@ -10,4 +10,5 @@ from backend.tools.permission_context import PermissionContext
 class SessionTask:
     session: SessionRecord
     permission_context: PermissionContext
+    turn_id: str | None = None
     tool_depth: int = 0

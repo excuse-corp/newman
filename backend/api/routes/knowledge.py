@@ -29,6 +29,7 @@ def _service(request: Request) -> KnowledgeBaseService:
         settings.models,
         settings.rag,
         settings.paths.chroma_dir,
+        request.app.state.runtime.usage_store,
     )
 
 

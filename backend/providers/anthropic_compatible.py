@@ -71,6 +71,7 @@ class AnthropicCompatibleProvider(BaseProvider):
         content_parts: list[str] = []
         tool_buffers: dict[int, dict[str, str]] = {}
         finish_reason = "stop"
+        usage = TokenUsage()
 
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout) as client:
@@ -82,7 +83,10 @@ class AnthropicCompatibleProvider(BaseProvider):
                 ) as response:
                     response.raise_for_status()
                     async for event, data in _iter_sse_events(response):
-                        if event == "content_block_start":
+                        if event == "message_start":
+                            usage_raw = ((data.get("message") or {}).get("usage") or {}) if isinstance(data, dict) else {}
+                            usage = _parse_anthropic_usage(usage_raw)
+                        elif event == "content_block_start":
                             index = int(data.get("index", 0))
                             block = data.get("content_block") or {}
                             if block.get("type") == "tool_use":
@@ -108,6 +112,10 @@ class AnthropicCompatibleProvider(BaseProvider):
                             delta = data.get("delta") or {}
                             if delta.get("stop_reason"):
                                 finish_reason = str(delta["stop_reason"])
+                            usage_delta = _parse_anthropic_usage(data.get("usage") or {})
+                            if usage_delta.output_tokens:
+                                usage.output_tokens = usage_delta.output_tokens
+                                usage.total_tokens = usage.input_tokens + usage.output_tokens
                         elif event == "message_stop":
                             break
         except httpx.TimeoutException as exc:
@@ -131,6 +139,8 @@ class AnthropicCompatibleProvider(BaseProvider):
                     arguments=arguments,
                 ),
             )
+        if usage.total_tokens > 0:
+            yield ProviderChunk(type="usage", usage=usage, finish_reason=finish_reason)
         yield ProviderChunk(type="done", finish_reason=finish_reason)
 
     def estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
@@ -176,6 +186,16 @@ def _parse_anthropic_tool_calls(content_blocks: list[dict[str, Any]]) -> list[To
             )
         )
     return tool_calls
+
+
+def _parse_anthropic_usage(usage_raw: dict[str, Any]) -> TokenUsage:
+    input_tokens = int(usage_raw.get("input_tokens", 0) or 0)
+    output_tokens = int(usage_raw.get("output_tokens", 0) or 0)
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+    )
 
 
 async def _iter_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, dict[str, Any]]]:

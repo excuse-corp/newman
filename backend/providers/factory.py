@@ -60,6 +60,8 @@ class MockProvider(BaseProvider):
             yield ProviderChunk(type="text", delta=response.content, finish_reason=response.finish_reason)
         for tool_call in response.tool_calls:
             yield ProviderChunk(type="tool_call", tool_call=tool_call)
+        if response.usage.total_tokens > 0:
+            yield ProviderChunk(type="usage", usage=response.usage, finish_reason=response.finish_reason)
         yield ProviderChunk(type="done", finish_reason=response.finish_reason)
 
     def estimate_tokens(self, messages: list[dict[str, Any]]) -> int:

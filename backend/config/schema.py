@@ -6,6 +6,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
+
+
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8005
@@ -22,6 +25,12 @@ class ModelConfig(BaseModel):
     timeout: int = 60
     max_tokens: int = 4096
     temperature: float = 0.2
+
+    @property
+    def effective_context_window(self) -> int | None:
+        if self.context_window is None:
+            return None
+        return max((self.context_window * EFFECTIVE_CONTEXT_WINDOW_PERCENT) // 100, 1)
 
 
 class ModelsConfig(BaseModel):

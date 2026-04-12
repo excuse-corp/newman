@@ -6,12 +6,15 @@ from typing import Any
 from backend.config.schema import ModelConfig
 from backend.providers.factory import build_provider
 from backend.rag.models import KnowledgeChunk
+from backend.usage.recorder import ModelRequestContext, record_model_usage
+from backend.usage.store import PostgresModelUsageStore
 
 
 class Reranker:
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, usage_store: PostgresModelUsageStore | None = None):
         self.config = config
         self.provider = build_provider(config)
+        self.usage_store = usage_store
 
     async def rerank(self, query: str, chunks: list[KnowledgeChunk], initial_scores: dict[str, float]) -> dict[str, float]:
         if not chunks:
@@ -52,6 +55,21 @@ class Reranker:
             ],
             tools=None,
             temperature=0,
+        )
+        record_model_usage(
+            self.usage_store,
+            ModelRequestContext(
+                request_kind="rag_rerank",
+                model_config=self.config,
+                provider_type=self.config.type,
+                streaming=False,
+                counts_toward_context_window=False,
+                metadata={
+                    "candidate_count": len(chunks),
+                    "query_length": len(query),
+                },
+            ),
+            response,
         )
         data = _parse_json_array(response.content)
         scores: dict[str, float] = {}

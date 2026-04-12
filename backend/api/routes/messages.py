@@ -61,6 +61,7 @@ async def send_message(session_id: str, request: Request):
                     analyses = await runtime.multimodal_analyzer.analyze_images(
                         content,
                         [Path(item["path"]) for item in saved_attachments],
+                        session_id=session_id,
                     )
                     for item, analysis in zip(saved_attachments, analyses, strict=True):
                         item["summary"] = analysis["summary"]

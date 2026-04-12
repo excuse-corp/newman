@@ -7,10 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from backend.config.schema import ModelConfig
 from backend.memory.checkpoint_store import CheckpointStore
 from backend.providers.base import BaseProvider
 from backend.sessions.models import CheckpointRecord, SessionRecord, utc_now
 from backend.sessions.session_store import SessionStore
+from backend.usage.recorder import ModelRequestContext, record_model_usage
+from backend.usage.store import PostgresModelUsageStore
 
 
 @dataclass(frozen=True)
@@ -83,17 +86,21 @@ class MemoryExtractor:
     def __init__(
         self,
         provider: BaseProvider,
+        model_config: ModelConfig,
         provider_type: str,
         session_store: SessionStore,
         checkpoints: CheckpointStore,
         user_path: Path,
         prompt_path: Path,
+        usage_store: PostgresModelUsageStore | None = None,
     ):
         self.provider = provider
+        self.model_config = model_config
         self.provider_type = provider_type
         self.session_store = session_store
         self.checkpoints = checkpoints
         self.prompt_path = prompt_path
+        self.usage_store = usage_store
         self.user_spec = MemoryFileSpec(
             path=user_path,
             header="# USER.md",
@@ -178,6 +185,23 @@ class MemoryExtractor:
                 },
             ],
             temperature=0,
+        )
+        record_model_usage(
+            self.usage_store,
+            ModelRequestContext(
+                request_kind="memory_extraction",
+                model_config=self.model_config,
+                provider_type=self.provider_type,
+                streaming=False,
+                counts_toward_context_window=False,
+                session_id=session_id,
+                metadata={
+                    "trigger": trigger,
+                    "recent_message_count": len(payload["recent_messages"]),
+                    "has_checkpoint": checkpoint is not None,
+                },
+            ),
+            response,
         )
         user_items = self._parse_extraction_result(response.content)
         added_user_items = await self._merge_updates(user_items)

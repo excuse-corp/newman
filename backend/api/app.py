@@ -74,6 +74,7 @@ def create_app() -> FastAPI:
             settings.models,
             settings.rag,
             settings.paths.chroma_dir,
+            app.state.runtime.usage_store,
         )
         sandbox_health = runtime.exec_sandbox.health() if runtime.exec_sandbox else None
         return {

@@ -25,6 +25,7 @@ class ProviderChunk:
     delta: str = ""
     tool_call: ToolCall | None = None
     finish_reason: str | None = None
+    usage: TokenUsage | None = None
 
 
 @dataclass

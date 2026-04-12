@@ -15,17 +15,26 @@ from backend.rag.parser import IMAGE_EXTENSIONS, SUPPORTED_EXTENSIONS, detect_co
 from backend.rag.reranker import Reranker
 from backend.rag.retriever import ChromaVectorStore
 from backend.rag.store import PostgresRAGStore
+from backend.usage.store import PostgresModelUsageStore
 
 
 class KnowledgeBaseService:
-    def __init__(self, knowledge_dir: Path, workspace: Path, models: ModelsConfig, rag: RagConfig, chroma_dir: Path):
+    def __init__(
+        self,
+        knowledge_dir: Path,
+        workspace: Path,
+        models: ModelsConfig,
+        rag: RagConfig,
+        chroma_dir: Path,
+        usage_store: PostgresModelUsageStore | None = None,
+    ):
         self.knowledge_dir = knowledge_dir.resolve()
         self.workspace = workspace.resolve()
         self.models = models
         self.rag = rag
         self.knowledge_dir.mkdir(parents=True, exist_ok=True)
         self.embedder = Embedder(models.embedding)
-        self.reranker = Reranker(models.reranker)
+        self.reranker = Reranker(models.reranker, usage_store)
         self.store = PostgresRAGStore(rag.postgres_dsn)
         self.vector_store = ChromaVectorStore(chroma_dir.resolve(), rag.chroma_collection)
 

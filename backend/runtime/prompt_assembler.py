@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from backend.memory.stable_context import StableContextLoader
 from backend.sessions.models import CheckpointRecord, SessionRecord
 
@@ -19,5 +21,40 @@ class PromptAssembler:
         if checkpoint and not has_restored_checkpoint:
             messages.append({"role": "system", "content": f"## Checkpoint Summary\n{checkpoint.summary}"})
         for item in session.messages:
+            if item.role == "assistant":
+                tool_calls = item.metadata.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    provider_tool_calls = []
+                    for raw_tool_call in tool_calls:
+                        if not isinstance(raw_tool_call, dict):
+                            continue
+                        name = raw_tool_call.get("name")
+                        arguments = raw_tool_call.get("arguments", {})
+                        if not isinstance(name, str) or not name:
+                            continue
+                        provider_tool_calls.append(
+                            {
+                                "id": str(raw_tool_call.get("id") or ""),
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                                },
+                            }
+                        )
+                    message: dict[str, object] = {"role": item.role, "content": item.content}
+                    if provider_tool_calls:
+                        message["tool_calls"] = provider_tool_calls
+                    messages.append(message)
+                    continue
+
+            if item.role == "tool":
+                message = {"role": item.role, "content": item.content}
+                tool_call_id = item.metadata.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    message["tool_call_id"] = tool_call_id
+                messages.append(message)
+                continue
+
             messages.append({"role": item.role, "content": item.content})
         return messages

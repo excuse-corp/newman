@@ -10,11 +10,16 @@ from backend.config.schema import AppConfig
 from backend.hooks.hook_manager import HookManager
 from backend.mcp.registry import MCPRegistry
 from backend.memory.checkpoint_store import CheckpointStore
-from backend.memory.compressor import estimate_pressure, summarize_messages
+from backend.memory.compressor import (
+    build_checkpoint_metadata,
+    estimate_pressure,
+    split_session_messages,
+    summarize_messages,
+)
 from backend.memory.memory_extract import MemoryExtractor
 from backend.memory.stable_context import StableContextLoader
 from backend.plugin_runtime.service import PluginService
-from backend.providers.base import ProviderError, ProviderResponse
+from backend.providers.base import ProviderError, ProviderResponse, TokenUsage
 from backend.providers.multimodal import MultimodalAnalyzer
 from backend.providers.factory import build_provider
 from backend.rag.service import KnowledgeBaseService
@@ -45,6 +50,8 @@ from backend.tools.router import ToolRouter
 from backend.tools.result import ToolExecutionResult
 from backend.sandbox.native_sandbox import NativeSandbox
 from backend.sandbox.resource_limits import ResourceLimits
+from backend.usage.recorder import ModelRequestContext, record_model_usage
+from backend.usage.store import PostgresModelUsageStore
 
 
 EventEmitter = Callable[[str, dict], Awaitable[None]]
@@ -54,17 +61,20 @@ class NewmanRuntime:
     def __init__(self, settings: AppConfig):
         self.settings = settings
         self.provider = build_provider(settings.provider)
-        self.multimodal_analyzer = MultimodalAnalyzer(settings.models.multimodal)
+        self.usage_store = PostgresModelUsageStore(settings.rag.postgres_dsn)
+        self.multimodal_analyzer = MultimodalAnalyzer(settings.models.multimodal, self.usage_store)
         self.session_store = SessionStore(settings.paths.sessions_dir)
         self.thread_manager = ThreadManager(self.session_store)
         self.checkpoints = CheckpointStore(settings.paths.sessions_dir)
         self.memory_extractor = MemoryExtractor(
             self.provider,
+            settings.provider,
             settings.provider.type,
             self.session_store,
             self.checkpoints,
             settings.paths.memory_dir / "USER.md",
             settings.paths.workspace / "backend" / "config" / "prompts" / "mem_extract.md",
+            self.usage_store,
         )
         self._background_tasks: set[asyncio.Task] = set()
         self.stable_context = StableContextLoader(settings.paths.memory_dir)
@@ -150,6 +160,7 @@ class NewmanRuntime:
             self.settings.models,
             self.settings.rag,
             self.settings.paths.chroma_dir,
+            self.usage_store,
         )
         registry = ToolRegistry()
         registry.register(ReadFileTool(workspace))
@@ -192,7 +203,7 @@ class NewmanRuntime:
         session = self.session_store.append_message(session_id, user_message)
         await self._emit_hooks("SessionStart", emit, session_id=session.session_id, content=content)
 
-        task = SessionTask(session=session, permission_context=PermissionContext())
+        task = SessionTask(session=session, permission_context=PermissionContext(), turn_id=user_message.id)
         await self._maybe_checkpoint(task, emit)
         provider_feedback_attempted = False
 
@@ -210,6 +221,10 @@ class NewmanRuntime:
                     assembled,
                     self.registry.tools_for_provider(task.permission_context),
                     emit,
+                    session_id=task.session.session_id,
+                    turn_id=task.turn_id,
+                    request_kind="session_turn",
+                    counts_toward_context_window=True,
                 )
             except ProviderError as exc:
                 result = self._provider_error_result(exc)
@@ -248,6 +263,24 @@ class NewmanRuntime:
                 )
                 return
 
+            assistant_tool_message = SessionMessage(
+                id=uuid4().hex,
+                role="assistant",
+                content=response.content,
+                metadata={
+                    "tool_calls": [
+                        {
+                            "id": tool_call.id,
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                        }
+                        for tool_call in response.tool_calls
+                    ]
+                },
+            )
+            task.session.messages.append(assistant_tool_message)
+            self.session_store.save(task.session)
+
             for tool_call in response.tool_calls:
                 task.tool_depth += 1
                 tool = self.router.route(tool_call.name, tool_call.arguments)
@@ -285,6 +318,7 @@ class NewmanRuntime:
                         role="tool",
                         content=result.stdout or result.summary,
                         metadata={
+                            "tool_call_id": tool_call.id,
                             "tool": result.tool,
                             "category": result.category,
                             "success": result.success,
@@ -365,10 +399,16 @@ class NewmanRuntime:
         assembled: list[dict[str, object]],
         tools: list[dict[str, object]],
         emit: EventEmitter,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        request_kind: str,
+        counts_toward_context_window: bool,
     ) -> ProviderResponse:
         content_parts: list[str] = []
         tool_calls = []
         finish_reason = "stop"
+        usage = TokenUsage()
         async for chunk in self.provider.chat_stream(assembled, tools=tools):
             if chunk.type == "text" and chunk.delta:
                 content_parts.append(chunk.delta)
@@ -381,14 +421,40 @@ class NewmanRuntime:
                 )
             elif chunk.type == "tool_call" and chunk.tool_call:
                 tool_calls.append(chunk.tool_call)
+            elif chunk.type == "usage" and chunk.usage:
+                usage = chunk.usage
             elif chunk.type == "done":
                 finish_reason = chunk.finish_reason or finish_reason
-        return ProviderResponse(
+                if chunk.usage:
+                    usage = chunk.usage
+        response = ProviderResponse(
             content="".join(content_parts),
             tool_calls=tool_calls,
+            usage=usage,
             model=self.settings.provider.model,
             finish_reason=finish_reason,
         )
+        record_model_usage(
+            self.usage_store,
+            ModelRequestContext(
+                request_kind=request_kind,
+                model_config=self.settings.provider,
+                provider_type=self.settings.provider.type,
+                streaming=True,
+                counts_toward_context_window=counts_toward_context_window,
+                session_id=session_id,
+                turn_id=turn_id,
+                metadata={
+                    "assembled_message_count": len(assembled),
+                    "tool_schema_count": len(tools),
+                    "estimated_input_tokens": self.provider.estimate_tokens(assembled),
+                    "response_content_length": len(response.content),
+                    "tool_call_count": len(response.tool_calls),
+                },
+            ),
+            response,
+        )
+        return response
 
     async def _record_failure_feedback(
         self,
@@ -455,7 +521,15 @@ class NewmanRuntime:
             self.checkpoints.get(task.session.session_id),
         )
         try:
-            response = await self._stream_provider_response(assembled, [], emit)
+            response = await self._stream_provider_response(
+                assembled,
+                [],
+                emit,
+                session_id=task.session.session_id,
+                turn_id=task.turn_id,
+                request_kind="tool_limit_finalize",
+                counts_toward_context_window=True,
+            )
             final_content = response.content.strip()
         except ProviderError:
             final_content = (
@@ -553,28 +627,47 @@ class NewmanRuntime:
             json.dumps(self.settings.approval.model_dump(mode="json"), ensure_ascii=False),
             self.checkpoints.get(task.session.session_id),
         )
-        pressure = estimate_pressure(self.provider, assembled)
+        effective_context_window = (
+            self.settings.provider.effective_context_window or self.settings.provider.context_window or 8_000
+        )
+        pressure = estimate_pressure(
+            self.provider,
+            assembled,
+            max_context_tokens=effective_context_window,
+        )
         if pressure < self.settings.runtime.context_compress_threshold:
             return
         critical = pressure >= self.settings.runtime.context_critical_threshold
-        preserve_recent = 2 if critical else 4
+        preserve_recent = 4
         original_count = len(task.session.messages)
         checkpoint = self.checkpoints.get(task.session.session_id)
-        summary = summarize_messages(task.session, checkpoint=checkpoint)
-        if not summary:
+        summary_result = await summarize_messages(
+            self.provider,
+            self.settings.provider,
+            self.settings.provider.type,
+            task.session,
+            preserve_recent=preserve_recent,
+            checkpoint=checkpoint,
+            usage_store=self.usage_store,
+            turn_id=task.turn_id,
+            request_kind="context_compaction",
+        )
+        if not summary_result:
             return
-        task.session.messages = task.session.messages[-preserve_recent:]
+        _, preserved_messages = split_session_messages(task.session, preserve_recent=preserve_recent)
+        task.session.messages = preserved_messages
         task.session.metadata["checkpoint_active"] = True
         self.session_store.save(task.session)
         checkpoint = self.checkpoints.save(
             task.session.session_id,
-            summary,
+            summary_result.summary,
             [0, max(0, original_count - preserve_recent)],
-            metadata={
-                "preserve_recent": preserve_recent,
-                "compression_level": "critical" if critical else "normal",
-                "original_message_count": original_count,
-            },
+            metadata=build_checkpoint_metadata(
+                summary_result,
+                preserve_recent=preserve_recent,
+                compression_level="critical" if critical else "normal",
+                original_message_count=original_count,
+            ),
         )
         task.session.metadata["checkpoint_restore_hint"] = checkpoint.checkpoint_id
         self.session_store.save(task.session)

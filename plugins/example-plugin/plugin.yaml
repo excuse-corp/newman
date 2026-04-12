@@ -1,7 +1,7 @@
 name: example-plugin
 version: 1.0.0
 description: Example Phase 3 plugin with a sample skill, hooks, and inline MCP server.
-enabled_by_default: true
+enabled_by_default: false
 hooks:
   - event: SessionStart
     message: Example plugin observed a new session round.

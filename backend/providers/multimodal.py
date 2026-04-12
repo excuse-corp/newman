@@ -5,14 +5,24 @@ from pathlib import Path
 
 from backend.config.schema import ModelConfig
 from backend.providers.factory import build_provider
+from backend.usage.recorder import ModelRequestContext, record_model_usage
+from backend.usage.store import PostgresModelUsageStore
 
 
 class MultimodalAnalyzer:
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, usage_store: PostgresModelUsageStore | None = None):
         self.config = config
         self.provider = build_provider(config)
+        self.usage_store = usage_store
 
-    async def analyze_images(self, prompt: str, image_paths: list[Path]) -> list[dict[str, str]]:
+    async def analyze_images(
+        self,
+        prompt: str,
+        image_paths: list[Path],
+        *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> list[dict[str, str]]:
         if not image_paths:
             return []
         if self.config.type == "mock":
@@ -55,6 +65,23 @@ class MultimodalAnalyzer:
             ],
             tools=None,
             temperature=0.1,
+        )
+        record_model_usage(
+            self.usage_store,
+            ModelRequestContext(
+                request_kind="multimodal_analysis",
+                model_config=self.config,
+                provider_type=self.config.type,
+                streaming=False,
+                counts_toward_context_window=False,
+                session_id=session_id,
+                turn_id=turn_id,
+                metadata={
+                    "image_count": len(image_paths),
+                    "filenames": [path.name for path in image_paths],
+                },
+            ),
+            response,
         )
 
         summary = response.content.strip() or "未获得可用图片分析结果。"

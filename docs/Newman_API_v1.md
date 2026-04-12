@@ -148,6 +148,7 @@ x-request-id: <uuid>
 
 - `list_files` 是 `list_dir` 的别名。
 - `grep` 是 `search_files` 的别名。
+- `read_file` 读取文本文件时支持 `offset` / `limit` 按行分页，返回带 `L{行号}:` 前缀的内容；读取二进制文件时仍使用 `max_bytes` 预览。
 - `write_file`、`edit_file` 默认需要审批。
 - `terminal` 采用两级前置审批：Level 1 黑名单直接拒绝，Level 2 风险模式进入人工审批；Linux 沙箱内的明显只读命令会自动放行。
 - 若配置了插件 MCP server，运行时还会额外挂载 `mcp__...` 工具。
@@ -313,7 +314,16 @@ text/event-stream
       "pending": 1
     }
   },
-  "checkpoint": null
+  "checkpoint": null,
+  "context_usage": {
+    "estimated_tokens": 1248,
+    "context_window": 95000,
+    "pressure": 0.01248,
+    "remaining_tokens": 93752,
+    "source": "latest_request_usage",
+    "request_kind": "session_turn",
+    "recorded_at": "2026-04-11T15:20:00+00:00"
+  }
 }
 ```
 
@@ -321,6 +331,68 @@ text/event-stream
 
 - `session.metadata.plan` 与顶层 `plan` 字段内容相同，后者只是为了前端读取更直接。
 - 只有在模型调用 `update_plan` 工具后，`plan` 才会出现。
+- `context_usage.context_window` 使用的是“有效上下文窗口”，当前定义为配置的模型 `context_window * 95%`。
+- `context_usage` 优先返回“最近一次计入上下文窗口的真实模型请求 usage”，也就是最近一条 `counts_toward_context_window=true` 且 `usage_available=true` 的记录。
+- 当前前端圆环使用的是：
+  - `pressure = latest_request.total_tokens / effective_context_window`
+  - `estimated_tokens = latest_request.total_tokens`
+- 如果当前 session 还没有可用的真实 usage 记录，才会退回到“session 历史上下文表示”的本地估算值。
+- 若存在 `checkpoint.summary`，其内容现在是基于 LLM 生成的 handoff summary，而不是简单的消息逐条拼接文本。
+- 若退回估算口径，计算方式为：
+  - 若存在 checkpoint 且当前 session 中还没有 `checkpoint_restore` 消息，则先计入 `## Checkpoint Summary\n{checkpoint.summary}`
+  - 再顺序计入当前 `session.messages`
+  - 最后用当前 provider 的 token 估算器计算 `estimated_tokens`
+  - `pressure = estimated_tokens / effective_context_window`
+
+## 3.2A 获取会话 usage 记录
+
+`GET /api/sessions/{session_id}/usage`
+
+查询参数：
+
+- `limit`: 可选，默认 `100`，最大 `500`
+
+响应示例：
+
+```json
+{
+  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "available": true,
+  "records": [
+    {
+      "request_id": "a4d8b7...",
+      "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+      "turn_id": "7b78...",
+      "request_kind": "session_turn",
+      "counts_toward_context_window": true,
+      "streaming": true,
+      "provider_type": "openai_compatible",
+      "model": "minimax-m2.5",
+      "context_window": 100000,
+      "effective_context_window": 95000,
+      "usage_available": true,
+      "input_tokens": 1420,
+      "output_tokens": 221,
+      "total_tokens": 1641,
+      "finish_reason": "stop",
+      "created_at": "2026-04-11T15:20:00+00:00",
+      "metadata": {
+        "assembled_message_count": 9,
+        "tool_schema_count": 12,
+        "estimated_input_tokens": 1398,
+        "response_content_length": 328,
+        "tool_call_count": 0
+      }
+    }
+  ]
+}
+```
+
+说明：
+
+- 当前会把模型请求 usage 详细写入 PostgreSQL `model_usage_records` 表。
+- 主对话轮次、压缩摘要、记忆提取、多模态分析、RAG rerank 等都会分别写入 usage 记录。
+- `counts_toward_context_window=true` 的记录才会参与聊天页上下文窗口圆环。
 
 ## 3.3A 获取会话结构化事件历史
 
@@ -407,23 +479,43 @@ text/event-stream
   "checkpoint": {
     "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
     "checkpoint_id": "cp_xxx",
-    "summary": "Checkpoint Summary\n- user: ...",
+    "summary": "## Current Progress\n- 已确认前端缺少真实事件聚合逻辑。\n\n## Important Context\n- 用户要求 Trace 节点使用用户可理解的进展文案。\n\n## What Remains To Be Done\n- 对齐事件聚合规则并更新展示。",
     "turn_range": [0, 8],
     "created_at": "2026-04-02T10:00:00+00:00",
     "metadata": {
       "preserve_recent": 4,
       "compression_level": "manual",
-      "original_message_count": 12
+      "original_message_count": 12,
+      "compressed_message_count": 8,
+      "summary_strategy": "llm_handoff_summary",
+      "summary_model": "qwen3-coder-plus",
+      "summary_usage": {
+        "input_tokens": 1620,
+        "output_tokens": 214,
+        "total_tokens": 1834
+      }
     }
+  },
+  "session": {
+    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+    "title": "供应商合同抽取",
+    "messages": []
   }
 }
 ```
 
 说明：
 
-- 运行时自动压缩分两档：
-  - 普通压缩：命中 `context_compress_threshold`，保留最近 4 条消息
-  - 强制压缩：命中 `context_critical_threshold`，保留最近 2 条消息
+- 运行时自动压缩当前统一保留最近 `4` 条消息。
+- 手动压缩与自动压缩现在共用同一套逻辑：都会裁剪 session，只保留最近 `4` 条消息，并写入新的 checkpoint。
+- `checkpoint.summary` 通过一次独立的 LLM handoff summary 请求生成，提示词参考 Codex 本地 compact 方案，要求输出“当前进展、关键约束、剩余工作、关键引用”等可供后续模型继续任务的摘要。
+- 若已存在旧 checkpoint，压缩请求会把旧 `summary` 与本轮将被裁剪的历史消息一起交给模型，要求产出一份“替换旧 summary 的刷新版摘要”，而不是简单字符串追加。
+- 若当前 provider 为 `mock`，或压缩摘要请求失败/返回空内容，则会退回到结构化归档摘要：保留旧 summary，并附加 `## Archived Message Snapshot` 文本快照。
+- 当当前会话消息数小于等于 `4` 时，没有可裁剪历史，接口会返回 `{"compressed": false, "reason": "nothing_to_compress"}`。
+- 压缩触发阈值基于有效上下文窗口计算：
+  - `effective_context_window = configured_context_window * 95%`
+  - `pressure = assembled_prompt_estimated_tokens / effective_context_window`
+  - 当 `pressure >= runtime.context_compress_threshold` 时自动触发压缩
 
 ## 3.6 恢复 Checkpoint
 
@@ -437,12 +529,12 @@ text/event-stream
   "checkpoint": {
     "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
     "checkpoint_id": "cp_xxx",
-    "summary": "Checkpoint Summary\n- user: ...",
+    "summary": "## Current Progress\n- 已完成首轮接口排查。\n\n## Important Context\n- 用户要求不要在主区暴露技术术语。\n\n## What Remains To Be Done\n- 继续对齐 Trace Timeline 的聚合规则。",
     "turn_range": [0, 8],
     "created_at": "2026-04-02T10:00:00+00:00",
     "metadata": {
-      "preserve_recent": 2,
-      "compression_level": "critical",
+      "preserve_recent": 4,
+      "compression_level": "normal",
       "original_message_count": 18
     }
   },
@@ -458,6 +550,8 @@ text/event-stream
 
 - 恢复不会重建原始 Working History。
 - 当前实现会把 checkpoint 摘要恢复为一条显式的 `system` message，并重新纳入后续上下文。
+- `restore-checkpoint` 不会在主循环中自动触发，只有显式调用该接口时才会执行。
+- 当 session 中已经存在 `checkpoint_restore` 消息时，后续上下文组装不会再额外从 checkpoint 文件重复补一份 `summary`。
 
 ---
 
@@ -524,7 +618,7 @@ text/event-stream
 示例：
 
 ```text
-/tool read_file {"path":"/root/newman/docs/prds/Newman_PRD_v9.md"}
+/tool read_file {"path":"/root/newman/docs/prds/Newman_PRD_v9.md","offset":120,"limit":80}
 /tool list_dir {"path":"backend","recursive":false}
 /tool search_files {"query":"handle_message","path":"backend","glob":"*.py"}
 /tool edit_file {"path":"README.md","edits":[{"old_text":"old","new_text":"new"}]}
@@ -1695,7 +1789,7 @@ multipart/form-data
   "data": {
     "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
     "checkpoint_id": "cp_xxx",
-    "summary": "Checkpoint Summary\n- user: ...",
+    "summary": "## Current Progress\n- 已完成首轮接口排查。\n\n## Important Context\n- 用户要求不要在主区暴露技术术语。\n\n## What Remains To Be Done\n- 继续对齐 Trace Timeline 的聚合规则。",
     "compression_level": "critical"
   },
   "ts": 1741234567890
