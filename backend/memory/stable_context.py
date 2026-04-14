@@ -2,9 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backend.config.loader import get_settings
-
-
 MEMORY_FILES = {
     "newman": "Newman.md",
     "user": "USER.md",
@@ -25,8 +22,7 @@ class StableContextLoader:
         self._ensure_defaults()
 
     def _ensure_defaults(self) -> None:
-        settings = get_settings()
-        template_dir = settings.paths.workspace / "backend" / "config" / "prompts"
+        template_dir = Path(__file__).resolve().parents[1] / "config" / "prompts"
         for key, filename in MEMORY_FILES.items():
             path = self.memory_dir / filename
             if path.exists():

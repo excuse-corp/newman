@@ -4,6 +4,7 @@ from typing import Any
 
 from backend.sandbox.native_sandbox import NativeSandbox
 from backend.tools.base import BaseTool, ToolMeta
+from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
 
 
@@ -28,3 +29,7 @@ class TerminalTool(BaseTool):
         result.tool = self.meta.name
         result.action = arguments["command"]
         return result
+
+
+def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
+    return [TerminalTool(context.sandbox)]

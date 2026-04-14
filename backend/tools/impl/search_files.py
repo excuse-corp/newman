@@ -5,13 +5,23 @@ from pathlib import Path
 from typing import Any
 
 from backend.tools.base import BaseTool, ToolMeta
+from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
-from backend.tools.workspace_fs import iter_workspace_files, matches_glob, read_text_file, resolve_workspace_path
+from backend.tools.workspace_fs import (
+    PathAccessPolicy,
+    coerce_path_access_policy,
+    display_path,
+    ensure_readable_path,
+    iter_workspace_files,
+    matches_glob,
+    read_text_file,
+)
 
 
 class SearchFilesTool(BaseTool):
-    def __init__(self, workspace: Path, name: str = "search_files", description: str | None = None):
-        self.workspace = workspace.resolve()
+    def __init__(self, policy_or_workspace: PathAccessPolicy | Path, name: str = "search_files", description: str | None = None):
+        self.policy = coerce_path_access_policy(policy_or_workspace)
+        self.workspace = self.policy.workspace
         self.meta = ToolMeta(
             name=name,
             description=description or "Search file contents in the workspace and return matching lines.",
@@ -31,13 +41,13 @@ class SearchFilesTool(BaseTool):
             risk_level="low",
             requires_approval=False,
             timeout_seconds=15,
-            allowed_paths=[str(self.workspace)],
+            allowed_paths=[str(path) for path in self.policy.readable_roots],
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:
         query = str(arguments["query"])
         try:
-            target = resolve_workspace_path(self.workspace, arguments.get("path"))
+            target = ensure_readable_path(self.policy, arguments.get("path"))
         except ValueError as exc:
             return ToolExecutionResult(False, self.meta.name, "search", "permission_error", summary=str(exc))
 
@@ -62,7 +72,9 @@ class SearchFilesTool(BaseTool):
         truncated = False
 
         for path in iter_workspace_files(target, self.workspace, include_hidden=show_hidden):
-            if not matches_glob(path.relative_to(self.workspace), file_glob):
+            display = display_path(self.policy, path)
+            path_for_glob = Path(display)
+            if not matches_glob(path_for_glob, file_glob):
                 continue
             text_file = read_text_file(path, max_bytes=200_000)
             if text_file is None:
@@ -71,7 +83,7 @@ class SearchFilesTool(BaseTool):
             for line_number, line in enumerate(text_file.content.splitlines(), start=1):
                 if not pattern.search(line):
                     continue
-                relative = path.relative_to(self.workspace).as_posix()
+                relative = display
                 lines.append(f"{relative}:{line_number}: {line.strip()}")
                 results.append(
                     {
@@ -108,3 +120,14 @@ class SearchFilesTool(BaseTool):
             stdout="\n".join(lines)[:20_000],
             metadata={"results": results, "scanned_files": scanned_files, "truncated": truncated},
         )
+
+
+def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
+    return [
+        SearchFilesTool(context.path_policy),
+        SearchFilesTool(
+            context.path_policy,
+            name="grep",
+            description="Alias of search_files. Search file contents in the workspace and return matching lines.",
+        ),
+    ]

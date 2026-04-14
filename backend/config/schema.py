@@ -66,9 +66,19 @@ class ApprovalConfig(BaseModel):
             "process_spawn",
             "terminal_mutation_or_unknown",
             "danger_full_access_terminal",
+            "maintain_memory",
+            "maintain_skill",
+            "maintain_plugin",
+            "maintain_tool",
         ]
     )
     timeout_seconds: int = 120
+
+
+class PermissionsConfig(BaseModel):
+    readable_paths: list[Path] = Field(default_factory=list)
+    writable_paths: list[Path] = Field(default_factory=list)
+    protected_paths: list[Path] = Field(default_factory=list)
 
 
 class RagConfig(BaseModel):
@@ -111,6 +121,7 @@ class AppConfig(BaseModel):
     rag: RagConfig = Field(default_factory=RagConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
+    permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
 

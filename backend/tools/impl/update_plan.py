@@ -4,6 +4,7 @@ from typing import Any
 
 from backend.sessions.models import SessionPlan
 from backend.tools.base import BaseTool, ToolMeta
+from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
 
 
@@ -79,3 +80,7 @@ class UpdatePlanTool(BaseTool):
                 "session_metadata_updates": {"plan": plan_payload},
             },
         )
+
+
+def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
+    return [UpdatePlanTool()]

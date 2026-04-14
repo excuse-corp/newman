@@ -18,3 +18,9 @@ class PluginRegistry:
         state = self.load_state()
         state[plugin_name] = enabled
         self.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def delete(self, plugin_name: str) -> None:
+        state = self.load_state()
+        if plugin_name in state:
+            del state[plugin_name]
+            self.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")

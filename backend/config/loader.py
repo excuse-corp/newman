@@ -17,6 +17,92 @@ LOGGER = logging.getLogger("newman.config")
 DISPLAY_LOGGER = logging.getLogger("uvicorn.error")
 SENSITIVE_MARKERS = {"api_key", "token", "secret", "password"}
 _LAST_SETTINGS_REPORT: "ConfigLoadReport | None" = None
+PROJECT_CONFIG_TEMPLATE = """# Newman project config
+# This file is the project deployment config generated during initialization.
+# backend/config/defaults.yaml provides the built-in baseline template and fallback values.
+# Keep actual project settings here.
+# Model settings and secrets can still be overridden through NEWMAN_* values in .env when needed.
+
+server:
+  host: "0.0.0.0"
+  port: 8005
+
+runtime:
+  max_tool_depth: 30
+  context_compress_threshold: 0.8
+  context_critical_threshold: 0.92
+  tool_retry_attempts: 3
+  tool_retry_backoff_seconds: 1.0
+
+rag:
+  chroma_collection: "knowledge_chunks"
+  lexical_candidate_count: 24
+  vector_candidate_count: 24
+  hybrid_candidate_count: 32
+
+sandbox:
+  enabled: true
+  backend: "linux_bwrap"
+  mode: "workspace-write"
+  network_access: false
+  writable_roots: []
+  timeout: 30
+  output_limit_bytes: 10240
+
+approval:
+  level1_blacklist:
+    - "rm -rf /"
+    - "sudo"
+    - "su "
+    - "chmod 777 /"
+    - "chown root"
+  level2_patterns:
+    - "write_file_outside_workspace"
+    - "process_spawn"
+    - "terminal_mutation_or_unknown"
+    - "danger_full_access_terminal"
+  timeout_seconds: 120
+
+permissions:
+  readable_paths:
+    - "backend"
+    - "frontend"
+    - "docs"
+    - "backend/tests"
+    - "scripts"
+  writable_paths:
+    - "backend_data/memory"
+    - "skills"
+    - "plugins"
+    - "backend/tools"
+  protected_paths:
+    - ".env"
+    - "newman.yaml"
+    - "backend_data/uploads"
+    - "backend_data/chroma"
+    - "backend_data/sessions"
+    - "backend_data/audit"
+
+channels:
+  feishu:
+    enabled: true
+  wecom:
+    enabled: true
+
+paths:
+  workspace: "."
+  data_dir: "backend_data"
+  sessions_dir: "backend_data/sessions"
+  memory_dir: "backend_data/memory"
+  audit_dir: "backend_data/audit"
+  knowledge_dir: "backend_data/knowledge"
+  chroma_dir: "backend_data/chroma"
+  plugins_dir: "plugins"
+  skills_dir: "skills"
+  mcp_dir: "backend_data/mcp"
+  scheduler_dir: "backend_data/scheduler"
+  channels_dir: "backend_data/channels"
+"""
 
 
 @dataclass
@@ -33,6 +119,17 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise ValueError(f"Expected mapping in config file: {path}")
     return loaded
+
+
+def _ensure_project_config(path: Path) -> None:
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(PROJECT_CONFIG_TEMPLATE, encoding="utf-8")
+    message = f"Created missing project config template: {path}"
+    LOGGER.info(message)
+    if DISPLAY_LOGGER is not LOGGER:
+        DISPLAY_LOGGER.info(message)
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -182,6 +279,17 @@ def _resolve_paths(config: AppConfig, project_root: Path) -> AppConfig:
         path = Path(raw_path)
         if not path.is_absolute():
             paths[name] = str((project_root / path).resolve())
+    permissions = data.get("permissions", {})
+    for key in ("readable_paths", "writable_paths", "protected_paths"):
+        resolved: list[str] = []
+        for raw_path in permissions.get(key, []):
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = (project_root / path).resolve()
+            else:
+                path = path.resolve()
+            resolved.append(str(path))
+        permissions[key] = resolved
     return AppConfig.model_validate(data)
 
 
@@ -196,6 +304,7 @@ def get_settings(project_root: str | None = None) -> AppConfig:
     user_dotenv_path = Path.home() / ".newman" / ".env"
 
     defaults = _read_yaml(defaults_path)
+    _ensure_project_config(project_config_path)
     project = _read_yaml(project_config_path)
     user = _read_yaml(user_config_path)
     dotenv_values = _read_dotenv(project_dotenv_path)

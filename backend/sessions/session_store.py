@@ -37,11 +37,13 @@ class SessionStore:
         return items
 
     def list_records(self) -> list[SessionRecord]:
-        items: list[SessionRecord] = []
-        for path in self.sessions_dir.glob("*.json"):
-            if path.name.endswith("_checkpoint.json"):
-                continue
-            items.append(SessionRecord.model_validate_json(path.read_text(encoding="utf-8")))
+        items_by_session_id: dict[str, SessionRecord] = {}
+        for path in self._all_session_paths():
+            record = SessionRecord.model_validate_json(path.read_text(encoding="utf-8"))
+            existing = items_by_session_id.get(record.session_id)
+            if existing is None or record.updated_at > existing.updated_at:
+                items_by_session_id[record.session_id] = record
+        items = list(items_by_session_id.values())
         items.sort(key=lambda item: item.updated_at, reverse=True)
         return items
 
@@ -56,22 +58,23 @@ class SessionStore:
         return None
 
     def get(self, session_id: str) -> SessionRecord:
-        path = self._path_for(session_id)
-        if not path.exists():
+        path = self._existing_path_for(session_id)
+        if path is None:
             raise FileNotFoundError(f"Session not found: {session_id}")
         return SessionRecord.model_validate_json(path.read_text(encoding="utf-8"))
 
     def save(self, session: SessionRecord, touch_updated_at: bool = True) -> None:
         if touch_updated_at:
             session.updated_at = utc_now()
-        self._path_for(session.session_id).write_text(
+        path = self._path_for(session)
+        path.write_text(
             json.dumps(session.model_dump(mode="json"), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        self._cleanup_duplicate_paths(session.session_id, keep=path)
 
     def delete(self, session_id: str) -> None:
-        path = self._path_for(session_id)
-        if path.exists():
+        for path in self._matching_paths(session_id):
             path.unlink()
         checkpoint_path = self.sessions_dir / f"{session_id}_checkpoint.json"
         if checkpoint_path.exists():
@@ -97,5 +100,43 @@ class SessionStore:
         self.save(session)
         return session
 
-    def _path_for(self, session_id: str) -> Path:
-        return self.sessions_dir / f"{session_id}.json"
+    def _all_session_paths(self) -> list[Path]:
+        return [
+            path
+            for path in self.sessions_dir.glob("*.json")
+            if not path.name.endswith("_checkpoint.json")
+        ]
+
+    def _existing_path_for(self, session_id: str) -> Path | None:
+        preferred_matches = sorted(self.sessions_dir.glob(f"*_{session_id}.json"))
+        if preferred_matches:
+            return preferred_matches[-1]
+        legacy_path = self.sessions_dir / f"{session_id}.json"
+        if legacy_path.exists():
+            return legacy_path
+        return None
+
+    def _matching_paths(self, session_id: str) -> list[Path]:
+        matches: dict[Path, None] = {}
+        legacy_path = self.sessions_dir / f"{session_id}.json"
+        if legacy_path.exists():
+            matches[legacy_path] = None
+        for path in self.sessions_dir.glob(f"*_{session_id}.json"):
+            matches[path] = None
+        return sorted(matches)
+
+    def _cleanup_duplicate_paths(self, session_id: str, keep: Path) -> None:
+        for path in self._matching_paths(session_id):
+            if path != keep and path.exists():
+                path.unlink()
+
+    def _path_for(self, session: SessionRecord) -> Path:
+        date_prefix = self._date_prefix(session.created_at)
+        return self.sessions_dir / f"{date_prefix}_{session.session_id}.json"
+
+    def _date_prefix(self, created_at: str) -> str:
+        if len(created_at) >= 10:
+            candidate = created_at[:10]
+            if candidate[4:5] == "-" and candidate[7:8] == "-":
+                return candidate
+        return utc_now()[:10]

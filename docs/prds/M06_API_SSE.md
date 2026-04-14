@@ -64,9 +64,16 @@ api/
 {
   "event": "<event_type>",
   "data": { "...": "..." },
-  "ts": 1741234567890
+  "ts": 1741234567890,
+  "request_id": "req_xxx"
 }
 ```
+
+补充约定：
+
+- 会话回合相关事件会在 `data.turn_id` 中标记归属 turn。
+- `assistant_delta` 用于更新当前 turn 的流式回答槽位。
+- `final_response` 用于标记回答完成，并携带 `message_id` / `created_at` 方便前端把流式回答与持久化 assistant message 对齐。
 
 ### 必须支持的事件类型
 
@@ -102,8 +109,9 @@ api/
 1. 所有 SSE 事件可重放
 2. 审批事件有超时处理（默认 120 秒）
 3. request_id 贯穿日志与事件
-4. 流式响应延迟 < 200ms
-5. 错误响应使用统一结构（code + message + request_id）
+4. turn 级事件包含 `data.turn_id`，前端可按 turn 聚合 timeline
+5. 流式响应延迟 < 200ms
+6. 错误响应使用统一结构（code + message + request_id）
 
 ---
 

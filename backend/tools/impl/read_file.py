@@ -6,8 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from backend.tools.base import BaseTool, ToolMeta
+from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
-from backend.tools.workspace_fs import resolve_workspace_path
+from backend.tools.workspace_fs import (
+    PathAccessPolicy,
+    coerce_path_access_policy,
+    ensure_readable_path,
+)
 
 
 DEFAULT_PREVIEW_BYTES = 256 * 1024
@@ -19,8 +24,9 @@ MAX_TEXT_LINE_CHARS = 500
 
 
 class ReadFileTool(BaseTool):
-    def __init__(self, workspace: Path):
-        self.workspace = workspace.resolve()
+    def __init__(self, policy_or_workspace: PathAccessPolicy | Path):
+        self.policy = coerce_path_access_policy(policy_or_workspace)
+        self.workspace = self.policy.workspace
         self.meta = ToolMeta(
             name="read_file",
             description="Read a workspace file. Text files support line-based pagination; binary files return a size-limited preview.",
@@ -51,12 +57,12 @@ class ReadFileTool(BaseTool):
             risk_level="low",
             requires_approval=False,
             timeout_seconds=10,
-            allowed_paths=[str(self.workspace)],
+            allowed_paths=[str(path) for path in self.policy.readable_roots],
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:
         try:
-            path = resolve_workspace_path(self.workspace, arguments.get("path"))
+            path = ensure_readable_path(self.policy, arguments.get("path"))
         except ValueError as exc:
             return ToolExecutionResult(False, self.meta.name, "read", "permission_error", summary=str(exc))
         if not path.exists():
@@ -189,3 +195,7 @@ def _truncate_line(line: str) -> str:
     if len(line) <= MAX_TEXT_LINE_CHARS:
         return line
     return line[:MAX_TEXT_LINE_CHARS]
+
+
+def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
+    return [ReadFileTool(context.path_policy)]

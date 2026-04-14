@@ -35,6 +35,7 @@ class ToolOrchestrator:
         emit: EventEmitter,
         extra_reasons: list[str] | None = None,
         turn_approval_mode: TurnApprovalMode = DEFAULT_TURN_APPROVAL_MODE,
+        turn_id: str | None = None,
     ) -> ToolExecutionResult:
         decision = self.approval_policy.evaluate(tool, arguments, extra_reasons)
         if decision.action == "ask" and turn_approval_mode == "auto_approve_level2":
@@ -60,6 +61,7 @@ class ToolOrchestrator:
                 tool_name=tool.meta.name,
                 arguments=arguments,
                 reason=", ".join(decision.reasons) or "requires_approval",
+                turn_id=turn_id,
             )
             await emit(
                 "tool_approval_request",

@@ -5,6 +5,7 @@ from typing import Any
 from backend.rag.citation import format_citation_label
 from backend.rag.service import KnowledgeBaseService
 from backend.tools.base import BaseTool, ToolMeta
+from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
 
 
@@ -50,3 +51,7 @@ class SearchKnowledgeBaseTool(BaseTool):
             ),
             metadata={"hits": [hit.model_dump(mode='json') for hit in hits]},
         )
+
+
+def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
+    return [SearchKnowledgeBaseTool(context.knowledge_base)]

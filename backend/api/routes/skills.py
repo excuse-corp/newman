@@ -6,14 +6,14 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from backend.tools.workspace_fs import resolve_workspace_path
+from backend.tools.workspace_fs import build_path_access_policy, ensure_readable_path
 
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
 
 
 class ImportSkillRequest(BaseModel):
-    source_path: str = Field(..., min_length=1, description="Workspace 内待导入的 skill 文件夹路径")
+    source_path: str = Field(..., min_length=1, description="可读目录内待导入的 skill 文件夹路径")
 
 
 class UpdateSkillRequest(BaseModel):
@@ -30,9 +30,10 @@ async def list_skills(request: Request):
 @router.post("/import")
 async def import_skill(payload: ImportSkillRequest, request: Request):
     runtime = request.app.state.runtime
-    source_dir = resolve_workspace_path(request.app.state.settings.paths.workspace, payload.source_path)
+    policy = build_path_access_policy(request.app.state.settings)
+    source_dir = ensure_readable_path(policy, payload.source_path)
     try:
-        skill = runtime.plugin_service.import_workspace_skill(source_dir)
+        skill = runtime.plugin_service.import_system_skill(source_dir)
     except FileExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     runtime.reload_ecosystem()
@@ -49,7 +50,7 @@ async def get_skill(skill_name: str, request: Request):
 async def update_skill(skill_name: str, payload: UpdateSkillRequest, request: Request):
     runtime = request.app.state.runtime
     try:
-        skill = runtime.plugin_service.update_workspace_skill(skill_name, payload.content)
+        skill = runtime.plugin_service.update_system_skill(skill_name, payload.content)
     except PermissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     runtime.reload_ecosystem()
@@ -60,7 +61,7 @@ async def update_skill(skill_name: str, payload: UpdateSkillRequest, request: Re
 async def delete_skill(skill_name: str, request: Request):
     runtime = request.app.state.runtime
     try:
-        skill = runtime.plugin_service.delete_workspace_skill(skill_name)
+        skill = runtime.plugin_service.delete_system_skill(skill_name)
     except PermissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     runtime.reload_ecosystem()
@@ -74,7 +75,7 @@ def _build_skill_detail(runtime, skill_name: str) -> dict:
     return {
         **skill.model_dump(mode="json"),
         "content": content,
-        "readonly": skill.source != "workspace",
+        "readonly": skill.source != "system",
         "available": True,
         "tool_dependencies": _extract_tool_dependencies(content, tool_names),
         "usage_limits_summary": _extract_usage_limits_summary(content),

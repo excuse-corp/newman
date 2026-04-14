@@ -85,15 +85,27 @@ Newman 按以下优先级加载配置：
 
 1. 环境变量
 2. `~/.newman/config.yaml`
-3. 项目根目录 `newman.yaml`（可选，默认不存在）
+3. 项目根目录 `newman.yaml`
 4. `backend/config/defaults.yaml`
+
+可以把这三层理解为：
+
+- `backend/config/defaults.yaml`：内置默认模板 / fallback 基线
+- 项目根目录 `newman.yaml`：当前项目的实际部署配置
+- `.env`：环境级动态覆盖，优先处理模型、密钥、endpoint、连接串等易变或敏感值
 
 这里要特别说明两点：
 
 - `~/.newman/config.yaml` 默认不存在；只有你想给“这台机器上的所有 Newman 项目”做全局配置时，才需要自己创建
-- 项目根目录 `newman.yaml` 也默认不存在；只有你想给“当前这个项目”单独覆盖配置时，才需要自己创建
+- 项目根目录 `newman.yaml` 是项目级配置入口；仓库中应保留该文件，且系统初始化时如果发现缺失，会自动创建一个项目部署模板
+- 模型配置可以放进 `newman.yaml`，但通常更推荐通过 `.env` 中的 `NEWMAN_*` 变量覆盖模型相关值，尤其是 `api_key`、endpoint、不同环境下会变化的模型参数
 
-也就是说，这两个文件没有也完全正常，Newman 仍然可以直接启动。
+部署约定：
+
+1. `backend/config/defaults.yaml` 作为代码仓库内的默认基线，不直接按环境修改
+2. 项目根目录 `newman.yaml` 作为部署必备文件，保存当前项目的实际配置
+3. 首次初始化时如果缺少 `newman.yaml`，Newman 会自动生成一份项目部署模板；部署时应主动检查并修改为目标环境配置
+4. `~/.newman/config.yaml` 只用于机器级全局覆盖，不作为项目部署依赖
 
 项目根目录 `.env` 和 `~/.newman/.env` 中以 `NEWMAN_` 开头的变量也会自动加载。可先复制：
 
@@ -119,20 +131,63 @@ cp .env.example .env
 最常见的本地开发做法是：
 
 1. 先保持 `backend/config/defaults.yaml` 不动
-2. 只在项目根目录 `.env` 里覆盖你真的需要改的几个值
+2. 检查项目根目录 `newman.yaml` 是否存在，并将它视为当前项目的实际配置文件
+3. 把模型、密钥、连接串这类更适合按环境切换的值放到项目根目录 `.env`
 
 例如：
 
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 8005
+
+sandbox:
+  enabled: true
+  mode: "workspace-write"
+
+paths:
+  workspace: "."
+```
+
+如果你希望把更多稳定配置固化到项目里，也可以继续写在 `newman.yaml`，例如：
+
+```yaml
+runtime:
+  max_tool_depth: 30
+
+rag:
+  chroma_collection: "knowledge_chunks"
+
+sandbox:
+  network_access: false
+```
+
 ```env
+NEWMAN_MODELS_PRIMARY_TYPE=openai_compatible
+NEWMAN_MODELS_PRIMARY_MODEL=gpt-5
+NEWMAN_MODELS_PRIMARY_ENDPOINT=http://127.0.0.1:4000/v1
+NEWMAN_MODELS_PRIMARY_API_KEY=your-api-key
 NEWMAN_SERVER_PORT=8005
 NEWMAN_RAG_POSTGRES_DSN=postgresql://postgres@127.0.0.1:65437/newman
 ```
+
+建议把 `newman.yaml` 纳入项目部署流程：
+
+1. 部署代码后先确认项目根目录存在 `newman.yaml`
+2. 如文件是系统自动生成的模板，按目标环境补全和修改项目实际配置
+3. 再补充 `.env` 中的敏感信息或临时环境变量
+4. 最后启动 Newman 服务
 
 后端启动时会在日志里打印一份“最终生效配置 + 来源摘要”：
 
 - 会显示每个叶子配置项最终取值
 - 会标明来源是 `defaults.yaml`、`newman.yaml`、`~/.newman/config.yaml` 还是 `environment`
 - `api_key` / `token` / `secret` / `password` 这类敏感值会自动脱敏为 `***`
+
+注意：
+
+- 如果某个值同时出现在 `newman.yaml` 和 `.env`，最终以 `.env` 为准
+- 如果你没有在 `newman.yaml` 里写某个配置项，运行时会继续使用 `defaults.yaml` 里的默认值，或再被 `.env` 覆盖
 
 模型配置现已拆为 4 个槽位：
 

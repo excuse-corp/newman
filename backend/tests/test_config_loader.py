@@ -73,6 +73,58 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual(report.values["models.primary.api_key"], "***")
             self.assertEqual(report.sources["models.primary.api_key"], "environment")
 
+    def test_missing_project_config_is_created_automatically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_project(root)
+            project_config = root / "newman.yaml"
+
+            self.assertFalse(project_config.exists())
+
+            with patch.dict(os.environ, {"HOME": str(root / "fake-home")}, clear=True):
+                settings = reload_settings(str(root))
+                report = get_settings_report(str(root))
+
+            self.assertTrue(project_config.exists())
+            project_config_text = project_config.read_text(encoding="utf-8")
+            self.assertIn("project deployment config generated during initialization", project_config_text)
+            self.assertIn("server:", project_config_text)
+            self.assertIn("runtime:", project_config_text)
+            self.assertIn("rag:", project_config_text)
+            self.assertIn("sandbox:", project_config_text)
+            self.assertIn("permissions:", project_config_text)
+            self.assertNotIn("models:", project_config_text)
+            self.assertEqual(settings.server.port, 8005)
+            self.assertEqual(report.sources["server.port"], "newman.yaml")
+            self.assertEqual(report.sources["models.primary.model"], "defaults.yaml")
+
+    def test_resolves_permission_paths_relative_to_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_project(root)
+            (root / "newman.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    permissions:
+                      readable_paths:
+                        - "docs"
+                      writable_paths:
+                        - "skills"
+                      protected_paths:
+                        - ".env"
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"HOME": str(root / "fake-home")}, clear=True):
+                settings = reload_settings(str(root))
+
+            self.assertEqual(settings.permissions.readable_paths, [root / "docs"])
+            self.assertEqual(settings.permissions.writable_paths, [root / "skills"])
+            self.assertEqual(settings.permissions.protected_paths, [root / ".env"])
+
     def _write_project(self, root: Path) -> None:
         config_dir = root / "backend" / "config"
         config_dir.mkdir(parents=True, exist_ok=True)

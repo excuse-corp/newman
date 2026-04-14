@@ -4,13 +4,20 @@ from pathlib import Path
 from typing import Any
 
 from backend.tools.base import BaseTool, ToolMeta
+from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
-from backend.tools.workspace_fs import resolve_workspace_path
+from backend.tools.workspace_fs import (
+    PathAccessPolicy,
+    coerce_path_access_policy,
+    display_path,
+    ensure_writable_path,
+)
 
 
 class WriteFileTool(BaseTool):
-    def __init__(self, workspace: Path):
-        self.workspace = workspace.resolve()
+    def __init__(self, policy_or_workspace: PathAccessPolicy | Path):
+        self.policy = coerce_path_access_policy(policy_or_workspace)
+        self.workspace = self.policy.workspace
         self.meta = ToolMeta(
             name="write_file",
             description="Create or overwrite a text file inside the workspace.",
@@ -26,12 +33,12 @@ class WriteFileTool(BaseTool):
             risk_level="high",
             requires_approval=True,
             timeout_seconds=15,
-            allowed_paths=[str(self.workspace)],
+            allowed_paths=[str(path) for path in self.policy.writable_roots],
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:
         try:
-            target = resolve_workspace_path(self.workspace, arguments.get("path"))
+            target = ensure_writable_path(self.policy, arguments.get("path"))
         except ValueError as exc:
             return ToolExecutionResult(False, self.meta.name, "write", "permission_error", summary=str(exc))
 
@@ -51,7 +58,7 @@ class WriteFileTool(BaseTool):
             success=True,
             tool=self.meta.name,
             action="write",
-            summary=f"已写入 {target.relative_to(self.workspace)}",
+            summary=f"已写入 {display_path(self.policy, target)}",
             stdout=preview,
             metadata={
                 "path": str(target),
@@ -59,3 +66,7 @@ class WriteFileTool(BaseTool):
                 "created": not existed_before,
             },
         )
+
+
+def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
+    return [WriteFileTool(context.path_policy)]

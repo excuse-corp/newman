@@ -4,13 +4,20 @@ from pathlib import Path
 from typing import Any
 
 from backend.tools.base import BaseTool, ToolMeta
+from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
-from backend.tools.workspace_fs import resolve_workspace_path, should_skip_path
+from backend.tools.workspace_fs import (
+    PathAccessPolicy,
+    coerce_path_access_policy,
+    ensure_readable_path,
+    should_skip_path,
+)
 
 
 class ListDirectoryTool(BaseTool):
-    def __init__(self, workspace: Path, name: str = "list_dir", description: str | None = None):
-        self.workspace = workspace.resolve()
+    def __init__(self, policy_or_workspace: PathAccessPolicy | Path, name: str = "list_dir", description: str | None = None):
+        self.policy = coerce_path_access_policy(policy_or_workspace)
+        self.workspace = self.policy.workspace
         self.meta = ToolMeta(
             name=name,
             description=description or "List files and directories inside the workspace.",
@@ -27,12 +34,12 @@ class ListDirectoryTool(BaseTool):
             risk_level="low",
             requires_approval=False,
             timeout_seconds=10,
-            allowed_paths=[str(self.workspace)],
+            allowed_paths=[str(path) for path in self.policy.readable_roots],
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:
         try:
-            target = resolve_workspace_path(self.workspace, arguments.get("path"))
+            target = ensure_readable_path(self.policy, arguments.get("path"))
         except ValueError as exc:
             return ToolExecutionResult(False, self.meta.name, "list", "permission_error", summary=str(exc))
 
@@ -90,3 +97,14 @@ class ListDirectoryTool(BaseTool):
             stdout="\n".join(lines)[:20_000],
             metadata={"entries": entries, "truncated": truncated},
         )
+
+
+def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
+    return [
+        ListDirectoryTool(context.path_policy),
+        ListDirectoryTool(
+            context.path_policy,
+            name="list_files",
+            description="Alias of list_dir. List files and directories inside the workspace.",
+        ),
+    ]

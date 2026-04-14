@@ -6,7 +6,12 @@ from pathlib import Path
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from backend.tools.workspace_fs import resolve_workspace_path, should_skip_path
+from backend.tools.workspace_fs import (
+    build_path_access_policy,
+    classify_path,
+    ensure_readable_path,
+    should_skip_path,
+)
 
 
 router = APIRouter(prefix="/api/workspace", tags=["workspace"])
@@ -58,16 +63,30 @@ async def update_memory_file(memory_key: str, payload: UpdateMemoryRequest, requ
     }
 
 
+@router.get("/roots")
+async def get_workspace_roots(request: Request):
+    settings = request.app.state.settings
+    policy = build_path_access_policy(settings)
+    return {
+        "workspace": str(policy.workspace),
+        "readable_roots": [str(path) for path in policy.readable_roots],
+        "writable_roots": [str(path) for path in policy.writable_roots],
+        "protected_roots": [str(path) for path in policy.protected_roots],
+    }
+
+
 @router.get("/files")
 async def list_workspace_files(request: Request, path: str = "."):
     settings = request.app.state.settings
-    target = resolve_workspace_path(settings.paths.workspace, path)
+    policy = build_path_access_policy(settings)
+    target = ensure_readable_path(policy, path)
     if not target.exists():
         raise FileNotFoundError(f"Path not found: {target}")
     if target.is_file():
         return {
             "path": str(target),
             "type": "file",
+            "access": classify_path(policy, target),
             "content": target.read_text(encoding="utf-8", errors="replace")[:20000],
         }
     items = []
@@ -79,9 +98,10 @@ async def list_workspace_files(request: Request, path: str = "."):
                 "name": child.name,
                 "path": str(child),
                 "type": "dir" if child.is_dir() else "file",
+                "access": classify_path(policy, child),
             }
         )
-    return {"path": str(target), "type": "dir", "entries": items}
+    return {"path": str(target), "type": "dir", "access": classify_path(policy, target), "entries": items}
 
 
 def _path_updated_at(path: Path) -> str | None:

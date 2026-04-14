@@ -4,7 +4,9 @@ import shutil
 from pathlib import Path
 from typing import Iterable
 
-from backend.plugin_runtime.models import LoadedPlugin, PluginLoadError, PluginRecord, SkillDescriptor
+import yaml
+
+from backend.plugin_runtime.models import LoadedPlugin, PluginLoadError, PluginManifest, PluginRecord, SkillDescriptor
 from backend.plugin_runtime.plugin_loader import PluginLoader
 from backend.plugin_runtime.plugin_registry import PluginRegistry
 from backend.plugin_runtime.skill_parser import parse_skill_file
@@ -64,6 +66,71 @@ class PluginService:
             raise FileNotFoundError(f"Plugin not found: {plugin_name}")
         return plugin
 
+    def get_plugin(self, plugin_name: str) -> LoadedPlugin:
+        self.ensure_fresh()
+        plugin = next((item for item in self._plugins if item.manifest.name == plugin_name), None)
+        if plugin is None:
+            raise FileNotFoundError(f"Plugin not found: {plugin_name}")
+        return plugin
+
+    def plugin_record(self, plugin_name: str) -> PluginRecord:
+        plugin = next((item for item in self.list_plugins() if item.name == plugin_name), None)
+        if plugin is None:
+            raise FileNotFoundError(f"Plugin not found: {plugin_name}")
+        return plugin
+
+    def read_plugin_manifest_content(self, plugin_name: str) -> str:
+        plugin = self.get_plugin(plugin_name)
+        manifest_path = plugin.root_path / "plugin.yaml"
+        return manifest_path.read_text(encoding="utf-8")
+
+    def import_plugin(self, source_dir: Path) -> PluginRecord:
+        self.plugins_dir.mkdir(parents=True, exist_ok=True)
+        source_dir = source_dir.resolve()
+        if not source_dir.exists() or not source_dir.is_dir():
+            raise FileNotFoundError(f"Plugin directory not found: {source_dir}")
+        manifest_path = source_dir / "plugin.yaml"
+        if not manifest_path.exists():
+            raise ValueError("Plugin 目录缺少 plugin.yaml")
+
+        loader = PluginLoader(source_dir.parent)
+        plugins, errors = loader.scan()
+        loaded = next((item for item in plugins if item.root_path.resolve() == source_dir), None)
+        if loaded is None:
+            detail = next((item.message for item in errors if Path(item.plugin_path).resolve() == source_dir), None)
+            raise ValueError(detail or "Plugin 清单无效")
+
+        plugin_name = loaded.manifest.name
+        if any(item.name == plugin_name for item in self.list_plugins()):
+            raise FileExistsError(f"Plugin 已存在：{plugin_name}")
+
+        target_dir = (self.plugins_dir / source_dir.name).resolve()
+        if target_dir.exists():
+            raise FileExistsError(f"Plugin 目录已存在：{target_dir.name}")
+        if source_dir == target_dir:
+            raise FileExistsError(f"Plugin 已位于目标目录：{source_dir.name}")
+
+        shutil.copytree(source_dir, target_dir)
+        self.reload()
+        return self.plugin_record(plugin_name)
+
+    def update_plugin_manifest(self, plugin_name: str, content: str) -> PluginRecord:
+        plugin = self.get_plugin(plugin_name)
+        manifest = PluginManifest.model_validate(yaml.safe_load(content) or {})
+        PluginLoader(self.plugins_dir)._validate_manifest_paths(plugin.root_path, manifest)
+        manifest_path = plugin.root_path / "plugin.yaml"
+        manifest_path.write_text(content, encoding="utf-8")
+        self.reload()
+        return self.plugin_record(plugin_name)
+
+    def delete_plugin(self, plugin_name: str) -> PluginRecord:
+        record = self.plugin_record(plugin_name)
+        plugin = self.get_plugin(plugin_name)
+        shutil.rmtree(plugin.root_path)
+        self.registry.delete(plugin_name)
+        self.reload()
+        return record
+
     def enabled_plugins(self) -> list[LoadedPlugin]:
         self.ensure_fresh()
         enabled_names = {item.name for item in self.list_plugins() if item.enabled}
@@ -81,11 +148,11 @@ class PluginService:
         if not matches:
             raise FileNotFoundError(f"Skill not found: {skill_name}")
 
-        workspace_matches = [item for item in matches if item.source == "workspace"]
+        system_matches = [item for item in matches if item.source == "system"]
         if len(matches) == 1:
             return matches[0]
-        if len(workspace_matches) == 1:
-            return workspace_matches[0]
+        if len(system_matches) == 1:
+            return system_matches[0]
         raise ValueError(f"Skill 名称不唯一：{skill_name}")
 
     def get_skill_by_path(self, skill_path: Path) -> SkillDescriptor:
@@ -97,20 +164,23 @@ class PluginService:
             raise FileNotFoundError(f"Skill not found: {resolved}")
         raise ValueError(f"Skill 路径不唯一：{resolved}")
 
-    def get_workspace_skill(self, skill_name: str) -> SkillDescriptor:
-        workspace_matches = [item for item in self.list_skills() if item.name == skill_name and item.source == "workspace"]
-        if len(workspace_matches) == 1:
-            return workspace_matches[0]
-        if len(workspace_matches) > 1:
-            raise ValueError(f"Workspace skill 名称不唯一：{skill_name}")
+    def get_system_skill(self, skill_name: str) -> SkillDescriptor:
+        system_matches = [item for item in self.list_skills() if item.name == skill_name and item.source == "system"]
+        if len(system_matches) == 1:
+            return system_matches[0]
+        if len(system_matches) > 1:
+            raise ValueError(f"System skill 名称不唯一：{skill_name}")
         if any(item.name == skill_name for item in self.list_skills()):
             raise PermissionError(f"Skill 为只读，不能修改：{skill_name}")
         raise FileNotFoundError(f"Skill not found: {skill_name}")
 
+    def get_workspace_skill(self, skill_name: str) -> SkillDescriptor:
+        return self.get_system_skill(skill_name)
+
     def read_skill_content(self, skill: SkillDescriptor) -> str:
         return Path(skill.path).read_text(encoding="utf-8")
 
-    def import_workspace_skill(self, source_dir: Path) -> SkillDescriptor:
+    def import_system_skill(self, source_dir: Path) -> SkillDescriptor:
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         source_dir = source_dir.resolve()
         if not source_dir.exists() or not source_dir.is_dir():
@@ -135,19 +205,28 @@ class PluginService:
         self.reload()
         return self.get_skill_by_path(target_dir / "SKILL.md")
 
-    def update_workspace_skill(self, skill_name: str, content: str) -> SkillDescriptor:
-        skill = self.get_workspace_skill(skill_name)
+    def import_workspace_skill(self, source_dir: Path) -> SkillDescriptor:
+        return self.import_system_skill(source_dir)
+
+    def update_system_skill(self, skill_name: str, content: str) -> SkillDescriptor:
+        skill = self.get_system_skill(skill_name)
         skill_path = Path(skill.path)
         skill_path.write_text(content, encoding="utf-8")
         self.reload()
         return self.get_skill_by_path(skill_path)
 
-    def delete_workspace_skill(self, skill_name: str) -> SkillDescriptor:
-        skill = self.get_workspace_skill(skill_name)
+    def update_workspace_skill(self, skill_name: str, content: str) -> SkillDescriptor:
+        return self.update_system_skill(skill_name, content)
+
+    def delete_system_skill(self, skill_name: str) -> SkillDescriptor:
+        skill = self.get_system_skill(skill_name)
         skill_dir = Path(skill.path).parent
         shutil.rmtree(skill_dir)
         self.reload()
         return skill
+
+    def delete_workspace_skill(self, skill_name: str) -> SkillDescriptor:
+        return self.delete_system_skill(skill_name)
 
     def write_skills_snapshot(self, snapshot_path: Path) -> None:
         skills = self.list_skills()
@@ -190,7 +269,7 @@ class PluginService:
             skills.append(
                 SkillDescriptor(
                     name=str(metadata["name"] or skill_dir.name),
-                    source="workspace",
+                    source="system",
                     path=str(skill_file),
                     description=str(metadata["description"] or ""),
                     when_to_use=str(metadata["when_to_use"]) if metadata["when_to_use"] else None,

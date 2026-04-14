@@ -26,6 +26,7 @@ async def get_pending_approval(session_id: str, request: Request):
         "session_id": session_id,
         "pending": {
             "approval_request_id": approval.approval_request_id,
+            "turn_id": approval.turn_id,
             "tool": approval.tool_name,
             "arguments": approval.arguments,
             "reason": approval.reason,

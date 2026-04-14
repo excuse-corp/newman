@@ -1,5 +1,7 @@
 EVENT_TYPES = [
     "session_created",
+    "thinking_delta",
+    "thinking_complete",
     "assistant_delta",
     "tool_call_started",
     "tool_call_finished",

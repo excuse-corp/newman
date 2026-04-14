@@ -1,60 +1,12 @@
-# Base defaults for all Newman projects.
-# Treat this file as the built-in template and fallback baseline.
-# Project-level newman.yaml should represent the actual deployed project config.
-# Model overrides and secrets are generally better placed in .env via NEWMAN_* variables.
+# Newman project config
+# This file is the project deployment config generated during initialization.
+# backend/config/defaults.yaml provides the built-in baseline template and fallback values.
+# Keep actual project settings here.
+# Model settings and secrets can still be overridden through NEWMAN_* values in .env when needed.
 
 server:
   host: "0.0.0.0"
   port: 8005
-  cors_origins:
-    - "http://localhost:3000"
-    - "http://localhost:5173"
-    - "http://localhost:6123"
-    - "http://127.0.0.1:6123"
-    - "http://localhost:7775"
-    - "http://127.0.0.1:7775"
-
-models:
-  primary:
-    type: "mock"
-    model: "newman-dev"
-    endpoint: null
-    api_key: null
-    context_window: 100000
-    embedding_dimension: null
-    timeout: 60
-    max_tokens: 4096
-    temperature: 0.2
-  multimodal:
-    type: "mock"
-    model: "newman-dev"
-    endpoint: null
-    api_key: null
-    context_window: 32000
-    embedding_dimension: null
-    timeout: 60
-    max_tokens: 4096
-    temperature: 0.2
-  embedding:
-    type: "mock"
-    model: "newman-dev"
-    endpoint: null
-    api_key: null
-    context_window: null
-    embedding_dimension: 4096
-    timeout: 60
-    max_tokens: 4096
-    temperature: 0.0
-  reranker:
-    type: "mock"
-    model: "newman-dev"
-    endpoint: null
-    api_key: null
-    context_window: 32000
-    embedding_dimension: null
-    timeout: 60
-    max_tokens: 4096
-    temperature: 0.0
 
 runtime:
   max_tool_depth: 30
@@ -64,7 +16,6 @@ runtime:
   tool_retry_backoff_seconds: 1.0
 
 rag:
-  postgres_dsn: "postgresql://postgres@127.0.0.1:65437/newman"
   chroma_collection: "knowledge_chunks"
   lexical_candidate_count: 24
   vector_candidate_count: 24
@@ -120,10 +71,8 @@ permissions:
 channels:
   feishu:
     enabled: true
-    webhook_token: null
   wecom:
     enabled: true
-    webhook_token: null
 
 paths:
   workspace: "."

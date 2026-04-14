@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from jinja2 import Template
 
-from backend.config.loader import get_settings
 from backend.providers.token_estimator import estimate_message_tokens
 from backend.tools.result import ToolExecutionResult
 
@@ -14,8 +15,7 @@ INITIAL_OUTPUT_LIMIT = 1200
 
 class FeedbackWriter:
     def __init__(self):
-        settings = get_settings()
-        template_path = settings.paths.workspace / "backend" / "config" / "prompts" / "error_feedback.md"
+        template_path = Path(__file__).resolve().parents[1] / "config" / "prompts" / "error_feedback.md"
         self.template = Template(template_path.read_text(encoding="utf-8"))
 
     def build(self, result: ToolExecutionResult) -> str:

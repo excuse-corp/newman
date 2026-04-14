@@ -1,4 +1,4 @@
-# Newman API 文档 v1.2
+# Newman API 文档 v1.3
 
 2026 · Phase 4 基线接口 + Stable Memory 抽取 + 轻量多阶段规划 + Linux 原生沙箱
 
@@ -17,6 +17,7 @@
 - [messages.py](/root/newman/backend/api/routes/messages.py)
 - [workspace.py](/root/newman/backend/api/routes/workspace.py)
 - [plugins.py](/root/newman/backend/api/routes/plugins.py)
+- [tools.py](/root/newman/backend/api/routes/tools.py)
 - [mcp.py](/root/newman/backend/api/routes/mcp.py)
 - [scheduler.py](/root/newman/backend/api/routes/scheduler.py)
 - [channels.py](/root/newman/backend/api/routes/channels.py)
@@ -153,6 +154,7 @@ x-request-id: <uuid>
 - `terminal` 采用两级前置审批：Level 1 黑名单直接拒绝，Level 2 风险模式进入人工审批；Linux 沙箱内的明显只读命令会自动放行。
 - 若配置了插件 MCP server，运行时还会额外挂载 `mcp__...` 工具。
 - `terminal` 在 Linux 下默认走原生沙箱；当前阶段仅实现 Linux，macOS / Windows 为待做。
+- 当前内置工具会从 `backend/tools/impl/` 动态发现；新增模块只要导出 `build_tools(context)`，并在生态重载后即可注册。
 
 ---
 
@@ -259,7 +261,30 @@ text/event-stream
   "session": {
     "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
     "title": "供应商合同抽取",
-    "messages": [],
+    "messages": [
+      {
+        "id": "turn_user_001",
+        "role": "user",
+        "content": "帮我检查一下前端 timeline 实现",
+        "created_at": "2026-04-12T08:30:00+00:00",
+        "metadata": {
+          "approval_mode": "manual",
+          "turn_id": "turn_user_001",
+          "request_id": "req_abc123"
+        }
+      },
+      {
+        "id": "msg_asst_001",
+        "role": "assistant",
+        "content": "我先对照 PRD 和现有代码看一下。",
+        "created_at": "2026-04-12T08:30:06+00:00",
+        "metadata": {
+          "turn_id": "turn_user_001",
+          "request_id": "req_abc123",
+          "finish_reason": "stop"
+        }
+      }
+    ],
     "metadata": {
       "plan": {
         "explanation": "先确认代码结构，再改后端，最后更新前端和文档。",
@@ -331,6 +356,8 @@ text/event-stream
 
 - `session.metadata.plan` 与顶层 `plan` 字段内容相同，后者只是为了前端读取更直接。
 - 只有在模型调用 `update_plan` 工具后，`plan` 才会出现。
+- Web chat 回合里的 `session.messages[*].metadata` 现在会尽量补齐 `turn_id`，便于前端把同一轮的用户消息、过程事件和最终回答聚合成一个 turn 容器。
+- 通过 `/api/sessions/{session_id}/messages` 发起的 HTTP 回合，消息元数据通常还会包含 `request_id`；最终 assistant 消息会额外写入 `finish_reason`。
 - `context_usage.context_window` 使用的是“有效上下文窗口”，当前定义为配置的模型 `context_window * 95%`。
 - `context_usage` 优先返回“最近一次计入上下文窗口的真实模型请求 usage”，也就是最近一条 `counts_toward_context_window=true` 且 `usage_available=true` 的记录。
 - 当前前端圆环使用的是：
@@ -642,6 +669,7 @@ text/event-stream
   "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
   "pending": {
     "approval_request_id": "apr_xxx",
+    "turn_id": "turn_user_001",
     "tool": "terminal",
     "arguments": {
       "command": "echo hi > /tmp/x"
@@ -955,7 +983,7 @@ multipart/form-data
 
 ---
 
-## 九、插件与 Skill 接口
+## 九、插件、Tool 与 Skill 接口
 
 ## 9.1 获取插件列表
 
@@ -991,10 +1019,107 @@ multipart/form-data
 
 - `plugins` 是已成功加载的插件
 - `errors` 是扫描时发现但未能加载的插件校验错误
-- 后端会在每轮新消息开始前自动感知 `plugins/` 和 `skills/` 目录变化，并在下一轮重建插件生态
-- 也可以手动调用 `/api/plugins/rescan` 立即刷新
+- 后端会在每轮新消息开始前自动感知 `plugins/`、`skills/` 和 `backend/tools/` 目录变化，并在下一轮重建生态
 
-## 9.2 重新扫描插件
+## 9.2 获取插件详情
+
+`GET /api/plugins/{plugin_name}`
+
+响应示例：
+
+```json
+{
+  "plugin": {
+    "name": "example-plugin",
+    "version": "1.0.0",
+    "description": "Example plugin",
+    "enabled": true,
+    "plugin_path": "/root/newman/plugins/example-plugin",
+    "skill_count": 1,
+    "hook_count": 2,
+    "mcp_server_count": 1,
+    "directory_path": "/root/newman/plugins/example-plugin",
+    "manifest_path": "/root/newman/plugins/example-plugin/plugin.yaml",
+    "manifest": {
+      "name": "example-plugin",
+      "version": "1.0.0",
+      "description": "Example plugin",
+      "enabled_by_default": true,
+      "skills": [],
+      "hooks": [],
+      "mcp_servers": [],
+      "required_permissions": [],
+      "ui": null
+    },
+    "manifest_content": "name: example-plugin\nversion: 1.0.0\n...",
+    "skill_paths": [
+      "/root/newman/plugins/example-plugin/skills/demo_skill"
+    ],
+    "hook_handlers": [
+      {
+        "event": "FileChanged",
+        "handler": "hooks/on_change.py",
+        "message": "",
+        "timeout_seconds": 5,
+        "path": "/root/newman/plugins/example-plugin/hooks/on_change.py"
+      }
+    ],
+    "tool_names": [],
+    "available": true
+  }
+}
+```
+
+## 9.3 导入插件
+
+`POST /api/plugins/import`
+
+请求体：
+
+```json
+{
+  "source_path": "imports/my_plugin"
+}
+```
+
+说明：
+
+- `source_path` 必须位于当前可读目录范围内
+- 目标文件夹内必须包含 `plugin.yaml`
+- 导入行为会把整个插件目录复制到 `plugins/`，然后立即重载插件生态
+
+## 9.4 更新插件 Manifest
+
+`PUT /api/plugins/{plugin_name}`
+
+请求体：
+
+```json
+{
+  "content": "name: example-plugin\nversion: 2.0.0\ndescription: Updated plugin\n"
+}
+```
+
+说明：
+
+- 当前接口更新的是目标插件的 `plugin.yaml` 完整内容
+- 其他插件文件仍建议通过文件工具或工作区文件接口维护
+- 更新成功后会立即重载插件生态
+
+## 9.5 删除插件
+
+`DELETE /api/plugins/{plugin_name}`
+
+响应示例：
+
+```json
+{
+  "deleted": true,
+  "plugin_name": "example-plugin"
+}
+```
+
+## 9.6 重新扫描插件
 
 `POST /api/plugins/rescan`
 
@@ -1006,15 +1131,85 @@ multipart/form-data
 }
 ```
 
-## 9.3 启用插件
+## 9.7 启用 / 禁用插件
 
 `POST /api/plugins/{plugin_name}/enable`
 
-## 9.4 禁用插件
-
 `POST /api/plugins/{plugin_name}/disable`
 
-## 9.5 获取 Skill 列表
+说明：
+
+- 这两个接口都会返回最新的插件详情结构
+- 启停状态会写入插件状态存储，并触发运行时生态重载
+
+## 9.8 获取 Tool 列表
+
+`GET /api/tools`
+
+响应示例：
+
+```json
+{
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "Read a workspace file. Text files support line-based pagination; binary files return a size-limited preview.",
+      "risk_level": "low",
+      "requires_approval": false,
+      "timeout_seconds": 10,
+      "allowed_paths": [
+        "/data/newman/runtime_workspace",
+        "/root/newman/backend",
+        "/root/newman/docs"
+      ],
+      "source_type": "builtin",
+      "module": "backend.tools.impl.read_file",
+      "class_name": "ReadFileTool",
+      "file_path": "/root/newman/backend/tools/impl/read_file.py",
+      "file_access": "writable",
+      "managed": true,
+      "input_schema": {
+        "type": "object"
+      }
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `source_type`
+  - `builtin`：内置工具，来自 `backend/tools/impl/`
+  - `mcp`：MCP 桥接工具
+  - `runtime`：其他运行时注册工具
+- `file_access` 表示该工具实现文件在当前权限模型中的访问级别
+- `managed = true` 表示该工具实现文件位于当前可维护范围内
+
+## 9.9 获取 Tool 详情
+
+`GET /api/tools/{tool_name}`
+
+返回结构与 `GET /api/tools` 中单个 `tool` 条目一致。
+
+## 9.10 重新扫描 Tool 生态
+
+`POST /api/tools/rescan`
+
+响应示例：
+
+```json
+{
+  "reloaded": true,
+  "tools": []
+}
+```
+
+说明：
+
+- 会触发运行时重建工具注册表
+- 当前内置 Tool 采用动态发现机制：`backend/tools/impl/` 下模块只要导出 `build_tools(context)`，重扫后即可注册
+
+## 9.11 获取 Skill 列表
 
 `GET /api/skills`
 
@@ -1025,7 +1220,7 @@ multipart/form-data
   "skills": [
     {
       "name": "session_review",
-      "source": "workspace",
+      "source": "system",
       "plugin_name": null,
       "path": "/root/newman/skills/session_review/SKILL.md",
       "description": "Review what happened in a session and identify the best next step.",
@@ -1042,11 +1237,11 @@ multipart/form-data
 - `SKILLS_SNAPSHOT.md` 只负责告诉模型“有哪些 skill 可用、什么时候该用”
 - 具体 Skill 正文建议通过工作区文件或 `read_file` 按需读取
 - `backend_data/memory/USER.md` 会被后台稳定记忆抽取逻辑自动合并更新
-- 已启用插件中的 skill 会和工作区 `skills/` 下的 skill 合并进入同一个 snapshot
+- 已启用插件中的 skill 会和平台 `skills/` 目录下的 skill 合并进入同一个 snapshot
 - 插件启停或 skill 文件变更后，下一轮 prompt 会使用最新 snapshot
-- 当前列表只返回“当前可用”的 skill：workspace skill + 已启用 plugin skill
+- 当前列表只返回“当前可用”的 skill：平台 skill + 已启用 plugin skill
 
-## 9.6 获取 Skill 详情
+## 9.12 获取 Skill 详情
 
 `GET /api/skills/{skill_name}`
 
@@ -1056,7 +1251,7 @@ multipart/form-data
 {
   "skill": {
     "name": "writer",
-    "source": "workspace",
+    "source": "system",
     "plugin_name": null,
     "path": "/root/newman/skills/writer/SKILL.md",
     "description": "Write and refine deliverables.",
@@ -1078,7 +1273,7 @@ multipart/form-data
 - `tool_dependencies` 为根据 `SKILL.md` 内容提取出的工具依赖摘要
 - `usage_limits_summary` 为根据 `SKILL.md` 中的约束/限制段落提取出的简要说明
 
-## 9.7 导入 Workspace Skill
+## 9.13 导入 Skill
 
 `POST /api/skills/import`
 
@@ -1092,33 +1287,11 @@ multipart/form-data
 
 说明：
 
-- `source_path` 只允许为 workspace 内部的 skill 文件夹路径
+- `source_path` 必须位于当前可读目录范围内
 - 目标文件夹内必须包含 `SKILL.md`
-- 导入行为会把整个 skill 文件夹复制到工作区 `skills/` 目录下，并立即刷新 snapshot
+- 导入行为会把整个 skill 文件夹复制到平台 `skills/` 目录下，并立即刷新 snapshot
 
-响应示例：
-
-```json
-{
-  "skill": {
-    "name": "reviewer",
-    "source": "workspace",
-    "plugin_name": null,
-    "path": "/root/newman/skills/reviewer/SKILL.md",
-    "description": "Review a change.",
-    "when_to_use": null,
-    "summary": "Review a change.",
-    "content": "---\nname: reviewer\ndescription: Review a change.\n---\n\nReview things carefully.\n",
-    "readonly": false,
-    "available": true,
-    "tool_dependencies": [],
-    "usage_limits_summary": "",
-    "directory_path": "/root/newman/skills/reviewer"
-  }
-}
-```
-
-## 9.8 更新 Workspace Skill
+## 9.14 更新 Skill
 
 `PUT /api/skills/{skill_name}`
 
@@ -1132,10 +1305,10 @@ multipart/form-data
 
 说明：
 
-- 只允许更新 workspace skill 的 `SKILL.md`
+- 只允许更新平台 `skills/` 目录中的 system skill
 - 若目标 skill 为 plugin skill 或其他只读来源，接口会返回冲突错误
 
-## 9.9 删除 Workspace Skill
+## 9.15 删除 Skill
 
 `DELETE /api/skills/{skill_name}`
 
@@ -1150,7 +1323,7 @@ multipart/form-data
 
 说明：
 
-- 只允许删除 workspace skill
+- 只允许删除 system skill
 - plugin skill 或其他只读来源不能通过该接口删除
 
 ---
@@ -1708,6 +1881,12 @@ multipart/form-data
 }
 ```
 
+补充约定：
+
+- 会话主消息流里的事件，`data.turn_id` 会标识该事件归属的 turn。
+- `assistant_delta` 只用于更新当前 turn 的流式回答槽位，不代表已持久化消息。
+- `final_response` 表示当前 turn 的回答文本已经完成，且会携带已持久化 assistant message 的 `message_id` / `created_at` 方便前端对账。
+
 ### 当前已实现事件
 
 - `assistant_delta`
@@ -1731,6 +1910,7 @@ multipart/form-data
 - `session_created` 已实现，但只出现在 `POST /api/sessions/stream` 的 SSE 中，不会出现在 `POST /api/sessions/{session_id}/messages` 的消息流里。
 - 前端当前应以 `final_response` 作为“本轮回答结束”的主信号；`assistant_done` 还未单独实现。
 - `memory_updated` 还未实现为 SSE 事件。前端若要看到最新 Memory 内容，当前应通过 `GET /api/workspace/memory` 主动刷新。
+- 为了支持“单 turn 单回答槽位”渲染，当前推荐前端同时消费三类数据：`assistant_delta` 的流式文本、`final_response` 的完成信号，以及 `GET /api/sessions/{session_id}` 返回的持久化 `assistant` 消息。
 
 说明：
 
@@ -1740,10 +1920,26 @@ multipart/form-data
 - `tool_call_finished`、`tool_error_feedback` 和 fatal `error` 事件会携带结构化错误恢复字段：
   `error_code`、`severity`、`risk_level`、`recovery_class`、`frontend_message`、`recommended_next_step`
 - 所有 SSE 事件当前都会附带 `request_id`，便于和 HTTP 请求、审计日志做关联。
+- 当前主消息流里的大多数 turn 级事件都会在 `data` 中携带 `turn_id`。
 - 消息流中的审计日志现在也按同一结构保存为完整事件包：`event`、`data`、`ts`、`request_id`
 - `GET /api/sessions/{session_id}/events` 会基于这些结构化审计事件返回前端可恢复的 timeline 数据
 
 ### 事件示例
+
+#### `assistant_delta`
+
+```json
+{
+  "event": "assistant_delta",
+  "data": {
+    "turn_id": "turn_user_001",
+    "content": "我先对照 PRD 和现有代码看一下。",
+    "model": "gpt-5"
+  },
+  "ts": 1741234567890,
+  "request_id": "req_abc123"
+}
+```
 
 #### `attachment_received`
 
@@ -1985,10 +2181,14 @@ fatal 错误事件示例：
   "event": "final_response",
   "data": {
     "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+    "turn_id": "turn_user_001",
     "content": "已达到当前回合的工具调用上限，请输入“继续”继续处理。",
-    "finish_reason": "tool_limit_reached"
+    "finish_reason": "tool_limit_reached",
+    "message_id": "msg_asst_001",
+    "created_at": "2026-04-12T08:31:02+00:00"
   },
-  "ts": 1741234567890
+  "ts": 1741234567890,
+  "request_id": "req_abc123"
 }
 ```
 

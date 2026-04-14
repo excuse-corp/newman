@@ -15,6 +15,7 @@ from backend.api.routes.plugins import router as plugins_router
 from backend.api.routes.scheduler import router as scheduler_router
 from backend.api.routes.sessions import router as sessions_router
 from backend.api.routes.skills import router as skills_router
+from backend.api.routes.tools import router as tools_router
 from backend.api.routes.workspace import router as workspace_router
 from backend.channels.service import ChannelService
 from backend.config.loader import get_settings, log_settings_report
@@ -50,6 +51,7 @@ def create_app() -> FastAPI:
     app.include_router(workspace_router)
     app.include_router(plugins_router)
     app.include_router(skills_router)
+    app.include_router(tools_router)
     app.include_router(mcp_router)
     app.include_router(scheduler_router)
     app.include_router(channels_router)

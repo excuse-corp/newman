@@ -22,7 +22,9 @@ def build_bwrap_command(
     *,
     bwrap_executable: str,
     workspace: Path,
+    readable_roots: list[Path],
     writable_roots: list[Path],
+    protected_roots: list[Path],
     mode: str,
     network_access: bool,
     command: str,
@@ -37,7 +39,7 @@ def build_bwrap_command(
     if not network_access:
         args.append("--unshare-net")
 
-    for root in _resolve_read_roots(workspace):
+    for root in _resolve_read_roots(readable_roots):
         args.extend(["--ro-bind", str(root), str(root)])
 
     args.extend(["--proc", "/proc", "--dev", "/dev"])
@@ -45,6 +47,12 @@ def build_bwrap_command(
     if mode == "workspace-write":
         for writable_root in writable_roots:
             args.extend(["--bind", str(writable_root), str(writable_root)])
+
+    for protected_root in _resolve_protected_roots(protected_roots):
+        if protected_root.is_dir():
+            args.extend(["--tmpfs", str(protected_root)])
+        else:
+            args.extend(["--ro-bind", "/dev/null", str(protected_root)])
 
     args.extend(
         [
@@ -61,8 +69,8 @@ def build_bwrap_command(
     return args
 
 
-def _resolve_read_roots(workspace: Path) -> list[Path]:
-    fixed_roots: list[Path] = [workspace.resolve(), *FIXED_READ_ROOTS]
+def _resolve_read_roots(readable_roots: list[Path]) -> list[Path]:
+    fixed_roots: list[Path] = [*(path.resolve() for path in readable_roots), *FIXED_READ_ROOTS]
     deduped: list[Path] = list(fixed_roots)
     for entry in os.environ.get("PATH", "").split(":"):
         if not entry:
@@ -79,6 +87,21 @@ def _resolve_read_roots(workspace: Path) -> list[Path]:
             if any(candidate == existing or _path_is_within(candidate, existing) for existing in deduped):
                 continue
             deduped.append(candidate)
+    return deduped
+
+
+def _resolve_protected_roots(protected_roots: list[Path]) -> list[Path]:
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in protected_roots:
+        candidate = root.resolve()
+        if not candidate.exists():
+            continue
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
     return deduped
 
 

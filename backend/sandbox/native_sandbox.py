@@ -10,6 +10,7 @@ from backend.sandbox.linux_bwrap import build_bwrap_command, resolve_bwrap_execu
 from backend.sandbox.resource_limits import ResourceLimits
 from backend.sandbox.workspace_mount import resolve_workspace
 from backend.tools.result import ToolExecutionResult
+from backend.tools.workspace_fs import PathAccessPolicy, coerce_path_access_policy
 
 
 @dataclass(frozen=True)
@@ -24,10 +25,17 @@ class SandboxHealth:
 
 
 class NativeSandbox:
-    def __init__(self, workspace: Path, limits: ResourceLimits, config: SandboxConfig):
+    def __init__(
+        self,
+        workspace: Path,
+        limits: ResourceLimits,
+        config: SandboxConfig,
+        path_policy: PathAccessPolicy | Path | None = None,
+    ):
         self.workspace = resolve_workspace(workspace)
         self.limits = limits
         self.config = config
+        self.path_policy = coerce_path_access_policy(path_policy or workspace)
         self.platform = sys.platform
         self._bwrap_executable = resolve_bwrap_executable() if self.platform == "linux" else None
 
@@ -125,11 +133,15 @@ class NativeSandbox:
         return _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
 
     async def _execute_bwrap(self, command: str) -> ToolExecutionResult:
+        readable_roots = self._resolve_readable_roots()
         writable_roots = self._resolve_writable_roots()
+        protected_roots = self._resolve_protected_roots()
         argv = build_bwrap_command(
             bwrap_executable=self._bwrap_executable or "bwrap",
             workspace=self.workspace,
+            readable_roots=readable_roots,
             writable_roots=writable_roots,
+            protected_roots=protected_roots,
             mode=self.config.mode,
             network_access=self.config.network_access,
             command=command,
@@ -154,10 +166,14 @@ class NativeSandbox:
 
         return _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
 
+    def _resolve_readable_roots(self) -> list[Path]:
+        return list(self.path_policy.readable_roots)
+
     def _resolve_writable_roots(self) -> list[Path]:
+        if self.config.mode != "workspace-write":
+            return []
         roots: list[Path] = []
-        if self.config.mode == "workspace-write":
-            roots.append(self.workspace)
+        roots.extend(self.path_policy.writable_roots)
         for raw in self.config.writable_roots:
             candidate = Path(raw)
             if not candidate.is_absolute():
@@ -175,6 +191,9 @@ class NativeSandbox:
             seen.add(key)
             deduped.append(root)
         return deduped
+
+    def _resolve_protected_roots(self) -> list[Path]:
+        return [path for path in self.path_policy.protected_roots if path.exists()]
 
 
 def _result_from_completed_process(

@@ -11,6 +11,7 @@ from uuid import uuid4
 class ApprovalRequest:
     approval_request_id: str
     session_id: str
+    turn_id: str | None
     tool_name: str
     arguments: dict[str, Any]
     reason: str
@@ -22,10 +23,18 @@ class ApprovalManager:
     def __init__(self):
         self._pending: dict[str, ApprovalRequest] = {}
 
-    def create(self, session_id: str, tool_name: str, arguments: dict[str, Any], reason: str) -> ApprovalRequest:
+    def create(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        reason: str,
+        turn_id: str | None = None,
+    ) -> ApprovalRequest:
         request = ApprovalRequest(
             approval_request_id=uuid4().hex,
             session_id=session_id,
+            turn_id=turn_id,
             tool_name=tool_name,
             arguments=arguments,
             reason=reason,

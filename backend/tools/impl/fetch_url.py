@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 
 from backend.tools.base import BaseTool, ToolMeta
+from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
 
 
@@ -45,3 +46,7 @@ class FetchUrlTool(BaseTool):
                 summary=str(exc),
                 retryable=True,
             )
+
+
+def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
+    return [FetchUrlTool()]

@@ -1,11 +1,49 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+fake_psycopg = types.ModuleType("psycopg")
+fake_psycopg.connect = lambda *args, **kwargs: None
+fake_rows = types.ModuleType("psycopg.rows")
+fake_rows.dict_row = object()
+fake_types = types.ModuleType("psycopg.types")
+fake_json = types.ModuleType("psycopg.types.json")
+fake_json.Jsonb = lambda value: value
+fake_chromadb = types.ModuleType("chromadb")
+
+
+class _FakeCollection:
+    def upsert(self, *args, **kwargs):
+        return None
+
+    def delete(self, *args, **kwargs):
+        return None
+
+    def query(self, *args, **kwargs):
+        return {"ids": [[]], "distances": [[]], "metadatas": [[]], "documents": [[]]}
+
+
+class _FakePersistentClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def get_or_create_collection(self, *args, **kwargs):
+        return _FakeCollection()
+
+
+fake_chromadb.PersistentClient = _FakePersistentClient
+sys.modules.setdefault("psycopg", fake_psycopg)
+sys.modules.setdefault("psycopg.rows", fake_rows)
+sys.modules.setdefault("psycopg.types", fake_types)
+sys.modules.setdefault("psycopg.types.json", fake_json)
+sys.modules.setdefault("chromadb", fake_chromadb)
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -13,12 +51,18 @@ from fastapi.testclient import TestClient
 from backend.api.middleware.error_handler import install_error_handlers
 from backend.api.routes.approvals import router as approvals_router
 from backend.api.routes.messages import router as messages_router
+from backend.api.routes.plugins import router as plugins_router
 from backend.api.routes.sessions import router as sessions_router
 from backend.api.routes.skills import router as skills_router
+from backend.api.routes.tools import router as tools_router
 from backend.api.routes.workspace import router as workspace_router
 from backend.plugin_runtime.service import PluginService
 from backend.skill_runtime.registry import SkillRegistry
 from backend.tools.approval import ApprovalManager, ApprovalRequest
+from backend.tools.base import BaseTool, ToolMeta
+from backend.tools.impl.read_file import ReadFileTool
+from backend.tools.result import ToolExecutionResult
+from backend.tools.workspace_fs import PathAccessPolicy
 
 
 class _DummySessionStore:
@@ -44,6 +88,7 @@ class _DummyMessageRuntime:
         emit,
         user_metadata: dict[str, object] | None = None,
         turn_approval_mode: str = "manual",
+        request_id: str | None = None,
     ) -> None:
         self.calls.append(
             {
@@ -51,6 +96,7 @@ class _DummyMessageRuntime:
                 "content": content,
                 "user_metadata": user_metadata,
                 "turn_approval_mode": turn_approval_mode,
+                "request_id": request_id,
             }
         )
         await emit(
@@ -76,11 +122,17 @@ class _DummyRegistry:
         return [_DummyTool(name) for name in self._tool_names]
 
 
+class _DummyMCPRegistry:
+    def build_tools(self, plugin_configs=None):
+        return []
+
+
 class _SkillRuntime:
     def __init__(self, plugin_service: PluginService, memory_dir: Path, tool_names: list[str]):
         self.plugin_service = plugin_service
         self.skill_registry = SkillRegistry(plugin_service, memory_dir)
         self.registry = _DummyRegistry(tool_names)
+        self.mcp_registry = _DummyMCPRegistry()
 
     def reload_ecosystem(self) -> None:
         self.plugin_service.reload()
@@ -146,6 +198,7 @@ class ApprovalRouteTests(unittest.TestCase):
         request = ApprovalRequest(
             approval_request_id="apr-1",
             session_id="session-1",
+            turn_id="turn-1",
             tool_name="terminal",
             arguments={"command": "pwd"},
             reason="terminal_mutation_or_unknown",
@@ -171,6 +224,7 @@ class ApprovalRouteTests(unittest.TestCase):
         second = ApprovalRequest(
             approval_request_id="apr-2",
             session_id="session-2",
+            turn_id="turn-2",
             tool_name="terminal",
             arguments={"command": "pwd"},
             reason="terminal_mutation_or_unknown",
@@ -188,6 +242,7 @@ class ApprovalRouteTests(unittest.TestCase):
         request = ApprovalRequest(
             approval_request_id="apr-3",
             session_id="session-2",
+            turn_id="turn-3",
             tool_name="terminal",
             arguments={"command": "pwd"},
             reason="terminal_mutation_or_unknown",
@@ -322,6 +377,141 @@ class SkillsRouteTests(unittest.TestCase):
             deleted = client.delete("/api/skills/reviewer")
             self.assertEqual(deleted.status_code, 200)
             self.assertFalse((skills_dir / "reviewer").exists())
+
+
+class PluginsRouteTests(unittest.TestCase):
+    def test_plugin_crud_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugins_dir = root / "plugins"
+            skills_dir = root / "skills"
+            memory_dir = root / "memory"
+            state_path = root / "state" / "plugin_state.json"
+            imports_dir = root / "imports"
+            plugins_dir.mkdir(parents=True, exist_ok=True)
+            skills_dir.mkdir(parents=True, exist_ok=True)
+            memory_dir.mkdir(parents=True, exist_ok=True)
+            imports_dir.mkdir(parents=True, exist_ok=True)
+
+            _write_plugin(
+                plugins_dir,
+                "demo_plugin",
+                """
+                name: demo-plugin
+                version: 1.0.0
+                description: Demo plugin
+                hooks:
+                  - event: FileChanged
+                    message: watched
+                """,
+            )
+            _write_plugin(
+                imports_dir,
+                "import_plugin",
+                """
+                name: imported-plugin
+                version: 1.0.0
+                description: Imported plugin
+                """,
+            )
+
+            service = PluginService(plugins_dir, skills_dir, state_path)
+            runtime = _SkillRuntime(service, memory_dir, ["read_file"])
+            settings = SimpleNamespace(paths=SimpleNamespace(workspace=root))
+            client = TestClient(_build_app(plugins_router, runtime=runtime, settings=settings))
+
+            listed = client.get("/api/plugins")
+            self.assertEqual(listed.status_code, 200)
+            self.assertEqual(len(listed.json()["plugins"]), 1)
+
+            detail = client.get("/api/plugins/demo-plugin")
+            self.assertEqual(detail.status_code, 200)
+            payload = detail.json()["plugin"]
+            self.assertEqual(payload["name"], "demo-plugin")
+            self.assertEqual(payload["manifest"]["version"], "1.0.0")
+            self.assertEqual(payload["hook_handlers"][0]["event"], "FileChanged")
+
+            imported = client.post("/api/plugins/import", json={"source_path": "imports/import_plugin"})
+            self.assertEqual(imported.status_code, 200)
+            self.assertTrue((plugins_dir / "import_plugin" / "plugin.yaml").exists())
+            self.assertEqual(imported.json()["plugin"]["name"], "imported-plugin")
+
+            updated = client.put(
+                "/api/plugins/demo-plugin",
+                json={
+                    "content": textwrap.dedent(
+                        """\
+                        name: demo-plugin
+                        version: 2.0.0
+                        description: Demo plugin updated
+                        """
+                    )
+                },
+            )
+            self.assertEqual(updated.status_code, 200)
+            self.assertEqual(updated.json()["plugin"]["version"], "2.0.0")
+
+            disabled = client.post("/api/plugins/demo-plugin/disable")
+            self.assertEqual(disabled.status_code, 200)
+            self.assertFalse(disabled.json()["plugin"]["enabled"])
+
+            enabled = client.post("/api/plugins/demo-plugin/enable")
+            self.assertEqual(enabled.status_code, 200)
+            self.assertTrue(enabled.json()["plugin"]["enabled"])
+
+            deleted = client.delete("/api/plugins/imported-plugin")
+            self.assertEqual(deleted.status_code, 200)
+            self.assertFalse((plugins_dir / "import_plugin").exists())
+
+
+class ToolsRouteTests(unittest.TestCase):
+    def test_tools_routes_return_tool_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            class _ToolRuntime:
+                def __init__(self):
+                    policy = PathAccessPolicy(
+                        workspace=workspace,
+                        readable_roots=(workspace, Path(__file__).resolve().parents[1] / "tools"),
+                        writable_roots=(workspace, Path(__file__).resolve().parents[1] / "tools"),
+                        protected_roots=(),
+                    )
+                    self.registry = SimpleNamespace(list_tools=lambda: [ReadFileTool(policy)])
+                    self.reload_count = 0
+
+                def reload_ecosystem(self) -> None:
+                    self.reload_count += 1
+
+            runtime = _ToolRuntime()
+            settings = SimpleNamespace(
+                paths=SimpleNamespace(
+                    workspace=workspace,
+                ),
+                permissions=SimpleNamespace(
+                    readable_paths=[],
+                    writable_paths=[Path(__file__).resolve().parents[1] / "tools"],
+                    protected_paths=[],
+                ),
+            )
+            client = TestClient(_build_app(tools_router, runtime=runtime, settings=settings))
+
+            listed = client.get("/api/tools")
+            self.assertEqual(listed.status_code, 200)
+            tool = listed.json()["tools"][0]
+            self.assertEqual(tool["name"], "read_file")
+            self.assertEqual(tool["source_type"], "builtin")
+
+            detail = client.get("/api/tools/read_file")
+            self.assertEqual(detail.status_code, 200)
+            self.assertEqual(detail.json()["tool"]["class_name"], "ReadFileTool")
+
+            rescanned = client.post("/api/tools/rescan")
+            self.assertEqual(rescanned.status_code, 200)
+            self.assertTrue(rescanned.json()["reloaded"])
+            self.assertGreaterEqual(runtime.reload_count, 2)
 
 
 class WorkspaceRouteTests(unittest.TestCase):

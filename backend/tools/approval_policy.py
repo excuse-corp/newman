@@ -87,6 +87,18 @@ PROCESS_SPAWN_MARKERS = (
 )
 
 SHELL_META_MARKERS = ("|", "&&", "||", ";", "$(", "`")
+PATH_DENY_REASONS = {
+    "read_outside_readable_paths",
+    "write_outside_writable_paths",
+    "read_protected_path",
+    "write_protected_path",
+    "write_file_outside_workspace",
+    "terminal_read_outside_readable_paths",
+    "terminal_write_outside_writable_paths",
+    "terminal_read_protected_path",
+    "terminal_write_protected_path",
+    "terminal_write_readonly_path",
+}
 
 
 @dataclass
@@ -102,6 +114,14 @@ class ApprovalPolicy:
 
     def evaluate(self, tool: BaseTool, arguments: dict, static_reasons: list[str] | None = None) -> ApprovalDecision:
         reasons = list(static_reasons or [])
+        for reason in reasons:
+            base = reason.split(":", 1)[0]
+            if base in PATH_DENY_REASONS:
+                return ApprovalDecision(
+                    action="deny",
+                    reasons=[reason],
+                    summary="目标路径不在当前权限范围内",
+                )
 
         if tool.meta.name == "terminal":
             command = str(arguments.get("command", ""))

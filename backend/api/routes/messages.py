@@ -98,6 +98,7 @@ async def send_message(session_id: str, request: Request):
                     emit,
                     user_metadata=metadata,
                     turn_approval_mode=approval_mode,
+                    request_id=request_id,
                 )
             except Exception as exc:
                 stream_failed = True

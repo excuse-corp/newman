@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import logo from "./assets/newman-logo.png";
 import "./styles.css";
 
@@ -20,6 +20,7 @@ type MemoryWorkspaceResponse = {
 
 type PendingApproval = {
   approval_request_id: string;
+  turn_id?: string | null;
   tool: string;
   arguments: Record<string, unknown>;
   reason: string;
@@ -105,7 +106,81 @@ type TraceEntry = {
   summary: string;
   inputs: string[];
   citations: string[];
+  output?: string | null;
+  turnId?: string | null;
   tags?: Array<{ label: string; tone: StatusTagTone }>;
+};
+
+type SecondaryCardType = "terminal" | "file" | "search" | "network" | "plan" | "generic";
+type TimelineNodeKind = "thinking" | "plan" | "progress" | "skill_progress" | "approval" | "error_recovery" | "fatal_error" | "system_meta";
+type TimelineNodeState = "running" | "completed" | "failed" | "pending" | "approved" | "rejected" | "recovering" | "updated";
+
+type TimelineSecondaryItem = {
+  id: string;
+  parentId: string;
+  label: string;
+  toolName?: string | null;
+  cardType: SecondaryCardType;
+  subtitle: string;
+  statusLabel: string;
+  statusTone: StatusTagTone;
+  meta: string[];
+  command?: string | null;
+  output?: string | null;
+  outputLineCount: number;
+  detail: TraceEntry;
+};
+
+type TimelineNode = {
+  id: string;
+  kind: TimelineNodeKind;
+  state: TimelineNodeState;
+  time: string;
+  primaryText: string;
+  secondaryItems: TimelineSecondaryItem[];
+  detail: TraceEntry;
+};
+
+type TurnAnswerPhase = "waiting" | "streaming" | "finalizing" | "persisted" | "failed";
+type TurnStatus = "running" | "needs_approval" | "completed" | "failed";
+
+type TurnMessage = {
+  id: string;
+  content: string;
+  createdAt: string;
+  persisted: boolean;
+  approvalMode?: TurnApprovalMode | null;
+};
+
+type TurnAnswer = {
+  detailId: string;
+  content: string;
+  createdAt: string;
+  phase: TurnAnswerPhase;
+  source: "live" | "session";
+  assistantMessageId?: string | null;
+  finishReason?: string | null;
+  errorMessage?: string | null;
+};
+
+type ChatTurn = {
+  id: string;
+  requestId?: string | null;
+  userMessage: TurnMessage;
+  answer: TurnAnswer | null;
+  timeline: TimelineNode[];
+  status: TurnStatus;
+  isLive: boolean;
+};
+
+type LiveTurnState = {
+  sessionId: string;
+  localId: string;
+  requestId: string | null;
+  serverTurnId: string | null;
+  userMessage: TurnMessage;
+  answer: TurnAnswer;
+  status: TurnStatus;
 };
 
 type SkillSummary = {
@@ -228,8 +303,6 @@ const approvalModeMeta: Record<
 
 const LEFT_MIN = 180;
 const LEFT_MAX = 360;
-const RIGHT_MIN = 260;
-const RIGHT_MAX = 460;
 const HANDLE_WIDTH = 8;
 
 function clamp(value: number, min: number, max: number) {
@@ -312,13 +385,352 @@ function isOpenableWorkspacePath(path: string, rootPath: string | null) {
 }
 
 function skillSourceLabel(skill: SkillSummary | SkillDetail) {
-  if (skill.source === "workspace") {
-    return "工作区";
+  if (skill.source === "system") {
+    return "系统";
   }
   if (skill.plugin_name) {
     return `插件 · ${skill.plugin_name}`;
   }
   return skill.source;
+}
+
+const TOOL_SEMANTIC_MAP: Record<
+  string,
+  {
+    label: string;
+    cardType: SecondaryCardType;
+    runningText: string;
+    completedText: string;
+  }
+> = {
+  read_file: { label: "read_file", cardType: "file", runningText: "我先读取一下相关文件", completedText: "相关文件我已经看过了" },
+  list_dir: { label: "list_dir", cardType: "file", runningText: "我先看一下目录结构", completedText: "目录结构我已经确认了" },
+  list_files: { label: "list_files", cardType: "file", runningText: "我先整理一下文件列表", completedText: "文件列表我已经拿到了" },
+  search_files: { label: "search_files", cardType: "search", runningText: "我先检索一下相关文件", completedText: "相关文件我已经找到了" },
+  grep: { label: "grep", cardType: "search", runningText: "我先搜索一下文件内容", completedText: "匹配内容我已经找到了" },
+  fetch_url: { label: "fetch_url", cardType: "network", runningText: "我先看一下网页资料", completedText: "网页资料我已经取回来了" },
+  terminal: { label: "terminal", cardType: "terminal", runningText: "我先运行一条命令确认情况", completedText: "命令我已经执行完了" },
+  write_file: { label: "write_file", cardType: "file", runningText: "我先创建对应文件", completedText: "文件我已经创建好了" },
+  edit_file: { label: "edit_file", cardType: "file", runningText: "我先修改对应文件", completedText: "文件我已经改好了" },
+  update_plan: { label: "update_plan", cardType: "plan", runningText: "我先整理一下执行步骤", completedText: "执行步骤我已经更新了" },
+  search_knowledge_base: {
+    label: "search_knowledge_base",
+    cardType: "search",
+    runningText: "我先检索一下知识资料",
+    completedText: "知识结果我已经找到了"
+  }
+};
+
+function resolveToolSemantic(toolName: string | null | undefined) {
+  if (!toolName) {
+    return {
+      label: "工具",
+      cardType: "generic" as const,
+      runningText: "我先获取完成任务需要的信息",
+      completedText: "这一步我已经完成了"
+    };
+  }
+  if (toolName.startsWith("mcp__")) {
+    return {
+      label: toolName,
+      cardType: "generic" as const,
+      runningText: "我先调用一下外部能力",
+      completedText: "外部能力调用我已经完成了"
+    };
+  }
+  return (
+    TOOL_SEMANTIC_MAP[toolName] ?? {
+      label: toolName,
+      cardType: "generic" as const,
+      runningText: "我先获取完成任务需要的信息",
+      completedText: "这一步我已经完成了"
+    }
+  );
+}
+
+function summarizeUserIntent(userPrompt: string | null | undefined) {
+  if (!userPrompt) {
+    return null;
+  }
+  const normalized = userPrompt.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return null;
+  }
+  return `你想了解「${compactString(normalized, 24)}」`;
+}
+
+function formatDuration(durationMs: unknown) {
+  if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs <= 0) {
+    return null;
+  }
+  if (durationMs < 1000) {
+    return `${durationMs}ms`;
+  }
+  if (durationMs < 10_000) {
+    return `${(durationMs / 1000).toFixed(1)}s`;
+  }
+  return `${Math.round(durationMs / 1000)}s`;
+}
+
+function formatCompactPath(path: string | null | undefined) {
+  if (!path) {
+    return null;
+  }
+  const fileName = extractName(path);
+  const parent = extractParentPath(path, null);
+  if (!parent || parent === ".") {
+    return fileName;
+  }
+  return `${extractName(parent)}/${fileName}`;
+}
+
+function formatUrlTarget(rawUrl: string | null | undefined) {
+  if (!rawUrl) {
+    return null;
+  }
+  try {
+    const url = new URL(rawUrl);
+    return url.hostname.replace(/^www\./, "") || rawUrl;
+  } catch {
+    return rawUrl;
+  }
+}
+
+function compactString(value: string, maxLength = 88) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+function formatJsonPreview(value: unknown, maxLength = 96) {
+  const rendered = stringifyForPanel(value).replace(/\s+/g, " ").trim();
+  if (!rendered) {
+    return null;
+  }
+  return compactString(rendered, maxLength);
+}
+
+function extractEventArguments(eventData: Record<string, unknown>) {
+  return "arguments" in eventData && eventData.arguments && typeof eventData.arguments === "object"
+    ? (eventData.arguments as Record<string, unknown>)
+    : null;
+}
+
+function resolveToolTarget(toolName: string | null | undefined, eventData: Record<string, unknown>) {
+  const targetLabel = typeof eventData.target_label === "string" ? eventData.target_label : null;
+  if (targetLabel) {
+    return targetLabel;
+  }
+
+  const argumentsPayload = extractEventArguments(eventData);
+  const rawPath =
+    (typeof eventData.path === "string" ? eventData.path : null) ??
+    (argumentsPayload && typeof argumentsPayload.path === "string" ? argumentsPayload.path : null);
+  if (rawPath) {
+    return formatCompactPath(rawPath);
+  }
+
+  const rawQuery =
+    (typeof eventData.query === "string" ? eventData.query : null) ??
+    (argumentsPayload && typeof argumentsPayload.query === "string" ? argumentsPayload.query : null);
+  if (rawQuery) {
+    return `「${compactString(rawQuery, 36)}」相关资料`;
+  }
+
+  const rawUrl =
+    (typeof eventData.url === "string" ? eventData.url : null) ??
+    (argumentsPayload && typeof argumentsPayload.url === "string" ? argumentsPayload.url : null);
+  if (rawUrl) {
+    return toolName === "fetch_url" ? "网页资料" : formatUrlTarget(rawUrl);
+  }
+
+  const resourceName =
+    (typeof eventData.resource_name === "string" ? eventData.resource_name : null) ??
+    (typeof eventData.title === "string" ? eventData.title : null);
+  return resourceName ? compactString(resourceName, 40) : null;
+}
+
+function inferResultCount(toolName: string | null | undefined, output: string | null | undefined) {
+  if (!output) {
+    return null;
+  }
+  const trimmed = output.trim();
+  if (!trimmed) {
+    return 0;
+  }
+
+  if (toolName === "search_knowledge_base") {
+    const hits = trimmed.split("\n").filter((line) => /^\[\d+\]/.test(line.trim())).length;
+    return hits || null;
+  }
+
+  if (toolName === "search_files" || toolName === "grep") {
+    const hits = trimmed
+      .split("\n")
+      .filter((line) => line.trim() && !line.includes("(结果已截断)") && /^\S+:\d+:/.test(line.trim())).length;
+    return hits || null;
+  }
+
+  if (toolName === "list_dir" || toolName === "list_files") {
+    const hits = trimmed
+      .split("\n")
+      .filter((line, index) => index > 0 && line.trim() && !line.includes("(结果已截断)")).length;
+    return hits || null;
+  }
+
+  return null;
+}
+
+function resolveProgressPrimaryText(
+  toolName: string | null | undefined,
+  status: "running" | "completed" | "failed",
+  eventData: Record<string, unknown>,
+  output?: string | null,
+  userPrompt?: string | null
+) {
+  const semantic = resolveToolSemantic(toolName);
+  const summaryText = typeof eventData.summary_text === "string" ? eventData.summary_text : null;
+  const intentLead = summarizeUserIntent(userPrompt);
+
+  if (status === "running") {
+    if (summaryText) {
+      return summaryText;
+    }
+    return intentLead ? `${intentLead}，${semantic.runningText}` : semantic.runningText;
+  }
+
+  if (status === "failed") {
+    return typeof eventData.frontend_message === "string" && eventData.frontend_message
+      ? eventData.frontend_message
+      : "这一步暂时没有成功";
+  }
+
+  if (summaryText) {
+    return summaryText;
+  }
+
+  const count = inferResultCount(toolName, output ?? null);
+  if (typeof count === "number") {
+    if (toolName === "search_files") {
+      return `已找到 ${count} 个相关文件`;
+    }
+    if (toolName === "grep") {
+      return `已找到 ${count} 处匹配`;
+    }
+    if (toolName === "search_knowledge_base") {
+      return `已找到 ${count} 条知识结果`;
+    }
+  }
+
+  return semantic.completedText;
+}
+
+function resolveSecondaryStatusMeta(
+  state: TimelineNodeState,
+  eventData: Record<string, unknown>,
+  fallbackTone: StatusTagTone = "blue"
+) {
+  if (state === "completed" || state === "approved" || state === "updated") {
+    return { label: state === "approved" ? "已批准" : "已完成", tone: "green" as StatusTagTone };
+  }
+  if (state === "failed" || state === "rejected") {
+    return { label: state === "rejected" ? "已拒绝" : "失败", tone: "orange" as StatusTagTone };
+  }
+  if (state === "pending") {
+    return { label: "待审批", tone: "orange" as StatusTagTone };
+  }
+  if (state === "recovering") {
+    return { label: "恢复中", tone: "orange" as StatusTagTone };
+  }
+  if (typeof eventData.attempt === "number" && eventData.attempt > 1) {
+    return { label: `第 ${eventData.attempt} 次`, tone: fallbackTone };
+  }
+  return { label: "运行中", tone: fallbackTone };
+}
+
+function buildToolSecondarySubtitle(toolName: string | null | undefined, eventData: Record<string, unknown>) {
+  const args = extractEventArguments(eventData);
+  if (toolName === "terminal") {
+    return typeof args?.command === "string" && args.command.trim() ? args.command.trim() : "执行命令";
+  }
+  const target = resolveToolTarget(toolName, eventData);
+  if (target) {
+    return target;
+  }
+  if (args) {
+    const preview = formatJsonPreview(args);
+    if (preview) {
+      return preview;
+    }
+  }
+  return "暂无更多参数";
+}
+
+function buildTraceDetail(
+  id: string,
+  type: TraceEntry["type"],
+  time: string,
+  text: string,
+  detailTitle: string,
+  summary: string,
+  eventData: Record<string, unknown>,
+  options?: {
+    tags?: Array<{ label: string; tone: StatusTagTone }>;
+    output?: string | null;
+  }
+): TraceEntry {
+  const inputs: string[] = [];
+  const citations: string[] = [];
+
+  if ("arguments" in eventData) {
+    const rendered = stringifyForPanel(eventData.arguments);
+    if (rendered) {
+      inputs.push(`arguments = ${rendered}`);
+    }
+  }
+  if ("plan" in eventData) {
+    const rendered = stringifyForPanel(eventData.plan);
+    if (rendered) {
+      inputs.push(`plan = ${rendered}`);
+    }
+  }
+  if ("context" in eventData) {
+    const rendered = stringifyForPanel(eventData.context);
+    if (rendered) {
+      inputs.push(`context = ${rendered}`);
+    }
+  }
+  if ("recommended_next_step" in eventData) {
+    const rendered = stringifyForPanel(eventData.recommended_next_step);
+    if (rendered) {
+      citations.push(`next = ${rendered}`);
+    }
+  }
+  if ("request_id" in eventData && typeof eventData.request_id === "string") {
+    citations.push(`request_id = ${eventData.request_id}`);
+  }
+
+  return {
+    id,
+    type,
+    time,
+    text,
+    detailTitle,
+    summary,
+    inputs,
+    citations,
+    output: options?.output ?? null,
+    tags: options?.tags
+  };
+}
+
+function countOutputLines(output: string | null | undefined) {
+  if (!output) {
+    return 0;
+  }
+  return output.split("\n").length;
 }
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -348,6 +760,20 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
+function dedupeSessionEvents(events: SessionEventPayload[]) {
+  const seen = new Set<string>();
+  const deduped: SessionEventPayload[] = [];
+  events.forEach((event) => {
+    const key = `${event.ts}:${event.request_id ?? ""}:${event.event}:${JSON.stringify(event.data)}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    deduped.push(event);
+  });
+  return deduped.sort((left, right) => left.ts - right.ts);
+}
+
 function mapSessionSummary(record: SessionSummaryRecord): ChatSession {
   return {
     id: record.session_id,
@@ -369,6 +795,10 @@ function formatEventTime(ts: number) {
   }).format(new Date(ts));
 }
 
+function isPaneNearBottom(pane: HTMLElement, threshold = 96) {
+  return pane.scrollHeight - pane.scrollTop - pane.clientHeight <= threshold;
+}
+
 function stringifyForPanel(value: unknown) {
   if (value === null || value === undefined) {
     return "";
@@ -379,192 +809,928 @@ function stringifyForPanel(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
-function buildTraceEntry(event: SessionEventPayload, index: number): TraceEntry | null {
-  const id = `${event.ts}-${index}-${event.event}`;
-  const tool = typeof event.data.tool === "string" ? event.data.tool : null;
-  const summary = typeof event.data.summary === "string" ? event.data.summary : null;
-  const frontendMessage = typeof event.data.frontend_message === "string" ? event.data.frontend_message : null;
-  const reason = typeof event.data.reason === "string" ? event.data.reason : null;
-  const message = typeof event.data.message === "string" ? event.data.message : null;
-  const inputs: string[] = [];
-  const citations: string[] = [];
-  const tags: Array<{ label: string; tone: StatusTagTone }> = [];
+function buildEventDataWithRequest(event: SessionEventPayload) {
+  return event.request_id ? { ...event.data, request_id: event.request_id } : event.data;
+}
 
-  if ("arguments" in event.data) {
-    const rendered = stringifyForPanel(event.data.arguments);
-    if (rendered) {
-      inputs.push(`arguments = ${rendered}`);
-    }
+function buildPlanSubtitle(plan: unknown) {
+  if (Array.isArray(plan)) {
+    return compactString(
+      plan
+        .map((step) => {
+          if (!step || typeof step !== "object") {
+            return null;
+          }
+          return "step" in step && typeof step.step === "string" ? step.step : null;
+        })
+        .filter((value): value is string => Boolean(value))
+        .slice(0, 3)
+        .join(" · ") || "计划已更新",
+      96
+    );
   }
-  if ("plan" in event.data) {
-    const rendered = stringifyForPanel(event.data.plan);
-    if (rendered) {
-      inputs.push(`plan = ${rendered}`);
-    }
+  if (plan && typeof plan === "object" && "steps" in plan && Array.isArray(plan.steps)) {
+    return buildPlanSubtitle(plan.steps);
   }
-  if ("context" in event.data) {
-    const rendered = stringifyForPanel(event.data.context);
-    if (rendered) {
-      inputs.push(`context = ${rendered}`);
-    }
+  if (typeof plan === "string") {
+    return compactString(plan, 96);
   }
-  if ("recommended_next_step" in event.data) {
-    const rendered = stringifyForPanel(event.data.recommended_next_step);
-    if (rendered) {
-      citations.push(`next = ${rendered}`);
-    }
-  }
-  if ("request_id" in event && event.request_id) {
-    citations.push(`request_id = ${event.request_id}`);
-  }
+  return "计划已更新";
+}
 
-  switch (event.event) {
-    case "tool_call_started":
-      return {
-        id,
-        type: "tool",
-        time: formatEventTime(event.ts),
-        text: tool ? `正在调用 ${tool}` : "正在调用工具",
-        detailTitle: tool ?? "工具调用",
-        summary: reason ?? "工具开始执行。",
-        inputs,
-        citations
-      };
-    case "tool_call_finished": {
-      const success = Boolean(event.data.success);
-      if (success) {
-        tags.push({ label: "成功", tone: "green" });
-      } else {
-        tags.push({ label: "失败", tone: "orange" });
+function buildToolSecondaryMeta(
+  toolName: string | null | undefined,
+  eventData: Record<string, unknown>,
+  output: string | null | undefined
+) {
+  const meta: string[] = [];
+  const duration = formatDuration(eventData.duration_ms);
+  if (duration) {
+    meta.push(duration);
+  }
+  if (typeof eventData.attempt_count === "number" && eventData.attempt_count > 1) {
+    meta.push(`第 ${eventData.attempt_count} 次`);
+  }
+  const count = inferResultCount(toolName, output);
+  if (typeof count === "number" && count > 0) {
+    meta.push(`${count} 条结果`);
+  }
+  if (toolName === "edit_file" && typeof eventData.replacements === "number") {
+    meta.push(`${eventData.replacements} 处替换`);
+  }
+  return meta;
+}
+
+function buildToolSecondaryItem(
+  parentId: string,
+  event: SessionEventPayload,
+  state: TimelineNodeState,
+  output: string | null = null,
+  userPrompt?: string | null
+): TimelineSecondaryItem {
+  const eventData = buildEventDataWithRequest(event);
+  const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
+  const semantic = resolveToolSemantic(toolName);
+  const status = resolveSecondaryStatusMeta(state, eventData);
+  const detailId = `secondary:${typeof eventData.tool_call_id === "string" ? eventData.tool_call_id : parentId}`;
+  const command =
+    toolName === "terminal" && typeof extractEventArguments(eventData)?.command === "string"
+      ? (extractEventArguments(eventData)?.command as string)
+      : null;
+  const summary =
+    (typeof eventData.frontend_message === "string" && eventData.frontend_message) ||
+    (typeof eventData.summary === "string" && eventData.summary) ||
+    resolveProgressPrimaryText(
+      toolName,
+      state === "failed" ? "failed" : state === "completed" ? "completed" : "running",
+      eventData,
+      output,
+      userPrompt
+    );
+
+  return {
+    id: detailId,
+    parentId,
+    label: toolName === "terminal" ? "Shell" : toolName ?? semantic.label,
+    toolName,
+    cardType: semantic.cardType,
+    subtitle: buildToolSecondarySubtitle(toolName, eventData),
+    statusLabel: status.label,
+    statusTone: status.tone,
+    meta: buildToolSecondaryMeta(toolName, eventData, output),
+    command,
+    output,
+    outputLineCount: countOutputLines(output),
+    detail: buildTraceDetail(
+      detailId,
+      "tool",
+      formatEventTime(event.ts),
+      toolName ?? semantic.label,
+      toolName ?? "工具过程",
+      summary,
+      eventData,
+      {
+        output,
+        tags: [{ label: status.label, tone: status.tone }]
       }
-      return {
-        id,
-        type: "tool",
-        time: formatEventTime(event.ts),
-        text: tool ? `${tool} ${success ? "已完成" : "执行失败"}` : success ? "工具已完成" : "工具执行失败",
-        detailTitle: tool ?? "工具结果",
-        summary: frontendMessage ?? summary ?? (success ? "工具执行完成。" : "工具执行失败。"),
-        inputs,
-        citations,
-        tags
-      };
-    }
-    case "tool_error_feedback":
-      tags.push({ label: "错误恢复", tone: "orange" });
-      return {
-        id,
-        type: "tool",
-        time: formatEventTime(event.ts),
-        text: tool ? `${tool} 需要恢复处理` : "工具需要恢复处理",
-        detailTitle: tool ?? "错误反馈",
-        summary: frontendMessage ?? summary ?? "后端返回了结构化错误反馈。",
-        inputs,
-        citations,
-        tags
-      };
-    case "plan_updated":
-      tags.push({ label: "计划更新", tone: "blue" });
-      return {
-        id,
-        type: "trace",
-        time: formatEventTime(event.ts),
-        text: "执行计划已更新",
-        detailTitle: "计划更新",
-        summary: summary ?? "Agent 更新了本轮任务计划。",
-        inputs,
-        citations,
-        tags
-      };
-    case "hook_triggered":
-      return {
-        id,
-        type: "skill",
-        time: formatEventTime(event.ts),
-        text: message ?? "插件 Hook 已触发",
-        detailTitle: typeof event.data.event === "string" ? event.data.event : "Hook",
-        summary: message ?? "插件 Hook 返回了一条说明信息。",
-        inputs,
-        citations
-      };
-    case "checkpoint_created":
-      tags.push({ label: "Checkpoint", tone: "blue" });
-      return {
-        id,
-        type: "trace",
-        time: formatEventTime(event.ts),
-        text: "上下文已压缩并创建 checkpoint",
-        detailTitle: "Checkpoint",
-        summary: summary ?? "上下文压力达到阈值，系统已创建 checkpoint。",
-        inputs,
-        citations,
-        tags
-      };
-    case "attachment_received":
-      return {
-        id,
-        type: "trace",
-        time: formatEventTime(event.ts),
-        text: "已接收附件，开始预处理",
-        detailTitle: "附件接收",
-        summary: "图片附件已上传，等待多模态预解析。",
-        inputs,
-        citations
-      };
-    case "attachment_processed":
-      return {
-        id,
-        type: "trace",
-        time: formatEventTime(event.ts),
-        text: "附件预处理完成",
-        detailTitle: "附件解析",
-        summary: "多模态摘要已写入本轮上下文。",
-        inputs,
-        citations
-      };
-    case "tool_approval_request":
-      tags.push({ label: "待审批", tone: "orange" });
-      return {
-        id,
-        type: "trace",
-        time: formatEventTime(event.ts),
-        text: tool ? `${tool} 等待审批` : "工具等待审批",
-        detailTitle: "审批请求",
-        summary: reason ?? "该操作需要人工确认后继续。",
-        inputs,
-        citations,
-        tags
-      };
-    case "tool_approval_resolved": {
-      const approved = Boolean(event.data.approved);
-      tags.push({ label: approved ? "已批准" : "已拒绝", tone: approved ? "green" : "orange" });
-      return {
-        id,
-        type: "trace",
-        time: formatEventTime(event.ts),
-        text: approved ? "审批已通过" : "审批已拒绝",
-        detailTitle: "审批结果",
-        summary: approved ? "工具调用恢复执行。" : "工具调用已被拒绝。",
-        inputs,
-        citations,
-        tags
-      };
-    }
-    case "error":
-      tags.push({ label: "错误", tone: "orange" });
-      return {
-        id,
-        type: "trace",
-        time: formatEventTime(event.ts),
-        text: message ?? "本轮执行中断",
-        detailTitle: "运行错误",
-        summary: frontendMessage ?? message ?? "运行时返回错误。",
-        inputs,
-        citations,
-        tags
-      };
-    default:
-      return null;
+    )
+  };
+}
+
+function buildProgressNode(
+  event: SessionEventPayload,
+  state: TimelineNodeState,
+  output: string | null = null,
+  userPrompt?: string | null
+): TimelineNode {
+  const eventData = buildEventDataWithRequest(event);
+  const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
+  const callId = typeof eventData.tool_call_id === "string" ? eventData.tool_call_id : `${event.ts}-${event.event}`;
+  const nodeId = `node:tool:${callId}`;
+  const primaryText = resolveProgressPrimaryText(
+    toolName,
+    state === "failed" ? "failed" : state === "completed" ? "completed" : "running",
+    eventData,
+    output,
+    userPrompt
+  );
+  const status = resolveSecondaryStatusMeta(state, eventData);
+  return {
+    id: nodeId,
+    kind: "progress",
+    state,
+    time: formatEventTime(event.ts),
+    primaryText,
+    secondaryItems: [buildToolSecondaryItem(nodeId, event, state, output, userPrompt)],
+    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), primaryText, toolName ?? "执行进展", primaryText, eventData, {
+      tags: [{ label: status.label, tone: status.tone }]
+    })
+  };
+}
+
+function buildRetryNode(event: SessionEventPayload): TimelineNode {
+  const eventData = buildEventDataWithRequest(event);
+  const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
+  const nodeId = `node:retry:${event.ts}:${toolName ?? "tool"}`;
+  const primaryText = "刚才那一步没成功，我换一种方式继续";
+  return {
+    id: nodeId,
+    kind: "error_recovery",
+    state: "recovering",
+    time: formatEventTime(event.ts),
+    primaryText,
+    secondaryItems: [buildToolSecondaryItem(nodeId, event, "recovering")],
+    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), primaryText, toolName ?? "重试", primaryText, eventData, {
+      tags: [{ label: "恢复中", tone: "orange" }]
+    })
+  };
+}
+
+function buildPlanNode(event: SessionEventPayload): TimelineNode {
+  const eventData = buildEventDataWithRequest(event);
+  const nodeId = `node:plan:${event.ts}`;
+  const subtitle = buildPlanSubtitle(eventData.plan);
+  const detailSummary = typeof eventData.summary === "string" && eventData.summary ? eventData.summary : subtitle;
+  return {
+    id: nodeId,
+    kind: "plan",
+    state: "updated",
+    time: formatEventTime(event.ts),
+    primaryText: "执行步骤已更新",
+    secondaryItems: [
+      {
+        id: `secondary:${nodeId}`,
+        parentId: nodeId,
+        label: "计划",
+        toolName: "update_plan",
+        cardType: "plan",
+        subtitle,
+        statusLabel: "已更新",
+        statusTone: "blue",
+        meta: [],
+        output: typeof eventData.plan === "undefined" ? null : stringifyForPanel(eventData.plan),
+        outputLineCount: countOutputLines(typeof eventData.plan === "undefined" ? null : stringifyForPanel(eventData.plan)),
+        detail: buildTraceDetail(
+          `secondary:${nodeId}`,
+          "trace",
+          formatEventTime(event.ts),
+          "计划",
+          "计划详情",
+          detailSummary,
+          eventData,
+          { output: typeof eventData.plan === "undefined" ? null : stringifyForPanel(eventData.plan) }
+        )
+      }
+    ],
+    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), "执行步骤已更新", "计划更新", detailSummary, eventData, {
+      tags: [{ label: "计划", tone: "blue" }]
+    })
+  };
+}
+
+function summarizeThinkingContent(content: string | null | undefined, state: TimelineNodeState) {
+  const normalized = (content ?? "").replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return state === "completed" ? "思路整理完成" : "我先理一下思路";
   }
+  const firstSentence = normalized.split(/(?<=[。！？.!?])\s+/)[0] || normalized;
+  return compactString(firstSentence, 56);
+}
+
+function buildThinkingNode(
+  ts: number,
+  content: string | null = null,
+  state: TimelineNodeState = "running",
+  detailTitle = "Thinking"
+): TimelineNode {
+  const time = formatEventTime(ts);
+  const nodeId = `node:thinking:${ts}`;
+  const primaryText = summarizeThinkingContent(content, state);
+  return {
+    id: nodeId,
+    kind: "thinking",
+    state,
+    time,
+    primaryText,
+    secondaryItems: [],
+    detail: {
+      id: nodeId,
+      type: "trace",
+      time,
+      text: primaryText,
+      detailTitle,
+      summary: primaryText,
+      inputs: [],
+      citations: [],
+      output: content,
+      tags: [{ label: "Thinking", tone: "blue" }]
+    }
+  };
+}
+
+function buildSkillNode(event: SessionEventPayload): TimelineNode {
+  const eventData = buildEventDataWithRequest(event);
+  const skillName = typeof eventData.event === "string" ? eventData.event : "Skill";
+  const message = typeof eventData.message === "string" && eventData.message ? eventData.message : "这个分析步骤已完成";
+  const contextOutput =
+    typeof eventData.context === "undefined" ? null : stringifyForPanel(eventData.context);
+  const nodeId = `node:skill:${event.ts}:${skillName}`;
+  return {
+    id: nodeId,
+    kind: "skill_progress",
+    state: "completed",
+    time: formatEventTime(event.ts),
+    primaryText: "这个分析步骤已完成",
+    secondaryItems: [
+      {
+        id: `secondary:${nodeId}`,
+        parentId: nodeId,
+        label: skillName,
+        toolName: null,
+        cardType: "generic",
+        subtitle: message,
+        statusLabel: "已完成",
+        statusTone: "green",
+        meta: ["Skill"],
+        output: contextOutput,
+        outputLineCount: countOutputLines(contextOutput),
+        detail: buildTraceDetail(
+          `secondary:${nodeId}`,
+          "skill",
+          formatEventTime(event.ts),
+          skillName,
+          "Skill 详情",
+          message,
+          eventData,
+          {
+            output: contextOutput,
+            tags: [{ label: "Skill", tone: "green" }]
+          }
+        )
+      }
+    ],
+    detail: buildTraceDetail(
+      nodeId,
+      "skill",
+      formatEventTime(event.ts),
+      "这个分析步骤已完成",
+      "Skill 进展",
+      message,
+      eventData,
+      {
+        tags: [{ label: "Skill", tone: "green" }]
+      }
+    )
+  };
+}
+
+function buildApprovalNode(event: SessionEventPayload, state: "pending" | "approved" | "rejected"): TimelineNode {
+  const eventData = buildEventDataWithRequest(event);
+  const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
+  const requestId =
+    typeof eventData.approval_request_id === "string" ? eventData.approval_request_id : `${event.ts}-${toolName ?? "approval"}`;
+  const nodeId = `node:approval:${requestId}`;
+  const primaryText =
+    state === "pending"
+      ? "这一步需要你确认后我才能继续"
+      : state === "approved"
+        ? "已获得你的确认，继续处理中"
+        : "你已拒绝这一步，我将改用别的方法";
+  const status = resolveSecondaryStatusMeta(state, eventData);
+  const args = extractEventArguments(eventData);
+  return {
+    id: nodeId,
+    kind: "approval",
+    state,
+    time: formatEventTime(event.ts),
+    primaryText,
+    secondaryItems: [
+      {
+        id: `secondary:${nodeId}`,
+        parentId: nodeId,
+        label: toolName ?? "审批",
+        toolName,
+        cardType: "generic",
+        subtitle: buildToolSecondarySubtitle(toolName, eventData),
+        statusLabel: status.label,
+        statusTone: status.tone,
+        meta: typeof eventData.timeout_seconds === "number" ? [`${eventData.timeout_seconds}s 超时`] : [],
+        output: args ? stringifyForPanel(args) : null,
+        outputLineCount: countOutputLines(args ? stringifyForPanel(args) : null),
+        detail: buildTraceDetail(
+          `secondary:${nodeId}`,
+          "trace",
+          formatEventTime(event.ts),
+          toolName ?? "审批",
+          "审批详情",
+          (typeof eventData.summary === "string" && eventData.summary) ||
+            (typeof eventData.reason === "string" && eventData.reason) ||
+            primaryText,
+          eventData,
+          {
+            output: args ? stringifyForPanel(args) : null,
+            tags: [{ label: status.label, tone: status.tone }]
+          }
+        )
+      }
+    ],
+    detail: buildTraceDetail(
+      nodeId,
+      "trace",
+      formatEventTime(event.ts),
+      primaryText,
+      state === "pending" ? "审批请求" : "审批结果",
+      (typeof eventData.summary === "string" && eventData.summary) ||
+        (typeof eventData.reason === "string" && eventData.reason) ||
+        primaryText,
+      eventData,
+      {
+        tags: [{ label: status.label, tone: status.tone }]
+      }
+    )
+  };
+}
+
+function buildErrorRecoveryNode(event: SessionEventPayload): TimelineNode {
+  const eventData = buildEventDataWithRequest(event);
+  const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
+  const recoveryClass = typeof eventData.recovery_class === "string" ? eventData.recovery_class : "recoverable";
+  const state = recoveryClass === "fatal" || recoveryClass === "blocked" ? "failed" : "recovering";
+  const nodeId = `node:error-recovery:${typeof eventData.tool_call_id === "string" ? eventData.tool_call_id : event.ts}`;
+  const primaryText =
+    state === "recovering" ? "刚才那一步失败了，我正在调整后继续" : "这一步暂时没成功，需要你关注一下";
+  const status = resolveSecondaryStatusMeta(state, eventData);
+  return {
+    id: nodeId,
+    kind: "error_recovery",
+    state,
+    time: formatEventTime(event.ts),
+    primaryText,
+    secondaryItems: [buildToolSecondaryItem(nodeId, event, state)],
+    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), primaryText, toolName ?? "错误恢复", primaryText, eventData, {
+      tags: [{ label: status.label, tone: status.tone }]
+    })
+  };
+}
+
+function buildFatalErrorNode(event: SessionEventPayload): TimelineNode {
+  const eventData = buildEventDataWithRequest(event);
+  const message =
+    (typeof eventData.frontend_message === "string" && eventData.frontend_message) ||
+    (typeof eventData.message === "string" && eventData.message) ||
+    "这次执行中断了，请查看错误详情";
+  const nodeId = `node:fatal:${event.ts}`;
+  const category = typeof eventData.category === "string" ? eventData.category : null;
+  return {
+    id: nodeId,
+    kind: "fatal_error",
+    state: "failed",
+    time: formatEventTime(event.ts),
+    primaryText: "这次执行中断了，请查看错误详情",
+    secondaryItems: [
+      {
+        id: `secondary:${nodeId}`,
+        parentId: nodeId,
+        label: category ?? "错误",
+        cardType: "generic",
+        subtitle: message,
+        statusLabel: "失败",
+        statusTone: "orange",
+        meta: category ? [category] : [],
+        output: null,
+        outputLineCount: 0,
+        detail: buildTraceDetail(`secondary:${nodeId}`, "trace", formatEventTime(event.ts), message, "错误详情", message, eventData, {
+          tags: [{ label: "失败", tone: "orange" }]
+        })
+      }
+    ],
+    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), "这次执行中断了，请查看错误详情", "运行错误", message, eventData, {
+      tags: [{ label: "错误", tone: "orange" }]
+    })
+  };
+}
+
+function applyTurnIdToNode(node: TimelineNode, turnId: string) {
+  node.detail.turnId = turnId;
+  node.secondaryItems.forEach((item) => {
+    item.detail.turnId = turnId;
+  });
+  return node;
+}
+
+function preserveNodeIdentity(existingNode: TimelineNode, nextNode: TimelineNode): TimelineNode {
+  return {
+    ...nextNode,
+    id: existingNode.id,
+    detail: {
+      ...nextNode.detail,
+      id: existingNode.id
+    },
+    secondaryItems: nextNode.secondaryItems.map((item, index) => {
+      const existingItem = existingNode.secondaryItems[index];
+      const nextId = existingItem?.id ?? item.id;
+      return {
+        ...item,
+        id: nextId,
+        parentId: existingNode.id,
+        detail: {
+          ...item.detail,
+          id: nextId
+        }
+      };
+    })
+  };
+}
+
+function isRunningThinkingNode(node: TimelineNode) {
+  return node.kind === "thinking" && node.state === "running";
+}
+
+function findNodeById(nodes: TimelineNode[], nodeId: string) {
+  const index = nodes.findIndex((node) => node.id === nodeId);
+  if (index === -1) {
+    return null;
+  }
+  return { node: nodes[index], index };
+}
+
+function findRecentToolNodeId(nodes: TimelineNode[], toolName: string | null | undefined) {
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const node = nodes[index];
+    if (node.secondaryItems.some((item) => item.toolName === toolName)) {
+      return node.id;
+    }
+  }
+  return null;
+}
+
+function buildTimelineNodes(events: SessionEventPayload[], toolMessages: SessionMessageRecord[], userPrompt?: string | null) {
+  const nodes: TimelineNode[] = [];
+  const toolCallToNodeId = new Map<string, string>();
+  const approvalToNodeId = new Map<string, string>();
+  const toolMessageByCallId = new Map<string, SessionMessageRecord>();
+  let thinkingNodeId: string | null = null;
+
+  toolMessages.forEach((message) => {
+    const toolCallId = typeof message.metadata.tool_call_id === "string" ? message.metadata.tool_call_id : null;
+    if (toolCallId) {
+      toolMessageByCallId.set(toolCallId, message);
+    }
+  });
+
+  events.forEach((event) => {
+    const eventData = buildEventDataWithRequest(event);
+    const toolCallId = typeof eventData.tool_call_id === "string" ? eventData.tool_call_id : null;
+    const approvalRequestId = typeof eventData.approval_request_id === "string" ? eventData.approval_request_id : null;
+    const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
+    const toolOutput = toolCallId ? toolMessageByCallId.get(toolCallId)?.content ?? null : null;
+
+    if (event.event === "thinking_delta" || event.event === "thinking_complete") {
+      const content = typeof eventData.content === "string" ? eventData.content : "";
+      const nextNode = buildThinkingNode(
+        event.ts,
+        content,
+        event.event === "thinking_complete" ? "completed" : "running",
+        "当前思路"
+      );
+      const existingNodeId = thinkingNodeId ?? nodes.find((node) => node.kind === "thinking")?.id ?? null;
+      const existing = existingNodeId ? findNodeById(nodes, existingNodeId) : null;
+      if (existing) {
+        const updatedNode = preserveNodeIdentity(existing.node, nextNode);
+        nodes.splice(existing.index, 1);
+        nodes.push(updatedNode);
+        thinkingNodeId = existing.node.id;
+      } else {
+        nodes.push(nextNode);
+        thinkingNodeId = nextNode.id;
+      }
+      return;
+    }
+
+    if (event.event === "tool_call_started") {
+      const node = buildProgressNode(event, "running", toolOutput, userPrompt);
+      nodes.push(node);
+      if (toolCallId) {
+        toolCallToNodeId.set(toolCallId, node.id);
+      }
+      return;
+    }
+
+    if (event.event === "tool_call_finished") {
+      const nextNode = buildProgressNode(event, Boolean(eventData.success) ? "completed" : "failed", toolOutput, userPrompt);
+      const existingNodeId = toolCallId ? toolCallToNodeId.get(toolCallId) ?? null : null;
+      const existing = existingNodeId ? findNodeById(nodes, existingNodeId) : null;
+      if (existing) {
+        nodes[existing.index] = preserveNodeIdentity(existing.node, nextNode);
+      } else {
+        nodes.push(nextNode);
+      }
+      if (toolCallId) {
+        toolCallToNodeId.set(toolCallId, existing?.node.id ?? nextNode.id);
+      }
+      return;
+    }
+
+    if (event.event === "tool_retry_scheduled") {
+      const retryNode = buildRetryNode(event);
+      const existingNodeId = findRecentToolNodeId(nodes, toolName);
+      const existing = existingNodeId ? findNodeById(nodes, existingNodeId) : null;
+      if (existing) {
+        nodes[existing.index] = preserveNodeIdentity(existing.node, retryNode);
+      } else {
+        nodes.push(retryNode);
+      }
+      return;
+    }
+
+    if (event.event === "tool_error_feedback") {
+      const recoveryNode = buildErrorRecoveryNode(event);
+      const existingNodeId = toolCallId ? toolCallToNodeId.get(toolCallId) ?? null : findRecentToolNodeId(nodes, toolName);
+      const existing = existingNodeId ? findNodeById(nodes, existingNodeId) : null;
+      if (existing) {
+        nodes[existing.index] = preserveNodeIdentity(existing.node, recoveryNode);
+      } else {
+        nodes.push(recoveryNode);
+      }
+      return;
+    }
+
+    if (event.event === "tool_approval_request") {
+      const node = buildApprovalNode(event, "pending");
+      nodes.push(node);
+      if (approvalRequestId) {
+        approvalToNodeId.set(approvalRequestId, node.id);
+      }
+      return;
+    }
+
+    if (event.event === "tool_approval_resolved") {
+      const node = buildApprovalNode(event, Boolean(eventData.approved) ? "approved" : "rejected");
+      const existingNodeId = approvalRequestId ? approvalToNodeId.get(approvalRequestId) ?? null : null;
+      const existing = existingNodeId ? findNodeById(nodes, existingNodeId) : null;
+      if (existing) {
+        nodes[existing.index] = preserveNodeIdentity(existing.node, node);
+      } else {
+        nodes.push(node);
+      }
+      if (approvalRequestId) {
+        approvalToNodeId.set(approvalRequestId, existing?.node.id ?? node.id);
+      }
+      return;
+    }
+
+    if (event.event === "plan_updated") {
+      nodes.push(buildPlanNode(event));
+      return;
+    }
+
+    if (event.event === "hook_triggered") {
+      nodes.push(buildSkillNode(event));
+      return;
+    }
+
+    if (event.event === "error") {
+      nodes.push(buildFatalErrorNode(event));
+    }
+  });
+
+  return nodes;
+}
+
+function parseTimestamp(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function readTurnId(value: Record<string, unknown>) {
+  const turnId = value.turn_id;
+  return typeof turnId === "string" && turnId ? turnId : null;
+}
+
+function readRequestId(value: Record<string, unknown>) {
+  const requestId = value.request_id;
+  return typeof requestId === "string" && requestId ? requestId : null;
+}
+
+function readApprovalMode(value: Record<string, unknown>) {
+  const approvalMode = value.approval_mode;
+  return approvalMode === "manual" || approvalMode === "auto_approve_level2" ? approvalMode : null;
+}
+
+function isAssistantToolCallMessage(message: SessionMessageRecord) {
+  const toolCalls = message.metadata.tool_calls;
+  return Array.isArray(toolCalls) && toolCalls.length > 0;
+}
+
+function resolveTurnIdForEvent(
+  event: SessionEventPayload,
+  turns: ChatTurn[],
+  turnIds: Set<string>
+) {
+  const directTurnId = readTurnId(event.data);
+  if (directTurnId && turnIds.has(directTurnId)) {
+    return directTurnId;
+  }
+  if (turns.length === 0) {
+    return null;
+  }
+
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const currentTurn = turns[index];
+    const start = parseTimestamp(currentTurn.userMessage.createdAt);
+    const nextTurn = turns[index + 1] ?? null;
+    const nextStart = nextTurn ? parseTimestamp(nextTurn.userMessage.createdAt) : null;
+    const afterStart = start === null || event.ts >= start;
+    const beforeNext = nextStart === null || event.ts < nextStart;
+    if (afterStart && beforeNext) {
+      return currentTurn.id;
+    }
+  }
+
+  return turns[turns.length - 1]?.id ?? null;
+}
+
+function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: SessionEventPayload[]) {
+  const turns: ChatTurn[] = [];
+  const turnsById = new Map<string, ChatTurn>();
+  const toolMessagesByTurn = new Map<string, SessionMessageRecord[]>();
+  const eventsByTurn = new Map<string, SessionEventPayload[]>();
+
+  messages.forEach((message) => {
+    if (message.role !== "user") {
+      return;
+    }
+    const turnId = readTurnId(message.metadata) ?? message.id;
+    const turn: ChatTurn = {
+      id: turnId,
+      requestId: readRequestId(message.metadata),
+      userMessage: {
+        id: message.id,
+        content: message.content,
+        createdAt: message.created_at,
+        persisted: true,
+        approvalMode: readApprovalMode(message.metadata)
+      },
+      answer: null,
+      timeline: [],
+      status: "running",
+      isLive: false
+    };
+    turns.push(turn);
+    turnsById.set(turnId, turn);
+  });
+
+  messages.forEach((message) => {
+    if (message.role !== "tool") {
+      return;
+    }
+    const turnId = readTurnId(message.metadata);
+    if (!turnId) {
+      return;
+    }
+    const items = toolMessagesByTurn.get(turnId) ?? [];
+    items.push(message);
+    toolMessagesByTurn.set(turnId, items);
+  });
+
+  messages.forEach((message) => {
+    if (message.role !== "assistant" || isAssistantToolCallMessage(message)) {
+      return;
+    }
+
+    const explicitTurnId = readTurnId(message.metadata);
+    let targetTurn = explicitTurnId ? turnsById.get(explicitTurnId) ?? null : null;
+
+    if (!targetTurn) {
+      const createdAt = parseTimestamp(message.created_at);
+      for (let index = turns.length - 1; index >= 0; index -= 1) {
+        const turn = turns[index];
+        const turnCreatedAt = parseTimestamp(turn.userMessage.createdAt);
+        if (turn.answer) {
+          continue;
+        }
+        if (createdAt === null || turnCreatedAt === null || turnCreatedAt <= createdAt) {
+          targetTurn = turn;
+          break;
+        }
+      }
+    }
+
+    if (!targetTurn) {
+      return;
+    }
+
+    targetTurn.answer = {
+      detailId: `assistant:${message.id}`,
+      content: message.content,
+      createdAt: message.created_at,
+      phase: "persisted",
+      source: "session",
+      assistantMessageId: message.id,
+      finishReason: typeof message.metadata.finish_reason === "string" ? message.metadata.finish_reason : null
+    };
+    targetTurn.requestId = targetTurn.requestId ?? readRequestId(message.metadata);
+    if (targetTurn.status === "running") {
+      targetTurn.status = "completed";
+    }
+  });
+
+  const turnIds = new Set(turns.map((turn) => turn.id));
+  sessionEvents.forEach((event, index) => {
+    const turnId = resolveTurnIdForEvent(event, turns, turnIds);
+    if (!turnId) {
+      return;
+    }
+    const turn = turnsById.get(turnId);
+    if (!turn) {
+      return;
+    }
+    const entries = eventsByTurn.get(turnId) ?? [];
+    entries.push(event);
+    eventsByTurn.set(turnId, entries);
+    turn.requestId = turn.requestId ?? event.request_id ?? null;
+
+    if (event.event === "tool_approval_request") {
+      turn.status = "needs_approval";
+      return;
+    }
+    if (event.event === "tool_approval_resolved") {
+      const approved = Boolean(event.data.approved);
+      turn.status = approved ? (turn.answer ? "completed" : "running") : "failed";
+      return;
+    }
+    if (event.event === "error") {
+      turn.status = "failed";
+      return;
+    }
+    if (event.event === "tool_error_feedback") {
+      const recoveryClass = event.data.recovery_class;
+      if (recoveryClass === "fatal" || recoveryClass === "blocked") {
+        turn.status = "failed";
+      }
+      return;
+    }
+    if (turn.status === "running" && turn.answer) {
+      turn.status = "completed";
+    }
+  });
+
+  turns.forEach((turn) => {
+    if (turn.status === "running" && turn.answer) {
+      turn.status = "completed";
+    }
+    turn.timeline = buildTimelineNodes(
+      eventsByTurn.get(turn.id) ?? [],
+      toolMessagesByTurn.get(turn.id) ?? [],
+      turn.userMessage.content
+    ).map((node) =>
+      applyTurnIdToNode(node, turn.id)
+    );
+  });
+
+  return turns;
+}
+
+function matchLiveTurnEvent(event: SessionEventPayload, liveTurn: LiveTurnState) {
+  const eventTurnId = readTurnId(event.data);
+  if (liveTurn.serverTurnId && eventTurnId === liveTurn.serverTurnId) {
+    return true;
+  }
+  if (liveTurn.requestId && event.request_id === liveTurn.requestId) {
+    return true;
+  }
+  return false;
+}
+
+function buildLiveTurn(liveTurn: LiveTurnState, sessionEvents: SessionEventPayload[]): ChatTurn {
+  const turnId = liveTurn.serverTurnId ?? liveTurn.localId;
+  const turnEvents = sessionEvents.filter((event) => matchLiveTurnEvent(event, liveTurn));
+  const timeline = buildTimelineNodes(
+    turnEvents,
+    [],
+    liveTurn.userMessage.content
+  ).map((node) => applyTurnIdToNode(node, turnId));
+  const thinkingTs = parseTimestamp(liveTurn.userMessage.createdAt) ?? Date.now();
+  const hasRunningThinking = timeline.some(isRunningThinkingNode);
+  const shouldShowThinking =
+    liveTurn.status === "running" &&
+    (liveTurn.answer.phase === "waiting" || liveTurn.answer.phase === "streaming") &&
+    !liveTurn.answer.content.trim() &&
+    !hasRunningThinking;
+  const nextTimeline = shouldShowThinking
+    ? [...timeline, applyTurnIdToNode(buildThinkingNode(thinkingTs, null, "running", "当前思路"), turnId)]
+    : timeline;
+
+  return {
+    id: turnId,
+    requestId: liveTurn.requestId,
+    userMessage: liveTurn.userMessage,
+    answer: liveTurn.answer,
+    timeline: nextTimeline,
+    status: liveTurn.status,
+    isLive: true
+  };
+}
+
+function turnMatchesLiveTurn(turn: ChatTurn, liveTurn: LiveTurnState | null) {
+  if (!liveTurn) {
+    return false;
+  }
+  if (liveTurn.serverTurnId && turn.id === liveTurn.serverTurnId) {
+    return true;
+  }
+  if (liveTurn.requestId && turn.requestId === liveTurn.requestId) {
+    return true;
+  }
+  return false;
+}
+
+function resolveAnswerCopy(answer: TurnAnswer | null, status: TurnStatus) {
+  if (answer && answer.content.trim()) {
+    return answer.content;
+  }
+  if (answer?.phase === "failed") {
+    return answer.errorMessage || "这轮执行暂时中断，请查看过程详情。";
+  }
+  if (status === "needs_approval") {
+    return "这一步需要你确认后我才能继续。";
+  }
+  if (answer?.phase === "finalizing") {
+    return "最终答案已经生成，正在同步到会话记录...";
+  }
+  if (answer?.phase === "streaming") {
+    return "正在生成回答...";
+  }
+  return "正在准备回答...";
+}
+
+function shouldRenderAnswerBubble(turn: ChatTurn) {
+  if (!turn.answer) {
+    return turn.status !== "completed";
+  }
+
+  if (turn.answer.content.trim()) {
+    return true;
+  }
+
+  if (turn.answer.phase === "failed") {
+    return true;
+  }
+
+  if (turn.status === "needs_approval") {
+    return true;
+  }
+
+  return !turn.isLive || !turn.timeline.some(isRunningThinkingNode);
+}
+
+function buildAnswerTags(answer: TurnAnswer | null, status: TurnStatus) {
+  const tags: Array<{ label: string; tone: StatusTagTone }> = [];
+  if (!answer) {
+    if (status === "needs_approval") {
+      tags.push({ label: "待确认", tone: "orange" });
+    } else if (status === "failed") {
+      tags.push({ label: "已中断", tone: "orange" });
+    }
+    return tags;
+  }
+
+  if (answer.phase === "failed") {
+    tags.push({ label: "已中断", tone: "orange" });
+  }
+
+  if (status === "needs_approval") {
+    tags.push({ label: "待确认", tone: "orange" });
+  }
+
+  if (answer.finishReason === "tool_limit_reached") {
+    tags.push({ label: "工具上限", tone: "blue" });
+  }
+
+  return tags;
 }
 
 function normalizeSessionEventPayload(payload: unknown): SessionEventPayload | null {
@@ -613,7 +1779,7 @@ function App() {
   const [chatError, setChatError] = useState<string | null>(null);
   const [chatNotice, setChatNotice] = useState<string | null>(null);
   const [sendingMessage, setSendingMessage] = useState(false);
-  const [streamingContent, setStreamingContent] = useState("");
+  const [liveTurn, setLiveTurn] = useState<LiveTurnState | null>(null);
   const [openSessionMenuId, setOpenSessionMenuId] = useState<string | null>(null);
   const [memoryFiles, setMemoryFiles] = useState<Record<MemoryKey, MemoryFile>>({
     memory: { path: "", content: "", updated_at: null },
@@ -655,12 +1821,10 @@ function App() {
   const [pluginsNotice, setPluginsNotice] = useState<string | null>(null);
   const [pluginBusyName, setPluginBusyName] = useState<string | null>(null);
   const [leftWidth, setLeftWidth] = useState(() => readStoredNumber("newman-left-rail-width", 220, LEFT_MIN, LEFT_MAX));
-  const [rightWidth, setRightWidth] = useState(() =>
-    readStoredNumber("newman-right-drawer-width", 320, RIGHT_MIN, RIGHT_MAX)
-  );
-  const [dragging, setDragging] = useState<null | "left" | "right">(null);
+  const [dragging, setDragging] = useState<null | "left">(null);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
-  const [openDetailId, setOpenDetailId] = useState<string | null>(null);
+  const [expandedTimelineIds, setExpandedTimelineIds] = useState<Record<string, boolean>>({});
+  const [expandedSecondaryIds, setExpandedSecondaryIds] = useState<Record<string, boolean>>({});
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [approvalActionLoading, setApprovalActionLoading] = useState<null | "approve" | "reject">(null);
@@ -669,6 +1833,7 @@ function App() {
   const [turnApprovalMode, setTurnApprovalMode] = useState<TurnApprovalMode>("manual");
   const conversationPaneRef = useRef<HTMLElement | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
+  const shouldAutoScrollRef = useRef(true);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -691,10 +1856,6 @@ function App() {
   }, [leftWidth]);
 
   useEffect(() => {
-    window.localStorage.setItem("newman-right-drawer-width", `${rightWidth}`);
-  }, [rightWidth]);
-
-  useEffect(() => {
     const onResize = () => setViewportWidth(window.innerWidth);
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -713,13 +1874,7 @@ function App() {
     if (!dragging) return;
 
     const onPointerMove = (event: PointerEvent) => {
-      if (dragging === "left") {
-        setLeftWidth(clamp(event.clientX, LEFT_MIN, LEFT_MAX));
-        return;
-      }
-
-      const width = window.innerWidth - event.clientX - 6;
-      setRightWidth(clamp(width, RIGHT_MIN, RIGHT_MAX));
+      setLeftWidth(clamp(event.clientX, LEFT_MIN, LEFT_MAX));
     };
 
     const onPointerUp = () => setDragging(null);
@@ -766,16 +1921,21 @@ function App() {
     }
   }
 
-  async function loadChatWorkspace(sessionId: string, signal?: AbortSignal) {
-    setChatLoading(true);
-    setChatError(null);
+  async function loadChatWorkspace(sessionId: string, signal?: AbortSignal, options?: { silent?: boolean }) {
+    const silent = options?.silent ?? false;
+    if (!silent) {
+      setChatLoading(true);
+      setChatError(null);
+    }
 
     try {
       const detail = await fetchJson<SessionDetailResponse>(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}`, { signal });
 
       let nextEvents: SessionEventPayload[] = [];
       try {
-        const events = await fetchJson<SessionEventsResponse>(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/events`, { signal });
+        const eventsUrl = new URL(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/events`);
+        eventsUrl.searchParams.set("limit", "2000");
+        const events = await fetchJson<SessionEventsResponse>(eventsUrl.toString(), { signal });
         nextEvents = events.events
           .map((event) => normalizeSessionEventPayload(event))
           .filter((event): event is SessionEventPayload => event !== null);
@@ -794,12 +1954,12 @@ function App() {
       }
 
       if (signal?.aborted || activeSessionIdRef.current !== sessionId) {
-        return;
+        return false;
       }
 
       setActiveSessionDetail(detail.session);
       setActiveContextUsage(detail.context_usage ?? null);
-      setSessionEvents(nextEvents);
+      setSessionEvents(dedupeSessionEvents(nextEvents));
       setChatSessions((currentSessions) =>
         currentSessions.map((session) =>
           session.id === sessionId
@@ -813,13 +1973,15 @@ function App() {
             : session
         )
       );
+      return true;
     } catch (error) {
       if (signal?.aborted) {
-        return;
+        return false;
       }
       setChatError(error instanceof Error ? error.message : "会话内容加载失败");
+      return false;
     } finally {
-      if (!signal?.aborted && activeSessionIdRef.current === sessionId) {
+      if (!silent && !signal?.aborted && activeSessionIdRef.current === sessionId) {
         setChatLoading(false);
       }
     }
@@ -836,13 +1998,16 @@ function App() {
       setActiveSessionDetail(null);
       setActiveContextUsage(null);
       setSessionEvents([]);
-      setStreamingContent("");
+      setLiveTurn(null);
       setChatLoading(false);
       return;
     }
 
     const controller = new AbortController();
-    setOpenDetailId(null);
+    setActiveSessionDetail(null);
+    setActiveContextUsage(null);
+    setSessionEvents([]);
+    setLiveTurn((currentTurn) => (currentTurn && currentTurn.sessionId !== activeSessionId ? null : currentTurn));
     void loadChatWorkspace(activeSessionId, controller.signal);
     return () => controller.abort();
   }, [activeSessionId, apiBase]);
@@ -939,19 +2104,8 @@ function App() {
 
   useEffect(() => {
     if (activePage !== "chat") return;
-    if (!activeSessionDetail || activeSessionDetail.messages.length === 0) return;
-
-    const frame = window.requestAnimationFrame(() => {
-      const pane = conversationPaneRef.current;
-      if (!pane) return;
-      pane.scrollTo({
-        top: pane.scrollHeight,
-        behavior: "smooth"
-      });
-    });
-
-    return () => window.cancelAnimationFrame(frame);
-  }, [activePage, activeSessionId, activeSessionDetail, streamingContent, sessionEvents.length]);
+    shouldAutoScrollRef.current = true;
+  }, [activePage, activeSessionId]);
 
   async function loadSkillsWorkspace(signal?: AbortSignal, preferredName?: string | null) {
     setSkillsLoading(true);
@@ -1107,41 +2261,15 @@ function App() {
   }, [activePage, apiBase]);
 
   const isMobile = viewportWidth <= 820;
-  const activeSession = chatSessions.find((session) => session.id === activeSessionId) ?? null;
-  const visibleMessages =
-    activeSessionDetail?.messages.filter((message) => message.role === "user" || message.role === "assistant") ?? [];
-  const traceEntries = sessionEvents
-    .map((event, index) => buildTraceEntry(event, index))
-    .filter((entry): entry is TraceEntry => entry !== null);
-  const selectedDetail =
-    activePage === "chat"
-      ? traceEntries.find((entry) => entry.id === openDetailId) ??
-        (openDetailId?.startsWith("assistant:")
-          ? (() => {
-              const assistantId = openDetailId.slice("assistant:".length);
-              const assistantMessage = visibleMessages.find((message) => message.id === assistantId && message.role === "assistant");
-              if (!assistantMessage) {
-                return null;
-              }
-              return {
-                id: openDetailId,
-                type: "result" as const,
-                time: formatDateTime(assistantMessage.created_at),
-                text: assistantMessage.content,
-                detailTitle: "最终回答",
-                summary: assistantMessage.content,
-                inputs: [],
-                citations: []
-              };
-            })()
-          : null)
-      : null;
+  const persistedSessionEvents = liveTurn ? sessionEvents.filter((event) => !matchLiveTurnEvent(event, liveTurn)) : sessionEvents;
+  const persistedTurns = buildChatTurns(activeSessionDetail?.messages ?? [], persistedSessionEvents);
+  const visiblePersistedTurns = persistedTurns.filter((turn) => !turnMatchesLiveTurn(turn, liveTurn));
+  const displayTurns = liveTurn ? [...visiblePersistedTurns, buildLiveTurn(liveTurn, sessionEvents)] : visiblePersistedTurns;
   const showEmptyChatState =
     activePage === "chat" &&
     !chatLoading &&
     !sendingMessage &&
-    visibleMessages.length === 0 &&
-    !streamingContent.trim();
+    displayTurns.length === 0;
   const contextPressure = activeContextUsage?.pressure ?? null;
   const contextProgress = contextPressure === null ? null : Math.min(Math.max(contextPressure, 0), 1);
   const contextPercent = contextPressure === null ? null : Math.max(0, Math.round(contextPressure * 100));
@@ -1152,15 +2280,38 @@ function App() {
   const hasSkillChanges = Boolean(skillDetail && skillDraft !== skillDetail.content);
   const currentWorkspaceLabel = workspaceView ? formatPathLabel(workspaceView.path, workspaceRootPath) : ".";
   const isWorkspaceRoot = Boolean(workspaceView && workspaceRootPath && workspaceView.path === workspaceRootPath);
-  const latestTraceEntries = traceEntries.slice(-12);
+
+  useEffect(() => {
+    if (activePage !== "chat") return;
+    const pane = conversationPaneRef.current;
+    if (!pane) return;
+
+    const handleScroll = () => {
+      shouldAutoScrollRef.current = isPaneNearBottom(pane);
+    };
+
+    handleScroll();
+    pane.addEventListener("scroll", handleScroll, { passive: true });
+    return () => pane.removeEventListener("scroll", handleScroll);
+  }, [activePage, activeSessionId, chatLoading, showEmptyChatState]);
+
+  useLayoutEffect(() => {
+    if (activePage !== "chat") return;
+    if (!activeSessionDetail && !liveTurn) return;
+
+    const pane = conversationPaneRef.current;
+    if (!pane) return;
+    if (!shouldAutoScrollRef.current && !isPaneNearBottom(pane)) {
+      return;
+    }
+
+    pane.scrollTop = pane.scrollHeight;
+  }, [activePage, activeSessionId, activeSessionDetail, liveTurn, sessionEvents.length]);
 
   const switchPage = (nextPage: WorkspacePage) => {
     setActivePage(nextPage);
     setOpenSessionMenuId(null);
     setApprovalMenuOpen(false);
-    if (nextPage !== "chat") {
-      setOpenDetailId(null);
-    }
   };
 
   async function ensureSession() {
@@ -1233,34 +2384,32 @@ function App() {
 
     try {
       const sessionId = await ensureSession();
-      const optimisticUserMessage: SessionMessageRecord = {
-        id: `local-user-${Date.now()}`,
-        role: "user",
-        content: trimmed,
-        created_at: new Date().toISOString(),
-        metadata: { approval_mode: turnApprovalMode }
-      };
-
-      if (activeSessionIdRef.current === sessionId) {
-        setActiveSessionDetail((currentDetail) => {
-          if (!currentDetail || currentDetail.session_id !== sessionId) {
-            return {
-              session_id: sessionId,
-              title: activeSession?.title ?? "未命名会话",
-              created_at: optimisticUserMessage.created_at,
-              updated_at: optimisticUserMessage.created_at,
-              messages: [optimisticUserMessage],
-              metadata: {}
-            };
-          }
-          return {
-            ...currentDetail,
-            updated_at: optimisticUserMessage.created_at,
-            messages: [...currentDetail.messages, optimisticUserMessage]
-          };
-        });
-        setStreamingContent("");
-      }
+      const createdAt = new Date().toISOString();
+      const liveTurnLocalId = `live-turn-${Date.now()}`;
+      setLiveTurn({
+        sessionId,
+        localId: liveTurnLocalId,
+        requestId: null,
+        serverTurnId: null,
+        userMessage: {
+          id: liveTurnLocalId,
+          content: trimmed,
+          createdAt,
+          persisted: false,
+          approvalMode: turnApprovalMode
+        },
+        answer: {
+          detailId: `live-answer:${liveTurnLocalId}`,
+          content: "",
+          createdAt,
+          phase: "waiting",
+          source: "live",
+          assistantMessageId: null,
+          finishReason: null,
+          errorMessage: null
+        },
+        status: "running"
+      });
 
       setChatSessions((currentSessions) =>
         currentSessions.map((session) =>
@@ -1269,7 +2418,7 @@ function App() {
                 ...session,
                 hasConversation: true,
                 messageCount: Math.max(1, session.messageCount),
-                updatedAt: optimisticUserMessage.created_at
+                updatedAt: createdAt
               }
             : session
         )
@@ -1293,31 +2442,127 @@ function App() {
         throw new Error(message || `请求失败：${response.status}`);
       }
 
+      const requestId = response.headers.get("x-request-id");
+      setLiveTurn((currentTurn) =>
+        currentTurn && currentTurn.localId === liveTurnLocalId
+          ? {
+              ...currentTurn,
+              requestId
+            }
+          : currentTurn
+      );
+
       await consumeSseStream(response, (payload) => {
         if (activeSessionIdRef.current !== sessionId) {
           return;
         }
 
         setSessionEvents((currentEvents) => [...currentEvents, payload]);
-
-        if (payload.event === "assistant_delta") {
-          setStreamingContent(typeof payload.data.content === "string" ? payload.data.content : "");
-        }
-
-        if (payload.event === "final_response") {
-          setStreamingContent(typeof payload.data.content === "string" ? payload.data.content : "");
-        }
-
         if (payload.event === "error") {
           setChatError(typeof payload.data.message === "string" ? payload.data.message : "消息流执行失败");
         }
+
+        setLiveTurn((currentTurn) => {
+          if (!currentTurn || currentTurn.localId !== liveTurnLocalId) {
+            return currentTurn;
+          }
+
+          const nextTurn = {
+            ...currentTurn,
+            requestId: currentTurn.requestId ?? payload.request_id ?? null,
+            serverTurnId: currentTurn.serverTurnId ?? readTurnId(payload.data)
+          };
+
+          if (payload.event === "assistant_delta") {
+            return {
+              ...nextTurn,
+              status: "running",
+              answer: {
+                ...nextTurn.answer,
+                phase: "streaming",
+                content: typeof payload.data.content === "string" ? payload.data.content : nextTurn.answer.content
+              }
+            };
+          }
+
+          if (payload.event === "thinking_delta" || payload.event === "thinking_complete") {
+            return {
+              ...nextTurn,
+              status: "running"
+            };
+          }
+
+          if (payload.event === "final_response") {
+            return {
+              ...nextTurn,
+              status: "completed",
+              answer: {
+                ...nextTurn.answer,
+                phase: "finalizing",
+                content: typeof payload.data.content === "string" ? payload.data.content : nextTurn.answer.content,
+                finishReason:
+                  typeof payload.data.finish_reason === "string" ? payload.data.finish_reason : nextTurn.answer.finishReason,
+                assistantMessageId:
+                  typeof payload.data.message_id === "string" ? payload.data.message_id : nextTurn.answer.assistantMessageId,
+                createdAt: typeof payload.data.created_at === "string" ? payload.data.created_at : nextTurn.answer.createdAt
+              }
+            };
+          }
+
+          if (payload.event === "tool_approval_request") {
+            return {
+              ...nextTurn,
+              status: "needs_approval"
+            };
+          }
+
+          if (payload.event === "tool_approval_resolved") {
+            return {
+              ...nextTurn,
+              status: Boolean(payload.data.approved) ? "running" : "failed"
+            };
+          }
+
+          if (payload.event === "error") {
+            const message = typeof payload.data.message === "string" ? payload.data.message : "消息流执行失败";
+            return {
+              ...nextTurn,
+              status: "failed",
+              answer: {
+                ...nextTurn.answer,
+                phase: "failed",
+                errorMessage: message,
+                content: nextTurn.answer.content || message
+              }
+            };
+          }
+
+          return nextTurn;
+        });
       });
 
       await loadChatSessions(undefined, sessionId);
-      await loadChatWorkspace(sessionId);
-      setStreamingContent("");
+      const refreshed = await loadChatWorkspace(sessionId, undefined, { silent: true });
+      if (refreshed && activeSessionIdRef.current === sessionId) {
+        setLiveTurn((currentTurn) => (currentTurn && currentTurn.localId === liveTurnLocalId ? null : currentTurn));
+      }
     } catch (error) {
-      setChatError(error instanceof Error ? error.message : "发送消息失败");
+      const message = error instanceof Error ? error.message : "发送消息失败";
+      setChatError(message);
+      setLiveTurn((currentTurn) =>
+        currentTurn
+          ? {
+              ...currentTurn,
+              status: "failed",
+              answer: {
+                ...currentTurn.answer,
+                phase: "failed",
+                errorMessage: message,
+                content: currentTurn.answer.content || message
+              }
+            }
+          : currentTurn
+      );
     } finally {
       setSendingMessage(false);
     }
@@ -1353,12 +2598,34 @@ function App() {
     void submitComposer();
   };
 
-  const toggleDetail = (id: string) => {
-    if (openDetailId === id) {
-      setOpenDetailId(null);
-      return;
+  const isTimelineExpanded = (node: TimelineNode) => {
+    const manual = expandedTimelineIds[node.id];
+    if (typeof manual === "boolean") {
+      return manual;
     }
-    setOpenDetailId(id);
+    return false;
+  };
+
+  const toggleTimelineNode = (node: TimelineNode) => {
+    setExpandedTimelineIds((current) => ({
+      ...current,
+      [node.id]: !isTimelineExpanded(node)
+    }));
+  };
+
+  const isSecondaryOutputExpanded = (item: TimelineSecondaryItem) => {
+    const manual = expandedSecondaryIds[item.id];
+    if (typeof manual === "boolean") {
+      return manual;
+    }
+    return item.outputLineCount <= 10 || item.statusLabel === "运行中";
+  };
+
+  const toggleSecondaryOutput = (item: TimelineSecondaryItem) => {
+    setExpandedSecondaryIds((current) => ({
+      ...current,
+      [item.id]: !isSecondaryOutputExpanded(item)
+    }));
   };
 
   const toggleSessionMenu = (sessionId: string) => {
@@ -1780,8 +3047,7 @@ function App() {
     <div
       className={`screen-shell ${dragging ? "is-resizing" : ""}`}
       style={{
-        gridTemplateColumns: isMobile ? "1fr" : `${leftWidth}px ${HANDLE_WIDTH}px minmax(0, 1fr)`,
-        ["--drawer-width" as string]: `${rightWidth}px`
+        gridTemplateColumns: isMobile ? "1fr" : `${leftWidth}px ${HANDLE_WIDTH}px minmax(0, 1fr)`
       }}
     >
       <aside className="left-rail">
@@ -1981,112 +3247,210 @@ function App() {
         ) : null}
 
         {activePage === "chat" ? (
-          <>
+          showEmptyChatState ? (
             <section
               ref={conversationPaneRef}
-              className={`conversation-pane ${showEmptyChatState ? "conversation-pane-empty" : ""}`}
+              className="conversation-pane conversation-pane-empty"
             >
-              {showEmptyChatState ? (
-                <div className="chat-empty-state">
-                  <div className="chat-empty-brand">
-                    <div className="chat-empty-brand-mark">
-                      <img src={logo} alt="Newman logo" className="chat-empty-brand-image" />
-                    </div>
-                    <div className="chat-empty-brand-copy">
-                      <h2>
-                        <span className="chat-empty-brand-name">Newman</span>
-                        <span className="chat-empty-brand-for">for</span>
-                        <span className="chat-empty-brand-cn">牛马</span>
-                      </h2>
-                    </div>
+              <div className="chat-empty-state">
+                <div className="chat-empty-brand">
+                  <div className="chat-empty-brand-mark">
+                    <img src={logo} alt="Newman logo" className="chat-empty-brand-image" />
                   </div>
-
-                  {renderChatComposer("hero")}
+                  <div className="chat-empty-brand-copy">
+                    <h2>
+                      <span className="chat-empty-brand-name">Newman</span>
+                      <span className="chat-empty-brand-for">for</span>
+                      <span className="chat-empty-brand-cn">牛马</span>
+                    </h2>
+                  </div>
                 </div>
-              ) : (
-                <>
-                  {chatError ? <div className="workspace-alert error">{chatError}</div> : null}
-                  {chatNotice ? <div className="workspace-alert success">{chatNotice}</div> : null}
-                  {chatLoading ? <div className="workspace-empty">正在加载会话内容...</div> : null}
 
-                  {!chatLoading && visibleMessages.length === 0 && latestTraceEntries.length === 0 && !streamingContent ? (
-                    <div className="workspace-empty">这个会话还没有内容，直接开始提需求就行。</div>
-                  ) : null}
+                {renderChatComposer("hero")}
+              </div>
+            </section>
+          ) : (
+            <div className="chat-stage">
+              <section
+                ref={conversationPaneRef}
+                className="conversation-pane conversation-pane-floating"
+              >
+                {chatError ? <div className="workspace-alert error">{chatError}</div> : null}
+                {chatNotice ? <div className="workspace-alert success">{chatNotice}</div> : null}
+                {chatLoading ? <div className="workspace-empty">正在加载会话内容...</div> : null}
 
-                  {!chatLoading ? (
-                    <>
-                      {visibleMessages.map((message) =>
-                        message.role === "user" ? (
-                          <div key={message.id}>
-                            <div className="user-row">
+                {!chatLoading ? (
+                  <>
+                    {displayTurns.length === 0 ? <div className="workspace-empty">这个会话还没有内容，直接开始提需求就行。</div> : null}
+
+                    {displayTurns.map((turn) => {
+                      const answerCopy = resolveAnswerCopy(turn.answer, turn.status);
+                      const answerTags = buildAnswerTags(turn.answer, turn.status);
+                      const showAnswerBubble = shouldRenderAnswerBubble(turn);
+                      return (
+                        <div key={turn.id} className={`turn-block ${turn.isLive ? "live" : ""}`}>
+                          <div className="user-row">
+                            <div className="turn-user-stack">
                               <div className="user-bubble">
-                                <p>{message.content}</p>
+                                <p>{turn.userMessage.content}</p>
                               </div>
                             </div>
                           </div>
-                        ) : (
-                          <div key={message.id}>
-                            <div className="trace-row">
-                              <button
-                                type="button"
-                                className={`trace-bubble wide final clickable ${
-                                  openDetailId === `assistant:${message.id}` ? "active" : ""
-                                }`}
-                                onClick={() => toggleDetail(`assistant:${message.id}`)}
-                              >
-                                <p className="trace-copy">{message.content}</p>
-                              </button>
-                            </div>
-                          </div>
-                        )
-                      )}
 
-                      {latestTraceEntries.length > 0 ? (
-                        <div className="trace-column">
-                          {latestTraceEntries.map((entry) => (
-                            <div key={entry.id} className={`trace-row ${entry.tags?.length ? "" : "compact"}`}>
-                              <button
-                                type="button"
-                                className={`trace-bubble ${entry.tags?.length ? "wide" : "compact"} clickable ${
-                                  openDetailId === entry.id ? "active" : ""
-                                }`}
-                                onClick={() => toggleDetail(entry.id)}
-                              >
-                                {entry.tags?.length ? (
-                                  <>
-                                    <p className="trace-title">{entry.text}</p>
-                                    <div className="trace-tags">
-                                      {entry.tags.map((tag) => (
-                                        <span key={tag.label} className={`status-tag ${tag.tone}`}>
-                                          {tag.label}
+                          {turn.timeline.length > 0 ? (
+                            <div className="timeline-stack trace-turn-column">
+                              {turn.timeline.map((node) => {
+                                if (node.kind === "thinking") {
+                                  if (node.state !== "running" || !turn.isLive) {
+                                    return null;
+                                  }
+                                  return (
+                                    <div key={node.id} className="thinking-logo-row" aria-label="Thinking">
+                                      <img src={logo} alt="" className="thinking-inline-logo" />
+                                      <div className="thinking-inline-copy">
+                                        <span className="thinking-inline-word">thinking</span>
+                                        <span className="thinking-inline-dots" aria-hidden="true">
+                                          <span className="thinking-inline-dot dot-one">.</span>
+                                          <span className="thinking-inline-dot dot-two">.</span>
+                                          <span className="thinking-inline-dot dot-three">.</span>
                                         </span>
-                                      ))}
+                                      </div>
                                     </div>
-                                  </>
-                                ) : (
-                                  entry.text
-                                )}
-                              </button>
+                                  );
+                                }
+
+                                const expanded = isTimelineExpanded(node);
+                                const timelineHint =
+                                  node.kind === "skill_progress"
+                                    ? "查看 skill 过程"
+                                    : node.kind === "approval"
+                                      ? "查看审批详情"
+                                      : node.kind === "error_recovery" || node.kind === "fatal_error"
+                                        ? "查看执行详情"
+                                        : "查看工具过程";
+                                return (
+                                  <article
+                                    key={node.id}
+                                    className={`timeline-node ${expanded ? "expanded" : ""} state-${node.state} kind-${node.kind}`}
+                                  >
+                                    <button
+                                      type="button"
+                                      className="timeline-primary-button"
+                                      onClick={() => toggleTimelineNode(node)}
+                                    >
+                                      <div className="timeline-primary-marker">
+                                        <span className="timeline-static-dot" />
+                                      </div>
+                                      <div className="timeline-primary-copy">
+                                        <div className="timeline-primary-meta">
+                                          <span className="timeline-primary-time">{node.time}</span>
+                                          <span className="timeline-primary-hint">{timelineHint}</span>
+                                        </div>
+                                        <p className="timeline-primary-text">{node.primaryText}</p>
+                                      </div>
+                                      <span className={`timeline-chevron ${expanded ? "expanded" : ""}`} aria-hidden="true">
+                                        ▾
+                                      </span>
+                                    </button>
+
+                                    {expanded ? (
+                                      <div className="timeline-secondary-list">
+                                        {node.secondaryItems.map((item) => {
+                                          const outputExpanded = isSecondaryOutputExpanded(item);
+                                          const outputLines = item.output ? item.output.split("\n") : [];
+                                          const visibleOutput =
+                                            item.output && !outputExpanded ? outputLines.slice(0, 10).join("\n") : item.output;
+
+                                          return (
+                                            <article
+                                              key={item.id}
+                                              className={`timeline-secondary-card ${item.cardType}`}
+                                            >
+                                              <div className="timeline-secondary-head">
+                                                <div className="timeline-secondary-head-main">
+                                                  <div className="timeline-secondary-label-row">
+                                                    <span className="timeline-secondary-label">{item.label}</span>
+                                                    <span className={`status-tag ${item.statusTone}`}>{item.statusLabel}</span>
+                                                  </div>
+                                                  <p className="timeline-secondary-subtitle">{item.subtitle}</p>
+                                                </div>
+                                              </div>
+
+                                              {item.cardType === "terminal" ? (
+                                                <div className="timeline-terminal-body">
+                                                  <div className="timeline-terminal-shelltag">Shell</div>
+                                                  <div className="timeline-terminal-command">$ {item.command || item.subtitle}</div>
+                                                  {visibleOutput ? <pre className="timeline-terminal-output">{visibleOutput}</pre> : null}
+                                                  {item.output && item.outputLineCount > 10 ? (
+                                                    <button
+                                                      type="button"
+                                                      className="timeline-output-toggle"
+                                                      onClick={() => toggleSecondaryOutput(item)}
+                                                    >
+                                                      {outputExpanded ? "收起输出" : "已运行命令 ⌄"}
+                                                    </button>
+                                                  ) : null}
+                                                </div>
+                                              ) : (
+                                                <>
+                                                  {item.meta.length > 0 ? (
+                                                    <div className="timeline-secondary-meta-row">
+                                                      {item.meta.map((metaItem) => (
+                                                        <span key={`${item.id}-${metaItem}`} className="timeline-secondary-meta">
+                                                          {metaItem}
+                                                        </span>
+                                                      ))}
+                                                    </div>
+                                                  ) : null}
+                                                  {visibleOutput ? <pre className="timeline-secondary-output">{visibleOutput}</pre> : null}
+                                                  {item.output && item.outputLineCount > 10 ? (
+                                                    <button
+                                                      type="button"
+                                                      className="timeline-output-toggle"
+                                                      onClick={() => toggleSecondaryOutput(item)}
+                                                    >
+                                                      {outputExpanded ? "收起详情" : "展开更多"}
+                                                    </button>
+                                                  ) : null}
+                                                </>
+                                              )}
+                                            </article>
+                                          );
+                                        })}
+                                      </div>
+                                    ) : null}
+                                  </article>
+                                );
+                              })}
                             </div>
-                          ))}
-                        </div>
-                      ) : null}
+                          ) : null}
 
-                      {sendingMessage || streamingContent ? (
-                        <div className="trace-row">
-                          <div className="trace-bubble wide final">
-                            <p className="trace-copy">{streamingContent || "正在生成回答..."}</p>
-                          </div>
+                          {showAnswerBubble ? (
+                            <div className="trace-row">
+                              <div className="trace-bubble wide final answer-bubble">
+                                {answerTags.length > 0 ? (
+                                  <div className="trace-tags answer-tags">
+                                    {answerTags.map((tag) => (
+                                      <span key={`${turn.id}-${tag.label}`} className={`status-tag ${tag.tone}`}>
+                                        {tag.label}
+                                      </span>
+                                    ))}
+                                  </div>
+                                ) : null}
+                                <p className="trace-copy">{answerCopy}</p>
+                              </div>
+                            </div>
+                          ) : null}
                         </div>
-                      ) : null}
-                    </>
-                  ) : null}
-                </>
-              )}
-            </section>
+                      );
+                    })}
+                  </>
+                ) : null}
+              </section>
 
-            {!showEmptyChatState ? <footer className="composer-bar">{renderChatComposer("footer")}</footer> : null}
-          </>
+              <footer className="composer-bar composer-bar-floating">{renderChatComposer("footer")}</footer>
+            </div>
+          )
         ) : null}
 
         {activePage === "skills" ? (
@@ -2165,7 +3529,7 @@ function App() {
                         >
                           <div className="skills-item-head">
                             <strong>{skill.name}</strong>
-                            <span className={`workspace-pill ${skill.source === "workspace" ? "accent" : "subtle"}`}>
+                            <span className={`workspace-pill ${skill.source === "system" ? "accent" : "subtle"}`}>
                               {skillSourceLabel(skill)}
                             </span>
                           </div>
@@ -2571,70 +3935,6 @@ function App() {
           </section>
         ) : null}
       </main>
-
-      <aside className={`right-drawer ${activePage === "chat" && selectedDetail ? "open" : ""}`}>
-        <div
-          className="drawer-resize-handle"
-          onPointerDown={() => setDragging("right")}
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="调整右侧栏宽度"
-        />
-
-        {activePage === "chat" && selectedDetail ? (
-          <div className="drawer-inner">
-            <div className="drawer-head">
-              <h3>详情</h3>
-              <button type="button" className="drawer-close" aria-label="关闭" onClick={() => setOpenDetailId(null)}>
-                ×
-              </button>
-            </div>
-
-            <div className="drawer-tabs">
-              <button type="button" className="drawer-tab active">
-                Trace
-              </button>
-              <button type="button" className="drawer-tab">
-                Tool IO
-              </button>
-              <button type="button" className="drawer-tab">
-                引用
-              </button>
-            </div>
-
-            <section className="drawer-card">
-              <span className="drawer-label">{selectedDetail.detailTitle}</span>
-              <p>{selectedDetail.summary}</p>
-            </section>
-
-            <section className="drawer-card">
-              <span className="drawer-label">输入输出</span>
-              {selectedDetail.inputs.length > 0 ? (
-                <ul className="drawer-list">
-                  {selectedDetail.inputs.map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
-              ) : (
-                <p>当前条目没有额外输入输出详情。</p>
-              )}
-            </section>
-
-            <section className="drawer-card">
-              <span className="drawer-label">引用与来源</span>
-              {selectedDetail.citations.length > 0 ? (
-                <ul className="drawer-list">
-                  {selectedDetail.citations.map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
-              ) : (
-                <p>当前条目没有额外引用信息。</p>
-              )}
-            </section>
-          </div>
-        ) : null}
-      </aside>
 
     </div>
   );
