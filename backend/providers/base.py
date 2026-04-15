@@ -31,6 +31,8 @@ class ProviderChunk:
 @dataclass
 class ProviderResponse:
     content: str = ""
+    thinking: str = ""
+    commentary: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: TokenUsage = field(default_factory=TokenUsage)
     model: str = ""

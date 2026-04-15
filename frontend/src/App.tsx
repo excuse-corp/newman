@@ -112,12 +112,13 @@ type TraceEntry = {
 };
 
 type SecondaryCardType = "terminal" | "file" | "search" | "network" | "plan" | "generic";
-type TimelineNodeKind = "thinking" | "plan" | "progress" | "skill_progress" | "approval" | "error_recovery" | "fatal_error" | "system_meta";
+type TimelineNodeKind = "thinking" | "progress" | "system_meta";
 type TimelineNodeState = "running" | "completed" | "failed" | "pending" | "approved" | "rejected" | "recovering" | "updated";
 
 type TimelineSecondaryItem = {
   id: string;
   parentId: string;
+  state: TimelineNodeState;
   label: string;
   toolName?: string | null;
   cardType: SecondaryCardType;
@@ -891,6 +892,7 @@ function buildToolSecondaryItem(
   return {
     id: detailId,
     parentId,
+    state,
     label: toolName === "terminal" ? "Shell" : toolName ?? semantic.label,
     toolName,
     cardType: semantic.cardType,
@@ -917,95 +919,9 @@ function buildToolSecondaryItem(
   };
 }
 
-function buildProgressNode(
-  event: SessionEventPayload,
-  state: TimelineNodeState,
-  output: string | null = null,
-  userPrompt?: string | null
-): TimelineNode {
-  const eventData = buildEventDataWithRequest(event);
-  const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
-  const callId = typeof eventData.tool_call_id === "string" ? eventData.tool_call_id : `${event.ts}-${event.event}`;
-  const nodeId = `node:tool:${callId}`;
-  const primaryText = resolveProgressPrimaryText(
-    toolName,
-    state === "failed" ? "failed" : state === "completed" ? "completed" : "running",
-    eventData,
-    output,
-    userPrompt
-  );
-  const status = resolveSecondaryStatusMeta(state, eventData);
-  return {
-    id: nodeId,
-    kind: "progress",
-    state,
-    time: formatEventTime(event.ts),
-    primaryText,
-    secondaryItems: [buildToolSecondaryItem(nodeId, event, state, output, userPrompt)],
-    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), primaryText, toolName ?? "执行进展", primaryText, eventData, {
-      tags: [{ label: status.label, tone: status.tone }]
-    })
-  };
-}
-
-function buildRetryNode(event: SessionEventPayload): TimelineNode {
-  const eventData = buildEventDataWithRequest(event);
-  const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
-  const nodeId = `node:retry:${event.ts}:${toolName ?? "tool"}`;
-  const primaryText = "刚才那一步没成功，我换一种方式继续";
-  return {
-    id: nodeId,
-    kind: "error_recovery",
-    state: "recovering",
-    time: formatEventTime(event.ts),
-    primaryText,
-    secondaryItems: [buildToolSecondaryItem(nodeId, event, "recovering")],
-    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), primaryText, toolName ?? "重试", primaryText, eventData, {
-      tags: [{ label: "恢复中", tone: "orange" }]
-    })
-  };
-}
-
-function buildPlanNode(event: SessionEventPayload): TimelineNode {
-  const eventData = buildEventDataWithRequest(event);
-  const nodeId = `node:plan:${event.ts}`;
-  const subtitle = buildPlanSubtitle(eventData.plan);
-  const detailSummary = typeof eventData.summary === "string" && eventData.summary ? eventData.summary : subtitle;
-  return {
-    id: nodeId,
-    kind: "plan",
-    state: "updated",
-    time: formatEventTime(event.ts),
-    primaryText: "执行步骤已更新",
-    secondaryItems: [
-      {
-        id: `secondary:${nodeId}`,
-        parentId: nodeId,
-        label: "计划",
-        toolName: "update_plan",
-        cardType: "plan",
-        subtitle,
-        statusLabel: "已更新",
-        statusTone: "blue",
-        meta: [],
-        output: typeof eventData.plan === "undefined" ? null : stringifyForPanel(eventData.plan),
-        outputLineCount: countOutputLines(typeof eventData.plan === "undefined" ? null : stringifyForPanel(eventData.plan)),
-        detail: buildTraceDetail(
-          `secondary:${nodeId}`,
-          "trace",
-          formatEventTime(event.ts),
-          "计划",
-          "计划详情",
-          detailSummary,
-          eventData,
-          { output: typeof eventData.plan === "undefined" ? null : stringifyForPanel(eventData.plan) }
-        )
-      }
-    ],
-    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), "执行步骤已更新", "计划更新", detailSummary, eventData, {
-      tags: [{ label: "计划", tone: "blue" }]
-    })
-  };
+function summarizeCommentaryContent(content: string | null | undefined, fallback: string) {
+  const normalized = (content ?? "").replace(/\s+/g, " ").trim();
+  return normalized || fallback;
 }
 
 function summarizeThinkingContent(content: string | null | undefined, state: TimelineNodeState) {
@@ -1048,186 +964,106 @@ function buildThinkingNode(
   };
 }
 
-function buildSkillNode(event: SessionEventPayload): TimelineNode {
+function buildProgressGroupNode(groupId: string, event: SessionEventPayload, primaryText: string): TimelineNode {
+  const eventData = buildEventDataWithRequest(event);
+  const nodeId = `node:group:${groupId}`;
+  const status = resolveSecondaryStatusMeta("running", eventData);
+  return {
+    id: nodeId,
+    kind: "progress",
+    state: "running",
+    time: formatEventTime(event.ts),
+    primaryText,
+    secondaryItems: [],
+    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), primaryText, "执行进展", primaryText, eventData, {
+      tags: [{ label: status.label, tone: status.tone }]
+    })
+  };
+}
+
+function buildSkillSecondaryItem(parentId: string, event: SessionEventPayload): TimelineSecondaryItem {
   const eventData = buildEventDataWithRequest(event);
   const skillName = typeof eventData.event === "string" ? eventData.event : "Skill";
   const message = typeof eventData.message === "string" && eventData.message ? eventData.message : "这个分析步骤已完成";
-  const contextOutput =
-    typeof eventData.context === "undefined" ? null : stringifyForPanel(eventData.context);
-  const nodeId = `node:skill:${event.ts}:${skillName}`;
+  const contextOutput = typeof eventData.context === "undefined" ? null : stringifyForPanel(eventData.context);
+  const contextTool =
+    eventData.context && typeof eventData.context === "object" && "tool" in eventData.context && typeof eventData.context.tool === "string"
+      ? eventData.context.tool
+      : null;
+  const detailId = `secondary:skill:${parentId}:${event.ts}:${skillName}`;
+
   return {
-    id: nodeId,
-    kind: "skill_progress",
+    id: detailId,
+    parentId,
     state: "completed",
-    time: formatEventTime(event.ts),
-    primaryText: "这个分析步骤已完成",
-    secondaryItems: [
-      {
-        id: `secondary:${nodeId}`,
-        parentId: nodeId,
-        label: skillName,
-        toolName: null,
-        cardType: "generic",
-        subtitle: message,
-        statusLabel: "已完成",
-        statusTone: "green",
-        meta: ["Skill"],
-        output: contextOutput,
-        outputLineCount: countOutputLines(contextOutput),
-        detail: buildTraceDetail(
-          `secondary:${nodeId}`,
-          "skill",
-          formatEventTime(event.ts),
-          skillName,
-          "Skill 详情",
-          message,
-          eventData,
-          {
-            output: contextOutput,
-            tags: [{ label: "Skill", tone: "green" }]
-          }
-        )
-      }
-    ],
+    label: skillName,
+    toolName: null,
+    cardType: "generic",
+    subtitle: message,
+    statusLabel: "已完成",
+    statusTone: "green",
+    meta: contextTool ? ["Skill", contextTool] : ["Skill"],
+    output: contextOutput,
+    outputLineCount: countOutputLines(contextOutput),
     detail: buildTraceDetail(
-      nodeId,
+      detailId,
       "skill",
       formatEventTime(event.ts),
-      "这个分析步骤已完成",
-      "Skill 进展",
+      skillName,
+      "Skill 详情",
       message,
       eventData,
       {
+        output: contextOutput,
         tags: [{ label: "Skill", tone: "green" }]
       }
     )
   };
 }
 
-function buildApprovalNode(event: SessionEventPayload, state: "pending" | "approved" | "rejected"): TimelineNode {
-  const eventData = buildEventDataWithRequest(event);
-  const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
-  const requestId =
-    typeof eventData.approval_request_id === "string" ? eventData.approval_request_id : `${event.ts}-${toolName ?? "approval"}`;
-  const nodeId = `node:approval:${requestId}`;
-  const primaryText =
-    state === "pending"
-      ? "这一步需要你确认后我才能继续"
-      : state === "approved"
-        ? "已获得你的确认，继续处理中"
-        : "你已拒绝这一步，我将改用别的方法";
-  const status = resolveSecondaryStatusMeta(state, eventData);
-  const args = extractEventArguments(eventData);
-  return {
-    id: nodeId,
-    kind: "approval",
-    state,
-    time: formatEventTime(event.ts),
-    primaryText,
-    secondaryItems: [
-      {
-        id: `secondary:${nodeId}`,
-        parentId: nodeId,
-        label: toolName ?? "审批",
-        toolName,
-        cardType: "generic",
-        subtitle: buildToolSecondarySubtitle(toolName, eventData),
-        statusLabel: status.label,
-        statusTone: status.tone,
-        meta: typeof eventData.timeout_seconds === "number" ? [`${eventData.timeout_seconds}s 超时`] : [],
-        output: args ? stringifyForPanel(args) : null,
-        outputLineCount: countOutputLines(args ? stringifyForPanel(args) : null),
-        detail: buildTraceDetail(
-          `secondary:${nodeId}`,
-          "trace",
-          formatEventTime(event.ts),
-          toolName ?? "审批",
-          "审批详情",
-          (typeof eventData.summary === "string" && eventData.summary) ||
-            (typeof eventData.reason === "string" && eventData.reason) ||
-            primaryText,
-          eventData,
-          {
-            output: args ? stringifyForPanel(args) : null,
-            tags: [{ label: status.label, tone: status.tone }]
-          }
-        )
-      }
-    ],
-    detail: buildTraceDetail(
-      nodeId,
-      "trace",
-      formatEventTime(event.ts),
-      primaryText,
-      state === "pending" ? "审批请求" : "审批结果",
-      (typeof eventData.summary === "string" && eventData.summary) ||
-        (typeof eventData.reason === "string" && eventData.reason) ||
-        primaryText,
-      eventData,
-      {
-        tags: [{ label: status.label, tone: status.tone }]
-      }
-    )
-  };
+function upsertProgressSecondaryItem(node: TimelineNode, item: TimelineSecondaryItem) {
+  const existingIndex = node.secondaryItems.findIndex((currentItem) => currentItem.id === item.id);
+  if (existingIndex === -1) {
+    node.secondaryItems.push(item);
+    return;
+  }
+  node.secondaryItems[existingIndex] = item;
 }
 
-function buildErrorRecoveryNode(event: SessionEventPayload): TimelineNode {
+function resolveProgressGroupState(items: TimelineSecondaryItem[]): TimelineNodeState {
+  if (items.some((item) => item.state === "failed" || item.state === "rejected")) {
+    return "failed";
+  }
+  if (items.some((item) => item.state === "running" || item.state === "pending" || item.state === "recovering")) {
+    return "running";
+  }
+  return items.length > 0 ? "completed" : "running";
+}
+
+function refreshProgressGroupNode(
+  node: TimelineNode,
+  event: SessionEventPayload,
+  primaryText: string,
+  detailSummary?: string | null
+) {
   const eventData = buildEventDataWithRequest(event);
-  const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
-  const recoveryClass = typeof eventData.recovery_class === "string" ? eventData.recovery_class : "recoverable";
-  const state = recoveryClass === "fatal" || recoveryClass === "blocked" ? "failed" : "recovering";
-  const nodeId = `node:error-recovery:${typeof eventData.tool_call_id === "string" ? eventData.tool_call_id : event.ts}`;
-  const primaryText =
-    state === "recovering" ? "刚才那一步失败了，我正在调整后继续" : "这一步暂时没成功，需要你关注一下";
-  const status = resolveSecondaryStatusMeta(state, eventData);
-  return {
-    id: nodeId,
-    kind: "error_recovery",
-    state,
-    time: formatEventTime(event.ts),
+  const nextState = resolveProgressGroupState(node.secondaryItems);
+  const status = resolveSecondaryStatusMeta(nextState, eventData);
+  node.state = nextState;
+  node.time = formatEventTime(event.ts);
+  node.primaryText = primaryText;
+  node.detail = buildTraceDetail(
+    node.id,
+    "trace",
+    formatEventTime(event.ts),
     primaryText,
-    secondaryItems: [buildToolSecondaryItem(nodeId, event, state)],
-    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), primaryText, toolName ?? "错误恢复", primaryText, eventData, {
+    "执行进展",
+    detailSummary || primaryText,
+    eventData,
+    {
       tags: [{ label: status.label, tone: status.tone }]
-    })
-  };
-}
-
-function buildFatalErrorNode(event: SessionEventPayload): TimelineNode {
-  const eventData = buildEventDataWithRequest(event);
-  const message =
-    (typeof eventData.frontend_message === "string" && eventData.frontend_message) ||
-    (typeof eventData.message === "string" && eventData.message) ||
-    "这次执行中断了，请查看错误详情";
-  const nodeId = `node:fatal:${event.ts}`;
-  const category = typeof eventData.category === "string" ? eventData.category : null;
-  return {
-    id: nodeId,
-    kind: "fatal_error",
-    state: "failed",
-    time: formatEventTime(event.ts),
-    primaryText: "这次执行中断了，请查看错误详情",
-    secondaryItems: [
-      {
-        id: `secondary:${nodeId}`,
-        parentId: nodeId,
-        label: category ?? "错误",
-        cardType: "generic",
-        subtitle: message,
-        statusLabel: "失败",
-        statusTone: "orange",
-        meta: category ? [category] : [],
-        output: null,
-        outputLineCount: 0,
-        detail: buildTraceDetail(`secondary:${nodeId}`, "trace", formatEventTime(event.ts), message, "错误详情", message, eventData, {
-          tags: [{ label: "失败", tone: "orange" }]
-        })
-      }
-    ],
-    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), "这次执行中断了，请查看错误详情", "运行错误", message, eventData, {
-      tags: [{ label: "错误", tone: "orange" }]
-    })
-  };
+    }
+  );
 }
 
 function applyTurnIdToNode(node: TimelineNode, turnId: string) {
@@ -1274,21 +1110,17 @@ function findNodeById(nodes: TimelineNode[], nodeId: string) {
   return { node: nodes[index], index };
 }
 
-function findRecentToolNodeId(nodes: TimelineNode[], toolName: string | null | undefined) {
-  for (let index = nodes.length - 1; index >= 0; index -= 1) {
-    const node = nodes[index];
-    if (node.secondaryItems.some((item) => item.toolName === toolName)) {
-      return node.id;
-    }
-  }
-  return null;
-}
-
-function buildTimelineNodes(events: SessionEventPayload[], toolMessages: SessionMessageRecord[], userPrompt?: string | null) {
+function buildTimelineNodes(
+  events: SessionEventPayload[],
+  toolMessages: SessionMessageRecord[],
+  assistantToolMessages: SessionMessageRecord[] = [],
+  userPrompt?: string | null
+) {
   const nodes: TimelineNode[] = [];
-  const toolCallToNodeId = new Map<string, string>();
-  const approvalToNodeId = new Map<string, string>();
+  const progressNodeByGroupId = new Map<string, TimelineNode>();
+  const toolCallToGroupId = new Map<string, string>();
   const toolMessageByCallId = new Map<string, SessionMessageRecord>();
+  const commentaryByGroupId = new Map<string, string>();
   let thinkingNodeId: string | null = null;
 
   toolMessages.forEach((message) => {
@@ -1298,11 +1130,51 @@ function buildTimelineNodes(events: SessionEventPayload[], toolMessages: Session
     }
   });
 
+  assistantToolMessages.forEach((message) => {
+    const groupId = typeof message.metadata.group_id === "string" ? message.metadata.group_id : null;
+    if (!groupId) {
+      return;
+    }
+    const rawCommentary =
+      typeof message.metadata.commentary === "string" && message.metadata.commentary
+        ? message.metadata.commentary
+        : message.content;
+    const commentary = summarizeCommentaryContent(rawCommentary, "");
+    if (commentary) {
+      commentaryByGroupId.set(groupId, commentary);
+    }
+  });
+
+  const resolveGroupId = (eventData: Record<string, unknown>, toolCallId: string | null) => {
+    if (typeof eventData.group_id === "string" && eventData.group_id) {
+      return eventData.group_id;
+    }
+    if (eventData.context && typeof eventData.context === "object" && "group_id" in eventData.context) {
+      const nestedGroupId = eventData.context.group_id;
+      if (typeof nestedGroupId === "string" && nestedGroupId) {
+        return nestedGroupId;
+      }
+    }
+    if (toolCallId) {
+      return toolCallToGroupId.get(toolCallId) ?? `legacy:${toolCallId}`;
+    }
+    return null;
+  };
+
+  const ensureProgressNode = (groupId: string, event: SessionEventPayload, primaryText: string) => {
+    const existingNode = progressNodeByGroupId.get(groupId);
+    if (existingNode) {
+      return existingNode;
+    }
+    const nextNode = buildProgressGroupNode(groupId, event, primaryText);
+    nodes.push(nextNode);
+    progressNodeByGroupId.set(groupId, nextNode);
+    return nextNode;
+  };
+
   events.forEach((event) => {
     const eventData = buildEventDataWithRequest(event);
     const toolCallId = typeof eventData.tool_call_id === "string" ? eventData.tool_call_id : null;
-    const approvalRequestId = typeof eventData.approval_request_id === "string" ? eventData.approval_request_id : null;
-    const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
     const toolOutput = toolCallId ? toolMessageByCallId.get(toolCallId)?.content ?? null : null;
 
     if (event.event === "thinking_delta" || event.event === "thinking_complete") {
@@ -1327,90 +1199,71 @@ function buildTimelineNodes(events: SessionEventPayload[], toolMessages: Session
       return;
     }
 
+    if (event.event === "commentary_delta" || event.event === "commentary_complete") {
+      const groupId = resolveGroupId(eventData, toolCallId);
+      if (!groupId) {
+        return;
+      }
+      const commentary = summarizeCommentaryContent(
+        typeof eventData.content === "string" ? eventData.content : commentaryByGroupId.get(groupId) ?? "",
+        "我先继续处理这一步"
+      );
+      commentaryByGroupId.set(groupId, commentary);
+      const node = ensureProgressNode(groupId, event, commentary);
+      refreshProgressGroupNode(node, event, commentary, commentary);
+      return;
+    }
+
     if (event.event === "tool_call_started") {
-      const node = buildProgressNode(event, "running", toolOutput, userPrompt);
-      nodes.push(node);
+      const groupId = resolveGroupId(eventData, toolCallId);
+      if (!groupId) {
+        return;
+      }
+      const primaryText =
+        commentaryByGroupId.get(groupId) ||
+        resolveProgressPrimaryText("tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null, "running", eventData, toolOutput, userPrompt);
+      const node = ensureProgressNode(groupId, event, primaryText);
+      const item = buildToolSecondaryItem(node.id, event, "running", toolOutput, userPrompt);
+      upsertProgressSecondaryItem(node, item);
+      refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
       if (toolCallId) {
-        toolCallToNodeId.set(toolCallId, node.id);
+        toolCallToGroupId.set(toolCallId, groupId);
       }
       return;
     }
 
     if (event.event === "tool_call_finished") {
-      const nextNode = buildProgressNode(event, Boolean(eventData.success) ? "completed" : "failed", toolOutput, userPrompt);
-      const existingNodeId = toolCallId ? toolCallToNodeId.get(toolCallId) ?? null : null;
-      const existing = existingNodeId ? findNodeById(nodes, existingNodeId) : null;
-      if (existing) {
-        nodes[existing.index] = preserveNodeIdentity(existing.node, nextNode);
-      } else {
-        nodes.push(nextNode);
+      const groupId = resolveGroupId(eventData, toolCallId);
+      if (!groupId) {
+        return;
       }
+      const nextState = Boolean(eventData.success) ? "completed" : "failed";
+      const primaryText =
+        commentaryByGroupId.get(groupId) ||
+        resolveProgressPrimaryText("tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null, nextState, eventData, toolOutput, userPrompt);
+      const node = ensureProgressNode(groupId, event, primaryText);
+      const item = buildToolSecondaryItem(node.id, event, nextState, toolOutput, userPrompt);
+      upsertProgressSecondaryItem(node, item);
+      refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
       if (toolCallId) {
-        toolCallToNodeId.set(toolCallId, existing?.node.id ?? nextNode.id);
+        toolCallToGroupId.set(toolCallId, groupId);
       }
-      return;
-    }
-
-    if (event.event === "tool_retry_scheduled") {
-      const retryNode = buildRetryNode(event);
-      const existingNodeId = findRecentToolNodeId(nodes, toolName);
-      const existing = existingNodeId ? findNodeById(nodes, existingNodeId) : null;
-      if (existing) {
-        nodes[existing.index] = preserveNodeIdentity(existing.node, retryNode);
-      } else {
-        nodes.push(retryNode);
-      }
-      return;
-    }
-
-    if (event.event === "tool_error_feedback") {
-      const recoveryNode = buildErrorRecoveryNode(event);
-      const existingNodeId = toolCallId ? toolCallToNodeId.get(toolCallId) ?? null : findRecentToolNodeId(nodes, toolName);
-      const existing = existingNodeId ? findNodeById(nodes, existingNodeId) : null;
-      if (existing) {
-        nodes[existing.index] = preserveNodeIdentity(existing.node, recoveryNode);
-      } else {
-        nodes.push(recoveryNode);
-      }
-      return;
-    }
-
-    if (event.event === "tool_approval_request") {
-      const node = buildApprovalNode(event, "pending");
-      nodes.push(node);
-      if (approvalRequestId) {
-        approvalToNodeId.set(approvalRequestId, node.id);
-      }
-      return;
-    }
-
-    if (event.event === "tool_approval_resolved") {
-      const node = buildApprovalNode(event, Boolean(eventData.approved) ? "approved" : "rejected");
-      const existingNodeId = approvalRequestId ? approvalToNodeId.get(approvalRequestId) ?? null : null;
-      const existing = existingNodeId ? findNodeById(nodes, existingNodeId) : null;
-      if (existing) {
-        nodes[existing.index] = preserveNodeIdentity(existing.node, node);
-      } else {
-        nodes.push(node);
-      }
-      if (approvalRequestId) {
-        approvalToNodeId.set(approvalRequestId, existing?.node.id ?? node.id);
-      }
-      return;
-    }
-
-    if (event.event === "plan_updated") {
-      nodes.push(buildPlanNode(event));
       return;
     }
 
     if (event.event === "hook_triggered") {
-      nodes.push(buildSkillNode(event));
+      const groupId = resolveGroupId(eventData, toolCallId);
+      if (!groupId) {
+        return;
+      }
+      const primaryText =
+        commentaryByGroupId.get(groupId) ||
+        summarizeCommentaryContent(typeof eventData.message === "string" ? eventData.message : "", "我先继续处理这一步");
+      const node = ensureProgressNode(groupId, event, primaryText);
+      const item = buildSkillSecondaryItem(node.id, event);
+      upsertProgressSecondaryItem(node, item);
+      refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
       return;
-    }
-
-    if (event.event === "error") {
-      nodes.push(buildFatalErrorNode(event));
     }
   });
 
@@ -1477,6 +1330,7 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
   const turns: ChatTurn[] = [];
   const turnsById = new Map<string, ChatTurn>();
   const toolMessagesByTurn = new Map<string, SessionMessageRecord[]>();
+  const assistantToolMessagesByTurn = new Map<string, SessionMessageRecord[]>();
   const eventsByTurn = new Map<string, SessionEventPayload[]>();
 
   messages.forEach((message) => {
@@ -1518,6 +1372,15 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
 
   messages.forEach((message) => {
     if (message.role !== "assistant" || isAssistantToolCallMessage(message)) {
+      if (message.role === "assistant" && isAssistantToolCallMessage(message)) {
+        const turnId = readTurnId(message.metadata);
+        if (!turnId) {
+          return;
+        }
+        const items = assistantToolMessagesByTurn.get(turnId) ?? [];
+        items.push(message);
+        assistantToolMessagesByTurn.set(turnId, items);
+      }
       return;
     }
 
@@ -1605,6 +1468,7 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
     turn.timeline = buildTimelineNodes(
       eventsByTurn.get(turn.id) ?? [],
       toolMessagesByTurn.get(turn.id) ?? [],
+      assistantToolMessagesByTurn.get(turn.id) ?? [],
       turn.userMessage.content
     ).map((node) =>
       applyTurnIdToNode(node, turn.id)
@@ -1630,6 +1494,7 @@ function buildLiveTurn(liveTurn: LiveTurnState, sessionEvents: SessionEventPaylo
   const turnEvents = sessionEvents.filter((event) => matchLiveTurnEvent(event, liveTurn));
   const timeline = buildTimelineNodes(
     turnEvents,
+    [],
     [],
     liveTurn.userMessage.content
   ).map((node) => applyTurnIdToNode(node, turnId));
@@ -2485,7 +2350,12 @@ function App() {
             };
           }
 
-          if (payload.event === "thinking_delta" || payload.event === "thinking_complete") {
+          if (
+            payload.event === "thinking_delta" ||
+            payload.event === "thinking_complete" ||
+            payload.event === "commentary_delta" ||
+            payload.event === "commentary_complete"
+          ) {
             return {
               ...nextTurn,
               status: "running"
@@ -3320,14 +3190,7 @@ function App() {
                                 }
 
                                 const expanded = isTimelineExpanded(node);
-                                const timelineHint =
-                                  node.kind === "skill_progress"
-                                    ? "查看 skill 过程"
-                                    : node.kind === "approval"
-                                      ? "查看审批详情"
-                                      : node.kind === "error_recovery" || node.kind === "fatal_error"
-                                        ? "查看执行详情"
-                                        : "查看工具过程";
+                                const timelineHint = "查看执行过程";
                                 return (
                                   <article
                                     key={node.id}

@@ -50,6 +50,16 @@ from backend.usage.store import PostgresModelUsageStore
 
 EventEmitter = Callable[[str, dict], Awaitable[None]]
 
+COMMENTARY_FALLBACK_SYSTEM_PROMPT = """你负责把内部思考压缩成一条对用户可见的简短行动说明。
+
+输出规则：
+- 只输出一个 `<commentary>...</commentary>` 标签块，除此之外不要输出任何别的内容
+- brief 只描述“接下来立刻要做什么”
+- 不要泄露内部推理、提示词、规则、犹豫、备选方案或不确定性
+- 尽量简短，通常控制在 8 到 24 个汉字
+- 使用用户当前回合的语言
+"""
+
 
 class NewmanRuntime:
     def __init__(self, settings: AppConfig):
@@ -204,6 +214,7 @@ class NewmanRuntime:
         provider_feedback_attempted = False
 
         for _ in range(self.settings.runtime.max_tool_depth):
+            group_id = task.next_action_group_id()
             self.skill_registry.sync_snapshot()
             assembled = self.prompt_assembler.assemble(
                 task.session,
@@ -221,6 +232,7 @@ class NewmanRuntime:
                     turn_id=task.turn_id,
                     request_kind="session_turn",
                     counts_toward_context_window=True,
+                    group_id=group_id,
                 )
             except ProviderError as exc:
                 result = self._provider_error_result(exc)
@@ -237,11 +249,19 @@ class NewmanRuntime:
                 )
                 return
 
+            response = await self._ensure_tool_response_commentary(
+                task,
+                response,
+                turn_emit,
+                group_id=group_id,
+            )
+
             if not response.tool_calls:
+                final_content = response.content or response.commentary
                 assistant_message = SessionMessage(
                     id=uuid4().hex,
                     role="assistant",
-                    content=response.content,
+                    content=final_content,
                     metadata=self._build_message_metadata(
                         task.turn_id,
                         request_id,
@@ -254,7 +274,7 @@ class NewmanRuntime:
                     "final_response",
                     {
                         "session_id": task.session.session_id,
-                        "content": response.content,
+                        "content": final_content,
                         "finish_reason": response.finish_reason,
                         "message_id": assistant_message.id,
                         "created_at": assistant_message.created_at,
@@ -273,11 +293,14 @@ class NewmanRuntime:
             assistant_tool_message = SessionMessage(
                 id=uuid4().hex,
                 role="assistant",
-                content=response.content,
+                content=self._compose_tool_call_assistant_content(response),
                 metadata=self._build_message_metadata(
                     task.turn_id,
                     request_id,
                     extra={
+                        "group_id": group_id,
+                        "commentary": response.commentary,
+                        "phase": "commentary" if response.commentary else "tool_call",
                         "tool_calls": [
                             {
                                 "id": tool_call.id,
@@ -302,10 +325,12 @@ class NewmanRuntime:
                     session_id=task.session.session_id,
                     tool=tool_call.name,
                     arguments=tool_call.arguments,
+                    group_id=group_id,
                 )
                 await turn_emit(
                     "tool_call_started",
                     {
+                        "group_id": group_id,
                         "tool_call_id": tool_call.id,
                         "tool": tool_call.name,
                         "arguments": tool_call.arguments,
@@ -332,6 +357,7 @@ class NewmanRuntime:
                         metadata={
                             "turn_id": task.turn_id,
                             **({"request_id": request_id} if request_id else {}),
+                            "group_id": group_id,
                             "tool_call_id": tool_call.id,
                             "tool": result.tool,
                             "category": result.category,
@@ -349,6 +375,7 @@ class NewmanRuntime:
                 await turn_emit(
                     "tool_call_finished",
                     {
+                        "group_id": group_id,
                         "tool_call_id": tool_call.id,
                         "tool": result.tool,
                         "success": result.success,
@@ -380,6 +407,7 @@ class NewmanRuntime:
                     tool=result.tool,
                     success=result.success,
                     category=result.category,
+                    group_id=group_id,
                 )
                 if result.success and result.tool in {"write_file", "edit_file"}:
                     changed_path = result.metadata.get("path")
@@ -392,6 +420,7 @@ class NewmanRuntime:
                             session_id=task.session.session_id,
                             tool=result.tool,
                             path=changed_path,
+                            group_id=group_id,
                         )
                 if result.success and result.tool == "terminal":
                     command = str(tool_call.arguments.get("command", ""))
@@ -442,55 +471,58 @@ class NewmanRuntime:
         turn_id: str | None,
         request_kind: str,
         counts_toward_context_window: bool,
+        group_id: str | None = None,
     ) -> ProviderResponse:
         content_parts: list[str] = []
         thinking_parts: list[str] = []
+        commentary_parts: list[str] = []
         tool_calls = []
         finish_reason = "stop"
         usage = TokenUsage()
         parser = ThinkTagStreamParser()
-        async for chunk in self.provider.chat_stream(assembled, tools=tools):
-            if chunk.type == "text" and chunk.delta:
-                for event in parser.feed(chunk.delta):
-                    if event.kind == "answer" and event.text:
-                        content_parts.append(event.text)
-                        await emit(
-                            "assistant_delta",
-                            {
-                                "content": "".join(content_parts),
-                                "delta": event.text,
-                                "model": self.settings.provider.model,
-                            },
-                        )
-                        continue
-                    if event.kind == "thinking" and event.text:
-                        thinking_parts.append(event.text)
-                        await emit(
-                            "thinking_delta",
-                            {
-                                "content": "".join(thinking_parts),
-                                "delta": event.text,
-                                "model": self.settings.provider.model,
-                            },
-                        )
-                        continue
-                    if event.kind == "thinking_complete":
-                        await emit(
-                            "thinking_complete",
-                            {
-                                "content": "".join(thinking_parts),
-                                "model": self.settings.provider.model,
-                            },
-                        )
-            elif chunk.type == "tool_call" and chunk.tool_call:
-                tool_calls.append(chunk.tool_call)
-            elif chunk.type == "usage" and chunk.usage:
-                usage = chunk.usage
-            elif chunk.type == "done":
-                finish_reason = chunk.finish_reason or finish_reason
-                if chunk.usage:
-                    usage = chunk.usage
-        for event in parser.flush():
+        commentary_visible = False
+        commentary_complete_pending = False
+
+        async def flush_commentary(*, force: bool = False, delta: str | None = None) -> None:
+            nonlocal commentary_visible, commentary_complete_pending
+            if not group_id or not commentary_parts:
+                return
+            if not commentary_visible:
+                if not force and not tool_calls:
+                    return
+                commentary_visible = True
+                await emit(
+                    "commentary_delta",
+                    {
+                        "group_id": group_id,
+                        "content": "".join(commentary_parts),
+                        "delta": "".join(commentary_parts),
+                        "model": self.settings.provider.model,
+                    },
+                )
+            elif delta:
+                await emit(
+                    "commentary_delta",
+                    {
+                        "group_id": group_id,
+                        "content": "".join(commentary_parts),
+                        "delta": delta,
+                        "model": self.settings.provider.model,
+                    },
+                )
+            if commentary_complete_pending:
+                await emit(
+                    "commentary_complete",
+                    {
+                        "group_id": group_id,
+                        "content": "".join(commentary_parts),
+                        "model": self.settings.provider.model,
+                    },
+                )
+                commentary_complete_pending = False
+
+        async def consume_parse_event(event) -> None:
+            nonlocal commentary_complete_pending
             if event.kind == "answer" and event.text:
                 content_parts.append(event.text)
                 await emit(
@@ -501,7 +533,7 @@ class NewmanRuntime:
                         "model": self.settings.provider.model,
                     },
                 )
-                continue
+                return
             if event.kind == "thinking" and event.text:
                 thinking_parts.append(event.text)
                 await emit(
@@ -512,7 +544,7 @@ class NewmanRuntime:
                         "model": self.settings.provider.model,
                     },
                 )
-                continue
+                return
             if event.kind == "thinking_complete":
                 await emit(
                     "thinking_complete",
@@ -521,8 +553,35 @@ class NewmanRuntime:
                         "model": self.settings.provider.model,
                     },
                 )
+                return
+            if event.kind == "commentary" and event.text:
+                commentary_parts.append(event.text)
+                await flush_commentary(delta=event.text)
+                return
+            if event.kind == "commentary_complete":
+                commentary_complete_pending = True
+                await flush_commentary()
+
+        async for chunk in self.provider.chat_stream(assembled, tools=tools):
+            if chunk.type == "text" and chunk.delta:
+                for event in parser.feed(chunk.delta):
+                    await consume_parse_event(event)
+            elif chunk.type == "tool_call" and chunk.tool_call:
+                tool_calls.append(chunk.tool_call)
+                await flush_commentary(force=True)
+            elif chunk.type == "usage" and chunk.usage:
+                usage = chunk.usage
+            elif chunk.type == "done":
+                finish_reason = chunk.finish_reason or finish_reason
+                if chunk.usage:
+                    usage = chunk.usage
+        for event in parser.flush():
+            await consume_parse_event(event)
+        await flush_commentary(force=bool(tool_calls))
         response = ProviderResponse(
             content="".join(content_parts),
+            thinking="".join(thinking_parts),
+            commentary="".join(commentary_parts),
             tool_calls=tool_calls,
             usage=usage,
             model=self.settings.provider.model,
@@ -543,12 +602,101 @@ class NewmanRuntime:
                     "tool_schema_count": len(tools),
                     "estimated_input_tokens": self.provider.estimate_tokens(assembled),
                     "response_content_length": len(response.content),
+                    "response_thinking_length": len(response.thinking),
+                    "response_commentary_length": len(response.commentary),
                     "tool_call_count": len(response.tool_calls),
                 },
             ),
             response,
         )
         return response
+
+    async def _ensure_tool_response_commentary(
+        self,
+        task: SessionTask,
+        response: ProviderResponse,
+        emit: EventEmitter,
+        *,
+        group_id: str,
+    ) -> ProviderResponse:
+        if not response.tool_calls or response.commentary.strip():
+            return response
+
+        commentary = await self._generate_commentary_from_thinking(task, response)
+        if not commentary:
+            return response
+
+        response.commentary = commentary
+        await emit(
+            "commentary_delta",
+            {
+                "group_id": group_id,
+                "content": commentary,
+                "delta": commentary,
+                "model": response.model or self.settings.provider.model,
+            },
+        )
+        await emit(
+            "commentary_complete",
+            {
+                "group_id": group_id,
+                "content": commentary,
+                "model": response.model or self.settings.provider.model,
+            },
+        )
+        return response
+
+    async def _generate_commentary_from_thinking(
+        self,
+        task: SessionTask,
+        response: ProviderResponse,
+    ) -> str:
+        thinking = response.thinking.strip()
+        if not thinking:
+            return ""
+        thinking_excerpt = thinking[:1600]
+
+        user_content = self._current_turn_user_content(task.session, task.turn_id)
+        tool_names = ", ".join(tool_call.name for tool_call in response.tool_calls) or "无"
+        messages = [
+            {"role": "system", "content": COMMENTARY_FALLBACK_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "请基于下面的信息生成一句工具调用前的 brief。\n\n"
+                    f"用户请求：\n{user_content or '（未找到）'}\n\n"
+                    f"即将执行的工具：\n{tool_names}\n\n"
+                    f"内部思考：\n{thinking_excerpt}"
+                ),
+            },
+        ]
+        try:
+            fallback = await self.provider.chat(messages, tools=[])
+        except ProviderError:
+            return ""
+
+        record_model_usage(
+            self.usage_store,
+            ModelRequestContext(
+                request_kind="commentary_fallback",
+                model_config=self.settings.provider,
+                provider_type=self.settings.provider.type,
+                streaming=False,
+                counts_toward_context_window=False,
+                session_id=task.session.session_id,
+                turn_id=task.turn_id,
+                metadata={
+                    "tool_names": [tool_call.name for tool_call in response.tool_calls],
+                    "thinking_length": len(thinking),
+                    "thinking_excerpt_length": len(thinking_excerpt),
+                },
+            ),
+            fallback,
+        )
+
+        commentary, answer = self._parse_response_text(fallback.content)
+        brief = commentary.strip() or answer.strip()
+        return self._sanitize_commentary_brief(brief)
 
     async def _record_failure_feedback(
         self,
@@ -784,6 +932,43 @@ class NewmanRuntime:
         lines.append("如果你愿意，我可以先不依赖这个工具，直接基于现有上下文继续回答。")
         return "\n".join(lines)
 
+    def _compose_tool_call_assistant_content(self, response: ProviderResponse) -> str:
+        commentary = response.commentary.strip()
+        content = response.content.strip()
+        if commentary and content:
+            return f"{commentary}\n\n{content}"
+        return commentary or content
+
+    def _parse_response_text(self, text: str) -> tuple[str, str]:
+        parser = ThinkTagStreamParser()
+        commentary_parts: list[str] = []
+        answer_parts: list[str] = []
+        for event in parser.feed(text):
+            if event.kind == "commentary" and event.text:
+                commentary_parts.append(event.text)
+            elif event.kind == "answer" and event.text:
+                answer_parts.append(event.text)
+        for event in parser.flush():
+            if event.kind == "commentary" and event.text:
+                commentary_parts.append(event.text)
+            elif event.kind == "answer" and event.text:
+                answer_parts.append(event.text)
+        return "".join(commentary_parts), "".join(answer_parts)
+
+    def _sanitize_commentary_brief(self, text: str) -> str:
+        return " ".join(text.replace("\n", " ").split()).strip()
+
+    def _current_turn_user_content(self, session, turn_id: str) -> str:
+        for message in reversed(session.messages):
+            if message.role != "user":
+                continue
+            if message.metadata.get("turn_id") == turn_id:
+                return message.content
+        for message in reversed(session.messages):
+            if message.role == "user":
+                return message.content
+        return ""
+
     def _provider_error_result(self, error: ProviderError) -> ToolExecutionResult:
         result = ToolExecutionResult(
             success=False,
@@ -836,10 +1021,17 @@ class NewmanRuntime:
         )
 
     async def _emit_hooks(self, event: str, emit: EventEmitter, **data) -> None:
+        group_id = data.get("group_id")
         for message in self.hook_manager.messages_for(event):
-            await emit("hook_triggered", {"event": event, "message": message, "context": data})
+            payload = {"event": event, "message": message, "context": data}
+            if isinstance(group_id, str) and group_id:
+                payload["group_id"] = group_id
+            await emit("hook_triggered", payload)
         for message in await self.hook_manager.handler_messages_for(event, data):
-            await emit("hook_triggered", {"event": event, "message": message, "context": data})
+            payload = {"event": event, "message": message, "context": data}
+            if isinstance(group_id, str) and group_id:
+                payload["group_id"] = group_id
+            await emit("hook_triggered", payload)
 
     async def _maybe_checkpoint(self, task: SessionTask, emit: EventEmitter) -> None:
         assembled = self.prompt_assembler.assemble(

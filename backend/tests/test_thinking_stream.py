@@ -10,6 +10,7 @@ def _collect_runtime_like_events(chunks: list[str]) -> tuple[list[tuple[str, str
     events: list[tuple[str, str]] = []
     answer_parts: list[str] = []
     thinking_parts: list[str] = []
+    commentary_parts: list[str] = []
 
     def consume(parsed_events) -> None:
         for event in parsed_events:
@@ -21,6 +22,11 @@ def _collect_runtime_like_events(chunks: list[str]) -> tuple[list[tuple[str, str
                 events.append(("thinking_delta", "".join(thinking_parts)))
             elif event.kind == "thinking_complete":
                 events.append(("thinking_complete", "".join(thinking_parts)))
+            elif event.kind == "commentary" and event.text:
+                commentary_parts.append(event.text)
+                events.append(("commentary_delta", "".join(commentary_parts)))
+            elif event.kind == "commentary_complete":
+                events.append(("commentary_complete", "".join(commentary_parts)))
 
     for chunk in chunks:
         consume(parser.feed(chunk))
@@ -66,6 +72,45 @@ class ThinkTagStreamParserTests(unittest.TestCase):
             ],
         )
         self.assertEqual(answer, "我来继续处理。")
+
+    def test_parser_handles_split_commentary_tags(self) -> None:
+        parser = ThinkTagStreamParser()
+
+        events = []
+        events.extend(parser.feed("<comm"))
+        events.extend(parser.feed("entary>我先定位文件"))
+        events.extend(parser.feed("</comment"))
+        events.extend(parser.feed("ary><think>再理顺思路</think>最后回答"))
+        events.extend(parser.flush())
+
+        self.assertEqual(
+            [(event.kind, event.text) for event in events],
+            [
+                ("commentary", "我先定位文件"),
+                ("commentary_complete", ""),
+                ("thinking", "再理顺思路"),
+                ("thinking_complete", ""),
+                ("answer", "最后回答"),
+            ],
+        )
+
+    def test_runtime_like_accumulation_keeps_commentary_and_answer_separate(self) -> None:
+        events, answer = _collect_runtime_like_events(
+            [
+                "<commentary>我先确认范围</commentary>",
+                "这是一句正式回答。",
+            ]
+        )
+
+        self.assertEqual(
+            events,
+            [
+                ("commentary_delta", "我先确认范围"),
+                ("commentary_complete", "我先确认范围"),
+                ("assistant_delta", "这是一句正式回答。"),
+            ],
+        )
+        self.assertEqual(answer, "这是一句正式回答。")
 
 
 if __name__ == "__main__":

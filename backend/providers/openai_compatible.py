@@ -43,7 +43,7 @@ class OpenAICompatibleProvider(BaseProvider):
             choice = body["choices"][0]
             message = choice["message"]
             usage = _parse_usage(body.get("usage", {}))
-            tool_calls = _parse_openai_tool_calls(message.get("tool_calls", []))
+            tool_calls = _parse_openai_tool_calls(message.get("tool_calls") or [])
             return ProviderResponse(
                 content=message.get("content") or "",
                 tool_calls=tool_calls,
@@ -155,9 +155,9 @@ def _parse_usage(usage_raw: dict[str, Any]) -> TokenUsage:
     )
 
 
-def _parse_openai_tool_calls(raw_calls: list[dict[str, Any]]) -> list[ToolCall]:
+def _parse_openai_tool_calls(raw_calls: list[dict[str, Any]] | None) -> list[ToolCall]:
     tool_calls: list[ToolCall] = []
-    for tool in raw_calls:
+    for tool in raw_calls or []:
         tool_calls.append(
             ToolCall(
                 id=str(tool["id"]),

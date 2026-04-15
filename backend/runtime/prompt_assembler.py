@@ -6,6 +6,14 @@ from backend.memory.stable_context import StableContextLoader
 from backend.sessions.models import CheckpointRecord, SessionRecord
 
 
+COMMENTARY_SYSTEM_GUARDRAIL = (
+    "CRITICAL TOOL/SKILL RULE:\n"
+    "If you will call any tool or use any skill in this turn, you must output exactly one short "
+    "<commentary>...</commentary> message immediately before the first tool or skill action.\n"
+    "Do not skip it. Use the user's language. Do not put final-answer content inside <commentary>."
+)
+
+
 class PromptAssembler:
     def __init__(self, stable_context_loader: StableContextLoader, workspace_path: str):
         self.stable_context_loader = stable_context_loader
@@ -13,7 +21,7 @@ class PromptAssembler:
 
     def assemble(self, session: SessionRecord, tools_overview: str, approval_policy: str, checkpoint: CheckpointRecord | None) -> list[dict]:
         stable_context = self.stable_context_loader.build(tools_overview, approval_policy, self.workspace_path)
-        messages = [{"role": "system", "content": stable_context}]
+        messages = [{"role": "system", "content": f"{COMMENTARY_SYSTEM_GUARDRAIL}\n\n{stable_context}"}]
         has_restored_checkpoint = any(
             item.role == "system" and item.metadata.get("type") == "checkpoint_restore"
             for item in session.messages

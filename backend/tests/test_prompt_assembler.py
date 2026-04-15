@@ -5,11 +5,27 @@ import unittest
 from pathlib import Path
 
 from backend.memory.stable_context import StableContextLoader
-from backend.runtime.prompt_assembler import PromptAssembler
+from backend.runtime.prompt_assembler import COMMENTARY_SYSTEM_GUARDRAIL, PromptAssembler
 from backend.sessions.models import SessionMessage, SessionRecord
 
 
 class PromptAssemblerTests(unittest.TestCase):
+    def test_prepends_commentary_guardrail_before_stable_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp)
+            (memory_dir / "Newman.md").write_text("# Newman\n", encoding="utf-8")
+            (memory_dir / "USER.md").write_text("# USER\n", encoding="utf-8")
+            (memory_dir / "SKILLS_SNAPSHOT.md").write_text("# Skills\n", encoding="utf-8")
+            assembler = PromptAssembler(StableContextLoader(memory_dir), "/tmp/workspace")
+
+            session = SessionRecord(session_id="session-1", title="Prompt Test", messages=[])
+
+            assembled = assembler.assemble(session, "tools", "approval", None)
+
+            self.assertEqual(assembled[0]["role"], "system")
+            self.assertTrue(assembled[0]["content"].startswith(COMMENTARY_SYSTEM_GUARDRAIL))
+            self.assertIn("# Newman", assembled[0]["content"])
+
     def test_preserves_tool_call_protocol_messages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_dir = Path(tmp)
