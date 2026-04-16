@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
 import logo from "./assets/newman-logo.png";
+import MessageContent, { type ChatAttachment } from "./chat/MessageContent";
 import "./styles.css";
 
 type WorkspacePage = "chat" | "memory" | "skills" | "files" | "settings";
@@ -148,6 +149,7 @@ type TurnStatus = "running" | "needs_approval" | "completed" | "failed";
 type TurnMessage = {
   id: string;
   content: string;
+  attachments: ChatAttachment[];
   createdAt: string;
   persisted: boolean;
   approvalMode?: TurnApprovalMode | null;
@@ -182,6 +184,11 @@ type LiveTurnState = {
   userMessage: TurnMessage;
   answer: TurnAnswer;
   status: TurnStatus;
+};
+
+type ComposerAttachment = ChatAttachment & {
+  file: File;
+  previewUrl: string;
 };
 
 type SkillSummary = {
@@ -351,6 +358,42 @@ function formatBytes(size: number) {
     return `${(size / 1024).toFixed(1)} KB`;
   }
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function makeAttachmentId(seed: string, index: number) {
+  return `${seed}:${index}`;
+}
+
+function parseMessageAttachments(value: unknown): ChatAttachment[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((item, index) => {
+    if (!item || typeof item !== "object") {
+      return [];
+    }
+    const filename = "filename" in item && typeof item.filename === "string" && item.filename ? item.filename : `image-${index + 1}`;
+    const contentType =
+      "content_type" in item && typeof item.content_type === "string" && item.content_type
+        ? item.content_type
+        : "application/octet-stream";
+    return [
+      {
+        id: makeAttachmentId("path" in item && typeof item.path === "string" ? item.path : filename, index),
+        filename,
+        contentType,
+        path: "path" in item && typeof item.path === "string" ? item.path : null,
+        previewUrl: null,
+        summary: "summary" in item && typeof item.summary === "string" ? item.summary : null,
+        sizeBytes: null,
+      },
+    ];
+  });
+}
+
+function readOriginalMessageContent(metadata: Record<string, unknown>, fallback: string) {
+  return typeof metadata.original_content === "string" ? metadata.original_content : fallback;
 }
 
 function extractName(path: string) {
@@ -1021,6 +1064,54 @@ function buildSkillSecondaryItem(parentId: string, event: SessionEventPayload): 
   };
 }
 
+function buildAttachmentSecondaryItem(parentId: string, event: SessionEventPayload): TimelineSecondaryItem {
+  const eventData = buildEventDataWithRequest(event);
+  const files =
+    Array.isArray(eventData.files) && eventData.files.every((item) => item && typeof item === "object")
+      ? (eventData.files as Array<Record<string, unknown>>)
+      : [];
+  const count = typeof eventData.count === "number" ? eventData.count : files.length;
+  const isProcessed = event.event === "attachment_processed";
+  const status = isProcessed ? { label: "已完成", tone: "green" as StatusTagTone } : { label: "处理中", tone: "blue" as StatusTagTone };
+  const subtitle =
+    files
+      .map((item) => {
+        const filename = typeof item.filename === "string" ? item.filename : "图片";
+        const summary = typeof item.summary === "string" && item.summary ? item.summary : null;
+        return summary ? `${filename}: ${summary}` : filename;
+      })
+      .join("\n") || `${count} 张图片`;
+  const detailId = `secondary:attachment:${parentId}`;
+
+  return {
+    id: detailId,
+    parentId,
+    state: isProcessed ? "completed" : "running",
+    label: "Images",
+    toolName: "image_attachment",
+    cardType: "generic",
+    subtitle: isProcessed ? "图片预解析已完成" : `已接收 ${count} 张图片`,
+    statusLabel: status.label,
+    statusTone: status.tone,
+    meta: count > 0 ? [`${count} 张图片`] : ["图片附件"],
+    output: subtitle,
+    outputLineCount: countOutputLines(subtitle),
+    detail: buildTraceDetail(
+      detailId,
+      "result",
+      formatEventTime(event.ts),
+      "attachment",
+      "图片附件",
+      isProcessed ? "图片预解析已完成" : `已接收 ${count} 张图片`,
+      eventData,
+      {
+        output: subtitle,
+        tags: [{ label: status.label, tone: status.tone }],
+      }
+    ),
+  };
+}
+
 function upsertProgressSecondaryItem(node: TimelineNode, item: TimelineSecondaryItem) {
   const existingIndex = node.secondaryItems.findIndex((currentItem) => currentItem.id === item.id);
   if (existingIndex === -1) {
@@ -1214,6 +1305,17 @@ function buildTimelineNodes(
       return;
     }
 
+    if (event.event === "attachment_received" || event.event === "attachment_processed") {
+      const attachmentCount = typeof eventData.count === "number" ? eventData.count : 0;
+      const groupId = `attachment:${event.request_id ?? "current"}`;
+      const primaryText = event.event === "attachment_processed" ? "图片预解析已完成" : `已接收 ${attachmentCount} 张图片`;
+      const node = ensureProgressNode(groupId, event, primaryText);
+      const item = buildAttachmentSecondaryItem(node.id, event);
+      upsertProgressSecondaryItem(node, item);
+      refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
+      return;
+    }
+
     if (event.event === "tool_call_started") {
       const groupId = resolveGroupId(eventData, toolCallId);
       if (!groupId) {
@@ -1343,7 +1445,8 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
       requestId: readRequestId(message.metadata),
       userMessage: {
         id: message.id,
-        content: message.content,
+        content: readOriginalMessageContent(message.metadata, message.content),
+        attachments: parseMessageAttachments(message.metadata.attachments),
         createdAt: message.created_at,
         persisted: true,
         approvalMode: readApprovalMode(message.metadata)
@@ -1695,10 +1798,14 @@ function App() {
   const [approvalActionLoading, setApprovalActionLoading] = useState<null | "approve" | "reject">(null);
   const [approvalError, setApprovalError] = useState<string | null>(null);
   const [composerValue, setComposerValue] = useState("");
+  const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [turnApprovalMode, setTurnApprovalMode] = useState<TurnApprovalMode>("manual");
   const conversationPaneRef = useRef<HTMLElement | null>(null);
+  const composerFileInputRef = useRef<HTMLInputElement | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
   const shouldAutoScrollRef = useRef(true);
+  const attachmentPreviewUrlsRef = useRef<string[]>([]);
+  const liveAttachmentUrlsRef = useRef<string[]>([]);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -1719,6 +1826,29 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem("newman-left-rail-width", `${leftWidth}`);
   }, [leftWidth]);
+
+  useEffect(() => {
+    return () => {
+      attachmentPreviewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      attachmentPreviewUrlsRef.current = [];
+    };
+  }, []);
+
+  useEffect(() => {
+    const nextLiveUrls =
+      liveTurn?.userMessage.attachments
+        .map((attachment) => attachment.previewUrl)
+        .filter((url): url is string => typeof url === "string" && url.startsWith("blob:")) ?? [];
+
+    liveAttachmentUrlsRef.current
+      .filter((url) => !nextLiveUrls.includes(url))
+      .forEach((url) => {
+        URL.revokeObjectURL(url);
+        attachmentPreviewUrlsRef.current = attachmentPreviewUrlsRef.current.filter((item) => item !== url);
+      });
+
+    liveAttachmentUrlsRef.current = nextLiveUrls;
+  }, [liveTurn]);
 
   useEffect(() => {
     const onResize = () => setViewportWidth(window.innerWidth);
@@ -2239,9 +2369,56 @@ function App() {
     }
   }
 
+  const appendComposerAttachments = (files: File[]) => {
+    if (files.length === 0) {
+      return;
+    }
+
+    setChatError(null);
+    setComposerAttachments((current) => [
+      ...current,
+      ...files
+        .filter((file) => file.type === "image/png" || file.type === "image/jpeg")
+        .map((file, index) => {
+          const previewUrl = URL.createObjectURL(file);
+          attachmentPreviewUrlsRef.current.push(previewUrl);
+          return {
+            id: makeAttachmentId(`${file.name}:${file.lastModified}:${file.size}`, current.length + index),
+            file,
+            filename: file.name,
+            contentType: file.type || "application/octet-stream",
+            previewUrl,
+            path: null,
+            summary: null,
+            sizeBytes: file.size,
+          };
+        }),
+    ]);
+  };
+
+  const handleComposerFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    if (files.some((file) => file.type !== "image/png" && file.type !== "image/jpeg")) {
+      setChatError("当前仅支持 PNG / JPEG 图片附件");
+    }
+    appendComposerAttachments(files);
+    event.target.value = "";
+  };
+
+  const removeComposerAttachment = (attachmentId: string) => {
+    setComposerAttachments((current) => {
+      const target = current.find((attachment) => attachment.id === attachmentId);
+      if (target?.previewUrl) {
+        URL.revokeObjectURL(target.previewUrl);
+        attachmentPreviewUrlsRef.current = attachmentPreviewUrlsRef.current.filter((url) => url !== target.previewUrl);
+      }
+      return current.filter((attachment) => attachment.id !== attachmentId);
+    });
+  };
+
   const submitComposer = async () => {
     const trimmed = composerValue.trim();
-    if (!trimmed || sendingMessage) return;
+    if ((!trimmed && composerAttachments.length === 0) || sendingMessage) return;
 
     setChatError(null);
     setChatNotice(null);
@@ -2251,6 +2428,7 @@ function App() {
       const sessionId = await ensureSession();
       const createdAt = new Date().toISOString();
       const liveTurnLocalId = `live-turn-${Date.now()}`;
+      const attachmentSnapshot = composerAttachments.map(({ file: _file, ...attachment }) => attachment);
       setLiveTurn({
         sessionId,
         localId: liveTurnLocalId,
@@ -2259,6 +2437,7 @@ function App() {
         userMessage: {
           id: liveTurnLocalId,
           content: trimmed,
+          attachments: attachmentSnapshot,
           createdAt,
           persisted: false,
           approvalMode: turnApprovalMode
@@ -2289,18 +2468,35 @@ function App() {
         )
       );
       setComposerValue("");
+      setComposerAttachments([]);
       switchPage("chat");
 
-      const response = await fetch(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          content: trimmed,
-          approval_mode: turnApprovalMode
-        })
-      });
+      const response =
+        composerAttachments.length > 0
+          ? await (() => {
+              const body = new FormData();
+              if (trimmed) {
+                body.append("content", trimmed);
+              }
+              composerAttachments.forEach((attachment) => {
+                body.append("images", attachment.file, attachment.filename);
+              });
+              body.append("approval_mode", turnApprovalMode);
+              return fetch(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+                method: "POST",
+                body,
+              });
+            })()
+          : await fetch(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                content: trimmed,
+                approval_mode: turnApprovalMode,
+              }),
+            });
 
       if (!response.ok) {
         const message = await response.text();
@@ -2752,6 +2948,16 @@ function App() {
     return (
       <div className={`composer-main ${variant === "hero" ? "composer-main-hero" : ""}`}>
         <div className={shellClassName}>
+          <input
+            ref={composerFileInputRef}
+            className="composer-file-input"
+            type="file"
+            accept="image/png,image/jpeg"
+            multiple
+            onChange={handleComposerFileChange}
+            tabIndex={-1}
+          />
+
           {!isHero && activePage === "chat" && pendingApproval ? (
             <div className="approval-popover" role="dialog" aria-modal="true" aria-labelledby="approval-modal-title">
               <div className="approval-popover-frame">
@@ -2815,14 +3021,44 @@ function App() {
             onChange={(event) => setComposerValue(event.target.value)}
             onKeyDown={handleComposerKeyDown}
             aria-label="message composer"
-            placeholder={sendingMessage ? "当前正在执行，稍等这一轮完成…" : "输入你的任务，按 Enter 发送；Shift + Enter 换行"}
+            placeholder={sendingMessage ? "当前正在执行，稍等这一轮完成…" : "输入你的任务，可附图片；按 Enter 发送，Shift + Enter 换行"}
             rows={3}
             disabled={sendingMessage}
           />
 
+          {composerAttachments.length > 0 ? (
+            <div className="composer-attachments" aria-label="已选择的图片">
+              {composerAttachments.map((attachment) => (
+                <div key={attachment.id} className="composer-attachment-chip">
+                  <img className="composer-attachment-thumb" src={attachment.previewUrl} alt={attachment.filename} />
+                  <div className="composer-attachment-meta">
+                    <span className="composer-attachment-name">{attachment.filename}</span>
+                    <span className="composer-attachment-size">
+                      {typeof attachment.sizeBytes === "number" ? formatBytes(attachment.sizeBytes) : "图片"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="composer-attachment-remove"
+                    aria-label={`移除 ${attachment.filename}`}
+                    onClick={() => removeComposerAttachment(attachment.id)}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
           <div className="composer-subbar">
             <div className="composer-subbar-left">
-              <button type="button" className="attach-trigger" aria-label="添加附件">
+              <button
+                type="button"
+                className="attach-trigger"
+                aria-label="添加附件"
+                onClick={() => composerFileInputRef.current?.click()}
+                disabled={sendingMessage}
+              >
                 +
               </button>
 
@@ -2892,7 +3128,7 @@ function App() {
                 type="button"
                 className="send-trigger send-trigger-inline"
                 onClick={() => void submitComposer()}
-                disabled={!composerValue.trim() || sendingMessage}
+                disabled={(!composerValue.trim() && composerAttachments.length === 0) || sendingMessage}
                 aria-label="发送"
               >
                 <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -3161,8 +3397,13 @@ function App() {
                         <div key={turn.id} className={`turn-block ${turn.isLive ? "live" : ""}`}>
                           <div className="user-row">
                             <div className="turn-user-stack">
-                              <div className="user-bubble">
-                                <p>{turn.userMessage.content}</p>
+                              <div className={`user-bubble ${turn.userMessage.attachments.length > 0 ? "has-attachments" : ""}`}>
+                                <MessageContent
+                                  apiBase={apiBase}
+                                  variant="user"
+                                  content={turn.userMessage.content}
+                                  attachments={turn.userMessage.attachments}
+                                />
                               </div>
                             </div>
                           </div>
@@ -3300,7 +3541,7 @@ function App() {
                                     ))}
                                   </div>
                                 ) : null}
-                                <p className="trace-copy">{answerCopy}</p>
+                                <MessageContent apiBase={apiBase} variant="assistant" content={answerCopy} className="trace-copy" />
                               </div>
                             </div>
                           ) : null}

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import mimetypes
 from pathlib import Path
 
 from fastapi import APIRouter, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from backend.tools.workspace_fs import (
@@ -102,6 +104,22 @@ async def list_workspace_files(request: Request, path: str = "."):
             }
         )
     return {"path": str(target), "type": "dir", "access": classify_path(policy, target), "entries": items}
+
+
+@router.get("/file-content")
+async def get_workspace_file_content(request: Request, path: str):
+    settings = request.app.state.settings
+    policy = build_path_access_policy(settings)
+    target = ensure_readable_path(policy, path)
+    if not target.exists():
+        raise FileNotFoundError(f"Path not found: {target}")
+    if not target.is_file():
+        raise ValueError("path 必须指向文件")
+
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    response = FileResponse(target, media_type=media_type)
+    response.headers["content-disposition"] = f'inline; filename="{target.name}"'
+    return response
 
 
 def _path_updated_at(path: Path) -> str | None:

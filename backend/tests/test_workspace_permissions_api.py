@@ -48,6 +48,31 @@ class WorkspacePermissionRouteTests(unittest.TestCase):
             self.assertEqual(payload["access"], "readable")
             self.assertIn("print('ok')", payload["content"])
 
+    def test_workspace_file_content_can_stream_readable_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            readable = root / "backend_data" / "uploads"
+            workspace.mkdir()
+            readable.mkdir(parents=True)
+            target = readable / "screen.png"
+            target.write_bytes(b"\x89PNG\r\n\x1a\nmock")
+            settings = SimpleNamespace(
+                paths=SimpleNamespace(workspace=workspace, memory_dir=root / "memory"),
+                permissions=SimpleNamespace(
+                    readable_paths=[readable],
+                    writable_paths=[],
+                    protected_paths=[],
+                ),
+            )
+            client = TestClient(_build_app(settings))
+
+            response = client.get("/api/workspace/file-content", params={"path": str(target)})
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, b"\x89PNG\r\n\x1a\nmock")
+            self.assertIn("inline", response.headers.get("content-disposition", ""))
+
     def test_workspace_files_rejects_protected_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
