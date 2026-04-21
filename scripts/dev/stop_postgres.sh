@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CONDA_PREFIX_DEFAULT="/root/anaconda3"
-CONDA_SH="${CONDA_PREFIX_DEFAULT}/etc/profile.d/conda.sh"
-ENV_NAME="${NEWMAN_CONDA_ENV:-newman}"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
 PG_DATA_DIR="${ROOT_DIR}/backend_data/postgres"
 PG_SYSTEM_USER="${NEWMAN_PG_SYSTEM_USER:-newmanpg}"
+
+ensure_host_service_control
+ensure_conda
 
 source "${CONDA_SH}"
 conda activate "${ENV_NAME}"

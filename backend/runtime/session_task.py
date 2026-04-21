@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from backend.sessions.models import SessionRecord
+from backend.sessions.models import SessionMessage, SessionRecord
 from backend.tools.permission_context import PermissionContext
 
 
@@ -13,6 +13,7 @@ class SessionTask:
     turn_id: str | None = None
     tool_depth: int = 0
     action_group_index: int = 0
+    transient_tool_messages: dict[str, SessionMessage] = field(default_factory=dict)
 
     def next_action_group_id(self) -> str:
         self.action_group_index += 1

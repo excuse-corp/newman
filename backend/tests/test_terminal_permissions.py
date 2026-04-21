@@ -21,6 +21,11 @@ class _FakeWriteFileTool:
         self.meta = SimpleNamespace(name="write_file")
 
 
+class _FakeMCPTool:
+    def __init__(self) -> None:
+        self.meta = SimpleNamespace(name="mcp__demo__fs_reader")
+
+
 class TerminalPermissionTests(unittest.TestCase):
     def test_terminal_static_checks_deny_protected_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -134,6 +139,49 @@ class TerminalPermissionTests(unittest.TestCase):
             )
 
             self.assertIn("maintain_plugin", reasons)
+
+    def test_mcp_static_checks_deny_paths_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            outside = root / "outside"
+            workspace.mkdir()
+            outside.mkdir()
+
+            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace)}})
+            router = ToolRouter(ToolRegistry(), settings)
+
+            reasons = router.static_checks(
+                _FakeMCPTool(),
+                {"path": str(outside / "demo.txt")},
+            )
+
+            self.assertEqual(len(reasons), 1)
+            self.assertTrue(reasons[0].startswith("mcp_path_outside_workspace:"))
+
+    def test_mcp_static_checks_deny_protected_workspace_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            protected_file = workspace / ".env"
+            workspace.mkdir()
+            protected_file.write_text("SECRET=1\n", encoding="utf-8")
+
+            settings = AppConfig.model_validate(
+                {
+                    "paths": {"workspace": str(workspace)},
+                    "permissions": {"protected_paths": [str(protected_file)]},
+                }
+            )
+            router = ToolRouter(ToolRegistry(), settings)
+
+            reasons = router.static_checks(
+                _FakeMCPTool(),
+                {"outputFile": str(protected_file)},
+            )
+
+            self.assertEqual(len(reasons), 1)
+            self.assertTrue(reasons[0].startswith("mcp_path_protected:"))
 
     def test_bwrap_command_mounts_readable_writable_and_protected_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

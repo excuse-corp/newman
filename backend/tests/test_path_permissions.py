@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,7 +33,8 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
             result = await ReadFileTool(policy).run({"path": str(target)}, "session-1")
 
             self.assertTrue(result.success)
-            self.assertIn("L1: hello", result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(base64.b64decode(payload["dataBase64"]).decode("utf-8"), "hello\nworld\n")
 
     async def test_write_file_rejects_read_only_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -56,6 +59,26 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result.success)
             self.assertEqual(result.category, "permission_error")
             self.assertEqual(result.summary, "path 不在允许写入的目录内")
+
+    async def test_write_file_requires_content_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+
+            policy = PathAccessPolicy(
+                workspace=workspace,
+                readable_roots=(workspace,),
+                writable_roots=(workspace,),
+                protected_roots=(),
+            )
+
+            result = await WriteFileTool(policy).run({"path": "missing.txt"}, "session-4")
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.category, "validation_error")
+            self.assertEqual(result.summary, "缺少必填参数: content")
+            self.assertFalse((workspace / "missing.txt").exists())
 
     async def test_edit_file_can_update_additional_writable_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

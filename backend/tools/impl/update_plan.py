@@ -5,6 +5,7 @@ from typing import Any
 from backend.sessions.models import SessionPlan
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.discovery import BuiltinToolContext
+from backend.tools.provider_exposure import CORE_TOOL_GROUP
 from backend.tools.result import ToolExecutionResult
 
 
@@ -45,8 +46,9 @@ class UpdatePlanTool(BaseTool):
                 "required": ["steps"],
             },
             risk_level="low",
-            requires_approval=False,
+            approval_behavior="safe",
             timeout_seconds=5,
+            provider_group=CORE_TOOL_GROUP,
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:

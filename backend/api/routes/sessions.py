@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from backend.api.sse.event_emitter import format_sse
 from backend.memory.compressor import (
+    build_context_usage_snapshot,
     build_checkpoint_metadata,
     split_session_messages,
     summarize_messages,
@@ -156,7 +157,7 @@ async def compress_session(session_id: str, request: Request):
     runtime = request.app.state.runtime
     session = runtime.session_store.get(session_id)
     checkpoint = runtime.checkpoints.get(session_id)
-    preserved = 4
+    preserved = runtime.settings.runtime.context_compaction_preserve_recent
     summary_result = await summarize_messages(
         runtime.provider,
         runtime.settings.provider,
@@ -177,7 +178,7 @@ async def compress_session(session_id: str, request: Request):
     checkpoint = runtime.checkpoints.save(
         session_id,
         summary_result.summary,
-        [0, max(0, original_count - preserved)],
+        [0, max(0, original_count - len(preserved_messages))],
         metadata=build_checkpoint_metadata(
             summary_result,
             preserve_recent=preserved,
@@ -241,37 +242,33 @@ async def update_session(session_id: str, payload: UpdateSessionRequest, request
 
 def _build_context_usage(runtime, session, checkpoint) -> dict[str, object]:
     usage_store = getattr(runtime, "usage_store", None)
+    latest_record = None
     if usage_store is not None:
         try:
             latest_record = usage_store.latest_context_record(session.session_id)
         except Exception:
             latest_record = None
-        if latest_record and latest_record.total_tokens > 0:
-            context_window = latest_record.effective_context_window or latest_record.context_window
-            pressure = (latest_record.total_tokens / context_window) if context_window else None
-            return {
-                "estimated_tokens": latest_record.total_tokens,
-                "context_window": context_window,
-                "pressure": pressure,
-                "remaining_tokens": max((context_window or 0) - latest_record.total_tokens, 0) if context_window else None,
-                "source": "latest_request_usage",
-                "request_kind": latest_record.request_kind,
-                "recorded_at": latest_record.created_at,
-            }
+    assembled_messages = _build_session_context_messages(runtime, session, checkpoint)
+    return build_context_usage_snapshot(
+        runtime.provider,
+        runtime.settings.provider,
+        runtime.settings.runtime,
+        assembled_messages,
+        session,
+        checkpoint,
+        latest_record=latest_record,
+    ).to_dict()
 
-    context_window = runtime.settings.provider.effective_context_window or runtime.settings.provider.context_window
-    history_messages = _build_session_history_messages(session, checkpoint)
-    estimated_tokens = runtime.provider.estimate_tokens(history_messages)
-    pressure = (estimated_tokens / context_window) if context_window else None
-    return {
-        "estimated_tokens": estimated_tokens,
-        "context_window": context_window,
-        "pressure": pressure,
-        "remaining_tokens": max((context_window or 0) - estimated_tokens, 0) if context_window else None,
-        "source": "estimated_session_history",
-        "request_kind": None,
-        "recorded_at": None,
-    }
+
+def _build_session_context_messages(runtime, session, checkpoint) -> list[dict[str, object]]:
+    prompt_assembler = getattr(runtime, "prompt_assembler", None)
+    if prompt_assembler is not None and hasattr(runtime, "_tools_overview"):
+        return prompt_assembler.assemble(
+            session,
+            runtime._tools_overview(),
+            checkpoint,
+        )
+    return _build_session_history_messages(session, checkpoint)
 
 
 def _build_session_history_messages(session, checkpoint) -> list[dict[str, object]]:

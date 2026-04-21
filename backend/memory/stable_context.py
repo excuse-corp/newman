@@ -40,7 +40,7 @@ class StableContextLoader:
             for key, filename in MEMORY_FILES.items()
         }
 
-    def build(self, tools_overview: str, approval_policy: str, workspace_path: str) -> str:
+    def build(self, tools_overview: str) -> str:
         context = self.load()
         return "\n\n".join(
             [
@@ -48,7 +48,5 @@ class StableContextLoader:
                 context["user"],
                 context["skills"],
                 f"## Tooling Overview\n{tools_overview}",
-                f"## Approval Policy\n{approval_policy}",
-                f"## Workspace\n{workspace_path}",
             ]
         )

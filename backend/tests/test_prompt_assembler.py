@@ -16,15 +16,17 @@ class PromptAssemblerTests(unittest.TestCase):
             (memory_dir / "Newman.md").write_text("# Newman\n", encoding="utf-8")
             (memory_dir / "USER.md").write_text("# USER\n", encoding="utf-8")
             (memory_dir / "SKILLS_SNAPSHOT.md").write_text("# Skills\n", encoding="utf-8")
-            assembler = PromptAssembler(StableContextLoader(memory_dir), "/tmp/workspace")
+            assembler = PromptAssembler(StableContextLoader(memory_dir))
 
             session = SessionRecord(session_id="session-1", title="Prompt Test", messages=[])
 
-            assembled = assembler.assemble(session, "tools", "approval", None)
+            assembled = assembler.assemble(session, "tools", None)
 
             self.assertEqual(assembled[0]["role"], "system")
             self.assertTrue(assembled[0]["content"].startswith(COMMENTARY_SYSTEM_GUARDRAIL))
             self.assertIn("# Newman", assembled[0]["content"])
+            self.assertNotIn("## Approval Policy", assembled[0]["content"])
+            self.assertNotIn("## Workspace", assembled[0]["content"])
 
     def test_preserves_tool_call_protocol_messages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -32,7 +34,7 @@ class PromptAssemblerTests(unittest.TestCase):
             (memory_dir / "Newman.md").write_text("# Newman\n", encoding="utf-8")
             (memory_dir / "USER.md").write_text("# USER\n", encoding="utf-8")
             (memory_dir / "SKILLS_SNAPSHOT.md").write_text("# Skills\n", encoding="utf-8")
-            assembler = PromptAssembler(StableContextLoader(memory_dir), "/tmp/workspace")
+            assembler = PromptAssembler(StableContextLoader(memory_dir))
 
             session = SessionRecord(
                 session_id="session-1",
@@ -62,7 +64,7 @@ class PromptAssemblerTests(unittest.TestCase):
                 ],
             )
 
-            assembled = assembler.assemble(session, "tools", "approval", None)
+            assembled = assembler.assemble(session, "tools", None)
 
             assistant_message = assembled[-2]
             tool_message = assembled[-1]
@@ -72,6 +74,61 @@ class PromptAssemblerTests(unittest.TestCase):
             self.assertIn("https://example.com", assistant_message["tool_calls"][0]["function"]["arguments"])
             self.assertEqual(tool_message["role"], "tool")
             self.assertEqual(tool_message["tool_call_id"], "call_1")
+
+    def test_prefers_transient_tool_override_for_current_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp)
+            (memory_dir / "Newman.md").write_text("# Newman\n", encoding="utf-8")
+            (memory_dir / "USER.md").write_text("# USER\n", encoding="utf-8")
+            (memory_dir / "SKILLS_SNAPSHOT.md").write_text("# Skills\n", encoding="utf-8")
+            assembler = PromptAssembler(StableContextLoader(memory_dir))
+
+            session = SessionRecord(
+                session_id="session-1",
+                title="Transient Tool Output Test",
+                messages=[
+                    SessionMessage(id="u1", role="user", content="读一下 README"),
+                    SessionMessage(
+                        id="a1",
+                        role="assistant",
+                        content="我先读取 README。",
+                        metadata={
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "name": "read_file",
+                                    "arguments": {"path": "README.md"},
+                                }
+                            ]
+                        },
+                    ),
+                    SessionMessage(
+                        id="t1",
+                        role="tool",
+                        content='{"summary":"Read complete file README.md; raw content omitted from persisted history"}',
+                        metadata={"tool_call_id": "call_1", "tool": "read_file"},
+                    ),
+                ],
+            )
+
+            assembled = assembler.assemble(
+                session,
+                "tools",
+                None,
+                tool_message_overrides={
+                    "call_1": SessionMessage(
+                        id="transient-1",
+                        role="tool",
+                        content='{"dataBase64":"UkVBRE1FCg=="}',
+                        metadata={"tool_call_id": "call_1", "tool": "read_file"},
+                    )
+                },
+            )
+
+            tool_message = assembled[-1]
+            self.assertEqual(tool_message["role"], "tool")
+            self.assertEqual(tool_message["tool_call_id"], "call_1")
+            self.assertEqual(tool_message["content"], '{"dataBase64":"UkVBRE1FCg=="}')
 
 
 if __name__ == "__main__":

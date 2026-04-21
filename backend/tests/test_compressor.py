@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,11 +10,28 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+fake_psycopg = types.ModuleType("psycopg")
+fake_psycopg.connect = lambda *args, **kwargs: None
+fake_rows = types.ModuleType("psycopg.rows")
+fake_rows.dict_row = object()
+fake_types = types.ModuleType("psycopg.types")
+fake_json = types.ModuleType("psycopg.types.json")
+fake_json.Jsonb = lambda value: value
+sys.modules.setdefault("psycopg", fake_psycopg)
+sys.modules.setdefault("psycopg.rows", fake_rows)
+sys.modules.setdefault("psycopg.types", fake_types)
+sys.modules.setdefault("psycopg.types.json", fake_json)
+
 from backend.api.middleware.error_handler import install_error_handlers
 from backend.api.routes.sessions import router as sessions_router
 from backend.config.schema import AppConfig, ModelConfig
 from backend.memory.checkpoint_store import CheckpointStore
-from backend.memory.compressor import summarize_messages
+from backend.memory.compressor import (
+    build_context_usage_snapshot,
+    microcompact_session,
+    split_session_messages,
+    summarize_messages,
+)
 from backend.providers.base import BaseProvider, ProviderChunk, ProviderResponse, TokenUsage
 from backend.providers.factory import MockProvider
 from backend.sessions.models import SessionMessage, SessionRecord
@@ -59,6 +78,71 @@ def _build_session(message_count: int) -> SessionRecord:
 
 
 class CompressionSummaryTests(unittest.IsolatedAsyncioTestCase):
+    def test_split_session_messages_preserves_complete_turn_tail(self) -> None:
+        session = SessionRecord(
+            session_id="session-1",
+            title="Tail Preserve Test",
+            messages=[
+                SessionMessage(id="m1", role="user", content="old-1", metadata={"turn_id": "turn-1"}),
+                SessionMessage(id="m2", role="assistant", content="old-2", metadata={"turn_id": "turn-1"}),
+                SessionMessage(id="m3", role="user", content="new-1", metadata={"turn_id": "turn-2"}),
+                SessionMessage(
+                    id="m4",
+                    role="assistant",
+                    content="tool-call",
+                    metadata={"turn_id": "turn-2", "group_id": "turn-2:group:1"},
+                ),
+                SessionMessage(
+                    id="m5",
+                    role="tool",
+                    content="tool-result-a",
+                    metadata={"turn_id": "turn-2", "group_id": "turn-2:group:1"},
+                ),
+                SessionMessage(
+                    id="m6",
+                    role="tool",
+                    content="tool-result-b",
+                    metadata={"turn_id": "turn-2", "group_id": "turn-2:group:1"},
+                ),
+            ],
+        )
+
+        compacted, preserved = split_session_messages(session, preserve_recent=2)
+
+        self.assertEqual([message.id for message in compacted], ["m1", "m2"])
+        self.assertEqual([message.id for message in preserved], ["m3", "m4", "m5", "m6"])
+
+    def test_microcompact_session_rewrites_only_old_tool_outputs(self) -> None:
+        long_output = "line " * 300
+        session = SessionRecord(
+            session_id="session-1",
+            title="Microcompact Test",
+            messages=[
+                SessionMessage(id="m1", role="user", content="old request", metadata={"turn_id": "turn-1"}),
+                SessionMessage(
+                    id="m2",
+                    role="tool",
+                    content=long_output,
+                    metadata={"turn_id": "turn-1", "tool": "terminal", "success": True},
+                ),
+                SessionMessage(id="m3", role="user", content="fresh request", metadata={"turn_id": "turn-2"}),
+                SessionMessage(
+                    id="m4",
+                    role="tool",
+                    content=long_output,
+                    metadata={"turn_id": "turn-2", "group_id": "turn-2:group:1", "tool": "terminal", "success": True},
+                ),
+            ],
+        )
+        session.metadata["last_compaction_stage"] = "microcompact"
+
+        compacted_count = microcompact_session(session, preserve_recent=2)
+
+        self.assertEqual(compacted_count, 1)
+        self.assertTrue(session.messages[1].metadata["microcompact_applied"])
+        self.assertIn("[Microcompact tool output]", session.messages[1].content)
+        self.assertEqual(session.messages[3].content, long_output)
+
     async def test_summarize_messages_uses_llm_handoff_summary(self) -> None:
         provider = _RecordingProvider()
         session = _build_session(6)
@@ -180,10 +264,43 @@ class CompressRouteTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             payload = response.json()
             context_usage = payload["context_usage"]
-            self.assertEqual(context_usage["estimated_tokens"], 1000)
-            self.assertEqual(context_usage["context_window"], 95000)
-            self.assertEqual(context_usage["source"], "latest_request_usage")
-            self.assertEqual(context_usage["request_kind"], "session_turn")
+            self.assertEqual(context_usage["effective_context_window"], 95000)
+            self.assertEqual(context_usage["confirmed_prompt_tokens"], 800)
+            self.assertEqual(context_usage["confirmed_request_kind"], "session_turn")
+            self.assertEqual(context_usage["projected_next_prompt_tokens"], 800)
+            self.assertEqual(context_usage["projection_source"], "confirmed_plus_delta")
+            self.assertFalse(context_usage["projected_over_limit"])
+            self.assertEqual(context_usage["compaction_fail_streak"], 0)
+            self.assertFalse(context_usage["context_irreducible"])
+
+    def test_context_usage_falls_back_to_assembled_prompt_estimate_without_confirmed_usage(self) -> None:
+        provider = _RecordingProvider()
+        session = _build_session(6)
+        session.metadata["last_compaction_stage"] = "checkpoint_compact"
+        session.metadata["compaction_fail_streak"] = 2
+        session.metadata["context_irreducible"] = True
+        session.metadata["last_compaction_failure_reason"] = "post_compaction_still_over_limit"
+        config = AppConfig.model_validate(
+            {"models": {"primary": {"type": "openai_compatible", "model": "recording-model", "context_window": 100000}}}
+        )
+
+        snapshot = build_context_usage_snapshot(
+            provider,
+            config.provider,
+            config.runtime,
+            [{"role": "system", "content": "stable"}, {"role": "user", "content": "hello"}],
+            session,
+            checkpoint=None,
+            latest_record=None,
+        )
+
+        self.assertIsNone(snapshot.confirmed_prompt_tokens)
+        self.assertEqual(snapshot.projected_next_prompt_tokens, 0)
+        self.assertEqual(snapshot.projection_source, "assembled_prompt_estimate")
+        self.assertEqual(snapshot.compaction_stage, "checkpoint_compact")
+        self.assertEqual(snapshot.compaction_fail_streak, 2)
+        self.assertTrue(snapshot.context_irreducible)
+        self.assertEqual(snapshot.last_compaction_failure_reason, "post_compaction_still_over_limit")
 
 
 if __name__ == "__main__":

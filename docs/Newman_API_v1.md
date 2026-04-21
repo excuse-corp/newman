@@ -1,4 +1,4 @@
-# Newman API 文档 v1.3
+# Newman API 文档 v1.4
 
 2026 · Phase 4 基线接口 + Stable Memory 抽取 + 轻量多阶段规划 + Linux 原生沙箱
 
@@ -15,6 +15,7 @@
 - [app.py](/root/newman/backend/api/app.py)
 - [sessions.py](/root/newman/backend/api/routes/sessions.py)
 - [messages.py](/root/newman/backend/api/routes/messages.py)
+- [config.py](/root/newman/backend/api/routes/config.py)
 - [workspace.py](/root/newman/backend/api/routes/workspace.py)
 - [plugins.py](/root/newman/backend/api/routes/plugins.py)
 - [tools.py](/root/newman/backend/api/routes/tools.py)
@@ -83,6 +84,7 @@ x-request-id: <uuid>
   },
   "tools": [
     "read_file",
+    "read_file_range",
     "list_dir",
     "list_files",
     "search_files",
@@ -141,7 +143,7 @@ x-request-id: <uuid>
 
 当前内置工具分为 3 类：
 
-- 读取与定位：`read_file`、`list_dir`、`list_files`、`search_files`、`grep`
+- 读取与定位：`read_file`、`read_file_range`、`list_dir`、`list_files`、`search_files`、`grep`
 - 编辑与执行：`write_file`、`edit_file`、`terminal`
 - 协作与知识：`update_plan`、`fetch_url`、`search_knowledge_base`
 
@@ -149,7 +151,12 @@ x-request-id: <uuid>
 
 - `list_files` 是 `list_dir` 的别名。
 - `grep` 是 `search_files` 的别名。
-- `read_file` 读取文本文件时支持 `offset` / `limit` 按行分页，返回带 `L{行号}:` 前缀的内容；读取二进制文件时仍使用 `max_bytes` 预览。
+- `read_file` 只用于“小文件完整读取”：只接收 `path`，返回完整文件内容的 base64 JSON 载荷 `{ "dataBase64": "..." }`；当前限制为不超过 `65536` 字节。
+- `read_file_range` 只用于“文本分段读取”：接收 `path`、`offset`、`limit`，其中 `offset` 为 1-based 起始行号，`limit` 为单次最多返回的行数；当前仅支持 UTF-8 文本文件。
+- 选择建议：
+  - 需要完整原始文件字节，且文件较小：用 `read_file`
+  - 文件较大，或只想看某段文本：用 `read_file_range`
+- `read_file` / `read_file_range` 的完整输出只会在当前 turn 的后续推理里临时可见；session 持久化历史只保留摘要和元数据，不会把 base64 或大段文本原样长期写进 `session.messages`。
 - `write_file`、`edit_file` 默认需要审批。
 - `terminal` 采用两级前置审批：Level 1 黑名单直接拒绝，Level 2 风险模式进入人工审批；Linux 沙箱内的明显只读命令会自动放行。
 - 若配置了插件 MCP server，运行时还会额外挂载 `mcp__...` 工具。
@@ -341,13 +348,20 @@ text/event-stream
   },
   "checkpoint": null,
   "context_usage": {
-    "estimated_tokens": 1248,
-    "context_window": 95000,
-    "pressure": 0.01248,
-    "remaining_tokens": 93752,
-    "source": "latest_request_usage",
-    "request_kind": "session_turn",
-    "recorded_at": "2026-04-11T15:20:00+00:00"
+    "effective_context_window": 95000,
+    "auto_compact_limit": 86808,
+    "confirmed_prompt_tokens": 1248,
+    "confirmed_pressure": 0.013136842105263158,
+    "confirmed_request_kind": "session_turn",
+    "confirmed_recorded_at": "2026-04-11T15:20:00+00:00",
+    "projected_next_prompt_tokens": 1376,
+    "projected_pressure": 0.01448421052631579,
+    "projection_source": "confirmed_plus_delta",
+    "projected_over_limit": false,
+    "compaction_stage": null,
+    "compaction_fail_streak": 0,
+    "context_irreducible": false,
+    "last_compaction_failure_reason": null
   }
 }
 ```
@@ -358,18 +372,15 @@ text/event-stream
 - 只有在模型调用 `update_plan` 工具后，`plan` 才会出现。
 - Web chat 回合里的 `session.messages[*].metadata` 现在会尽量补齐 `turn_id`，便于前端把同一轮的用户消息、过程事件和最终回答聚合成一个 turn 容器。
 - 通过 `/api/sessions/{session_id}/messages` 发起的 HTTP 回合，消息元数据通常还会包含 `request_id`；最终 assistant 消息会额外写入 `finish_reason`。
-- `context_usage.context_window` 使用的是“有效上下文窗口”，当前定义为配置的模型 `context_window * 95%`。
-- `context_usage` 优先返回“最近一次计入上下文窗口的真实模型请求 usage”，也就是最近一条 `counts_toward_context_window=true` 且 `usage_available=true` 的记录。
-- 当前前端圆环使用的是：
-  - `pressure = latest_request.total_tokens / effective_context_window`
-  - `estimated_tokens = latest_request.total_tokens`
-- 如果当前 session 还没有可用的真实 usage 记录，才会退回到“session 历史上下文表示”的本地估算值。
+- `context_usage.effective_context_window` 使用的是“有效上下文窗口”，当前定义为配置的模型 `context_window * 95%`。
+- `context_usage.auto_compact_limit` 是运行时真正用来判断自动压缩的阈值，已经扣除了回答预留、压缩预留和安全缓冲。
+- `context_usage.confirmed_*` 表示最近一次真实模型请求里已确认的 prompt 占用；只有最近一条 `counts_toward_context_window=true` 且 `usage_available=true` 的记录才会填充这些字段。
+- `context_usage.projected_*` 表示“如果现在再发起下一次模型请求”，运行时估算出的上下文占用与压力。
+- 若存在最近一次真实 usage 记录，且新消息增量可估算，则 `projection_source = "confirmed_plus_delta"`；否则会退回 `projection_source = "assembled_prompt_estimate"`。
+- 投影估算基于当前完整 prompt 组装结果，而不只是 `session.messages`：会一并考虑 Stable Memory、工具总览、checkpoint summary 和当前会话消息。
+- `projected_over_limit = true` 表示下一次请求的估算 prompt 已超过自动压缩阈值，不等同于一定超过模型硬 context window。
 - 若存在 `checkpoint.summary`，其内容现在是基于 LLM 生成的 handoff summary，而不是简单的消息逐条拼接文本。
-- 若退回估算口径，计算方式为：
-  - 若存在 checkpoint 且当前 session 中还没有 `checkpoint_restore` 消息，则先计入 `## Checkpoint Summary\n{checkpoint.summary}`
-  - 再顺序计入当前 `session.messages`
-  - 最后用当前 provider 的 token 估算器计算 `estimated_tokens`
-  - `pressure = estimated_tokens / effective_context_window`
+- `compaction_stage`、`compaction_fail_streak`、`context_irreducible` 和 `last_compaction_failure_reason` 用于前端展示压缩状态与失败原因。
 
 ## 3.2A 获取会话 usage 记录
 
@@ -533,12 +544,12 @@ text/event-stream
 
 说明：
 
-- 运行时自动压缩当前统一保留最近 `4` 条消息。
-- 手动压缩与自动压缩现在共用同一套逻辑：都会裁剪 session，只保留最近 `4` 条消息，并写入新的 checkpoint。
+- 手动压缩与自动压缩现在共用同一套逻辑：都会裁剪 session，并保留最近 `runtime.context_compaction_preserve_recent` 条消息；默认值为 `4`。
+- 实际保留时会尽量对齐同一 turn / tool group，避免把一轮消息从中间截断。
 - `checkpoint.summary` 通过一次独立的 LLM handoff summary 请求生成，提示词参考 Codex 本地 compact 方案，要求输出“当前进展、关键约束、剩余工作、关键引用”等可供后续模型继续任务的摘要。
 - 若已存在旧 checkpoint，压缩请求会把旧 `summary` 与本轮将被裁剪的历史消息一起交给模型，要求产出一份“替换旧 summary 的刷新版摘要”，而不是简单字符串追加。
 - 若当前 provider 为 `mock`，或压缩摘要请求失败/返回空内容，则会退回到结构化归档摘要：保留旧 summary，并附加 `## Archived Message Snapshot` 文本快照。
-- 当当前会话消息数小于等于 `4` 时，没有可裁剪历史，接口会返回 `{"compressed": false, "reason": "nothing_to_compress"}`。
+- 当当前会话消息数小于等于当前配置的保留数量时，没有可裁剪历史，接口会返回 `{"compressed": false, "reason": "nothing_to_compress"}`。
 - 压缩触发阈值基于有效上下文窗口计算：
   - `effective_context_window = configured_context_window * 95%`
   - `pressure = assembled_prompt_estimated_tokens / effective_context_window`
@@ -616,6 +627,7 @@ text/event-stream
 
 - `approval_mode` 会随本轮用户消息一起写入该条 user message 的 `metadata.approval_mode`
 - 后端按该次请求提交的值锁定本轮审批策略
+- `auto_approve_level2` 只影响 Level 2 命中的审批；工具自身 `requires_approval=true` 的 mandatory 审批仍需人工确认
 - 用户发送后即使在前端切换 UI 选项，也不会影响已经开始执行的这一轮
 - 未传 `approval_mode` 时，默认值为 `manual`
 
@@ -631,9 +643,11 @@ text/event-stream
 - 默认 Provider 为 `mock`
 - 支持普通消息和 `/tool ...` 调试指令
 - 支持图片附件与多模态预解析
+- 同一 `session_id` 同时只允许一个活跃回合；若上一轮仍在执行或等待审批，再次发送会返回 `409`
 - 单轮最大工具调用深度默认 30
 - 插件 hook 会通过 `hook_triggered` 事件回传
 - 结束时统一发送 `stream_completed`
+- 若需要主动停止当前回合，可调用 `POST /api/sessions/{session_id}/interrupt`
 
 工具深度上限说明：
 
@@ -645,7 +659,8 @@ text/event-stream
 示例：
 
 ```text
-/tool read_file {"path":"/root/newman/docs/prds/Newman_PRD_v9.md","offset":120,"limit":80}
+/tool read_file {"path":"/root/newman/docs/prds/Newman_PRD_v9.md"}
+/tool read_file_range {"path":"README.md","offset":1,"limit":120}
 /tool list_dir {"path":"backend","recursive":false}
 /tool search_files {"query":"handle_message","path":"backend","glob":"*.py"}
 /tool edit_file {"path":"README.md","edits":[{"old_text":"old","new_text":"new"}]}
@@ -653,6 +668,38 @@ text/event-stream
 /tool search_knowledge_base {"query":"混合检索","limit":3}
 /tool mcp__example-inline__echo_context {"text":"hello"}
 ```
+
+## 4.2 停止当前会话中的运行任务
+
+`POST /api/sessions/{session_id}/interrupt`
+
+响应示例：
+
+```json
+{
+  "interrupted": true,
+  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "request_id": "req_abc123",
+  "turn_id": "turn_user_001",
+  "message": "当前任务已停止"
+}
+```
+
+若当前没有活跃任务：
+
+```json
+{
+  "interrupted": false,
+  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "reason": "no_active_run"
+}
+```
+
+说明：
+
+- 成功停止后，后端会取消当前 worker，并在 session 中追加一条 `role=system`、`metadata.type="turn_interrupted"` 的消息。
+- 同时会把结构化 `turn_interrupted` 事件写入审计日志，因此 `GET /api/sessions/{session_id}/events` 可恢复该状态。
+- 若当前会话正有一条活跃的 `/messages` SSE 连接，后端会先把 `turn_interrupted` 推回这条流，再结束本轮并发送 `stream_completed`。
 
 ---
 
@@ -734,7 +781,7 @@ text/event-stream
 
 ---
 
-## 六、审计接口
+## 六、审计与配置接口
 
 ## 6.1 获取审计日志
 
@@ -755,6 +802,87 @@ text/event-stream
 
 - 这是调试接口，返回原始审计日志行，不保证适合前端直接恢复 timeline。
 - 前端恢复会话过程状态时，优先使用 `GET /api/sessions/{session_id}/events`。
+
+## 6.2 获取项目配置文件
+
+`GET /api/config/project`
+
+响应示例：
+
+```json
+{
+  "path": "/root/newman/newman.yaml",
+  "content": "server:\n  port: 8005\npaths:\n  workspace: \".\"\n",
+  "effective_workspace": "/root/newman",
+  "source_priority": [
+    "environment",
+    "~/.newman/config.yaml",
+    "newman.yaml",
+    "defaults.yaml"
+  ],
+  "reload_supported": true
+}
+```
+
+说明：
+
+- `content` 返回项目根目录下 `newman.yaml` 的完整文本。
+- `effective_workspace` 返回当前已生效配置解析后的绝对路径。
+- `source_priority` 表示配置合并优先级，越靠前优先级越高。
+
+## 6.3 保存项目配置文件
+
+`PUT /api/config/project`
+
+请求体：
+
+```json
+{
+  "content": "server:\n  port: 8010\npaths:\n  workspace: \"workspace\"\n"
+}
+```
+
+响应示例：
+
+```json
+{
+  "saved": true,
+  "path": "/root/newman/newman.yaml",
+  "content": "server:\n  port: 8010\npaths:\n  workspace: \"workspace\"\n",
+  "effective_workspace": "/root/newman/workspace",
+  "requires_reload": true,
+  "warnings": []
+}
+```
+
+说明：
+
+- 保存前会先校验 YAML 语法以及配置结构；顶层必须是 YAML 对象。
+- 该接口只负责写入 `newman.yaml`，不会自动热重载当前进程。
+- `warnings` 会提示“即使 reload 也不能立刻生效”的配置项变化，例如监听地址或 CORS。
+
+## 6.4 重载项目配置
+
+`POST /api/config/reload`
+
+响应示例：
+
+```json
+{
+  "reloaded": true,
+  "path": "/root/newman/newman.yaml",
+  "effective_workspace": "/root/newman/workspace",
+  "warnings": [
+    "`server.host` / `server.port` 的变化需要重启进程后才能真正改变监听地址。"
+  ]
+}
+```
+
+说明：
+
+- 该接口会重新加载配置，并热替换 `settings`、`runtime`、`scheduler` 与 `channels` 服务实例。
+- 新运行时会先重建生态并刷新 scheduler；若启动新实例失败，会回滚到旧实例。
+- `server.host`、`server.port` 和 `server.cors_origins` 的变化会写入配置，但仍需要重启进程才能完全生效。
 
 ---
 
@@ -831,6 +959,34 @@ text/event-stream
 }
 ```
 
+## 7.2A 获取工作区根权限信息
+
+`GET /api/workspace/roots`
+
+响应示例：
+
+```json
+{
+  "workspace": "/root/newman",
+  "readable_roots": [
+    "/root/newman",
+    "/root/newman/backend",
+    "/root/newman/docs"
+  ],
+  "writable_roots": [
+    "/root/newman"
+  ],
+  "protected_roots": [
+    "/root/newman/backend_data/secrets"
+  ]
+}
+```
+
+说明：
+
+- 该接口返回当前路径访问策略展开后的绝对路径集合。
+- 前端可用它判断哪些目录允许浏览、编辑或需要特别标识。
+
 ## 7.3 浏览工作区文件
 
 `GET /api/workspace/files?path=.`
@@ -841,11 +997,13 @@ text/event-stream
 {
   "path": "/root/newman",
   "type": "dir",
+  "access": "writable",
   "entries": [
     {
       "name": "backend",
       "path": "/root/newman/backend",
-      "type": "dir"
+      "type": "dir",
+      "access": "writable"
     }
   ]
 }
@@ -857,9 +1015,25 @@ text/event-stream
 {
   "path": "/root/newman/docs/Newman_API_v1.md",
   "type": "file",
+  "access": "readable",
   "content": "# Newman API 文档 ..."
 }
 ```
+
+说明：
+
+- 若 `path` 指向目录，当前最多返回前 `200` 个子项，并默认跳过隐藏/忽略路径。
+- 若 `path` 指向文件，返回的是文本预览内容，当前最多截断到前 `20000` 个字符。
+- `access` 来自当前路径权限模型，常见值包括 `writable`、`readable`、`protected`。
+
+## 7.3A 获取文件原始内容
+
+`GET /api/workspace/file-content?path=frontend/src/assets/newman-logo.png`
+
+说明：
+
+- 该接口直接返回文件响应，自动推断 `Content-Type`，并设置 `content-disposition: inline`。
+- 适合前端预览图片、PDF 或需要完整内容的文件；相比 `GET /api/workspace/files` 不会进行文本截断。
 
 ---
 
@@ -1153,7 +1327,7 @@ multipart/form-data
   "tools": [
     {
       "name": "read_file",
-      "description": "Read a workspace file. Text files support line-based pagination; binary files return a size-limited preview.",
+      "description": "Read a small workspace file and return the entire contents as base64 in dataBase64. Use this only when you need the exact complete file bytes. If the file may be large or you only need part of a text file, use read_file_range instead.",
       "risk_level": "low",
       "requires_approval": false,
       "timeout_seconds": 10,
@@ -1233,8 +1407,11 @@ multipart/form-data
 
 说明：
 
+- 运行时里的 skill 是“一个目录”，不是单独一段文本；目录内必须有 `SKILL.md`，也可以包含 `scripts/`、`references/`、`templates/`、`assets/`、`requirements.txt`、`pyproject.toml` 等辅助资源。
 - 运行时会动态生成 `backend_data/memory/SKILLS_SNAPSHOT.md`
 - `SKILLS_SNAPSHOT.md` 只负责告诉模型“有哪些 skill 可用、什么时候该用”
+- 列表接口只返回 skill 元数据摘要，不会内联同目录下的脚本、模板、参考资料等辅助文件
+- `path` 指向 skill 的 `SKILL.md`；若需要 skill 目录根路径，请使用详情接口中的 `directory_path`
 - 具体 Skill 正文建议通过工作区文件或 `read_file` 按需读取
 - `backend_data/memory/USER.md` 会被后台稳定记忆抽取逻辑自动合并更新
 - 已启用插件中的 skill 会和平台 `skills/` 目录下的 skill 合并进入同一个 snapshot
@@ -1270,8 +1447,10 @@ multipart/form-data
 字段说明：
 
 - `readonly = true` 表示该 skill 来自 plugin 或其他只读来源，不能通过管理接口修改
+- `content` 仅返回该 skill 的 `SKILL.md` 文本，不会展开同目录下的 `scripts/`、`references/`、`templates/` 等文件
 - `tool_dependencies` 为根据 `SKILL.md` 内容提取出的工具依赖摘要
 - `usage_limits_summary` 为根据 `SKILL.md` 中的约束/限制段落提取出的简要说明
+- `directory_path` 为 skill 目录根路径；若要检查或编辑同目录下的脚本和参考文件，应基于这个目录进一步读取文件
 
 ## 9.13 导入 Skill
 
@@ -1290,6 +1469,8 @@ multipart/form-data
 - `source_path` 必须位于当前可读目录范围内
 - 目标文件夹内必须包含 `SKILL.md`
 - 导入行为会把整个 skill 文件夹复制到平台 `skills/` 目录下，并立即刷新 snapshot
+- 复制范围不仅包含 `SKILL.md`，也包含同目录下的 `scripts/`、`references/`、`templates/`、依赖清单等资源文件
+- 当前没有单独的“创建空 skill”接口；新增 skill 的受支持方式是先准备一个合法 skill 目录，再通过本接口导入
 
 ## 9.14 更新 Skill
 
@@ -1306,6 +1487,7 @@ multipart/form-data
 说明：
 
 - 只允许更新平台 `skills/` 目录中的 system skill
+- 当前该接口只会覆盖目标 skill 的 `SKILL.md` 内容，不会修改同目录下的脚本、模板、参考资料或依赖文件
 - 若目标 skill 为 plugin skill 或其他只读来源，接口会返回冲突错误
 
 ## 9.15 删除 Skill
@@ -1324,6 +1506,7 @@ multipart/form-data
 说明：
 
 - 只允许删除 system skill
+- 删除行为针对整个 skill 目录，而不只是删除 `SKILL.md`
 - plugin skill 或其他只读来源不能通过该接口删除
 
 ---
@@ -1670,6 +1853,7 @@ multipart/form-data
 
 - MCP 工具会统一注册为 `mcp__{server_name}__{tool_name}`
 - `risk_level` 和 `requires_approval` 会进入统一 ToolRouter / Approval 流程
+- MCP 工具参数里出现路径类字段时，运行前会做 preflight 校验：只允许落在当前 `runtime workspace` 内；命中受保护路径也会直接拒绝
 - MCP 资源当前通过运行时工具概览暴露给模型，不单独作为前端 UI 区块展示
 - `http_json` / `http_sse` 默认约定以下端点：
   - `GET /tools`
@@ -1889,6 +2073,12 @@ multipart/form-data
 
 ### 当前已实现事件
 
+- `session_created`
+- `thinking_delta`
+- `thinking_complete`
+- `commentary_delta`
+- `commentary_complete`
+- `answer_started`
 - `assistant_delta`
 - `attachment_received`
 - `attachment_processed`
@@ -1901,6 +2091,7 @@ multipart/form-data
 - `tool_approval_resolved`
 - `tool_error_feedback`
 - `checkpoint_created`
+- `turn_interrupted`
 - `final_response`
 - `stream_completed`
 - `error`
@@ -1908,8 +2099,11 @@ multipart/form-data
 ### 与前端 PRD 对齐说明
 
 - `session_created` 已实现，但只出现在 `POST /api/sessions/stream` 的 SSE 中，不会出现在 `POST /api/sessions/{session_id}/messages` 的消息流里。
+- `thinking_delta` / `thinking_complete` 与 `commentary_delta` / `commentary_complete` 已实现，用于前端展示“当前思路”和“正在执行的短说明”。
+- `answer_started` 已实现，用于标记“当前子轮次开始进入正式回答阶段”；它适合作为 timeline 的“开始回答”节点来源，但不是回答完成信号。
 - 前端当前应以 `final_response` 作为“本轮回答结束”的主信号；`assistant_done` 还未单独实现。
 - `memory_updated` 还未实现为 SSE 事件。前端若要看到最新 Memory 内容，当前应通过 `GET /api/workspace/memory` 主动刷新。
+- `turn_interrupted` 会由 `POST /api/sessions/{session_id}/interrupt` 持久化到审计日志和事件历史；若当前消息流仍处于活跃状态，也会实时推回同一条 `/messages` SSE 连接。
 - 为了支持“单 turn 单回答槽位”渲染，当前推荐前端同时消费三类数据：`assistant_delta` 的流式文本、`final_response` 的完成信号，以及 `GET /api/sessions/{session_id}` 返回的持久化 `assistant` 消息。
 
 说明：
@@ -1917,6 +2111,8 @@ multipart/form-data
 - `tool_approval_request` 只会在通过前置审批后、需要用户人工确认时触发。
 - 若命中 Level 1 黑名单，后端会直接拒绝，不会发送 `tool_approval_request`。
 - `tool_error_feedback` 不仅用于工具执行失败，也用于 Provider 层的可恢复错误回灌。
+- `answer_started` 当前只会出现在“本 turn 已经发生过工具调用，且本次 provider 流真正开始输出正式回答”时；纯直接回答回合不会发送这个事件。
+- 若模型先吐出一段回答、随后又决定继续调工具，后端会发送 `assistant_delta` 且 `data.reset = true`，前端应清空之前的临时回答槽位并等待后续新的回答片段。
 - `tool_call_finished`、`tool_error_feedback` 和 fatal `error` 事件会携带结构化错误恢复字段：
   `error_code`、`severity`、`risk_level`、`recovery_class`、`frontend_message`、`recommended_next_step`
 - 所有 SSE 事件当前都会附带 `request_id`，便于和 HTTP 请求、审计日志做关联。
@@ -1926,6 +2122,21 @@ multipart/form-data
 
 ### 事件示例
 
+#### `answer_started`
+
+```json
+{
+  "event": "answer_started",
+  "data": {
+    "turn_id": "turn_user_001",
+    "group_id": "turn_user_001:group:final",
+    "model": "gpt-5"
+  },
+  "ts": 1741234567890,
+  "request_id": "req_abc123"
+}
+```
+
 #### `assistant_delta`
 
 ```json
@@ -1934,12 +2145,18 @@ multipart/form-data
   "data": {
     "turn_id": "turn_user_001",
     "content": "我先对照 PRD 和现有代码看一下。",
+    "delta": "我先对照 PRD 和现有代码看一下。",
     "model": "gpt-5"
   },
   "ts": 1741234567890,
   "request_id": "req_abc123"
 }
 ```
+
+补充说明：
+
+- `delta` 是本次新增的流式片段；`content` 是当前 turn 临时回答槽位的完整累计文本
+- 若 `data.reset = true`，表示之前泄露出来的临时回答应被视为失效，前端应先清空这段回答，再等待新的回答流
 
 #### `attachment_received`
 

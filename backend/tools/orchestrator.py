@@ -8,7 +8,6 @@ from backend.config.schema import AppConfig
 from backend.runtime.retry_policy import RetryPolicy
 from backend.tools.approval import ApprovalManager
 from backend.tools.approval_policy import (
-    ApprovalDecision,
     ApprovalPolicy,
     DEFAULT_TURN_APPROVAL_MODE,
     TurnApprovalMode,
@@ -33,17 +32,30 @@ class ToolOrchestrator:
         arguments: dict,
         session_id: str,
         emit: EventEmitter,
+        tool_call_id: str | None = None,
+        group_id: str | None = None,
         extra_reasons: list[str] | None = None,
         turn_approval_mode: TurnApprovalMode = DEFAULT_TURN_APPROVAL_MODE,
         turn_id: str | None = None,
     ) -> ToolExecutionResult:
-        decision = self.approval_policy.evaluate(tool, arguments, extra_reasons)
-        if decision.action == "ask" and turn_approval_mode == "auto_approve_level2":
-            decision = ApprovalDecision(
-                action="allow",
-                reasons=decision.reasons,
-                summary="本轮对话已启用 Level 2 默认通过",
+        validation_error = tool.validate_arguments(arguments)
+        if validation_error is not None:
+            return ToolExecutionResult(
+                success=False,
+                tool=tool.meta.name,
+                action="validation",
+                category="validation_error",
+                error_code="invalid_arguments",
+                summary=validation_error,
+                retryable=False,
             )
+
+        decision = self.approval_policy.evaluate(
+            tool,
+            arguments,
+            extra_reasons,
+            turn_approval_mode=turn_approval_mode,
+        )
         if decision.action == "deny":
             return ToolExecutionResult(
                 success=False,
@@ -77,10 +89,11 @@ class ToolOrchestrator:
             try:
                 approved = await self.approvals.wait(request.approval_request_id, self.settings.approval.timeout_seconds)
             except asyncio.TimeoutError:
-                self.approvals.discard(request.approval_request_id)
                 approved = False
-            else:
+            except asyncio.CancelledError:
                 self.approvals.discard(request.approval_request_id)
+                raise
+            self.approvals.discard(request.approval_request_id)
             await emit(
                 "tool_approval_resolved",
                 {
@@ -103,8 +116,26 @@ class ToolOrchestrator:
         while True:
             started = perf_counter()
             try:
+                async def emit_tool_output(stream: str, delta: str) -> None:
+                    if not tool_call_id:
+                        return
+                    await emit(
+                        "tool_call_output_delta",
+                        {
+                            **({"group_id": group_id} if group_id else {}),
+                            "tool_call_id": tool_call_id,
+                            "tool": tool.meta.name,
+                            "stream": stream,
+                            "delta": delta,
+                        },
+                    )
+
                 result = await asyncio.wait_for(
-                    tool.run(arguments, session_id=session_id),
+                    tool.run_streaming(
+                        arguments,
+                        session_id=session_id,
+                        emit_output=emit_tool_output if tool_call_id else None,
+                    ),
                     timeout=tool.meta.timeout_seconds,
                 )
             except asyncio.TimeoutError:

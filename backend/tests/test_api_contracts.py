@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import sys
 import tempfile
 import textwrap
@@ -8,6 +10,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 fake_psycopg = types.ModuleType("psycopg")
 fake_psycopg.connect = lambda *args, **kwargs: None
@@ -50,13 +53,17 @@ from fastapi.testclient import TestClient
 
 from backend.api.middleware.error_handler import install_error_handlers
 from backend.api.routes.approvals import router as approvals_router
-from backend.api.routes.messages import router as messages_router
+from backend.api.routes.config import router as config_router
+from backend.api.routes.messages import ActiveSessionRun, router as messages_router
 from backend.api.routes.plugins import router as plugins_router
 from backend.api.routes.sessions import router as sessions_router
 from backend.api.routes.skills import router as skills_router
 from backend.api.routes.tools import router as tools_router
 from backend.api.routes.workspace import router as workspace_router
+from backend.config.loader import reload_settings
 from backend.plugin_runtime.service import PluginService
+from backend.sessions.models import SessionMessage
+from backend.sessions.session_store import SessionStore
 from backend.skill_runtime.registry import SkillRegistry
 from backend.tools.approval import ApprovalManager, ApprovalRequest
 from backend.tools.base import BaseTool, ToolMeta
@@ -89,6 +96,8 @@ class _DummyMessageRuntime:
         user_metadata: dict[str, object] | None = None,
         turn_approval_mode: str = "manual",
         request_id: str | None = None,
+        turn_id: str | None = None,
+        on_turn_created=None,
     ) -> None:
         self.calls.append(
             {
@@ -99,6 +108,8 @@ class _DummyMessageRuntime:
                 "request_id": request_id,
             }
         )
+        if callable(on_turn_created):
+            on_turn_created(turn_id or "dummy-turn")
         await emit(
             "final_response",
             {
@@ -139,10 +150,13 @@ class _SkillRuntime:
         self.skill_registry.sync_snapshot()
 
 
-def _build_app(router, *, runtime=None, settings=None) -> FastAPI:
+def _build_app(router, *, runtime=None, settings=None, project_root=None, scheduler=None, channels=None) -> FastAPI:
     app = FastAPI()
     app.state.runtime = runtime or SimpleNamespace()
     app.state.settings = settings or SimpleNamespace()
+    app.state.project_root = project_root
+    app.state.scheduler = scheduler or SimpleNamespace()
+    app.state.channels = channels or SimpleNamespace()
     install_error_handlers(app)
     app.include_router(router)
     return app
@@ -158,8 +172,32 @@ def _write_plugin(root: Path, name: str, manifest: str, *, skill_dir_name: str =
         (skill_dir / "SKILL.md").write_text(skill_body, encoding="utf-8")
 
 
+def _write_config_project(root: Path, project_config: str) -> None:
+    config_dir = root / "backend" / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    defaults_source = Path(__file__).resolve().parents[1] / "config" / "defaults.yaml"
+    (config_dir / "defaults.yaml").write_text(defaults_source.read_text(encoding="utf-8"), encoding="utf-8")
+    (root / "newman.yaml").write_text(textwrap.dedent(project_config).strip() + "\n", encoding="utf-8")
+
+
 class MessageRouteTests(unittest.TestCase):
     def test_messages_json_parses_approval_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = _DummyMessageRuntime()
+            settings = SimpleNamespace(paths=SimpleNamespace(audit_dir=root / "audit", data_dir=root / "data"))
+            client = TestClient(_build_app(messages_router, runtime=runtime, settings=settings))
+
+            response = client.post(
+                "/api/sessions/session-1/messages",
+                json={"content": "hello", "approval_mode": "auto_allow"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(runtime.calls[0]["turn_approval_mode"], "auto_allow")
+            self.assertEqual(runtime.calls[0]["user_metadata"]["approval_mode"], "auto_allow")
+
+    def test_messages_json_accepts_legacy_auto_approve_level2_alias(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             runtime = _DummyMessageRuntime()
@@ -172,8 +210,8 @@ class MessageRouteTests(unittest.TestCase):
             )
 
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(runtime.calls[0]["turn_approval_mode"], "auto_approve_level2")
-            self.assertEqual(runtime.calls[0]["user_metadata"]["approval_mode"], "auto_approve_level2")
+            self.assertEqual(runtime.calls[0]["turn_approval_mode"], "auto_allow")
+            self.assertEqual(runtime.calls[0]["user_metadata"]["approval_mode"], "auto_allow")
 
     def test_messages_form_defaults_approval_mode_to_manual(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,6 +228,78 @@ class MessageRouteTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(runtime.calls[0]["turn_approval_mode"], "manual")
             self.assertEqual(runtime.calls[0]["user_metadata"]["approval_mode"], "manual")
+
+    def test_interrupt_route_persists_turn_interrupted_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="interrupt-me")
+            request_id = "req-interrupt"
+            turn_id = "turn-interrupt"
+            session.messages.append(
+                SessionMessage(
+                    id="user-1",
+                    role="user",
+                    content="处理中",
+                    metadata={"turn_id": turn_id, "request_id": request_id},
+                )
+            )
+            session_store.save(session)
+
+            class _InterruptWorker:
+                def __init__(self) -> None:
+                    self.cancelled = False
+
+                def done(self) -> bool:
+                    return False
+
+                def cancel(self) -> None:
+                    self.cancelled = True
+
+                def __await__(self):
+                    async def _wait():
+                        raise asyncio.CancelledError
+
+                    return _wait().__await__()
+
+            worker = _InterruptWorker()
+            event_queue: asyncio.Queue[bytes] = asyncio.Queue()
+            runtime = SimpleNamespace(session_store=session_store)
+            settings = SimpleNamespace(paths=SimpleNamespace(audit_dir=root / "audit", data_dir=root / "data"))
+            client = TestClient(_build_app(messages_router, runtime=runtime, settings=settings))
+            client.app.state.active_message_runs = {
+                session.session_id: ActiveSessionRun(
+                    session_id=session.session_id,
+                    request_id=request_id,
+                    worker=worker,
+                    event_queue=event_queue,
+                    turn_id=turn_id,
+                )
+            }
+
+            response = client.post(f"/api/sessions/{session.session_id}/interrupt")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertTrue(payload["interrupted"])
+            self.assertEqual(payload["turn_id"], turn_id)
+            self.assertTrue(worker.cancelled)
+            self.assertNotIn(session.session_id, client.app.state.active_message_runs)
+
+            saved = session_store.get(session.session_id)
+            self.assertEqual(saved.messages[-1].role, "system")
+            self.assertEqual(saved.messages[-1].metadata["type"], "turn_interrupted")
+            self.assertEqual(saved.messages[-1].metadata["turn_id"], turn_id)
+
+            audit_lines = (root / "audit" / f"{session.session_id}.log").read_text(encoding="utf-8").splitlines()
+            self.assertTrue(audit_lines)
+            event_payload = json.loads(audit_lines[-1])
+            self.assertEqual(event_payload["event"], "turn_interrupted")
+            self.assertEqual(event_payload["data"]["turn_id"], turn_id)
+
+            queued_payload = json.loads(event_queue.get_nowait().decode("utf-8").removeprefix("data: ").strip())
+            self.assertEqual(queued_payload["event"], "turn_interrupted")
+            self.assertEqual(queued_payload["data"]["turn_id"], turn_id)
 
 
 class ApprovalRouteTests(unittest.TestCase):
@@ -464,6 +574,132 @@ class PluginsRouteTests(unittest.TestCase):
             self.assertFalse((plugins_dir / "import_plugin").exists())
 
 
+class ConfigRouteTests(unittest.TestCase):
+    def test_project_config_can_be_read_saved_and_reloaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_config_project(
+                root,
+                """
+                server:
+                  port: 8005
+                paths:
+                  workspace: "."
+                """,
+            )
+            home = root / "fake-home"
+            home.mkdir(parents=True, exist_ok=True)
+
+            class _ReloadRuntime:
+                def __init__(self, settings):
+                    self.settings = settings
+                    self.scheduler_store = object()
+                    self.closed = False
+                    self.reload_count = 0
+
+                def reload_ecosystem(self) -> None:
+                    self.reload_count += 1
+
+                def close(self) -> None:
+                    self.closed = True
+
+            class _ReloadScheduler:
+                def __init__(self, task_store, runtime):
+                    self.task_store = task_store
+                    self.runtime = runtime
+                    self._running = False
+                    self.start_count = 0
+                    self.stop_count = 0
+                    self.refresh_count = 0
+
+                async def start(self) -> None:
+                    self._running = True
+                    self.start_count += 1
+
+                async def stop(self) -> None:
+                    self._running = False
+                    self.stop_count += 1
+
+                def refresh_schedule(self) -> None:
+                    self.refresh_count += 1
+
+            class _ReloadChannels:
+                def __init__(self, settings, runtime):
+                    self.settings = settings
+                    self.runtime = runtime
+
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=True):
+                current_settings = reload_settings(str(root))
+                previous_runtime = _ReloadRuntime(current_settings)
+                previous_scheduler = _ReloadScheduler(object(), previous_runtime)
+                previous_channels = _ReloadChannels(current_settings, previous_runtime)
+                client = TestClient(
+                    _build_app(
+                        config_router,
+                        runtime=previous_runtime,
+                        settings=current_settings,
+                        project_root=root,
+                        scheduler=previous_scheduler,
+                        channels=previous_channels,
+                    )
+                )
+
+                with patch("backend.api.routes.config.NewmanRuntime", _ReloadRuntime), patch(
+                    "backend.api.routes.config.SchedulerEngine", _ReloadScheduler
+                ), patch("backend.api.routes.config.ChannelService", _ReloadChannels):
+                    detail = client.get("/api/config/project")
+                    self.assertEqual(detail.status_code, 200)
+                    self.assertEqual(detail.json()["effective_workspace"], str(current_settings.paths.workspace))
+
+                    updated = client.put(
+                        "/api/config/project",
+                        json={
+                            "content": textwrap.dedent(
+                                """\
+                                server:
+                                  port: 8010
+                                paths:
+                                  workspace: "workspace"
+                                """
+                            )
+                        },
+                    )
+                    self.assertEqual(updated.status_code, 200)
+                    self.assertTrue(updated.json()["saved"])
+                    self.assertEqual(updated.json()["effective_workspace"], str((root / "workspace").resolve()))
+
+                    reloaded = client.post("/api/config/reload")
+                    self.assertEqual(reloaded.status_code, 200)
+                    self.assertTrue(reloaded.json()["reloaded"])
+                    self.assertEqual(reloaded.json()["effective_workspace"], str((root / "workspace").resolve()))
+
+                self.assertEqual(previous_scheduler.stop_count, 1)
+                self.assertTrue(previous_runtime.closed)
+                self.assertEqual(client.app.state.settings.server.port, 8010)
+                self.assertEqual(client.app.state.settings.paths.workspace, (root / "workspace").resolve())
+
+    def test_project_config_rejects_invalid_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_config_project(
+                root,
+                """
+                server:
+                  port: 8005
+                """,
+            )
+            home = root / "fake-home"
+            home.mkdir(parents=True, exist_ok=True)
+
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=True):
+                settings = reload_settings(str(root))
+                client = TestClient(_build_app(config_router, settings=settings, project_root=root))
+
+                invalid = client.put("/api/config/project", json={"content": "- invalid\n- list\n"})
+                self.assertEqual(invalid.status_code, 400)
+                self.assertIn("顶层必须是 YAML 对象", invalid.json()["error"]["message"])
+
+
 class ToolsRouteTests(unittest.TestCase):
     def test_tools_routes_return_tool_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -507,6 +743,8 @@ class ToolsRouteTests(unittest.TestCase):
             detail = client.get("/api/tools/read_file")
             self.assertEqual(detail.status_code, 200)
             self.assertEqual(detail.json()["tool"]["class_name"], "ReadFileTool")
+            self.assertEqual(detail.json()["tool"]["approval_behavior"], "safe")
+            self.assertFalse(detail.json()["tool"]["requires_approval"])
 
             rescanned = client.post("/api/tools/rescan")
             self.assertEqual(rescanned.status_code, 200)

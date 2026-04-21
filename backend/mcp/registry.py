@@ -11,8 +11,9 @@ from backend.tools.base import BaseTool
 
 
 class MCPRegistry:
-    def __init__(self, config_path: Path):
+    def __init__(self, config_path: Path, workspace: Path | None = None):
         self.store = MCPConfigStore(config_path)
+        self.workspace = workspace.resolve() if workspace is not None else None
         self._statuses: list[MCPServerStatus] = []
         self._resources: list[MCPResourceRecord] = []
         self._clients: dict[str, MCPClient] = {}
@@ -141,7 +142,7 @@ class MCPRegistry:
             return existing
         if existing is not None:
             existing.close()
-        client = MCPClient(server)
+        client = MCPClient(server, workspace=self.workspace)
         self._clients[server.name] = client
         return client
 

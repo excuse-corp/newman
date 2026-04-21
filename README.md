@@ -53,6 +53,20 @@ conda activate newman
 - 后端 API
 - 前端工作台
 
+常用配套命令：
+
+```bash
+./scripts/dev/status_services.sh
+./scripts/dev/restart_services.sh
+./scripts/dev/stop_services.sh
+```
+
+说明：
+
+- 这些脚本会按端口监听和健康检查确认状态，不再只依赖 PID 文件
+- `backend_data/run/*.pid` 会尽量记录真实监听进程 PID，而不是仅记录启动壳进程
+- 这些脚本应在主机 shell 中运行；如果在 `bwrap` / Codex 这类 PID namespace 沙箱里执行，会直接报错并退出，避免误导性的“已启动 / 已停止”提示
+
 ### 本地 PostgreSQL
 
 ```bash
@@ -112,6 +126,14 @@ Newman 按以下优先级加载配置：
 ```bash
 cp .env.example .env
 ```
+
+如果你要使用基于 SerpApi 的 Google 联网搜索工具，还可以在 `.env` 里补充：
+
+```env
+SERPAPI_API_KEY=your_serpapi_api_key_here
+```
+
+`google_search` 工具固定调用的接口是 `https://serpapi.com/search?engine=google_light`，并兼容读取 `SERPAPI_API_KEY`、`SERPAPI_KEY` 或 `NEWMAN_SERPAPI_API_KEY`。
 
 常见变量示例：
 
@@ -241,6 +263,14 @@ conda activate newman
 - 日志目录：`backend_data/run/logs/`
 - PID 文件：`backend_data/run/backend.pid`、`backend_data/run/frontend.pid`
 
+状态与重启：
+
+```bash
+cd /root/newman
+./scripts/dev/status_services.sh
+./scripts/dev/restart_services.sh
+```
+
 停止命令：
 
 ```bash
@@ -279,8 +309,7 @@ npm run dev -- --host 0.0.0.0 --port 7775 --strictPort
 
 ```bash
 cd /root/newman
-./scripts/dev/stop_services.sh
-./scripts/dev/start_services.sh
+./scripts/dev/restart_services.sh
 ```
 
 如果仍有问题，再单独看 PostgreSQL：

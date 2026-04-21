@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from backend.memory.stable_context import StableContextLoader
-from backend.sessions.models import CheckpointRecord, SessionRecord
+from backend.sessions.models import CheckpointRecord, SessionMessage, SessionRecord
 
 
 COMMENTARY_SYSTEM_GUARDRAIL = (
@@ -15,13 +15,20 @@ COMMENTARY_SYSTEM_GUARDRAIL = (
 
 
 class PromptAssembler:
-    def __init__(self, stable_context_loader: StableContextLoader, workspace_path: str):
+    def __init__(self, stable_context_loader: StableContextLoader):
         self.stable_context_loader = stable_context_loader
-        self.workspace_path = workspace_path
 
-    def assemble(self, session: SessionRecord, tools_overview: str, approval_policy: str, checkpoint: CheckpointRecord | None) -> list[dict]:
-        stable_context = self.stable_context_loader.build(tools_overview, approval_policy, self.workspace_path)
+    def assemble(
+        self,
+        session: SessionRecord,
+        tools_overview: str,
+        checkpoint: CheckpointRecord | None,
+        *,
+        tool_message_overrides: dict[str, SessionMessage] | None = None,
+    ) -> list[dict]:
+        stable_context = self.stable_context_loader.build(tools_overview)
         messages = [{"role": "system", "content": f"{COMMENTARY_SYSTEM_GUARDRAIL}\n\n{stable_context}"}]
+        overrides = tool_message_overrides or {}
         has_restored_checkpoint = any(
             item.role == "system" and item.metadata.get("type") == "checkpoint_restore"
             for item in session.messages
@@ -57,8 +64,14 @@ class PromptAssembler:
                     continue
 
             if item.role == "tool":
-                message = {"role": item.role, "content": item.content}
+                source_item = item
                 tool_call_id = item.metadata.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    override = overrides.get(tool_call_id)
+                    if override is not None:
+                        source_item = override
+                message = {"role": source_item.role, "content": source_item.content}
+                tool_call_id = source_item.metadata.get("tool_call_id") or item.metadata.get("tool_call_id")
                 if isinstance(tool_call_id, str) and tool_call_id:
                     message["tool_call_id"] = tool_call_id
                 messages.append(message)

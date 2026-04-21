@@ -6,6 +6,7 @@ from backend.rag.citation import format_citation_label
 from backend.rag.service import KnowledgeBaseService
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.discovery import BuiltinToolContext
+from backend.tools.provider_exposure import KNOWLEDGE_TOOL_GROUP
 from backend.tools.result import ToolExecutionResult
 
 
@@ -24,8 +25,9 @@ class SearchKnowledgeBaseTool(BaseTool):
                 "required": ["query"],
             },
             risk_level="low",
-            requires_approval=False,
+            approval_behavior="safe",
             timeout_seconds=10,
+            provider_group=KNOWLEDGE_TOOL_GROUP,
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:

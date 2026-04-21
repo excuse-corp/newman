@@ -112,6 +112,14 @@ class ConfigLoadReport:
     sources: dict[str, str]
 
 
+def resolve_project_root(project_root: str | None = None) -> Path:
+    return Path(project_root or Path(__file__).resolve().parents[2]).resolve()
+
+
+def get_project_config_path(project_root: str | None = None) -> Path:
+    return resolve_project_root(project_root) / "newman.yaml"
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -245,6 +253,16 @@ def _log_report(report: ConfigLoadReport) -> None:
         DISPLAY_LOGGER.info(message)
 
 
+def parse_project_config_content(content: str) -> dict[str, Any]:
+    try:
+        loaded = yaml.safe_load(content) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"newman.yaml YAML 解析失败: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError("newman.yaml 顶层必须是 YAML 对象")
+    return loaded
+
+
 def _build_env_path_map(defaults: dict[str, Any]) -> dict[str, tuple[str, ...]]:
     env_map: dict[str, tuple[str, ...]] = {}
     for path in _flatten_paths(defaults):
@@ -293,10 +311,7 @@ def _resolve_paths(config: AppConfig, project_root: Path) -> AppConfig:
     return AppConfig.model_validate(data)
 
 
-@lru_cache(maxsize=1)
-def get_settings(project_root: str | None = None) -> AppConfig:
-    global _LAST_SETTINGS_REPORT
-    root = Path(project_root or Path(__file__).resolve().parents[2]).resolve()
+def _load_settings_uncached(root: Path, *, project_payload: dict[str, Any] | None = None) -> tuple[AppConfig, ConfigLoadReport]:
     defaults_path = root / "backend" / "config" / "defaults.yaml"
     project_config_path = root / "newman.yaml"
     user_config_path = Path.home() / ".newman" / "config.yaml"
@@ -305,7 +320,7 @@ def get_settings(project_root: str | None = None) -> AppConfig:
 
     defaults = _read_yaml(defaults_path)
     _ensure_project_config(project_config_path)
-    project = _read_yaml(project_config_path)
+    project = project_payload if project_payload is not None else _read_yaml(project_config_path)
     user = _read_yaml(user_config_path)
     dotenv_values = _read_dotenv(project_dotenv_path)
     dotenv_values.update(_read_dotenv(user_dotenv_path))
@@ -323,6 +338,27 @@ def get_settings(project_root: str | None = None) -> AppConfig:
     settings = AppConfig.model_validate_merged(merged)
     settings = _resolve_paths(settings, root)
     report = _build_report(root, settings.model_dump(mode="json"), source_map)
+    return settings, report
+
+
+def read_project_config_text(project_root: str | None = None) -> str:
+    path = get_project_config_path(project_root)
+    _ensure_project_config(path)
+    return path.read_text(encoding="utf-8")
+
+
+def validate_project_config_content(content: str, project_root: str | None = None) -> AppConfig:
+    root = resolve_project_root(project_root)
+    project_payload = parse_project_config_content(content)
+    settings, _ = _load_settings_uncached(root, project_payload=project_payload)
+    return settings
+
+
+@lru_cache(maxsize=1)
+def get_settings(project_root: str | None = None) -> AppConfig:
+    global _LAST_SETTINGS_REPORT
+    root = resolve_project_root(project_root)
+    settings, report = _load_settings_uncached(root)
     _LAST_SETTINGS_REPORT = report
 
     for path in [

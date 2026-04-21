@@ -5,6 +5,7 @@ from typing import Any
 
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.discovery import BuiltinToolContext
+from backend.tools.provider_exposure import CORE_TOOL_GROUP
 from backend.tools.result import ToolExecutionResult
 from backend.tools.workspace_fs import (
     PathAccessPolicy,
@@ -32,9 +33,11 @@ class ListDirectoryTool(BaseTool):
                 },
             },
             risk_level="low",
-            requires_approval=False,
+            approval_behavior="safe",
             timeout_seconds=10,
             allowed_paths=[str(path) for path in self.policy.readable_roots],
+            provider_group=CORE_TOOL_GROUP,
+            alias_of="list_dir" if name == "list_files" else None,
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:

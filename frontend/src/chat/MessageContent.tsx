@@ -1,3 +1,4 @@
+import { Children, isValidElement, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
@@ -166,6 +167,122 @@ function renderAttachmentGrid(apiBase: string, attachments: ChatAttachment[]) {
   );
 }
 
+const CODE_LANGUAGE_LABELS: Record<string, string> = {
+  bash: "Bash",
+  css: "CSS",
+  html: "HTML",
+  javascript: "JavaScript",
+  js: "JavaScript",
+  json: "JSON",
+  jsx: "JSX",
+  markdown: "Markdown",
+  md: "Markdown",
+  python: "Python",
+  py: "Python",
+  shell: "Shell",
+  sh: "Shell",
+  sql: "SQL",
+  text: "Text",
+  plaintext: "Text",
+  ts: "TypeScript",
+  tsx: "TSX",
+  typescript: "TypeScript",
+  yaml: "YAML",
+  yml: "YAML",
+};
+
+function extractCodeLanguage(className?: string) {
+  const match = className?.match(/language-([A-Za-z0-9_-]+)/);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+function formatCodeLanguageLabel(language: string | null) {
+  if (!language) {
+    return "Code";
+  }
+  if (CODE_LANGUAGE_LABELS[language]) {
+    return CODE_LANGUAGE_LABELS[language];
+  }
+  return language
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((segment) => segment.slice(0, 1).toUpperCase() + segment.slice(1))
+    .join(" ");
+}
+
+function extractNodeText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") {
+    return String(node);
+  }
+  if (Array.isArray(node)) {
+    return node.map((child) => extractNodeText(child)).join("");
+  }
+  if (isValidElement<{ children?: ReactNode }>(node)) {
+    return extractNodeText(node.props.children);
+  }
+  return "";
+}
+
+function MarkdownCodeBlock({ children }: ComponentProps<"pre">) {
+  const timeoutRef = useRef<number | null>(null);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const childNodes = Children.toArray(children);
+  const codeChild = childNodes.find((child) =>
+    isValidElement<{ className?: string; children?: ReactNode }>(child),
+  );
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current !== null) {
+        window.clearTimeout(timeoutRef.current);
+      }
+    };
+  }, []);
+
+  if (!isValidElement<{ className?: string; children?: ReactNode }>(codeChild)) {
+    return <pre>{children}</pre>;
+  }
+
+  const language = extractCodeLanguage(codeChild.props.className);
+  const codeText = extractNodeText(codeChild.props.children).replace(/\n$/, "");
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(codeText);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+    }
+
+    if (timeoutRef.current !== null) {
+      window.clearTimeout(timeoutRef.current);
+    }
+
+    timeoutRef.current = window.setTimeout(() => {
+      setCopyState("idle");
+      timeoutRef.current = null;
+    }, 1800);
+  };
+
+  return (
+    <div className="chat-code-block">
+      <div className="chat-code-block-head">
+        <span className="chat-code-block-language">{formatCodeLanguageLabel(language)}</span>
+        <button
+          type="button"
+          className={`chat-code-block-copy ${copyState !== "idle" ? `is-${copyState}` : ""}`}
+          onClick={handleCopy}
+        >
+          {copyState === "copied" ? "已复制" : copyState === "failed" ? "复制失败" : "复制代码"}
+        </button>
+      </div>
+      <pre className="chat-code-block-pre">
+        <code className={codeChild.props.className}>{codeText}</code>
+      </pre>
+    </div>
+  );
+}
+
 export default function MessageContent({
   apiBase,
   variant,
@@ -193,6 +310,7 @@ export default function MessageContent({
           rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSchema]]}
           components={{
             a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
+            pre: ({ node: _node, ...props }) => <MarkdownCodeBlock {...props} />,
           }}
         >
           {content}

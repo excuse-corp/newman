@@ -181,6 +181,7 @@ class MCPRegistryTests(unittest.TestCase):
 
             self.assertEqual(len(tools), 1)
             self.assertTrue(tools[0].meta.requires_approval)
+            self.assertEqual(tools[0].meta.approval_behavior, "confirmable")
             self.assertEqual(status.status, "connected")
             self.assertEqual(status.tool_count, 1)
             self.assertEqual(status.resource_count, 1)
@@ -290,6 +291,81 @@ class MCPRegistryTests(unittest.TestCase):
                 self.assertEqual(registry.list_resources()[0].name, "stdio-context")
                 self.assertTrue(result.success)
                 self.assertEqual(result.stdout, "stdio")
+            finally:
+                registry.close()
+
+    def test_stdio_server_runs_with_workspace_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            script_path = root / "stdio_mcp_server.py"
+            script_path.write_text(
+                textwrap.dedent(
+                    """
+                    import json
+                    import os
+                    from pathlib import Path
+                    import sys
+
+                    for line in sys.stdin:
+                        payload = json.loads(line)
+                        method = payload.get("method")
+                        if method == "tools.list":
+                            result = {
+                                "tools": [
+                                    {
+                                        "name": "inspect_workspace",
+                                        "description": "Inspect cwd",
+                                        "input_schema": {
+                                            "type": "object",
+                                            "properties": {},
+                                        },
+                                        "risk_level": "low",
+                                    }
+                                ]
+                            }
+                        elif method == "resources.list":
+                            result = {"resources": []}
+                        elif method == "tools.invoke":
+                            result = {
+                                "success": True,
+                                "summary": "inspect_workspace completed",
+                                "stdout": json.dumps(
+                                    {
+                                        "cwd": str(Path.cwd()),
+                                        "workspace_env": os.environ.get("NEWMAN_RUNTIME_WORKSPACE", ""),
+                                    }
+                                ),
+                            }
+                        else:
+                            result = {}
+                        sys.stdout.write(json.dumps({"id": payload.get("id"), "result": result}) + "\\n")
+                        sys.stdout.flush()
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            registry = MCPRegistry(root / "servers.yaml", workspace=workspace)
+            registry.upsert_server(
+                MCPServerConfig(
+                    name="stdio-cwd-demo",
+                    transport="stdio",
+                    command=[sys.executable],
+                    args=[str(script_path)],
+                )
+            )
+
+            try:
+                tools = registry.build_tools()
+                result = asyncio.run(tools[0].run({}, "session-stdio-cwd"))
+                payload = json.loads(result.stdout)
+
+                self.assertTrue(result.success)
+                self.assertEqual(payload["cwd"], str(workspace.resolve()))
+                self.assertEqual(payload["workspace_env"], str(workspace.resolve()))
             finally:
                 registry.close()
 

@@ -146,14 +146,12 @@ Do not skip it. Use the user's language. Do not put final-answer content inside 
 
 ### 3.2 Stable Context
 
-`stable_context` 由下面 6 段内容按顺序拼起来，中间用两个换行分隔：
+`stable_context` 由下面 4 段内容按顺序拼起来，中间用两个换行分隔：
 
 1. `backend_data/memory/Newman.md`
 2. `backend_data/memory/USER.md`
 3. `backend_data/memory/SKILLS_SNAPSHOT.md`
 4. `## Tooling Overview\n{tools_overview}`
-5. `## Approval Policy\n{approval_policy_json}`
-6. `## Workspace\n{workspace_path}`
 
 拼接逻辑等价于：
 
@@ -166,15 +164,9 @@ Do not skip it. Use the user's language. Do not put final-answer content inside 
 
 ## Tooling Overview
 {tools_overview}
-
-## Approval Policy
-{approval_policy_json}
-
-## Workspace
-{workspace_path}
 ```
 
-### 3.3 这 6 段现在分别是什么
+### 3.3 这 4 段现在分别是什么
 
 #### 3.3.1 `Newman.md`
 
@@ -225,7 +217,7 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 - Trigger rules: if the user names a skill, or the task clearly matches a skill description, you must use that skill for this turn.
 - Progressive disclosure: do not preload skill bodies. First decide which single skill is most relevant, then read its `SKILL.md` with `read_file`.
 - If the skill references sibling files such as `references/`, `templates/`, or `scripts/`, inspect only the files needed for the current task.
-- Prefer using existing tools (`read_file`, `list_dir`, `search_files`, `write_file`, `edit_file`, `update_plan`, `terminal`) exactly as the skill instructs.
+- Prefer using existing tools (`read_file`, `read_file_range`, `list_dir`, `search_files`, `write_file`, `edit_file`, `update_plan`, `terminal`) exactly as the skill instructs.
 - Do not read multiple skills up front unless the user explicitly asks for a comparison.
 ```
 
@@ -239,15 +231,16 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 - edit_file: Edit a text file by applying exact string replacements.
 - fetch_url: Fetch a URL over HTTP(S).
 - list_dir: List files and directories inside the workspace.
-- list_files: Alias of list_dir. List files and directories inside the workspace.
-- read_file: Read a workspace file. Text files support line-based pagination; binary files return a size-limited preview.
+- read_file: Read a small workspace file and return the entire contents as base64 in dataBase64. Use this only when you need the exact complete file bytes.
+- read_file_range: Read up to limit lines from a UTF-8 text file starting at offset (1-based line number). Use this for large text files or partial reads.
 - search_files: Search file contents in the workspace and return matching lines.
-- grep: Alias of search_files. Search file contents in the workspace and return matching lines.
 - search_knowledge_base: Search imported knowledge documents and return the most relevant snippets.
 - terminal: Execute a shell command inside the native sandbox.
 - update_plan: Create or update the current multi-step plan for this session. Use it for complex tasks, and keep at most one step in_progress.
 - write_file: Create or overwrite a text file inside the workspace.
 ```
+
+这里的 alias 工具（如 `list_files`、`grep`）不会再进入 overview；overview 只展示主工具名，避免重复占用 token。
 
 如果未来 MCP resource 有描述，还会额外拼一段：
 
@@ -257,28 +250,6 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 ```
 
 当前实例里没有这段。
-
-#### 3.3.5 `Approval Policy`
-
-这块不是自然语言说明，而是把 `settings.approval.model_dump(mode="json")` 的结果直接 `json.dumps(..., ensure_ascii=False)` 后塞进去。
-
-当前实际内容是：
-
-```json
-{"level1_blacklist": ["rm -rf /", "sudo", "su ", "chmod 777 /", "chown root"], "level2_patterns": ["write_file_outside_workspace", "process_spawn", "terminal_mutation_or_unknown", "danger_full_access_terminal", "maintain_memory", "maintain_skill", "maintain_plugin", "maintain_tool"], "timeout_seconds": 120}
-```
-
-所以这块注入的是“完整审批配置 JSON”，不是摘取几个字段。
-
-#### 3.3.6 `Workspace`
-
-这里塞的是当前配置里的工作区路径字符串。
-
-当前实际值是：
-
-```text
-/root/newman
-```
 
 ## 4. 第二大块：可选 Checkpoint Summary Block
 
@@ -401,7 +372,7 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
   "type": "function",
   "function": {
     "name": "read_file",
-    "description": "Read a workspace file. Text files support line-based pagination; binary files return a size-limited preview.",
+    "description": "Read a small workspace file and return the entire contents as base64 in dataBase64. Use this only when you need the exact complete file bytes.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -414,8 +385,8 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 
 这里有两个关键点：
 
-1. `Tooling Overview` 是给模型看的纯文本说明
-2. `tools` 才是 provider 真正用来发起 function call 的结构化接口定义
+1. `Tooling Overview` 是给模型看的纯文本说明，展示的是主工具摘要
+2. `tools` 才是 provider 真正用来发起 function call 的结构化接口定义，而且当前实现会按本轮任务做分组筛选，不一定把所有工具 schema 都发进去
 
 两者都会同时存在。
 
@@ -502,7 +473,7 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 ```json
 {
   "role": "tool",
-  "content": "result.stdout or result.summary",
+  "content": "persisted_output if provided, otherwise result.stdout or result.summary",
   "metadata": {
     "tool_call_id": "...",
     "tool": "...",
@@ -511,6 +482,8 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
   }
 }
 ```
+
+对于 `read_file` / `read_file_range` 这类容易膨胀上下文的工具，当前实现会把 session 中的 `content` 收缩成摘要 JSON，而不是把完整 base64 或全文长期持久化。
 
 但下一次真正进入主模型上下文时，只有：
 
@@ -523,6 +496,8 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 ```
 
 会被保留下来。
+
+如果当前 turn 还没有结束，运行时还可以用一份临时 override 把这条 `tool` message 替换回完整输出，让同一轮后续推理继续使用真实内容；等 turn 结束后，长期保留的仍然是 session 里的摘要版。
 
 ## 9. 特殊收口请求还会额外塞 system 消息
 
@@ -637,7 +612,8 @@ messages = [
 
 并且工具返回：
 
-- `已读取文本文件 README.md 的第 1-40 行`
+- `{"dataBase64":"IyBOZXdtYW4KLi4u"}`
+- 同时 session 持久化层只保存一条摘要版 tool message，例如 `{"summary":"Read complete file README.md; raw content omitted from persisted history", ...}`
 
 那么下一次主模型请求时，相关 history 会长这样：
 
@@ -667,13 +643,13 @@ messages = [
   },
   {
     "role": "tool",
-    "content": "已读取文本文件 README.md 的第 1-40 行",
+    "content": "{\"dataBase64\":\"IyBOZXdtYW4KLi4u\"}",
     "tool_call_id": "call_1"
   }
 ]
 ```
 
-也就是说，工具协议链条会完整保留进下一次请求里。
+也就是说，在同一 turn 的下一次请求里，工具协议链条仍会使用完整工具输出；只是 turn 结束后，长期保留在 session 里的会是摘要版，而不是整段 base64。
 
 ## 13. 例子 4：restore-checkpoint 之后
 

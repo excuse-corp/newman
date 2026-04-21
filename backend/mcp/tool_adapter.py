@@ -18,8 +18,8 @@ class MCPToolAdapter(BaseTool):
             description=spec.description or f"MCP tool {spec.name} from {server.name}",
             input_schema=spec.input_schema,
             risk_level=spec.risk_level,
-            requires_approval=server.requires_approval,
             timeout_seconds=server.timeout_seconds,
+            approval_behavior="confirmable" if server.requires_approval else "safe",
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:
@@ -57,4 +57,3 @@ class MCPToolAdapter(BaseTool):
             retryable=bool(body.get("retryable", False)),
             metadata=body.get("metadata", {}) if isinstance(body.get("metadata"), dict) else {},
         )
-

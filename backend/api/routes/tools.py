@@ -51,6 +51,7 @@ def _build_tool_detail(request: Request, tool) -> dict:
         "name": tool.meta.name,
         "description": tool.meta.description,
         "risk_level": tool.meta.risk_level,
+        "approval_behavior": tool.meta.approval_behavior,
         "requires_approval": tool.meta.requires_approval,
         "timeout_seconds": tool.meta.timeout_seconds,
         "allowed_paths": tool.meta.allowed_paths,

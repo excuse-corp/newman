@@ -28,3 +28,11 @@ Use these guidelines when creating or revising a skill.
 
 - Inspect similar skills before inventing a new layout.
 - Keep headings and folder names consistent with existing workspace skills when possible.
+
+## Isolate Python dependencies when needed
+
+- If a skill includes Python code that depends on third-party packages, prefer a skill-local virtual environment at `<skill-root>/.venv`.
+- For beginners: `.venv` is a private Python installation for just that skill. It keeps package versions for one skill from breaking another skill or the machine's global Python setup.
+- Commit the files that describe and bootstrap the environment, such as `requirements.txt`, `pyproject.toml`, and a wrapper script. Do not commit the generated `.venv` folder unless the user explicitly asks for that.
+- In `SKILL.md`, instruct the agent to run the wrapper script rather than invoking bare `python` directly.
+- Make wrapper scripts idempotent when possible: create `.venv` if missing, install dependencies, then run the actual script using the interpreter inside `.venv`.

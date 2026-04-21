@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Awaitable, Callable
 from uuid import uuid4
@@ -11,8 +12,9 @@ from backend.hooks.hook_manager import HookManager
 from backend.mcp.registry import MCPRegistry
 from backend.memory.checkpoint_store import CheckpointStore
 from backend.memory.compressor import (
+    build_context_usage_snapshot,
     build_checkpoint_metadata,
-    estimate_pressure,
+    microcompact_session,
     split_session_messages,
     summarize_messages,
 )
@@ -38,6 +40,7 @@ from backend.tools.orchestrator import ToolOrchestrator
 from backend.tools.approval_policy import DEFAULT_TURN_APPROVAL_MODE, TurnApprovalMode
 from backend.tools.discovery import BuiltinToolContext, load_builtin_tools
 from backend.tools.permission_context import PermissionContext
+from backend.tools.provider_exposure import infer_provider_tool_groups
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import ToolRouter, analyze_terminal_command
 from backend.tools.result import ToolExecutionResult
@@ -59,6 +62,16 @@ COMMENTARY_FALLBACK_SYSTEM_PROMPT = """你负责把内部思考压缩成一条�
 - 尽量简短，通常控制在 8 到 24 个汉字
 - 使用用户当前回合的语言
 """
+
+RAW_TOOL_CALL_MARKUP_RE = re.compile(r"<(?:[\w.-]+:)?tool_call\b", re.IGNORECASE)
+
+
+def _build_tool_message_output(result: ToolExecutionResult) -> str:
+    if result.tool != "terminal":
+        return result.stdout
+
+    outputs = [part for part in [result.stdout.strip(), result.stderr.strip()] if part]
+    return "\n".join(outputs)
 
 
 class NewmanRuntime:
@@ -82,7 +95,7 @@ class NewmanRuntime:
         )
         self._background_tasks: set[asyncio.Task] = set()
         self.stable_context = StableContextLoader(settings.paths.memory_dir)
-        self.prompt_assembler = PromptAssembler(self.stable_context, str(settings.paths.workspace))
+        self.prompt_assembler = PromptAssembler(self.stable_context)
         self.feedback_writer = FeedbackWriter()
         self.approvals = ApprovalManager()
         self.plugin_service = PluginService(
@@ -92,7 +105,7 @@ class NewmanRuntime:
         )
         self.skill_registry = SkillRegistry(self.plugin_service, settings.paths.memory_dir)
         self.hook_manager = HookManager(self.plugin_service)
-        self.mcp_registry = MCPRegistry(settings.paths.mcp_dir / "servers.yaml")
+        self.mcp_registry = MCPRegistry(settings.paths.mcp_dir / "servers.yaml", workspace=settings.paths.workspace)
         self.scheduler_store = TaskStore(settings.paths.scheduler_dir / "tasks.json")
         self.registry = ToolRegistry()
         self.router = ToolRouter(self.registry, settings)
@@ -192,10 +205,13 @@ class NewmanRuntime:
         user_metadata: dict[str, object] | None = None,
         turn_approval_mode: TurnApprovalMode = DEFAULT_TURN_APPROVAL_MODE,
         request_id: str | None = None,
+        turn_id: str | None = None,
+        on_turn_created: Callable[[str], None] | None = None,
     ) -> None:
         self.reload_ecosystem()
+        resolved_turn_id = turn_id or uuid4().hex
         user_message = SessionMessage(
-            id=uuid4().hex,
+            id=resolved_turn_id,
             role="user",
             content=content,
             metadata=self._build_message_metadata(
@@ -204,35 +220,34 @@ class NewmanRuntime:
                 extra=user_metadata or {},
             ),
         )
-        user_message.metadata["turn_id"] = user_message.id
+        user_message.metadata["turn_id"] = resolved_turn_id
         session = self.session_store.append_message(session_id, user_message)
+        if on_turn_created is not None:
+            on_turn_created(resolved_turn_id)
 
-        task = SessionTask(session=session, permission_context=PermissionContext(), turn_id=user_message.id)
+        task = SessionTask(session=session, permission_context=PermissionContext(), turn_id=resolved_turn_id)
         turn_emit = self._bind_turn_emitter(emit, task.turn_id)
         await self._emit_hooks("SessionStart", turn_emit, session_id=session.session_id, content=content)
-        await self._maybe_checkpoint(task, turn_emit)
         provider_feedback_attempted = False
 
         for _ in range(self.settings.runtime.max_tool_depth):
             group_id = task.next_action_group_id()
             self.skill_registry.sync_snapshot()
-            assembled = self.prompt_assembler.assemble(
-                task.session,
-                self._tools_overview(),
-                json.dumps(self.settings.approval.model_dump(mode="json"), ensure_ascii=False),
-                self.checkpoints.get(task.session.session_id),
-            )
+            await self._maybe_checkpoint(task, turn_emit)
+            assembled = self._assemble_task_messages(task)
+            provider_tools = self._provider_tools_for_turn(task)
 
             try:
                 response = await self._stream_provider_response(
                     assembled,
-                    self.registry.tools_for_provider(task.permission_context),
+                    provider_tools,
                     turn_emit,
                     session_id=task.session.session_id,
                     turn_id=task.turn_id,
                     request_kind="session_turn",
                     counts_toward_context_window=True,
                     group_id=group_id,
+                    emit_answer_started=task.tool_depth > 0,
                 )
             except ProviderError as exc:
                 result = self._provider_error_result(exc)
@@ -341,7 +356,9 @@ class NewmanRuntime:
                     tool_call.arguments,
                     task.session.session_id,
                     turn_emit,
-                    extra_reasons,
+                    tool_call_id=tool_call.id,
+                    group_id=group_id,
+                    extra_reasons=extra_reasons,
                     turn_approval_mode=turn_approval_mode,
                     turn_id=task.turn_id,
                 )
@@ -350,25 +367,12 @@ class NewmanRuntime:
                 if isinstance(metadata_updates, dict):
                     task.session.metadata.update(metadata_updates)
                 task.session.messages.append(
-                    SessionMessage(
-                        id=uuid4().hex,
-                        role="tool",
-                        content=result.stdout or result.summary,
-                        metadata={
-                            "turn_id": task.turn_id,
-                            **({"request_id": request_id} if request_id else {}),
-                            "group_id": group_id,
-                            "tool_call_id": tool_call.id,
-                            "tool": result.tool,
-                            "category": result.category,
-                            "success": result.success,
-                            "error_code": result.error_code,
-                            "severity": result.severity,
-                            "risk_level": result.risk_level,
-                            "recovery_class": result.recovery_class,
-                            "frontend_message": result.frontend_message,
-                            "recommended_next_step": result.recommended_next_step,
-                        },
+                    self._build_tool_session_message(
+                        task,
+                        result,
+                        tool_call_id=tool_call.id,
+                        group_id=group_id,
+                        request_id=request_id,
                     )
                 )
                 self.session_store.save(task.session)
@@ -472,6 +476,7 @@ class NewmanRuntime:
         request_kind: str,
         counts_toward_context_window: bool,
         group_id: str | None = None,
+        emit_answer_started: bool = False,
     ) -> ProviderResponse:
         content_parts: list[str] = []
         thinking_parts: list[str] = []
@@ -482,6 +487,9 @@ class NewmanRuntime:
         parser = ThinkTagStreamParser()
         commentary_visible = False
         commentary_complete_pending = False
+        answer_visible = False
+        answer_started_emitted = False
+        buffer_answer_until_done = emit_answer_started and bool(tools)
 
         async def flush_commentary(*, force: bool = False, delta: str | None = None) -> None:
             nonlocal commentary_visible, commentary_complete_pending
@@ -522,9 +530,23 @@ class NewmanRuntime:
                 commentary_complete_pending = False
 
         async def consume_parse_event(event) -> None:
-            nonlocal commentary_complete_pending
+            nonlocal commentary_complete_pending, answer_visible, answer_started_emitted
             if event.kind == "answer" and event.text:
                 content_parts.append(event.text)
+                if not "".join(content_parts).strip():
+                    return
+                if buffer_answer_until_done:
+                    return
+                if emit_answer_started and not answer_started_emitted:
+                    answer_started_emitted = True
+                    await emit(
+                        "answer_started",
+                        {
+                            "group_id": group_id,
+                            "model": self.settings.provider.model,
+                        },
+                    )
+                answer_visible = True
                 await emit(
                     "assistant_delta",
                     {
@@ -567,6 +589,24 @@ class NewmanRuntime:
                 for event in parser.feed(chunk.delta):
                     await consume_parse_event(event)
             elif chunk.type == "tool_call" and chunk.tool_call:
+                leaked_answer = self._sanitize_commentary_brief("".join(content_parts))
+                if answer_visible:
+                    content_parts.clear()
+                    answer_visible = False
+                    await emit(
+                        "assistant_delta",
+                        {
+                            "content": "",
+                            "delta": "",
+                            "model": self.settings.provider.model,
+                            "reset": True,
+                        },
+                    )
+                elif leaked_answer:
+                    content_parts.clear()
+                if leaked_answer and not commentary_parts:
+                    commentary_parts.append(leaked_answer)
+                    commentary_complete_pending = True
                 tool_calls.append(chunk.tool_call)
                 await flush_commentary(force=True)
             elif chunk.type == "usage" and chunk.usage:
@@ -577,6 +617,25 @@ class NewmanRuntime:
                     usage = chunk.usage
         for event in parser.flush():
             await consume_parse_event(event)
+        if buffer_answer_until_done and not tool_calls and "".join(content_parts).strip():
+            if emit_answer_started and not answer_started_emitted:
+                answer_started_emitted = True
+                await emit(
+                    "answer_started",
+                    {
+                        "group_id": group_id,
+                        "model": self.settings.provider.model,
+                    },
+                )
+            answer_visible = True
+            await emit(
+                "assistant_delta",
+                {
+                    "content": "".join(content_parts),
+                    "delta": "".join(content_parts),
+                    "model": self.settings.provider.model,
+                },
+            )
         await flush_commentary(force=bool(tool_calls))
         response = ProviderResponse(
             content="".join(content_parts),
@@ -771,13 +830,9 @@ class NewmanRuntime:
             )
         )
         self.session_store.save(task.session)
+        await self._maybe_checkpoint(task, emit)
 
-        assembled = self.prompt_assembler.assemble(
-            task.session,
-            self._tools_overview(),
-            json.dumps(self.settings.approval.model_dump(mode="json"), ensure_ascii=False),
-            self.checkpoints.get(task.session.session_id),
-        )
+        assembled = self._assemble_task_messages(task)
         try:
             response = await self._stream_provider_response(
                 assembled,
@@ -787,6 +842,7 @@ class NewmanRuntime:
                 turn_id=task.turn_id,
                 request_kind="tool_limit_finalize",
                 counts_toward_context_window=True,
+                emit_answer_started=task.tool_depth > 0,
             )
             final_content = response.content.strip()
         except ProviderError:
@@ -863,13 +919,9 @@ class NewmanRuntime:
             )
         )
         self.session_store.save(task.session)
+        await self._maybe_checkpoint(task, emit)
 
-        assembled = self.prompt_assembler.assemble(
-            task.session,
-            self._tools_overview(),
-            json.dumps(self.settings.approval.model_dump(mode="json"), ensure_ascii=False),
-            self.checkpoints.get(task.session.session_id),
-        )
+        assembled = self._assemble_task_messages(task)
 
         finish_reason = "fatal_tool_error"
         try:
@@ -881,8 +933,11 @@ class NewmanRuntime:
                 turn_id=task.turn_id,
                 request_kind="fatal_tool_finalize",
                 counts_toward_context_window=True,
+                emit_answer_started=task.tool_depth > 0,
             )
             final_content = response.content.strip()
+            if response.tool_calls or self._contains_raw_tool_call_markup(final_content):
+                final_content = ""
             if response.finish_reason:
                 finish_reason = response.finish_reason
         except ProviderError:
@@ -920,7 +975,17 @@ class NewmanRuntime:
             finish_reason="fatal_tool_error",
         )
 
+    def _contains_raw_tool_call_markup(self, text: str) -> bool:
+        normalized = text.strip()
+        if not normalized:
+            return False
+        if RAW_TOOL_CALL_MARKUP_RE.search(normalized):
+            return True
+        return "<invoke" in normalized or "<parameter" in normalized
+
     def _build_fatal_tool_fallback_message(self, result: ToolExecutionResult) -> str:
+        if result.error_code == "NEWMAN-TOOL-005" or result.category == "user_rejected":
+            return "工具调用申请被用户拒绝或审批超时，当前任务已终止"
         blocker = result.frontend_message or "工具执行失败"
         summary = result.summary.strip() or "没有返回更具体的错误摘要。"
         lines = [
@@ -968,6 +1033,25 @@ class NewmanRuntime:
             if message.role == "user":
                 return message.content
         return ""
+
+    def _assemble_task_messages(
+        self,
+        task: SessionTask,
+        *,
+        checkpoint=None,
+    ) -> list[dict]:
+        resolved_checkpoint = checkpoint if checkpoint is not None else self.checkpoints.get(task.session.session_id)
+        return self.prompt_assembler.assemble(
+            task.session,
+            self._tools_overview(),
+            resolved_checkpoint,
+            tool_message_overrides=task.transient_tool_messages,
+        )
+
+    def _provider_tools_for_turn(self, task: SessionTask) -> list[dict[str, object]]:
+        user_content = self._current_turn_user_content(task.session, task.turn_id)
+        active_groups = infer_provider_tool_groups(user_content)
+        return self.registry.tools_for_provider(task.permission_context, active_groups=active_groups)
 
     def _provider_error_result(self, error: ProviderError) -> ToolExecutionResult:
         result = ToolExecutionResult(
@@ -1034,24 +1118,46 @@ class NewmanRuntime:
             await emit("hook_triggered", payload)
 
     async def _maybe_checkpoint(self, task: SessionTask, emit: EventEmitter) -> None:
-        assembled = self.prompt_assembler.assemble(
-            task.session,
-            self._tools_overview(),
-            json.dumps(self.settings.approval.model_dump(mode="json"), ensure_ascii=False),
-            self.checkpoints.get(task.session.session_id),
-        )
-        effective_context_window = (
-            self.settings.provider.effective_context_window or self.settings.provider.context_window or 8_000
-        )
-        pressure = estimate_pressure(
+        assembled = self._assemble_task_messages(task)
+        latest_record = self._latest_context_record(task.session.session_id)
+        context_usage = build_context_usage_snapshot(
             self.provider,
+            self.settings.provider,
+            self.settings.runtime,
             assembled,
-            max_context_tokens=effective_context_window,
+            task.session,
+            self.checkpoints.get(task.session.session_id),
+            latest_record=latest_record,
         )
-        if pressure < self.settings.runtime.context_compress_threshold:
+        projected_next_prompt_tokens = context_usage.projected_next_prompt_tokens
+        auto_compact_limit = context_usage.auto_compact_limit
+        if projected_next_prompt_tokens < auto_compact_limit:
+            self._reset_compaction_state(task)
             return
-        critical = pressure >= self.settings.runtime.context_critical_threshold
-        preserve_recent = 4
+
+        if self._compaction_fail_streak(task) >= self.settings.runtime.context_compaction_max_failures:
+            self._mark_compaction_failure(task, irreducible=True, reason="max_failures_reached")
+            return
+
+        critical = context_usage.projected_pressure >= self.settings.runtime.context_critical_threshold
+        preserve_recent = self.settings.runtime.context_compaction_preserve_recent
+        microcompact_count = microcompact_session(task.session, preserve_recent=preserve_recent)
+        if microcompact_count > 0:
+            task.session.metadata["last_compaction_stage"] = "microcompact"
+            self.session_store.save(task.session)
+            microcompact_usage = build_context_usage_snapshot(
+                self.provider,
+                self.settings.provider,
+                self.settings.runtime,
+                self._assemble_task_messages(task),
+                task.session,
+                self.checkpoints.get(task.session.session_id),
+                latest_record=latest_record,
+            )
+            if microcompact_usage.projected_next_prompt_tokens < microcompact_usage.auto_compact_limit:
+                self._reset_compaction_state(task)
+                return
+
         original_count = len(task.session.messages)
         checkpoint = self.checkpoints.get(task.session.session_id)
         summary_result = await summarize_messages(
@@ -1066,15 +1172,17 @@ class NewmanRuntime:
             request_kind="context_compaction",
         )
         if not summary_result:
+            self._mark_compaction_failure(task, irreducible=True, reason="nothing_to_compress")
             return
         _, preserved_messages = split_session_messages(task.session, preserve_recent=preserve_recent)
         task.session.messages = preserved_messages
         task.session.metadata["checkpoint_active"] = True
+        task.session.metadata["last_compaction_stage"] = "checkpoint_compact"
         self.session_store.save(task.session)
         checkpoint = self.checkpoints.save(
             task.session.session_id,
             summary_result.summary,
-            [0, max(0, original_count - preserve_recent)],
+            [0, max(0, original_count - len(preserved_messages))],
             metadata=build_checkpoint_metadata(
                 summary_result,
                 preserve_recent=preserve_recent,
@@ -1084,6 +1192,19 @@ class NewmanRuntime:
         )
         task.session.metadata["checkpoint_restore_hint"] = checkpoint.checkpoint_id
         self.session_store.save(task.session)
+        refreshed_usage = build_context_usage_snapshot(
+            self.provider,
+            self.settings.provider,
+            self.settings.runtime,
+            self._assemble_task_messages(task, checkpoint=checkpoint),
+            task.session,
+            checkpoint,
+            latest_record=latest_record,
+        )
+        if refreshed_usage.projected_next_prompt_tokens >= refreshed_usage.auto_compact_limit:
+            self._mark_compaction_failure(task, irreducible=False, reason="post_compaction_still_over_limit")
+        else:
+            self._reset_compaction_state(task)
         await emit(
             "checkpoint_created",
             {
@@ -1093,6 +1214,33 @@ class NewmanRuntime:
                 "compression_level": checkpoint.metadata.get("compression_level", "normal"),
             },
         )
+
+    def _latest_context_record(self, session_id: str):
+        if self.usage_store is None:
+            return None
+        try:
+            return self.usage_store.latest_context_record(session_id)
+        except Exception:
+            return None
+
+    def _compaction_fail_streak(self, task: SessionTask) -> int:
+        raw_value = task.session.metadata.get("compaction_fail_streak")
+        return raw_value if isinstance(raw_value, int) and raw_value >= 0 else 0
+
+    def _reset_compaction_state(self, task: SessionTask) -> None:
+        task.session.metadata["compaction_fail_streak"] = 0
+        task.session.metadata["context_irreducible"] = False
+        task.session.metadata.pop("last_compaction_failure_reason", None)
+        self.session_store.save(task.session)
+
+    def _mark_compaction_failure(self, task: SessionTask, *, irreducible: bool, reason: str) -> None:
+        next_fail_streak = self._compaction_fail_streak(task) + 1
+        task.session.metadata["compaction_fail_streak"] = next_fail_streak
+        task.session.metadata["context_irreducible"] = irreducible or (
+            next_fail_streak >= self.settings.runtime.context_compaction_max_failures
+        )
+        task.session.metadata["last_compaction_failure_reason"] = reason
+        self.session_store.save(task.session)
 
     def _build_message_metadata(
         self,
@@ -1109,6 +1257,49 @@ class NewmanRuntime:
         if extra:
             metadata.update(extra)
         return metadata
+
+    def _build_tool_session_message(
+        self,
+        task: SessionTask,
+        result: ToolExecutionResult,
+        *,
+        tool_call_id: str,
+        group_id: str,
+        request_id: str | None,
+    ) -> SessionMessage:
+        model_output = _build_tool_message_output(result) or result.summary
+        persisted_output = result.persisted_output if result.persisted_output is not None else model_output
+        metadata = {
+            "turn_id": task.turn_id,
+            **({"request_id": request_id} if request_id else {}),
+            "group_id": group_id,
+            "tool_call_id": tool_call_id,
+            "tool": result.tool,
+            "category": result.category,
+            "success": result.success,
+            "error_code": result.error_code,
+            "severity": result.severity,
+            "risk_level": result.risk_level,
+            "recovery_class": result.recovery_class,
+            "frontend_message": result.frontend_message,
+            "recommended_next_step": result.recommended_next_step,
+            "content_persisted": persisted_output == model_output,
+        }
+        if persisted_output != model_output:
+            task.transient_tool_messages[tool_call_id] = SessionMessage(
+                id=uuid4().hex,
+                role="tool",
+                content=model_output,
+                metadata=dict(metadata),
+            )
+        else:
+            task.transient_tool_messages.pop(tool_call_id, None)
+        return SessionMessage(
+            id=uuid4().hex,
+            role="tool",
+            content=persisted_output,
+            metadata=dict(metadata),
+        )
 
     def _bind_turn_emitter(self, emit: EventEmitter, turn_id: str | None) -> EventEmitter:
         async def emit_with_turn(event: str, data: dict) -> None:

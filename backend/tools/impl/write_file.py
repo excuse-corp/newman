@@ -5,6 +5,7 @@ from typing import Any
 
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.discovery import BuiltinToolContext
+from backend.tools.provider_exposure import EDITING_TOOL_GROUP
 from backend.tools.result import ToolExecutionResult
 from backend.tools.workspace_fs import (
     PathAccessPolicy,
@@ -31,12 +32,24 @@ class WriteFileTool(BaseTool):
                 "required": ["path", "content"],
             },
             risk_level="high",
-            requires_approval=True,
             timeout_seconds=15,
+            approval_behavior="confirmable",
             allowed_paths=[str(path) for path in self.policy.writable_roots],
+            provider_group=EDITING_TOOL_GROUP,
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:
+        validation_error = self.validate_arguments(arguments)
+        if validation_error is not None:
+            return ToolExecutionResult(
+                False,
+                self.meta.name,
+                "write",
+                "validation_error",
+                error_code="invalid_arguments",
+                summary=validation_error,
+            )
+
         try:
             target = ensure_writable_path(self.policy, arguments.get("path"))
         except ValueError as exc:
@@ -50,7 +63,7 @@ class WriteFileTool(BaseTool):
             return ToolExecutionResult(False, self.meta.name, "write", "validation_error", summary="目标文件已存在，overwrite=false")
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        content = str(arguments.get("content", ""))
+        content = arguments["content"]
         target.write_text(content, encoding="utf-8")
 
         preview = content[:2_000]

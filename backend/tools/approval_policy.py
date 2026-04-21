@@ -8,7 +8,7 @@ from backend.tools.base import BaseTool
 
 
 ApprovalAction = Literal["allow", "ask", "deny"]
-TurnApprovalMode = Literal["manual", "auto_approve_level2"]
+TurnApprovalMode = Literal["manual", "auto_allow"]
 DEFAULT_TURN_APPROVAL_MODE: TurnApprovalMode = "manual"
 
 SAFE_TERMINAL_PREFIXES = (
@@ -93,6 +93,8 @@ PATH_DENY_REASONS = {
     "read_protected_path",
     "write_protected_path",
     "write_file_outside_workspace",
+    "mcp_path_outside_workspace",
+    "mcp_path_protected",
     "terminal_read_outside_readable_paths",
     "terminal_write_outside_writable_paths",
     "terminal_read_protected_path",
@@ -112,7 +114,13 @@ class ApprovalPolicy:
     def __init__(self, settings: AppConfig):
         self.settings = settings
 
-    def evaluate(self, tool: BaseTool, arguments: dict, static_reasons: list[str] | None = None) -> ApprovalDecision:
+    def evaluate(
+        self,
+        tool: BaseTool,
+        arguments: dict,
+        static_reasons: list[str] | None = None,
+        turn_approval_mode: TurnApprovalMode = DEFAULT_TURN_APPROVAL_MODE,
+    ) -> ApprovalDecision:
         reasons = list(static_reasons or [])
         for reason in reasons:
             base = reason.split(":", 1)[0]
@@ -141,21 +149,36 @@ class ApprovalPolicy:
             if self._requires_terminal_approval(command):
                 reasons.append("terminal_mutation_or_unknown")
             else:
-                if tool.meta.requires_approval:
-                    return ApprovalDecision(action="ask", reasons=["requires_approval"], summary="工具默认需要审批")
                 return ApprovalDecision(action="allow", summary="只读终端命令已自动放行")
 
-        if tool.meta.requires_approval:
-            reasons.append("requires_approval")
-
         ask_reasons = self._filter_level2_reasons(reasons)
-        if ask_reasons:
+        confirmable = tool.meta.approval_behavior == "confirmable" or bool(ask_reasons)
+        if not confirmable:
+            return ApprovalDecision(action="allow", summary="未命中审批条件")
+
+        decision_reasons = ask_reasons
+        if tool.meta.approval_behavior == "confirmable":
+            decision_reasons = _dedupe_reasons(["requires_approval", *ask_reasons])
+
+        if turn_approval_mode == "auto_allow":
+            return ApprovalDecision(
+                action="allow",
+                reasons=decision_reasons,
+                summary="本轮对话已启用默认全部通过",
+            )
+
+        if tool.meta.approval_behavior == "confirmable":
             return ApprovalDecision(
                 action="ask",
-                reasons=ask_reasons,
-                summary="命中 Level 2 风险规则，需人工审批",
+                reasons=decision_reasons,
+                summary="工具需要审批确认",
             )
-        return ApprovalDecision(action="allow", summary="未命中审批条件")
+
+        return ApprovalDecision(
+            action="ask",
+            reasons=decision_reasons,
+            summary="命中风险规则，需人工审批",
+        )
 
     def _match_level1_blacklist(self, command: str) -> str | None:
         lowered = f" {command.lower()} "
@@ -169,7 +192,7 @@ class ApprovalPolicy:
         filtered: list[str] = []
         for reason in reasons:
             base = reason.split(":", 1)[0]
-            if reason == "requires_approval" or base in configured:
+            if base in configured:
                 if reason not in filtered:
                     filtered.append(reason)
         return filtered
@@ -194,6 +217,17 @@ class ApprovalPolicy:
 
 
 def normalize_turn_approval_mode(value: object) -> TurnApprovalMode:
-    if value == "auto_approve_level2":
-        return "auto_approve_level2"
+    if value in {"auto_allow", "auto_approve_level2"}:
+        return "auto_allow"
     return DEFAULT_TURN_APPROVAL_MODE
+
+
+def _dedupe_reasons(reasons: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for reason in reasons:
+        if reason in seen:
+            continue
+        seen.add(reason)
+        deduped.append(reason)
+    return deduped

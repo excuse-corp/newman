@@ -90,7 +90,7 @@ ResultNormalizer → ErrorClassifier → FeedbackWriter
 
 | 层 | 内容 | 规则 |
 |----|------|------|
-| Stable Context | Newman.md, USER.md, SKILLS_SNAPSHOT.md, 工具列表, 审批策略 | 永不压缩、永不截断、每轮重新装载 |
+| Stable Context | Newman.md, USER.md, SKILLS_SNAPSHOT.md, 工具列表 | 永不压缩、永不截断、每轮重新装载 |
 | Working History | user / assistant / tool_call / tool_result 消息 | 主要压缩对象 |
 | Checkpoint Summary | 结构化摘要 | 上下文超限时替换旧 Working History |
 

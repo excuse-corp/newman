@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backend.config.schema import AppConfig
+from backend.mcp.path_guard import validate_mcp_argument_paths
 from backend.tools.base import BaseTool
 from backend.tools.registry import ToolRegistry
 from backend.tools.workspace_fs import build_path_access_policy, classify_path, resolve_requested_path
@@ -24,11 +25,22 @@ class ToolRouter:
         checks: list[str] = []
         if tool.meta.name == "terminal":
             return self._terminal_static_checks(str(arguments.get("command", "")))
+        if tool.meta.name.startswith("mcp__"):
+            return self._mcp_static_checks(arguments)
         if "path" not in arguments:
             return checks
 
         tool_name = tool.meta.name
-        if tool_name not in {"read_file", "list_dir", "list_files", "search_files", "grep", "write_file", "edit_file"}:
+        if tool_name not in {
+            "read_file",
+            "read_file_range",
+            "list_dir",
+            "list_files",
+            "search_files",
+            "grep",
+            "write_file",
+            "edit_file",
+        }:
             return checks
 
         path = resolve_requested_path(self.path_policy, arguments.get("path"))
@@ -47,6 +59,9 @@ class ToolRouter:
         elif state == "forbidden":
             checks.append("read_outside_readable_paths")
         return checks
+
+    def _mcp_static_checks(self, arguments: dict) -> list[str]:
+        return validate_mcp_argument_paths(self.path_policy, arguments)
 
     def _terminal_static_checks(self, command: str) -> list[str]:
         analysis = analyze_terminal_command(command, self.path_policy)

@@ -60,6 +60,14 @@ runtime:
   max_tool_depth: 30
   context_compress_threshold: 0.8
   context_critical_threshold: 0.92
+  context_compaction_preserve_recent: 4
+  context_reply_reserve_tokens_large: 4096
+  context_reply_reserve_tokens_small: 2048
+  context_compact_reserve_tokens: 2048
+  context_safety_buffer_tokens_large: 4096
+  context_safety_buffer_tokens_medium: 2048
+  context_safety_buffer_tokens_small: 1024
+  context_compaction_max_failures: 3
   tool_retry_attempts: 3
   tool_retry_backoff_seconds: 1.0
 

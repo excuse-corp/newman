@@ -1,11 +1,14 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import logo from "./assets/newman-logo.png";
 import MessageContent, { type ChatAttachment } from "./chat/MessageContent";
 import "./styles.css";
 
 type WorkspacePage = "chat" | "memory" | "skills" | "files" | "settings";
 type MemoryKey = "memory" | "user";
-type TurnApprovalMode = "manual" | "auto_approve_level2";
+type TurnApprovalMode = "manual" | "auto_allow";
+type UiTheme = "classic" | "coral";
 type StatusTagTone = "blue" | "green" | "orange";
 
 type MemoryFile = {
@@ -27,6 +30,13 @@ type PendingApproval = {
   reason: string;
   timeout_seconds: number;
   remaining_seconds: number;
+};
+
+type ApprovalRequestLike = Pick<PendingApproval, "tool" | "arguments" | "reason">;
+type ApprovalNodePayload = ApprovalRequestLike & {
+  approvalRequestId: string;
+  summary: string | null;
+  timeoutSeconds: number | null;
 };
 
 type PendingApprovalResponse = {
@@ -68,10 +78,20 @@ type SessionDetailResponse = {
     steps?: Array<{ step: string; status: string }>;
   } | null;
   context_usage?: {
-    estimated_tokens: number;
-    context_window: number | null;
-    pressure: number | null;
-    remaining_tokens: number | null;
+    effective_context_window: number;
+    auto_compact_limit: number;
+    confirmed_prompt_tokens: number | null;
+    confirmed_pressure: number | null;
+    confirmed_request_kind: string | null;
+    confirmed_recorded_at: string | null;
+    projected_next_prompt_tokens: number;
+    projected_pressure: number | null;
+    projection_source: string;
+    projected_over_limit: boolean;
+    compaction_stage: string | null;
+    compaction_fail_streak: number;
+    context_irreducible: boolean;
+    last_compaction_failure_reason: string | null;
   } | null;
 };
 
@@ -109,12 +129,25 @@ type TraceEntry = {
   citations: string[];
   output?: string | null;
   turnId?: string | null;
-  tags?: Array<{ label: string; tone: StatusTagTone }>;
 };
 
 type SecondaryCardType = "terminal" | "file" | "search" | "network" | "plan" | "generic";
-type TimelineNodeKind = "thinking" | "progress" | "system_meta";
+type TimelineNodeKind = "thinking" | "progress" | "system_meta" | "answer_start" | "approval";
 type TimelineNodeState = "running" | "completed" | "failed" | "pending" | "approved" | "rejected" | "recovering" | "updated";
+type TimelineMarkerIconName =
+  | "folder"
+  | "file"
+  | "file_plus"
+  | "file_edit"
+  | "search"
+  | "code_search"
+  | "globe"
+  | "terminal"
+  | "plan"
+  | "image"
+  | "approval"
+  | "generic"
+  | "answer";
 
 type TimelineSecondaryItem = {
   id: string;
@@ -140,6 +173,7 @@ type TimelineNode = {
   time: string;
   primaryText: string;
   secondaryItems: TimelineSecondaryItem[];
+  approval?: ApprovalNodePayload | null;
   detail: TraceEntry;
 };
 
@@ -218,6 +252,8 @@ type SkillDetailResponse = {
   skill: SkillDetail;
 };
 
+type SkillDocumentView = "preview" | "edit";
+
 type WorkspaceEntry = {
   name: string;
   path: string;
@@ -285,6 +321,39 @@ type PluginsResponse = {
   errors: PluginLoadError[];
 };
 
+type ProjectConfigResponse = {
+  path: string;
+  content: string;
+  effective_workspace: string;
+  source_priority: string[];
+  reload_supported: boolean;
+};
+
+type UpdateProjectConfigResponse = {
+  saved: boolean;
+  path: string;
+  content: string;
+  effective_workspace: string;
+  requires_reload: boolean;
+  warnings: string[];
+};
+
+type ReloadProjectConfigResponse = {
+  reloaded: boolean;
+  path: string;
+  effective_workspace: string;
+  warnings: string[];
+};
+
+type InterruptTurnResponse = {
+  interrupted: boolean;
+  session_id: string;
+  request_id?: string | null;
+  turn_id?: string | null;
+  message?: string | null;
+  reason?: string | null;
+};
+
 const navItems: Array<{ id: Exclude<WorkspacePage, "settings">; label: string; hint: string }> = [
   { id: "chat", label: "Chat", hint: "对话" },
   { id: "memory", label: "Memory", hint: "记忆" },
@@ -299,15 +368,38 @@ const approvalModeMeta: Record<
     helper: string;
   }
 > = {
-  auto_approve_level2: {
+  auto_allow: {
     label: "全部默认通过",
-    helper: "本轮命中 Level 2 的工具默认放行，不再逐个弹确认。"
+    helper: "本轮所有需要审批的工具都会默认放行；只有命中硬拒绝规则的调用仍会被直接拦截。"
   },
   manual: {
     label: "逐个手动确认",
-    helper: "本轮每个命中 Level 2 的工具都需要你点击确认后才继续。"
+    helper: "本轮所有需要审批的工具都要你逐个点击确认后才继续。"
   }
 };
+
+const uiThemeOptions: Array<{
+  id: UiTheme;
+  kicker: string;
+  label: string;
+  description: string;
+  previewClass: string;
+}> = [
+  {
+    id: "classic",
+    kicker: "Classic",
+    label: "原版暖白",
+    description: "保留当前这套浅暖白工作台，适合连续阅读、编辑和日常操作。",
+    previewClass: "classic"
+  },
+  {
+    id: "coral",
+    kicker: "Coral",
+    label: "参考图主题",
+    description: "按参考图重做配色，采用石墨黑侧栏、暖白主舞台和珊瑚红强调色。",
+    previewClass: "coral"
+  }
+];
 
 const LEFT_MIN = 180;
 const LEFT_MAX = 360;
@@ -330,6 +422,23 @@ function isWorkspacePage(value: string | null): value is WorkspacePage {
   return value === "chat" || value === "memory" || value === "skills" || value === "files" || value === "settings";
 }
 
+function isUiTheme(value: string | null): value is UiTheme {
+  return value === "classic" || value === "coral";
+}
+
+function formatCompactionStage(stage: string | null | undefined) {
+  if (stage === "microcompact") return "最近压缩：Microcompact";
+  if (stage === "checkpoint_compact") return "最近压缩：Checkpoint";
+  return null;
+}
+
+function formatCompactionFailureReason(reason: string | null | undefined) {
+  if (reason === "max_failures_reached") return "压缩连续失败次数已达上限";
+  if (reason === "nothing_to_compress") return "已没有可继续裁剪的历史";
+  if (reason === "post_compaction_still_over_limit") return "压缩后仍接近或超过预算";
+  return reason ?? null;
+}
+
 function getApiBase() {
   if (import.meta.env.VITE_API_BASE) {
     return import.meta.env.VITE_API_BASE;
@@ -348,6 +457,40 @@ function formatDateTime(value: string | null | undefined) {
     hour: "2-digit",
     minute: "2-digit"
   }).format(new Date(value));
+}
+
+function formatMessageTime(value: string | null | undefined) {
+  if (!value) {
+    return "--:--";
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(new Date(value));
+}
+
+async function copyTextToClipboard(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  const copied = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  if (!copied) {
+    throw new Error("copy_failed");
+  }
 }
 
 function formatBytes(size: number) {
@@ -438,6 +581,28 @@ function skillSourceLabel(skill: SkillSummary | SkillDetail) {
   return skill.source;
 }
 
+function orderSkillWorkspaceEntries(entries: WorkspaceEntry[], skillFilePath: string | null) {
+  return [...entries].sort((left, right) => {
+    const leftIsSkillFile = Boolean(skillFilePath && left.path === skillFilePath) || left.name.toLowerCase() === "skill.md";
+    const rightIsSkillFile =
+      Boolean(skillFilePath && right.path === skillFilePath) || right.name.toLowerCase() === "skill.md";
+
+    if (leftIsSkillFile !== rightIsSkillFile) {
+      return leftIsSkillFile ? -1 : 1;
+    }
+
+    if (left.type !== right.type) {
+      return left.type === "dir" ? -1 : 1;
+    }
+
+    return left.name.localeCompare(right.name, "zh-CN", { sensitivity: "base" });
+  });
+}
+
+function getSkillDirectoryPath(skillPath: string) {
+  return extractParentPath(skillPath, null);
+}
+
 const TOOL_SEMANTIC_MAP: Record<
   string,
   {
@@ -448,6 +613,12 @@ const TOOL_SEMANTIC_MAP: Record<
   }
 > = {
   read_file: { label: "read_file", cardType: "file", runningText: "我先读取一下相关文件", completedText: "相关文件我已经看过了" },
+  read_file_range: {
+    label: "read_file_range",
+    cardType: "file",
+    runningText: "我先分段读取一下相关文本",
+    completedText: "相关文本片段我已经看过了"
+  },
   list_dir: { label: "list_dir", cardType: "file", runningText: "我先看一下目录结构", completedText: "目录结构我已经确认了" },
   list_files: { label: "list_files", cardType: "file", runningText: "我先整理一下文件列表", completedText: "文件列表我已经拿到了" },
   search_files: { label: "search_files", cardType: "search", runningText: "我先检索一下相关文件", completedText: "相关文件我已经找到了" },
@@ -490,6 +661,412 @@ function resolveToolSemantic(toolName: string | null | undefined) {
       completedText: "这一步我已经完成了"
     }
   );
+}
+
+function TimelineMarkerIcon({ name, className }: { name: TimelineMarkerIconName; className?: string }) {
+  const props = {
+    viewBox: "0 0 20 20",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.35,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    className
+  };
+
+  if (name === "folder") {
+    return (
+      <svg {...props}>
+        <path d="M2.75 6.5h4.1l1.9 2h8.5v7.25a1 1 0 0 1-1 1H3.75a1 1 0 0 1-1-1V7.5a1 1 0 0 1 1-1Z" />
+        <path d="M2.75 8.5h14.5" />
+      </svg>
+    );
+  }
+
+  if (name === "file") {
+    return (
+      <svg {...props}>
+        <path d="M5.5 2.75h5.5l3.5 3.5v10a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1Z" />
+        <path d="M11 2.75v3.5h3.5" />
+        <path d="M7.25 10h5.5" />
+        <path d="M7.25 13h5.5" />
+      </svg>
+    );
+  }
+
+  if (name === "file_plus") {
+    return (
+      <svg {...props}>
+        <path d="M5.5 2.75h5.5l3.5 3.5v10a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1Z" />
+        <path d="M11 2.75v3.5h3.5" />
+        <path d="M10 9.5v5" />
+        <path d="M7.5 12h5" />
+      </svg>
+    );
+  }
+
+  if (name === "file_edit") {
+    return (
+      <svg {...props}>
+        <path d="M5.5 2.75h5.5l3.5 3.5v10a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1Z" />
+        <path d="M11 2.75v3.5h3.5" />
+        <path d="m7.25 13.75 5.2-5.2 1.3 1.3-5.2 5.2-2 .7.7-2Z" />
+      </svg>
+    );
+  }
+
+  if (name === "search") {
+    return (
+      <svg {...props}>
+        <circle cx="8.75" cy="8.75" r="4.75" />
+        <path d="m12.4 12.4 4.1 4.1" />
+      </svg>
+    );
+  }
+
+  if (name === "code_search") {
+    return (
+      <svg {...props}>
+        <path d="m5.25 8.5-2.5 2 2.5 2" />
+        <path d="m14.75 8.5 2.5 2-2.5 2" />
+        <circle cx="10" cy="10" r="2.75" />
+        <path d="m12.1 12.1 2.65 2.65" />
+      </svg>
+    );
+  }
+
+  if (name === "globe") {
+    return (
+      <svg {...props}>
+        <circle cx="10" cy="10" r="7" />
+        <path d="M3.75 10h12.5" />
+        <path d="M10 3c1.8 1.9 2.75 4.28 2.75 7s-.95 5.1-2.75 7" />
+        <path d="M10 3c-1.8 1.9-2.75 4.28-2.75 7s.95 5.1 2.75 7" />
+      </svg>
+    );
+  }
+
+  if (name === "terminal") {
+    return (
+      <svg {...props}>
+        <rect x="2.75" y="4" width="14.5" height="12" rx="2.25" />
+        <path d="m6 8.25 2.25 1.75L6 11.75" />
+        <path d="M10.5 12h3.5" />
+      </svg>
+    );
+  }
+
+  if (name === "plan") {
+    return (
+      <svg {...props}>
+        <path d="M6 4.25h8a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1Z" />
+        <path d="M7.5 2.75h5" />
+        <path d="M7.75 8h4.75" />
+        <path d="M7.75 11h4.75" />
+        <path d="m6.25 7.75.8.8 1.2-1.55" />
+        <path d="m6.25 10.75.8.8 1.2-1.55" />
+      </svg>
+    );
+  }
+
+  if (name === "approval") {
+    return (
+      <svg {...props}>
+        <path d="M10 2.9 14.7 4.7v4.45c0 3-1.78 5.5-4.7 6.95-2.92-1.45-4.7-3.95-4.7-6.95V4.7L10 2.9Z" />
+        <path d="m7.45 10.1 1.45 1.5 3.2-3.35" />
+      </svg>
+    );
+  }
+
+  if (name === "image") {
+    return (
+      <svg {...props}>
+        <rect x="3" y="4" width="14" height="12" rx="2" />
+        <circle cx="7.2" cy="8.2" r="1.3" />
+        <path d="m5 14 3.4-3.6 2.6 2.6 1.9-1.9L15 14" />
+      </svg>
+    );
+  }
+
+  if (name === "answer") {
+    return (
+      <svg {...props}>
+        <circle cx="10" cy="10" r="7" />
+        <path d="m6.7 10.1 2.1 2.25 4.5-4.8" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg {...props}>
+      <rect x="4" y="4" width="5" height="5" rx="1" />
+      <rect x="11" y="4" width="5" height="5" rx="1" />
+      <rect x="4" y="11" width="5" height="5" rx="1" />
+      <rect x="11" y="11" width="5" height="5" rx="1" />
+    </svg>
+  );
+}
+
+function CopyMiniIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.25}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <rect x="5.1" y="2.9" width="7.1" height="8.6" rx="1.4" />
+      <path d="M4.3 5.3H3.6a1.3 1.3 0 0 0-1.3 1.3v5.1A1.3 1.3 0 0 0 3.6 13h5.1A1.3 1.3 0 0 0 10 11.7V11" />
+    </svg>
+  );
+}
+
+function CopySuccessMiniIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.35}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M6.05 2.9h4.35l2.75 2.75v5.9a1.45 1.45 0 0 1-1.45 1.45h-5.65A1.45 1.45 0 0 1 4.6 11.55V4.35A1.45 1.45 0 0 1 6.05 2.9Z" />
+      <path d="M10.4 2.9v2.75h2.75" />
+      <path d="m6.7 8.35 1.1 1.15 2.25-2.4" />
+    </svg>
+  );
+}
+
+function SkillSidebarIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.4}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <rect x="2.75" y="3.25" width="14.5" height="11.5" rx="2.25" />
+      <path d="M6 16.25h8" />
+      <path d="M8 8.75h1.75l1-1.85 1.25 3 1-1.6H14" />
+    </svg>
+  );
+}
+
+function SkillFolderIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.4}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M2.75 6.5h4.05l1.7 1.8h8.75v7a1 1 0 0 1-1 1H3.75a1 1 0 0 1-1-1v-7.8a1 1 0 0 1 1-1Z" />
+    </svg>
+  );
+}
+
+function SkillFileIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.35}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M5.75 2.75h5l3.5 3.5v9a1 1 0 0 1-1 1h-7.5a1 1 0 0 1-1-1v-11.5a1 1 0 0 1 1-1Z" />
+      <path d="M10.75 2.75v3.5h3.5" />
+      <path d="M7.3 10h5.3" />
+    </svg>
+  );
+}
+
+function ChevronStrokeIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.6}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="m4.25 6 3.75 4 3.75-4" />
+    </svg>
+  );
+}
+
+function PlusSmallIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.6}
+      strokeLinecap="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M8 3.25v9.5" />
+      <path d="M3.25 8h9.5" />
+    </svg>
+  );
+}
+
+function ApprovalSmallIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.25}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M8 2.75 9.35 4.1l1.9-.1.42 1.86 1.52 1.13-.94 1.66.36 1.88-1.8.6L9.75 12.7 8 11.95l-1.75.75-1.06-1.57-1.8-.6.36-1.88-.94-1.66L4.33 5.86 4.75 4l1.9.1L8 2.75Z" />
+      <path d="m6.25 8.1 1.15 1.15L9.8 6.85" />
+    </svg>
+  );
+}
+
+function RefreshSmallIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M13 5.2A5 5 0 1 0 14 8" />
+      <path d="M13 2.75v2.75h-2.75" />
+    </svg>
+  );
+}
+
+type MessageHoverShellProps = {
+  shellClassName: "user" | "assistant";
+  align: "start" | "end";
+  timestamp: string;
+  copyValue?: string | null;
+  copyLabel: string;
+  showMeta?: boolean;
+  children: ReactNode;
+};
+
+function MessageHoverShell({
+  shellClassName,
+  align,
+  timestamp,
+  copyValue,
+  copyLabel,
+  showMeta = true,
+  children,
+}: MessageHoverShellProps) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const canCopy = Boolean(copyValue && copyValue.trim());
+  const copyTitle =
+    copyState === "copied" ? "已复制" : copyState === "failed" ? "复制失败，请重试" : `复制${copyLabel}`;
+
+  function resetCopyState() {
+    setCopyState("idle");
+  }
+
+  async function handleCopy() {
+    if (!copyValue || !copyValue.trim()) {
+      return;
+    }
+
+    try {
+      await copyTextToClipboard(copyValue);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+    }
+  }
+
+  return (
+    <div className={`message-hover-shell ${shellClassName}`} onMouseLeave={resetCopyState}>
+      {children}
+      {showMeta ? (
+        <div className={`message-hover-meta align-${align}`}>
+          {canCopy ? (
+            <button
+              type="button"
+              className={`message-hover-copy is-${copyState}`}
+              onClick={() => {
+                void handleCopy();
+              }}
+              aria-label={copyTitle}
+              title={copyTitle}
+            >
+              {copyState === "copied" ? (
+                <CopySuccessMiniIcon className="message-hover-copy-icon" />
+              ) : (
+                <CopyMiniIcon className="message-hover-copy-icon" />
+              )}
+            </button>
+          ) : null}
+          <span className="message-hover-time" aria-label={`消息时间 ${formatDateTime(timestamp)}`}>
+            {formatMessageTime(timestamp)}
+          </span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function resolveTimelineNodeIcon(node: TimelineNode): TimelineMarkerIconName {
+  if (node.kind === "approval") return "approval";
+  if (node.kind === "answer_start") return "answer";
+
+  const latestItem = [...node.secondaryItems].reverse().find((item) => item.toolName || item.cardType);
+  const toolName = latestItem?.toolName ?? null;
+
+  if (toolName === "list_dir" || toolName === "list_files") return "folder";
+  if (toolName === "read_file" || toolName === "read_file_range") return "file";
+  if (toolName === "write_file") return "file_plus";
+  if (toolName === "edit_file") return "file_edit";
+  if (toolName === "search_files" || toolName === "search_knowledge_base") return "search";
+  if (toolName === "grep") return "code_search";
+  if (toolName === "fetch_url") return "globe";
+  if (toolName === "terminal") return "terminal";
+  if (toolName === "update_plan") return "plan";
+  if (toolName === "image_attachment") return "image";
+  if (toolName && toolName.startsWith("mcp__")) return "generic";
+
+  if (latestItem?.cardType === "file") return "file";
+  if (latestItem?.cardType === "search") return "search";
+  if (latestItem?.cardType === "network") return "globe";
+  if (latestItem?.cardType === "terminal") return "terminal";
+  if (latestItem?.cardType === "plan") return "plan";
+
+  return "generic";
 }
 
 function summarizeUserIntent(userPrompt: string | null | undefined) {
@@ -709,7 +1286,56 @@ function buildToolSecondarySubtitle(toolName: string | null | undefined, eventDa
       return preview;
     }
   }
-  return "暂无更多参数";
+  return "";
+}
+
+function buildTimelineToolSummary(node: TimelineNode) {
+  const labels = Array.from(
+    new Set(
+      node.secondaryItems
+        .map((item) => (item.toolName && item.toolName.trim() ? item.toolName.trim() : item.label.trim()))
+        .filter(Boolean)
+    )
+  );
+
+  if (labels.length === 0) {
+    return "查看步骤详情";
+  }
+  if (labels.length === 1) {
+    return `调用 ${labels[0]}`;
+  }
+  if (labels.length === 2) {
+    return `调用 ${labels[0]} · ${labels[1]}`;
+  }
+  return `调用 ${labels[0]} 等 ${labels.length} 个步骤`;
+}
+
+function buildTimelineSecondaryResultText(item: TimelineSecondaryItem) {
+  const output = item.output?.trim();
+  if (output) {
+    return output;
+  }
+
+  if (item.toolName !== "terminal") {
+    const subtitle = item.subtitle.trim();
+    if (subtitle) {
+      return subtitle;
+    }
+  }
+
+  if (item.state === "running") {
+    return "正在执行中，结果返回后会显示在这里。";
+  }
+  if (item.state === "failed" || item.state === "rejected") {
+    return "执行失败，当前没有更多可展示的结果。";
+  }
+  if (item.state === "pending") {
+    return "等待审批通过后开始执行。";
+  }
+  if (item.state === "recovering") {
+    return "正在恢复执行，请稍后查看结果。";
+  }
+  return "本次调用没有返回可展示的结果。";
 }
 
 function buildTraceDetail(
@@ -721,7 +1347,6 @@ function buildTraceDetail(
   summary: string,
   eventData: Record<string, unknown>,
   options?: {
-    tags?: Array<{ label: string; tone: StatusTagTone }>;
     output?: string | null;
   }
 ): TraceEntry {
@@ -766,7 +1391,6 @@ function buildTraceDetail(
     inputs,
     citations,
     output: options?.output ?? null,
-    tags: options?.tags
   };
 }
 
@@ -793,7 +1417,16 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     let message = `请求失败：${response.status}`;
     if (payload && typeof payload === "object" && payload !== null) {
-      const detail = "detail" in payload ? payload.detail : "message" in payload ? payload.message : null;
+      const nestedError =
+        "error" in payload && payload.error && typeof payload.error === "object" ? payload.error : null;
+      const detail =
+        "detail" in payload
+          ? payload.detail
+          : "message" in payload
+            ? payload.message
+            : nestedError && "message" in nestedError
+              ? nestedError.message
+              : null;
       if (typeof detail === "string" && detail.trim()) {
         message = detail;
       }
@@ -802,6 +1435,10 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   }
 
   return payload as T;
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function dedupeSessionEvents(events: SessionEventPayload[]) {
@@ -851,6 +1488,127 @@ function stringifyForPanel(value: unknown) {
     return value;
   }
   return JSON.stringify(value, null, 2);
+}
+
+function isMachineApprovalReason(reason: string | null | undefined) {
+  const normalized = (reason ?? "").trim();
+  if (!normalized || normalized === "requires_approval") {
+    return true;
+  }
+  return /^[a-z0-9_.,:/-]+$/i.test(normalized);
+}
+
+function resolveApprovalTargetLabel(request: ApprovalRequestLike) {
+  return resolveToolTarget(request.tool, {
+    tool: request.tool,
+    arguments: request.arguments
+  });
+}
+
+function buildApprovalActionText(toolName: string, argumentsPayload: Record<string, unknown>) {
+  const target = resolveApprovalTargetLabel({
+    tool: toolName,
+    arguments: argumentsPayload,
+    reason: "requires_approval"
+  });
+  if (toolName === "terminal") {
+    return "执行命令";
+  }
+  if (toolName === "write_file") {
+    return target ? `创建 ${target}` : "创建文件";
+  }
+  if (toolName === "edit_file") {
+    return target ? `修改 ${target}` : "修改文件";
+  }
+  if (toolName === "read_file" || toolName === "read_file_range") {
+    return target ? `读取 ${target}` : "读取文件";
+  }
+  if (target) {
+    return `处理 ${target}`;
+  }
+  return "";
+}
+
+function buildApprovalOperationText(request: ApprovalRequestLike) {
+  const action = buildApprovalActionText(request.tool, request.arguments);
+  if (action) {
+    return `调用 ${request.tool}，${action}`;
+  }
+  return `调用 ${request.tool}`;
+}
+
+function buildApprovalPrompt(request: ApprovalRequestLike) {
+  return `需要获取你的确认：${buildApprovalOperationText(request)}`;
+}
+
+function buildApprovalSupportCopy(request: ApprovalRequestLike) {
+  const normalizedReason = request.reason?.trim() ?? "";
+  if (normalizedReason && !isMachineApprovalReason(normalizedReason)) {
+    return "确认后我会继续执行这一步；如果拒绝，本次调用会立即停止。";
+  }
+  if (request.tool === "terminal") {
+    return "确认后会继续执行这条命令；如果拒绝，本次调用会立即停止。";
+  }
+  return "确认后我会继续执行这一步；如果拒绝，本次调用会立即停止。";
+}
+
+function buildApprovalPayloadLabel(request: ApprovalRequestLike) {
+  if (request.tool === "terminal") {
+    const command = typeof request.arguments.command === "string" ? request.arguments.command.trim() : "";
+    if (command) {
+      return "执行命令";
+    }
+  }
+  return "参数预览";
+}
+
+function buildApprovalPayloadPreview(request: ApprovalRequestLike) {
+  if (request.tool === "terminal") {
+    const command = typeof request.arguments.command === "string" ? request.arguments.command.trim() : "";
+    if (command) {
+      return command;
+    }
+  }
+  return stringifyForPanel(request.arguments);
+}
+
+function buildApprovalNodePrimaryText(approval: ApprovalNodePayload, state: TimelineNodeState) {
+  const operation = buildApprovalOperationText(approval);
+  if (state === "approved") {
+    return `已确认${operation}`;
+  }
+  if (state === "rejected" || state === "failed") {
+    return `已拒绝${operation}`;
+  }
+  return buildApprovalPrompt(approval);
+}
+
+function buildApprovalNodeSupportCopy(approval: ApprovalNodePayload, state: TimelineNodeState) {
+  const summary = approval.summary?.trim() ?? "";
+  const normalizedReason = approval.reason?.trim() ?? "";
+  if (state === "approved") {
+    return "这一步已经继续执行，后续结果会继续出现在时间线里。";
+  }
+  if (state === "rejected" || state === "failed") {
+    return "当前调用已停止；如果需要，我可以换一种更低风险的方式继续。";
+  }
+  if (summary) {
+    return summary;
+  }
+  if (normalizedReason && !isMachineApprovalReason(normalizedReason)) {
+    return normalizedReason;
+  }
+  return buildApprovalSupportCopy(approval);
+}
+
+function buildApprovalStateLabel(state: TimelineNodeState) {
+  if (state === "approved") {
+    return "已允许";
+  }
+  if (state === "rejected" || state === "failed") {
+    return "已拒绝";
+  }
+  return "待确认";
 }
 
 function buildEventDataWithRequest(event: SessionEventPayload) {
@@ -936,7 +1694,7 @@ function buildToolSecondaryItem(
     id: detailId,
     parentId,
     state,
-    label: toolName === "terminal" ? "Shell" : toolName ?? semantic.label,
+    label: toolName ?? semantic.label,
     toolName,
     cardType: semantic.cardType,
     subtitle: buildToolSecondarySubtitle(toolName, eventData),
@@ -956,7 +1714,6 @@ function buildToolSecondaryItem(
       eventData,
       {
         output,
-        tags: [{ label: status.label, tone: status.tone }]
       }
     )
   };
@@ -1002,15 +1759,119 @@ function buildThinkingNode(
       inputs: [],
       citations: [],
       output: content,
-      tags: [{ label: "Thinking", tone: "blue" }]
     }
   };
+}
+
+function buildAnswerStartNode(event: SessionEventPayload): TimelineNode {
+  const nodeId = `node:answer_start:${event.ts}:${event.request_id ?? "local"}`;
+  const time = formatEventTime(event.ts);
+  const eventData = buildEventDataWithRequest(event);
+  const primaryText = "开始回答用户问题";
+
+  return {
+    id: nodeId,
+    kind: "answer_start",
+    state: "completed",
+    time,
+    primaryText,
+    secondaryItems: [],
+    detail: buildTraceDetail(nodeId, "result", time, primaryText, "回答开始", primaryText, eventData)
+  };
+}
+
+function buildSystemMetaNode(event: SessionEventPayload, primaryText: string): TimelineNode {
+  const nodeId = `node:system:${event.event}:${event.ts}:${event.request_id ?? "local"}`;
+  const time = formatEventTime(event.ts);
+  const eventData = buildEventDataWithRequest(event);
+  return {
+    id: nodeId,
+    kind: "system_meta",
+    state: "updated",
+    time,
+    primaryText,
+    secondaryItems: [],
+    detail: buildTraceDetail(nodeId, "result", time, primaryText, "系统消息", primaryText, eventData)
+  };
+}
+
+function extractApprovalNodePayload(event: SessionEventPayload, fallback: ApprovalNodePayload | null = null): ApprovalNodePayload {
+  const eventData = buildEventDataWithRequest(event);
+  const approvalRequestId =
+    typeof eventData.approval_request_id === "string" && eventData.approval_request_id
+      ? eventData.approval_request_id
+      : fallback?.approvalRequestId ?? `approval:${event.ts}:${event.request_id ?? "local"}`;
+  const argumentsPayload =
+    "arguments" in eventData &&
+    eventData.arguments &&
+    typeof eventData.arguments === "object" &&
+    !Array.isArray(eventData.arguments)
+      ? (eventData.arguments as Record<string, unknown>)
+      : fallback?.arguments ?? {};
+  const summary =
+    typeof eventData.summary === "string" && eventData.summary.trim()
+      ? eventData.summary
+      : fallback?.summary ?? null;
+
+  return {
+    approvalRequestId,
+    tool: typeof eventData.tool === "string" && eventData.tool ? eventData.tool : fallback?.tool ?? "tool",
+    arguments: argumentsPayload,
+    reason: typeof eventData.reason === "string" && eventData.reason ? eventData.reason : fallback?.reason ?? "requires_approval",
+    summary,
+    timeoutSeconds:
+      typeof eventData.timeout_seconds === "number" ? eventData.timeout_seconds : fallback?.timeoutSeconds ?? null
+  };
+}
+
+function buildApprovalNode(
+  event: SessionEventPayload,
+  state: Extract<TimelineNodeState, "pending" | "approved" | "rejected" | "failed">,
+  fallback: ApprovalNodePayload | null = null
+): TimelineNode {
+  const eventData = buildEventDataWithRequest(event);
+  const approval = extractApprovalNodePayload(event, fallback);
+  const time = formatEventTime(event.ts);
+  const nodeId = `node:approval:${approval.approvalRequestId}`;
+  const primaryText = buildApprovalNodePrimaryText(approval, state);
+  const summary = buildApprovalNodeSupportCopy(approval, state);
+  const preview = buildApprovalPayloadPreview(approval);
+
+  return {
+    id: nodeId,
+    kind: "approval",
+    state,
+    time,
+    primaryText,
+    secondaryItems: [],
+    approval,
+    detail: buildTraceDetail(nodeId, "trace", time, primaryText, "审批确认", summary, eventData, {
+      output: preview || null
+    })
+  };
+}
+
+function refreshApprovalNode(
+  node: TimelineNode,
+  event: SessionEventPayload,
+  state: Extract<TimelineNodeState, "pending" | "approved" | "rejected" | "failed">
+) {
+  const eventData = buildEventDataWithRequest(event);
+  const approval = extractApprovalNodePayload(event, node.approval ?? null);
+  const summary = buildApprovalNodeSupportCopy(approval, state);
+  const preview = buildApprovalPayloadPreview(approval);
+  node.state = state;
+  node.time = formatEventTime(event.ts);
+  node.primaryText = buildApprovalNodePrimaryText(approval, state);
+  node.approval = approval;
+  node.detail = buildTraceDetail(node.id, "trace", node.time, node.primaryText, "审批确认", summary, eventData, {
+    output: preview || null
+  });
 }
 
 function buildProgressGroupNode(groupId: string, event: SessionEventPayload, primaryText: string): TimelineNode {
   const eventData = buildEventDataWithRequest(event);
   const nodeId = `node:group:${groupId}`;
-  const status = resolveSecondaryStatusMeta("running", eventData);
   return {
     id: nodeId,
     kind: "progress",
@@ -1018,9 +1879,7 @@ function buildProgressGroupNode(groupId: string, event: SessionEventPayload, pri
     time: formatEventTime(event.ts),
     primaryText,
     secondaryItems: [],
-    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), primaryText, "执行进展", primaryText, eventData, {
-      tags: [{ label: status.label, tone: status.tone }]
-    })
+    detail: buildTraceDetail(nodeId, "trace", formatEventTime(event.ts), primaryText, "执行进展", primaryText, eventData)
   };
 }
 
@@ -1058,7 +1917,6 @@ function buildSkillSecondaryItem(parentId: string, event: SessionEventPayload): 
       eventData,
       {
         output: contextOutput,
-        tags: [{ label: "Skill", tone: "green" }]
       }
     )
   };
@@ -1106,7 +1964,6 @@ function buildAttachmentSecondaryItem(parentId: string, event: SessionEventPaylo
       eventData,
       {
         output: subtitle,
-        tags: [{ label: status.label, tone: status.tone }],
       }
     ),
   };
@@ -1118,7 +1975,15 @@ function upsertProgressSecondaryItem(node: TimelineNode, item: TimelineSecondary
     node.secondaryItems.push(item);
     return;
   }
-  node.secondaryItems[existingIndex] = item;
+  const existingItem = node.secondaryItems[existingIndex];
+  node.secondaryItems[existingIndex] = {
+    ...item,
+    command: item.command ?? existingItem.command ?? null,
+    detail: {
+      ...item.detail,
+      output: item.detail.output ?? existingItem.detail.output ?? null,
+    },
+  };
 }
 
 function resolveProgressGroupState(items: TimelineSecondaryItem[]): TimelineNodeState {
@@ -1139,7 +2004,6 @@ function refreshProgressGroupNode(
 ) {
   const eventData = buildEventDataWithRequest(event);
   const nextState = resolveProgressGroupState(node.secondaryItems);
-  const status = resolveSecondaryStatusMeta(nextState, eventData);
   node.state = nextState;
   node.time = formatEventTime(event.ts);
   node.primaryText = primaryText;
@@ -1151,9 +2015,6 @@ function refreshProgressGroupNode(
     "执行进展",
     detailSummary || primaryText,
     eventData,
-    {
-      tags: [{ label: status.label, tone: status.tone }]
-    }
   );
 }
 
@@ -1169,6 +2030,7 @@ function preserveNodeIdentity(existingNode: TimelineNode, nextNode: TimelineNode
   return {
     ...nextNode,
     id: existingNode.id,
+    approval: nextNode.approval ?? existingNode.approval ?? null,
     detail: {
       ...nextNode.detail,
       id: existingNode.id
@@ -1209,10 +2071,13 @@ function buildTimelineNodes(
 ) {
   const nodes: TimelineNode[] = [];
   const progressNodeByGroupId = new Map<string, TimelineNode>();
+  const approvalNodeByRequestId = new Map<string, TimelineNode>();
   const toolCallToGroupId = new Map<string, string>();
   const toolMessageByCallId = new Map<string, SessionMessageRecord>();
+  const toolOutputByCallId = new Map<string, string>();
   const commentaryByGroupId = new Map<string, string>();
   let thinkingNodeId: string | null = null;
+  let answerStartNodeId: string | null = null;
 
   toolMessages.forEach((message) => {
     const toolCallId = typeof message.metadata.tool_call_id === "string" ? message.metadata.tool_call_id : null;
@@ -1263,10 +2128,31 @@ function buildTimelineNodes(
     return nextNode;
   };
 
+  const resolveToolOutput = (toolCallId: string | null) => {
+    if (!toolCallId) {
+      return null;
+    }
+    return toolOutputByCallId.get(toolCallId) ?? toolMessageByCallId.get(toolCallId)?.content ?? null;
+  };
+
   events.forEach((event) => {
     const eventData = buildEventDataWithRequest(event);
     const toolCallId = typeof eventData.tool_call_id === "string" ? eventData.tool_call_id : null;
-    const toolOutput = toolCallId ? toolMessageByCallId.get(toolCallId)?.content ?? null : null;
+
+    if (event.event === "checkpoint_created") {
+      nodes.push(buildSystemMetaNode(event, "上下文已压缩"));
+      return;
+    }
+
+    if (event.event === "turn_interrupted") {
+      nodes.push(
+        buildSystemMetaNode(
+          event,
+          typeof eventData.message === "string" && eventData.message ? eventData.message : "当前任务已停止"
+        )
+      );
+      return;
+    }
 
     if (event.event === "thinking_delta" || event.event === "thinking_complete") {
       const content = typeof eventData.content === "string" ? eventData.content : "";
@@ -1286,6 +2172,64 @@ function buildTimelineNodes(
       } else {
         nodes.push(nextNode);
         thinkingNodeId = nextNode.id;
+      }
+      return;
+    }
+
+    if (event.event === "answer_started") {
+      const nextNode = buildAnswerStartNode(event);
+      nodes.push(nextNode);
+      answerStartNodeId = nextNode.id;
+      return;
+    }
+
+    if (event.event === "tool_approval_request") {
+      const nextNode = buildApprovalNode(event, "pending");
+      const approvalRequestId = nextNode.approval?.approvalRequestId ?? nextNode.id;
+      const existingNode = approvalNodeByRequestId.get(approvalRequestId);
+      if (existingNode) {
+        refreshApprovalNode(existingNode, event, "pending");
+      } else {
+        nodes.push(nextNode);
+        approvalNodeByRequestId.set(approvalRequestId, nextNode);
+      }
+      return;
+    }
+
+    if (event.event === "tool_approval_resolved") {
+      const approvalRequestId =
+        typeof eventData.approval_request_id === "string" && eventData.approval_request_id ? eventData.approval_request_id : null;
+      const nextState = Boolean(eventData.approved) ? "approved" : "rejected";
+      const existingNode =
+        (approvalRequestId ? approvalNodeByRequestId.get(approvalRequestId) : null) ??
+        (approvalRequestId
+          ? nodes.find((node) => node.kind === "approval" && node.approval?.approvalRequestId === approvalRequestId)
+          : null);
+      if (existingNode) {
+        refreshApprovalNode(existingNode, event, nextState);
+        const resolvedRequestId = existingNode.approval?.approvalRequestId ?? approvalRequestId ?? existingNode.id;
+        approvalNodeByRequestId.set(resolvedRequestId, existingNode);
+      } else {
+        const nextNode = buildApprovalNode(event, nextState);
+        nodes.push(nextNode);
+        approvalNodeByRequestId.set(nextNode.approval?.approvalRequestId ?? nextNode.id, nextNode);
+      }
+      return;
+    }
+
+    if (event.event === "assistant_delta" && eventData.reset === true) {
+      const existingNodeId =
+        answerStartNodeId ?? [...nodes].reverse().find((node) => node.kind === "answer_start")?.id ?? null;
+      if (!existingNodeId) {
+        return;
+      }
+      const existing = findNodeById(nodes, existingNodeId);
+      if (!existing) {
+        return;
+      }
+      nodes.splice(existing.index, 1);
+      if (answerStartNodeId === existingNodeId) {
+        answerStartNodeId = null;
       }
       return;
     }
@@ -1316,7 +2260,37 @@ function buildTimelineNodes(
       return;
     }
 
+    if (event.event === "tool_call_output_delta") {
+      if (!toolCallId) {
+        return;
+      }
+      const delta = typeof eventData.delta === "string" ? eventData.delta : "";
+      const nextOutput = `${toolOutputByCallId.get(toolCallId) ?? ""}${delta}`;
+      toolOutputByCallId.set(toolCallId, nextOutput);
+      const groupId = resolveGroupId(eventData, toolCallId);
+      if (!groupId) {
+        return;
+      }
+      const toolOutput = resolveToolOutput(toolCallId);
+      const primaryText =
+        commentaryByGroupId.get(groupId) ||
+        resolveProgressPrimaryText(
+          "tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null,
+          "running",
+          eventData,
+          toolOutput,
+          userPrompt
+        );
+      const node = ensureProgressNode(groupId, event, primaryText);
+      const item = buildToolSecondaryItem(node.id, event, "running", toolOutput, userPrompt);
+      upsertProgressSecondaryItem(node, item);
+      refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
+      toolCallToGroupId.set(toolCallId, groupId);
+      return;
+    }
+
     if (event.event === "tool_call_started") {
+      const toolOutput = resolveToolOutput(toolCallId);
       const groupId = resolveGroupId(eventData, toolCallId);
       if (!groupId) {
         return;
@@ -1335,6 +2309,7 @@ function buildTimelineNodes(
     }
 
     if (event.event === "tool_call_finished") {
+      const toolOutput = resolveToolOutput(toolCallId);
       const groupId = resolveGroupId(eventData, toolCallId);
       if (!groupId) {
         return;
@@ -1392,12 +2367,89 @@ function readRequestId(value: Record<string, unknown>) {
 
 function readApprovalMode(value: Record<string, unknown>) {
   const approvalMode = value.approval_mode;
-  return approvalMode === "manual" || approvalMode === "auto_approve_level2" ? approvalMode : null;
+  if (approvalMode === "auto_allow" || approvalMode === "auto_approve_level2") {
+    return "auto_allow";
+  }
+  return approvalMode === "manual" ? approvalMode : null;
 }
 
 function isAssistantToolCallMessage(message: SessionMessageRecord) {
   const toolCalls = message.metadata.tool_calls;
   return Array.isArray(toolCalls) && toolCalls.length > 0;
+}
+
+function readNonEmptyText(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function isRawToolCallMarkupText(text: string) {
+  const normalized = text.trim();
+  if (!normalized) {
+    return false;
+  }
+  return normalized.includes("<minimax:tool_call>") || normalized.includes("<invoke") || normalized.includes("<parameter");
+}
+
+function buildFailedTurnCopyFromEvent(event: SessionEventPayload) {
+  const tool = readNonEmptyText(event.data.tool);
+  const frontendMessage = readNonEmptyText(event.data.frontend_message);
+  const message = readNonEmptyText(event.data.message);
+  const summary = readNonEmptyText(event.data.summary);
+  const recommendedNextStep = readNonEmptyText(event.data.recommended_next_step);
+  const errorCode = readNonEmptyText(event.data.error_code);
+  const category = readNonEmptyText(event.data.category);
+  const blocker = frontendMessage ?? message ?? summary;
+
+  if (event.event !== "error" && event.event !== "tool_error_feedback") {
+    return null;
+  }
+
+  if (errorCode === "NEWMAN-TOOL-005" || category === "user_rejected") {
+    return "工具调用申请被用户拒绝或审批超时，当前任务已终止";
+  }
+
+  const lines: string[] = [];
+  if (tool && blocker) {
+    lines.push(`这一步被阻塞了：\`${tool}\` ${blocker}。`);
+  } else if (tool) {
+    lines.push(`这一步被阻塞了：\`${tool}\`。`);
+  }
+
+  const reason = summary && summary !== blocker ? summary : blocker;
+  if (reason) {
+    if (lines.length > 0) {
+      lines.push(`原因：${reason}`);
+    } else {
+      lines.push(reason);
+    }
+  }
+
+  if (recommendedNextStep) {
+    lines.push(`建议：${recommendedNextStep}`);
+  }
+
+  return lines.join("\n").trim() || "这轮执行暂时中断，请查看过程详情。";
+}
+
+function synthesizeFailedTurnAnswer(turnId: string, events: SessionEventPayload[]): TurnAnswer | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    const content = buildFailedTurnCopyFromEvent(event);
+    if (!content) {
+      continue;
+    }
+    return {
+      detailId: `failed:${turnId}:${index}`,
+      content,
+      createdAt: new Date(event.ts).toISOString(),
+      phase: "failed",
+      source: "session",
+      assistantMessageId: null,
+      finishReason: event.event,
+      errorMessage: content
+    };
+  }
+  return null;
 }
 
 function resolveTurnIdForEvent(
@@ -1552,6 +2604,10 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
       turn.status = "failed";
       return;
     }
+    if (event.event === "turn_interrupted") {
+      turn.status = "failed";
+      return;
+    }
     if (event.event === "tool_error_feedback") {
       const recoveryClass = event.data.recovery_class;
       if (recoveryClass === "fatal" || recoveryClass === "blocked") {
@@ -1565,11 +2621,18 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
   });
 
   turns.forEach((turn) => {
+    const turnEvents = eventsByTurn.get(turn.id) ?? [];
+    if (turn.status === "failed" && (!turn.answer || isRawToolCallMarkupText(turn.answer.content))) {
+      const failedAnswer = synthesizeFailedTurnAnswer(turn.id, turnEvents);
+      if (failedAnswer) {
+        turn.answer = failedAnswer;
+      }
+    }
     if (turn.status === "running" && turn.answer) {
       turn.status = "completed";
     }
     turn.timeline = buildTimelineNodes(
-      eventsByTurn.get(turn.id) ?? [],
+      turnEvents,
       toolMessagesByTurn.get(turn.id) ?? [],
       assistantToolMessagesByTurn.get(turn.id) ?? [],
       turn.userMessage.content
@@ -1584,6 +2647,9 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
 function matchLiveTurnEvent(event: SessionEventPayload, liveTurn: LiveTurnState) {
   const eventTurnId = readTurnId(event.data);
   if (liveTurn.serverTurnId && eventTurnId === liveTurn.serverTurnId) {
+    return true;
+  }
+  if (eventTurnId === liveTurn.localId) {
     return true;
   }
   if (liveTurn.requestId && event.request_id === liveTurn.requestId) {
@@ -1636,12 +2702,23 @@ function turnMatchesLiveTurn(turn: ChatTurn, liveTurn: LiveTurnState | null) {
   return false;
 }
 
+function hasSystemMetaNode(turn: ChatTurn) {
+  return turn.timeline.some((node) => node.kind === "system_meta");
+}
+
+function hasPendingApprovalNode(turn: ChatTurn) {
+  return turn.timeline.some((node) => node.kind === "approval" && node.state === "pending");
+}
+
 function resolveAnswerCopy(answer: TurnAnswer | null, status: TurnStatus) {
   if (answer && answer.content.trim()) {
     return answer.content;
   }
   if (answer?.phase === "failed") {
     return answer.errorMessage || "这轮执行暂时中断，请查看过程详情。";
+  }
+  if (status === "failed") {
+    return "这轮执行暂时中断，请查看过程详情。";
   }
   if (status === "needs_approval") {
     return "这一步需要你确认后我才能继续。";
@@ -1657,7 +2734,17 @@ function resolveAnswerCopy(answer: TurnAnswer | null, status: TurnStatus) {
 
 function shouldRenderAnswerBubble(turn: ChatTurn) {
   if (!turn.answer) {
+    if (turn.status === "needs_approval" && hasPendingApprovalNode(turn)) {
+      return false;
+    }
+    if (turn.status === "failed" && hasSystemMetaNode(turn)) {
+      return false;
+    }
     return turn.status !== "completed";
+  }
+
+  if (turn.status === "failed" && !turn.answer.content.trim() && hasSystemMetaNode(turn)) {
+    return false;
   }
 
   if (turn.answer.content.trim()) {
@@ -1668,37 +2755,29 @@ function shouldRenderAnswerBubble(turn: ChatTurn) {
     return true;
   }
 
+  if (turn.status === "needs_approval" && hasPendingApprovalNode(turn)) {
+    return false;
+  }
+
   if (turn.status === "needs_approval") {
     return true;
+  }
+
+  if (turn.isLive && turn.status === "running" && turn.timeline.some((node) => node.kind === "progress")) {
+    return false;
   }
 
   return !turn.isLive || !turn.timeline.some(isRunningThinkingNode);
 }
 
-function buildAnswerTags(answer: TurnAnswer | null, status: TurnStatus) {
-  const tags: Array<{ label: string; tone: StatusTagTone }> = [];
-  if (!answer) {
-    if (status === "needs_approval") {
-      tags.push({ label: "待确认", tone: "orange" });
-    } else if (status === "failed") {
-      tags.push({ label: "已中断", tone: "orange" });
-    }
-    return tags;
+function shouldRenderAssistantMessageMeta(turn: ChatTurn) {
+  if (!turn.answer) {
+    return false;
   }
-
-  if (answer.phase === "failed") {
-    tags.push({ label: "已中断", tone: "orange" });
+  if (turn.answer.phase === "persisted" || turn.answer.phase === "failed") {
+    return true;
   }
-
-  if (status === "needs_approval") {
-    tags.push({ label: "待确认", tone: "orange" });
-  }
-
-  if (answer.finishReason === "tool_limit_reached") {
-    tags.push({ label: "工具上限", tone: "blue" });
-  }
-
-  return tags;
+  return turn.status === "completed" || turn.status === "failed";
 }
 
 function normalizeSessionEventPayload(payload: unknown): SessionEventPayload | null {
@@ -1736,6 +2815,10 @@ function App() {
     const stored = window.localStorage.getItem("newman-active-page");
     return isWorkspacePage(stored) ? stored : "chat";
   });
+  const [uiTheme, setUiTheme] = useState<UiTheme>(() => {
+    const stored = window.localStorage.getItem("newman-ui-theme");
+    return isUiTheme(stored) ? stored : "classic";
+  });
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
@@ -1743,10 +2826,12 @@ function App() {
   const [activeSessionDetail, setActiveSessionDetail] = useState<SessionRecordDetail | null>(null);
   const [activeContextUsage, setActiveContextUsage] = useState<SessionDetailResponse["context_usage"]>(null);
   const [sessionEvents, setSessionEvents] = useState<SessionEventPayload[]>([]);
+  const [liveSessionEvents, setLiveSessionEvents] = useState<SessionEventPayload[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [chatNotice, setChatNotice] = useState<string | null>(null);
   const [sendingMessage, setSendingMessage] = useState(false);
+  const [stoppingMessage, setStoppingMessage] = useState(false);
   const [liveTurn, setLiveTurn] = useState<LiveTurnState | null>(null);
   const [openSessionMenuId, setOpenSessionMenuId] = useState<string | null>(null);
   const [memoryFiles, setMemoryFiles] = useState<Record<MemoryKey, MemoryFile>>({
@@ -1769,11 +2854,21 @@ function App() {
   const [skillDetail, setSkillDetail] = useState<SkillDetail | null>(null);
   const [skillDetailLoading, setSkillDetailLoading] = useState(false);
   const [skillDraft, setSkillDraft] = useState("");
+  const [skillDocumentView, setSkillDocumentView] = useState<SkillDocumentView>("preview");
   const [skillSaveNotice, setSkillSaveNotice] = useState<string | null>(null);
   const [skillImportPath, setSkillImportPath] = useState("");
+  const [showSkillImportPanel, setShowSkillImportPanel] = useState(false);
   const [skillSaving, setSkillSaving] = useState(false);
   const [skillDeleting, setSkillDeleting] = useState(false);
   const [skillImporting, setSkillImporting] = useState(false);
+  const [skillTreeEntriesByName, setSkillTreeEntriesByName] = useState<Record<string, WorkspaceEntry[]>>({});
+  const [skillTreeErrors, setSkillTreeErrors] = useState<Record<string, string>>({});
+  const [skillTreeLoadingByName, setSkillTreeLoadingByName] = useState<Record<string, boolean>>({});
+  const [skillFolderEntriesByPath, setSkillFolderEntriesByPath] = useState<Record<string, WorkspaceEntry[]>>({});
+  const [skillFolderErrors, setSkillFolderErrors] = useState<Record<string, string>>({});
+  const [skillFolderLoadingByPath, setSkillFolderLoadingByPath] = useState<Record<string, boolean>>({});
+  const [expandedSkillNames, setExpandedSkillNames] = useState<Record<string, boolean>>({});
+  const [expandedSkillFolders, setExpandedSkillFolders] = useState<Record<string, boolean>>({});
   const [workspacePath, setWorkspacePath] = useState(".");
   const [workspaceRootPath, setWorkspaceRootPath] = useState<string | null>(null);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceBrowserResponse | null>(null);
@@ -1787,12 +2882,22 @@ function App() {
   const [pluginsLoading, setPluginsLoading] = useState(false);
   const [pluginsError, setPluginsError] = useState<string | null>(null);
   const [pluginsNotice, setPluginsNotice] = useState<string | null>(null);
+  const [projectConfigPath, setProjectConfigPath] = useState("");
+  const [projectConfigContent, setProjectConfigContent] = useState("");
+  const [projectConfigDraft, setProjectConfigDraft] = useState("");
+  const [projectConfigEffectiveWorkspace, setProjectConfigEffectiveWorkspace] = useState("");
+  const [projectConfigSourcePriority, setProjectConfigSourcePriority] = useState<string[]>([]);
+  const [configWarnings, setConfigWarnings] = useState<string[]>([]);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [configSaving, setConfigSaving] = useState(false);
+  const [configReloading, setConfigReloading] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [configNotice, setConfigNotice] = useState<string | null>(null);
   const [pluginBusyName, setPluginBusyName] = useState<string | null>(null);
   const [leftWidth, setLeftWidth] = useState(() => readStoredNumber("newman-left-rail-width", 220, LEFT_MIN, LEFT_MAX));
   const [dragging, setDragging] = useState<null | "left">(null);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [expandedTimelineIds, setExpandedTimelineIds] = useState<Record<string, boolean>>({});
-  const [expandedSecondaryIds, setExpandedSecondaryIds] = useState<Record<string, boolean>>({});
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [approvalActionLoading, setApprovalActionLoading] = useState<null | "approve" | "reject">(null);
@@ -1803,6 +2908,7 @@ function App() {
   const conversationPaneRef = useRef<HTMLElement | null>(null);
   const composerFileInputRef = useRef<HTMLInputElement | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
+  const activeMessageControllerRef = useRef<AbortController | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const attachmentPreviewUrlsRef = useRef<string[]>([]);
   const liveAttachmentUrlsRef = useRef<string[]>([]);
@@ -1814,6 +2920,14 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem("newman-active-page", activePage);
   }, [activePage]);
+
+  useEffect(() => {
+    window.localStorage.setItem("newman-ui-theme", uiTheme);
+    document.body.dataset.newmanTheme = uiTheme;
+    return () => {
+      delete document.body.dataset.newmanTheme;
+    };
+  }, [uiTheme]);
 
   useEffect(() => {
     if (activeSessionId) {
@@ -1831,6 +2945,13 @@ function App() {
     return () => {
       attachmentPreviewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
       attachmentPreviewUrlsRef.current = [];
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      activeMessageControllerRef.current?.abort();
+      activeMessageControllerRef.current = null;
     };
   }, []);
 
@@ -1993,6 +3114,7 @@ function App() {
       setActiveSessionDetail(null);
       setActiveContextUsage(null);
       setSessionEvents([]);
+      setLiveSessionEvents([]);
       setLiveTurn(null);
       setChatLoading(false);
       return;
@@ -2002,6 +3124,7 @@ function App() {
     setActiveSessionDetail(null);
     setActiveContextUsage(null);
     setSessionEvents([]);
+    setLiveSessionEvents([]);
     setLiveTurn((currentTurn) => (currentTurn && currentTurn.sessionId !== activeSessionId ? null : currentTurn));
     void loadChatWorkspace(activeSessionId, controller.signal);
     return () => controller.abort();
@@ -2129,6 +3252,91 @@ function App() {
     }
   }
 
+  async function fetchWorkspaceDirectoryEntries(targetPath: string, signal?: AbortSignal) {
+    const url = new URL(`${apiBase}/api/workspace/files`);
+    url.searchParams.set("path", targetPath);
+    const data = await fetchJson<WorkspaceBrowserResponse>(url.toString(), { signal });
+    return data.type === "dir" ? data.entries : [];
+  }
+
+  async function loadSkillDirectoryEntries(skillName: string, directoryPath: string, signal?: AbortSignal) {
+    setSkillTreeLoadingByName((current) => ({
+      ...current,
+      [skillName]: true
+    }));
+    setSkillTreeErrors((current) => {
+      const next = { ...current };
+      delete next[skillName];
+      return next;
+    });
+
+    try {
+      const entries = await fetchWorkspaceDirectoryEntries(directoryPath, signal);
+      if (signal?.aborted) return;
+
+      setSkillTreeEntriesByName((current) => ({
+        ...current,
+        [skillName]: entries
+      }));
+    } catch (error) {
+      if (signal?.aborted) return;
+      setSkillTreeEntriesByName((current) => ({
+        ...current,
+        [skillName]: []
+      }));
+      setSkillTreeErrors((current) => ({
+        ...current,
+        [skillName]: error instanceof Error ? error.message : "Skill 目录读取失败"
+      }));
+    } finally {
+      if (!signal?.aborted) {
+        setSkillTreeLoadingByName((current) => ({
+          ...current,
+          [skillName]: false
+        }));
+      }
+    }
+  }
+
+  async function loadSkillFolderEntries(directoryPath: string, signal?: AbortSignal) {
+    setSkillFolderLoadingByPath((current) => ({
+      ...current,
+      [directoryPath]: true
+    }));
+    setSkillFolderErrors((current) => {
+      const next = { ...current };
+      delete next[directoryPath];
+      return next;
+    });
+
+    try {
+      const entries = await fetchWorkspaceDirectoryEntries(directoryPath, signal);
+      if (signal?.aborted) return;
+
+      setSkillFolderEntriesByPath((current) => ({
+        ...current,
+        [directoryPath]: entries
+      }));
+    } catch (error) {
+      if (signal?.aborted) return;
+      setSkillFolderEntriesByPath((current) => ({
+        ...current,
+        [directoryPath]: []
+      }));
+      setSkillFolderErrors((current) => ({
+        ...current,
+        [directoryPath]: error instanceof Error ? error.message : "目录读取失败"
+      }));
+    } finally {
+      if (!signal?.aborted) {
+        setSkillFolderLoadingByPath((current) => ({
+          ...current,
+          [directoryPath]: false
+        }));
+      }
+    }
+  }
+
   useEffect(() => {
     if (activePage !== "skills") return;
 
@@ -2136,6 +3344,18 @@ function App() {
     void loadSkillsWorkspace(controller.signal);
     return () => controller.abort();
   }, [activePage, apiBase]);
+
+  useEffect(() => {
+    if (!selectedSkillName) return;
+    setExpandedSkillNames((current) => (
+      current[selectedSkillName]
+        ? current
+        : {
+            ...current,
+            [selectedSkillName]: true
+          }
+    ));
+  }, [selectedSkillName]);
 
   useEffect(() => {
     const skillName = selectedSkillName ?? "";
@@ -2168,6 +3388,24 @@ function App() {
 
     return () => controller.abort();
   }, [activePage, selectedSkillName, apiBase]);
+
+  useEffect(() => {
+    if (activePage !== "skills" || !selectedSkillName) return;
+    if (Object.prototype.hasOwnProperty.call(skillTreeEntriesByName, selectedSkillName)) return;
+
+    const selectedSkill = skills.find((item) => item.name === selectedSkillName);
+    if (!selectedSkill) return;
+
+    const controller = new AbortController();
+    void loadSkillDirectoryEntries(selectedSkill.name, getSkillDirectoryPath(selectedSkill.path), controller.signal);
+    return () => controller.abort();
+  }, [activePage, selectedSkillName, skills, skillTreeEntriesByName]);
+
+  useEffect(() => {
+    if (skillDetail?.readonly) {
+      setSkillDocumentView("preview");
+    }
+  }, [skillDetail?.readonly]);
 
   async function loadWorkspaceBrowser(targetPath: string, signal?: AbortSignal) {
     setWorkspaceLoading(true);
@@ -2228,6 +3466,28 @@ function App() {
     return () => controller.abort();
   }, [activePage, apiBase]);
 
+  async function loadProjectConfig(signal?: AbortSignal) {
+    setConfigLoading(true);
+    setConfigError(null);
+
+    try {
+      const data = await fetchJson<ProjectConfigResponse>(`${apiBase}/api/config/project`, { signal });
+      if (signal?.aborted) return;
+      setProjectConfigPath(data.path);
+      setProjectConfigContent(data.content);
+      setProjectConfigDraft(data.content);
+      setProjectConfigEffectiveWorkspace(data.effective_workspace);
+      setProjectConfigSourcePriority(data.source_priority);
+    } catch (error) {
+      if (signal?.aborted) return;
+      setConfigError(error instanceof Error ? error.message : "项目配置加载失败");
+    } finally {
+      if (!signal?.aborted) {
+        setConfigLoading(false);
+      }
+    }
+  }
+
   async function loadPluginsWorkspace(signal?: AbortSignal) {
     setPluginsLoading(true);
     setPluginsError(null);
@@ -2251,30 +3511,160 @@ function App() {
     if (activePage !== "settings") return;
 
     const controller = new AbortController();
+    setConfigNotice(null);
+    setConfigWarnings([]);
     void loadPluginsWorkspace(controller.signal);
+    void loadProjectConfig(controller.signal);
     return () => controller.abort();
   }, [activePage, apiBase]);
 
   const isMobile = viewportWidth <= 820;
-  const persistedSessionEvents = liveTurn ? sessionEvents.filter((event) => !matchLiveTurnEvent(event, liveTurn)) : sessionEvents;
-  const persistedTurns = buildChatTurns(activeSessionDetail?.messages ?? [], persistedSessionEvents);
-  const visiblePersistedTurns = persistedTurns.filter((turn) => !turnMatchesLiveTurn(turn, liveTurn));
-  const displayTurns = liveTurn ? [...visiblePersistedTurns, buildLiveTurn(liveTurn, sessionEvents)] : visiblePersistedTurns;
+  const liveTurnLocalId = liveTurn?.localId ?? null;
+  const liveTurnRequestId = liveTurn?.requestId ?? null;
+  const liveTurnServerTurnId = liveTurn?.serverTurnId ?? null;
+  const persistedTurns = useMemo(
+    () => buildChatTurns(activeSessionDetail?.messages ?? [], sessionEvents),
+    [activeSessionDetail?.messages, sessionEvents]
+  );
+  const visiblePersistedTurns = useMemo(
+    () => persistedTurns.filter((turn) => !turnMatchesLiveTurn(turn, liveTurn)),
+    [persistedTurns, liveTurnLocalId, liveTurnRequestId, liveTurnServerTurnId]
+  );
+  const liveDisplayTurn = useMemo(
+    () => (liveTurn ? buildLiveTurn(liveTurn, liveSessionEvents) : null),
+    [liveTurn, liveSessionEvents]
+  );
+  const displayTurns = useMemo(
+    () => (liveDisplayTurn ? [...visiblePersistedTurns, liveDisplayTurn] : visiblePersistedTurns),
+    [visiblePersistedTurns, liveDisplayTurn]
+  );
   const showEmptyChatState =
     activePage === "chat" &&
     !chatLoading &&
     !sendingMessage &&
     displayTurns.length === 0;
-  const contextPressure = activeContextUsage?.pressure ?? null;
+  const contextPressure = activeContextUsage?.confirmed_pressure ?? null;
   const contextProgress = contextPressure === null ? null : Math.min(Math.max(contextPressure, 0), 1);
   const contextPercent = contextPressure === null ? null : Math.max(0, Math.round(contextPressure * 100));
   const contextRingProgress = contextProgress ?? 0;
+  const compactionStageLabel = formatCompactionStage(activeContextUsage?.compaction_stage);
+  const compactionFailureLabel = formatCompactionFailureReason(activeContextUsage?.last_compaction_failure_reason);
+  const contextMetaSecondary = activeContextUsage?.context_irreducible
+    ? "当前上下文已不可再压缩"
+    : activeContextUsage?.projected_over_limit
+      ? "当前上下文已达到自动压缩判断线"
+      : compactionFailureLabel
+        ? compactionFailureLabel
+        : compactionStageLabel;
+  const contextMetaDetail =
+    activeContextUsage && activeContextUsage.compaction_fail_streak > 0
+      ? `连续失败 ${activeContextUsage.compaction_fail_streak} 次`
+      : null;
+  const hasContextMeta = Boolean(contextMetaSecondary || contextMetaDetail);
   const activeApprovalMode = approvalModeMeta[turnApprovalMode];
   const hasMemoryChanges =
     memoryDrafts.memory !== memoryFiles.memory.content || memoryDrafts.user !== memoryFiles.user.content;
   const hasSkillChanges = Boolean(skillDetail && skillDraft !== skillDetail.content);
+  const selectedSkillSummary = selectedSkillName ? skills.find((item) => item.name === selectedSkillName) ?? null : null;
+  const selectedSkillTreeEntries = selectedSkillName
+    ? orderSkillWorkspaceEntries(
+        skillTreeEntriesByName[selectedSkillName] ?? [],
+        skillDetail?.name === selectedSkillName ? skillDetail.path : selectedSkillSummary?.path ?? null
+      )
+    : [];
+  const selectedSkillTreeError = selectedSkillName ? skillTreeErrors[selectedSkillName] ?? null : null;
+  const selectedSkillTreeLoading = Boolean(selectedSkillName && skillTreeLoadingByName[selectedSkillName]);
+  const hasProjectConfigChanges = projectConfigDraft !== projectConfigContent;
   const currentWorkspaceLabel = workspaceView ? formatPathLabel(workspaceView.path, workspaceRootPath) : ".";
   const isWorkspaceRoot = Boolean(workspaceView && workspaceRootPath && workspaceView.path === workspaceRootPath);
+
+  const renderSkillTreeNodes = (skill: SkillSummary, entries: WorkspaceEntry[], depth = 0): ReactNode =>
+    entries.map((entry) => {
+      const isDirectory = entry.type === "dir";
+      const isSkillFile = entry.path === skill.path || entry.name.toLowerCase() === "skill.md";
+      const isExpanded = isDirectory ? Boolean(expandedSkillFolders[entry.path]) : false;
+      const nextDepth = depth + 1;
+      const childEntries = isDirectory
+        ? orderSkillWorkspaceEntries(skillFolderEntriesByPath[entry.path] ?? [], skill.path)
+        : [];
+      const childError = isDirectory ? skillFolderErrors[entry.path] ?? null : null;
+      const childLoading = isDirectory ? Boolean(skillFolderLoadingByPath[entry.path]) : false;
+
+      return (
+        <div key={entry.path} className="skill-tree-branch">
+          {isDirectory ? (
+            <button
+              type="button"
+              className={`skill-tree-node dir ${isExpanded ? "expanded" : ""}`}
+              onClick={() => {
+                const nextExpanded = !isExpanded;
+                setExpandedSkillFolders((current) => ({
+                  ...current,
+                  [entry.path]: nextExpanded
+                }));
+                if (
+                  nextExpanded &&
+                  !Object.prototype.hasOwnProperty.call(skillFolderEntriesByPath, entry.path) &&
+                  !skillFolderLoadingByPath[entry.path]
+                ) {
+                  void loadSkillFolderEntries(entry.path);
+                }
+              }}
+              aria-expanded={isExpanded}
+              title={entry.path}
+              style={{ paddingInlineStart: `${nextDepth * 18}px` }}
+            >
+              <span className="skill-tree-node-icon" aria-hidden="true">
+                <SkillFolderIcon className="skill-tree-node-icon-svg" />
+              </span>
+              <span className="skill-tree-node-label">{entry.name}</span>
+              <span className={`skill-tree-node-trailing ${isExpanded ? "expanded" : ""}`} aria-hidden="true">
+                <ChevronStrokeIcon className="skill-tree-node-chevron" />
+              </span>
+            </button>
+          ) : (
+            <div
+              className={`skill-tree-node file ${isSkillFile ? "primary" : ""}`}
+              title={entry.path}
+              style={{ paddingInlineStart: `${nextDepth * 18}px` }}
+            >
+              <span className="skill-tree-node-icon" aria-hidden="true">
+                <SkillFileIcon className="skill-tree-node-icon-svg" />
+              </span>
+              <span className="skill-tree-node-label">{entry.name}</span>
+            </div>
+          )}
+
+          {isDirectory && isExpanded ? (
+            <div className="skill-tree-children nested">
+              {childLoading ? (
+                <div className="skill-tree-node muted" style={{ paddingInlineStart: `${(nextDepth + 1) * 18}px` }}>
+                  正在读取目录...
+                </div>
+              ) : null}
+              {!childLoading && childError ? (
+                <div className="skill-tree-node muted" style={{ paddingInlineStart: `${(nextDepth + 1) * 18}px` }}>
+                  {childError}
+                </div>
+              ) : null}
+              {!childLoading && !childError ? renderSkillTreeNodes(skill, childEntries, nextDepth) : null}
+              {!childLoading && !childError && childEntries.length === 0 ? (
+                <div className="skill-tree-node muted" style={{ paddingInlineStart: `${(nextDepth + 1) * 18}px` }}>
+                  该目录下暂无可展示项。
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      );
+    });
+
+  const scrollConversationToBottom = () => {
+    shouldAutoScrollRef.current = true;
+    const pane = conversationPaneRef.current;
+    if (!pane) return;
+    pane.scrollTop = pane.scrollHeight;
+  };
 
   useEffect(() => {
     if (activePage !== "chat") return;
@@ -2300,7 +3690,7 @@ function App() {
       return;
     }
 
-    pane.scrollTop = pane.scrollHeight;
+    scrollConversationToBottom();
   }, [activePage, activeSessionId, activeSessionDetail, liveTurn, sessionEvents.length]);
 
   const switchPage = (nextPage: WorkspacePage) => {
@@ -2342,30 +3732,34 @@ function App() {
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
 
-    while (true) {
-      const { value, done } = await reader.read();
-      buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
-      const chunks = buffer.split("\n\n");
-      buffer = chunks.pop() ?? "";
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() ?? "";
 
-      for (const chunk of chunks) {
-        const dataLines = chunk
-          .split("\n")
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).trim())
-          .filter(Boolean);
+        for (const chunk of chunks) {
+          const dataLines = chunk
+            .split("\n")
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trim())
+            .filter(Boolean);
 
-        if (dataLines.length === 0) {
-          continue;
+          if (dataLines.length === 0) {
+            continue;
+          }
+
+          const payload = JSON.parse(dataLines.join("\n")) as SessionEventPayload;
+          onEvent(payload);
         }
 
-        const payload = JSON.parse(dataLines.join("\n")) as SessionEventPayload;
-        onEvent(payload);
+        if (done) {
+          break;
+        }
       }
-
-      if (done) {
-        break;
-      }
+    } finally {
+      reader.releaseLock();
     }
   }
 
@@ -2416,6 +3810,60 @@ function App() {
     });
   };
 
+  const stopActiveComposerRun = async () => {
+    if (stoppingMessage) {
+      return;
+    }
+    const controller = activeMessageControllerRef.current;
+    if (!controller) {
+      return;
+    }
+
+    const sessionId = liveTurn?.sessionId ?? activeSessionIdRef.current;
+    if (!sessionId) {
+      return;
+    }
+
+    setStoppingMessage(true);
+    setPendingApproval(null);
+    setApprovalError(null);
+    setChatError(null);
+    setChatNotice("正在停止当前任务...");
+
+    try {
+      const data = await fetchJson<InterruptTurnResponse>(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/interrupt`, {
+        method: "POST"
+      });
+      activeMessageControllerRef.current = null;
+      controller.abort();
+      setLiveSessionEvents([]);
+      setLiveTurn((currentTurn) =>
+        currentTurn
+          ? {
+              ...currentTurn,
+              status: "failed",
+              answer: {
+                ...currentTurn.answer,
+                phase: "failed",
+                errorMessage: data.message || "当前任务已停止",
+                content: ""
+              }
+            }
+          : currentTurn
+      );
+      await loadChatSessions(undefined, sessionId);
+      await loadChatWorkspace(sessionId, undefined, { silent: true });
+      setLiveTurn(null);
+      setLiveSessionEvents([]);
+      setChatNotice(data.message || (data.interrupted ? "当前任务已停止" : "当前没有可停止的任务"));
+    } catch (error) {
+      setChatNotice(null);
+      setChatError(error instanceof Error ? error.message : "停止当前任务失败");
+    } finally {
+      setStoppingMessage(false);
+    }
+  };
+
   const submitComposer = async () => {
     const trimmed = composerValue.trim();
     if ((!trimmed && composerAttachments.length === 0) || sendingMessage) return;
@@ -2423,9 +3871,22 @@ function App() {
     setChatError(null);
     setChatNotice(null);
     setSendingMessage(true);
+    const controller = new AbortController();
+    activeMessageControllerRef.current = controller;
+
+    const finishStreamingState = () => {
+      if (activeMessageControllerRef.current === controller) {
+        activeMessageControllerRef.current = null;
+      }
+      setSendingMessage(false);
+    };
 
     try {
       const sessionId = await ensureSession();
+      if (controller.signal.aborted) {
+        return;
+      }
+      scrollConversationToBottom();
       const createdAt = new Date().toISOString();
       const liveTurnLocalId = `live-turn-${Date.now()}`;
       const attachmentSnapshot = composerAttachments.map(({ file: _file, ...attachment }) => attachment);
@@ -2469,6 +3930,7 @@ function App() {
       );
       setComposerValue("");
       setComposerAttachments([]);
+      setLiveSessionEvents([]);
       switchPage("chat");
 
       const response =
@@ -2485,6 +3947,7 @@ function App() {
               return fetch(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
                 method: "POST",
                 body,
+                signal: controller.signal,
               });
             })()
           : await fetch(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
@@ -2492,6 +3955,7 @@ function App() {
               headers: {
                 "Content-Type": "application/json",
               },
+              signal: controller.signal,
               body: JSON.stringify({
                 content: trimmed,
                 approval_mode: turnApprovalMode,
@@ -2518,7 +3982,7 @@ function App() {
           return;
         }
 
-        setSessionEvents((currentEvents) => [...currentEvents, payload]);
+        setLiveSessionEvents((currentEvents) => [...currentEvents, payload]);
         if (payload.event === "error") {
           setChatError(typeof payload.data.message === "string" ? payload.data.message : "消息流执行失败");
         }
@@ -2535,13 +3999,18 @@ function App() {
           };
 
           if (payload.event === "assistant_delta") {
+            const isReset = payload.data.reset === true;
             return {
               ...nextTurn,
               status: "running",
               answer: {
                 ...nextTurn.answer,
-                phase: "streaming",
-                content: typeof payload.data.content === "string" ? payload.data.content : nextTurn.answer.content
+                phase: isReset ? "waiting" : "streaming",
+                content: isReset
+                  ? ""
+                  : typeof payload.data.content === "string"
+                    ? payload.data.content
+                    : nextTurn.answer.content
               }
             };
           }
@@ -2550,7 +4019,8 @@ function App() {
             payload.event === "thinking_delta" ||
             payload.event === "thinking_complete" ||
             payload.event === "commentary_delta" ||
-            payload.event === "commentary_complete"
+            payload.event === "commentary_complete" ||
+            payload.event === "tool_call_output_delta"
           ) {
             return {
               ...nextTurn,
@@ -2606,13 +4076,18 @@ function App() {
           return nextTurn;
         });
       });
+      finishStreamingState();
 
       await loadChatSessions(undefined, sessionId);
       const refreshed = await loadChatWorkspace(sessionId, undefined, { silent: true });
       if (refreshed && activeSessionIdRef.current === sessionId) {
+        setLiveSessionEvents([]);
         setLiveTurn((currentTurn) => (currentTurn && currentTurn.localId === liveTurnLocalId ? null : currentTurn));
       }
     } catch (error) {
+      if (controller.signal.aborted || isAbortError(error)) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "发送消息失败";
       setChatError(message);
       setLiveTurn((currentTurn) =>
@@ -2630,12 +4105,12 @@ function App() {
           : currentTurn
       );
     } finally {
-      setSendingMessage(false);
+      finishStreamingState();
     }
   };
 
-  const resolveApproval = async (action: "approve" | "reject") => {
-    if (!pendingApproval) return;
+  const resolveApproval = async (action: "approve" | "reject", approvalRequestId: string | null = pendingApproval?.approval_request_id ?? null) => {
+    if (!approvalRequestId) return;
 
     setApprovalActionLoading(action);
     setApprovalError(null);
@@ -2646,9 +4121,11 @@ function App() {
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ approval_request_id: pendingApproval.approval_request_id })
+        body: JSON.stringify({ approval_request_id: approvalRequestId })
       });
-      setPendingApproval(null);
+      setPendingApproval((current) =>
+        current?.approval_request_id === approvalRequestId ? null : current
+      );
     } catch (error) {
       setApprovalError(error instanceof Error ? error.message : "审批操作失败");
     } finally {
@@ -2676,21 +4153,6 @@ function App() {
     setExpandedTimelineIds((current) => ({
       ...current,
       [node.id]: !isTimelineExpanded(node)
-    }));
-  };
-
-  const isSecondaryOutputExpanded = (item: TimelineSecondaryItem) => {
-    const manual = expandedSecondaryIds[item.id];
-    if (typeof manual === "boolean") {
-      return manual;
-    }
-    return item.outputLineCount <= 10 || item.statusLabel === "运行中";
-  };
-
-  const toggleSecondaryOutput = (item: TimelineSecondaryItem) => {
-    setExpandedSecondaryIds((current) => ({
-      ...current,
-      [item.id]: !isSecondaryOutputExpanded(item)
     }));
   };
 
@@ -2862,6 +4324,7 @@ function App() {
         body: JSON.stringify({ source_path: trimmed })
       });
       setSkillImportPath("");
+      setShowSkillImportPanel(false);
       setSkillSaveNotice(`已导入 ${data.skill.name}`);
       await loadSkillsWorkspace(undefined, data.skill.name);
     } catch (error) {
@@ -2885,6 +4348,26 @@ function App() {
       await fetchJson<{ deleted: boolean }>(`${apiBase}/api/skills/${encodeURIComponent(skillDetail.name)}`, {
         method: "DELETE"
       });
+      setSkillTreeEntriesByName((current) => {
+        const next = { ...current };
+        delete next[skillDetail.name];
+        return next;
+      });
+      setSkillTreeErrors((current) => {
+        const next = { ...current };
+        delete next[skillDetail.name];
+        return next;
+      });
+      setSkillTreeLoadingByName((current) => {
+        const next = { ...current };
+        delete next[skillDetail.name];
+        return next;
+      });
+      setExpandedSkillNames((current) => {
+        const next = { ...current };
+        delete next[skillDetail.name];
+        return next;
+      });
       setSkillDetail(null);
       setSkillDraft("");
       setSkillSaveNotice(`已删除 ${skillDetail.name}`);
@@ -2896,8 +4379,76 @@ function App() {
     }
   };
 
+  const saveProjectConfig = async () => {
+    setConfigSaving(true);
+    setConfigError(null);
+    setConfigNotice(null);
+
+    try {
+      const data = await fetchJson<UpdateProjectConfigResponse>(`${apiBase}/api/config/project`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ content: projectConfigDraft })
+      });
+      setProjectConfigPath(data.path);
+      setProjectConfigContent(data.content);
+      setProjectConfigDraft(data.content);
+      setProjectConfigEffectiveWorkspace(data.effective_workspace);
+      setConfigWarnings(data.warnings);
+      setConfigNotice("newman.yaml 已保存，点击 Reload 后才会切到新配置。");
+    } catch (error) {
+      setConfigError(error instanceof Error ? error.message : "项目配置保存失败");
+    } finally {
+      setConfigSaving(false);
+    }
+  };
+
+  const reloadProjectConfig = async () => {
+    if (
+      hasProjectConfigChanges &&
+      !window.confirm("编辑器里还有未保存修改。Reload 只会加载磁盘上的 newman.yaml，确定继续吗？")
+    ) {
+      return;
+    }
+
+    setConfigReloading(true);
+    setConfigError(null);
+    setConfigNotice(null);
+
+    try {
+      const data = await fetchJson<ReloadProjectConfigResponse>(`${apiBase}/api/config/reload`, {
+        method: "POST"
+      });
+      setProjectConfigPath(data.path);
+      setProjectConfigEffectiveWorkspace(data.effective_workspace);
+      setConfigWarnings(data.warnings);
+      setConfigNotice("运行配置已重新加载，后续请求会使用新的 settings。");
+      setWorkspacePath(".");
+      setWorkspaceRootPath(null);
+      setWorkspaceView(null);
+      await Promise.all([loadProjectConfig(), loadPluginsWorkspace()]);
+    } catch (error) {
+      setConfigError(error instanceof Error ? error.message : "项目配置重载失败");
+    } finally {
+      setConfigReloading(false);
+    }
+  };
+
   const refreshFilesWorkspace = async () => {
     await Promise.all([loadWorkspaceBrowser(workspacePath), loadKnowledgeDocuments()]);
+  };
+
+  const refreshSkillsWorkspace = async () => {
+    setSkillTreeEntriesByName({});
+    setSkillTreeErrors({});
+    setSkillTreeLoadingByName({});
+    setSkillFolderEntriesByPath({});
+    setSkillFolderErrors({});
+    setSkillFolderLoadingByPath({});
+    setExpandedSkillFolders({});
+    await loadSkillsWorkspace();
   };
 
   const togglePluginEnabled = async (plugin: PluginRecord) => {
@@ -2944,6 +4495,8 @@ function App() {
     const isHero = variant === "hero";
     const shellClassName = variant === "hero" ? "composer-shell composer-shell-hero" : "composer-shell composer-shell-footer";
     const inputClassName = variant === "hero" ? "composer-input composer-input-hero" : "composer-input";
+    const isComposerEmpty = !composerValue.trim() && composerAttachments.length === 0;
+    const showContextMeter = !isHero;
 
     return (
       <div className={`composer-main ${variant === "hero" ? "composer-main-hero" : ""}`}>
@@ -2958,72 +4511,21 @@ function App() {
             tabIndex={-1}
           />
 
-          {!isHero && activePage === "chat" && pendingApproval ? (
-            <div className="approval-popover" role="dialog" aria-modal="true" aria-labelledby="approval-modal-title">
-              <div className="approval-popover-frame">
-                <div className="approval-popover-summary">
-                  <div className="approval-popover-titlebar">
-                    <div>
-                      <p className="approval-popover-eyebrow">待确认工具操作</p>
-                      <h3 id="approval-modal-title">{pendingApproval.tool}</h3>
-                    </div>
-                    <div className="approval-popover-countdown">
-                      <span>{pendingApproval.remaining_seconds}s</span>
-                    </div>
-                  </div>
-
-                  <p className="approval-popover-copy">{pendingApproval.reason || "这一步需要你确认后我才能继续"}</p>
-                </div>
-
-                <div className="approval-popover-details">
-                  <div className="approval-popover-detail">
-                    <span className="approval-popover-label">本轮策略</span>
-                    <p>{activeApprovalMode.label}</p>
-                  </div>
-                  <div className="approval-popover-detail">
-                    <span className="approval-popover-label">超时处理</span>
-                    <p>{pendingApproval.timeout_seconds}s 后自动拒绝</p>
-                  </div>
-                </div>
-
-                <div className="approval-popover-arguments-wrap">
-                  <span className="approval-popover-label">参数预览</span>
-                  <pre className="approval-popover-arguments">{JSON.stringify(pendingApproval.arguments, null, 2)}</pre>
-                </div>
-
-                {approvalError ? <div className="workspace-alert error">{approvalError}</div> : null}
-
-                <div className="approval-popover-actions">
-                  <button
-                    type="button"
-                    className="approval-popover-button ghost"
-                    onClick={() => void resolveApproval("reject")}
-                    disabled={approvalActionLoading !== null}
-                  >
-                    {approvalActionLoading === "reject" ? "拒绝中..." : "拒绝"}
-                  </button>
-                  <button
-                    type="button"
-                    className="approval-popover-button solid"
-                    onClick={() => void resolveApproval("approve")}
-                    disabled={approvalActionLoading !== null}
-                  >
-                    {approvalActionLoading === "approve" ? "允许中..." : "允许继续"}
-                  </button>
-                </div>
-              </div>
-            </div>
-          ) : null}
-
           <textarea
             className={inputClassName}
             value={composerValue}
             onChange={(event) => setComposerValue(event.target.value)}
             onKeyDown={handleComposerKeyDown}
             aria-label="message composer"
-            placeholder={sendingMessage ? "当前正在执行，稍等这一轮完成…" : "输入你的任务，可附图片；按 Enter 发送，Shift + Enter 换行"}
+            placeholder={
+              stoppingMessage
+                ? "正在停止当前任务，请稍候…"
+                : sendingMessage
+                  ? "当前正在执行，点击右侧按钮可立即停止…"
+                  : "输入你的任务，可附图片；按 Enter 发送，Shift + Enter 换行"
+            }
             rows={3}
-            disabled={sendingMessage}
+            disabled={sendingMessage || stoppingMessage}
           />
 
           {composerAttachments.length > 0 ? (
@@ -3054,12 +4556,12 @@ function App() {
             <div className="composer-subbar-left">
               <button
                 type="button"
-                className="attach-trigger"
+                className="composer-action-button attach-trigger"
                 aria-label="添加附件"
                 onClick={() => composerFileInputRef.current?.click()}
-                disabled={sendingMessage}
+                disabled={sendingMessage || stoppingMessage}
               >
-                +
+                <span className="session-create-button-mark" aria-hidden="true" />
               </button>
 
               {!isHero ? (
@@ -3069,15 +4571,14 @@ function App() {
                 >
                   <button
                     type="button"
-                    className="approval-mini-trigger"
+                    className="composer-action-button approval-mini-trigger"
                     title={activeApprovalMode.helper}
                     aria-haspopup="menu"
                     aria-expanded={approvalMenuOpen}
                     aria-label="选择本轮审批策略"
                     onClick={() => setApprovalMenuOpen((current) => !current)}
                   >
-                    <span className="approval-mini-value">{activeApprovalMode.label}</span>
-                    <span className="approval-mini-caret" aria-hidden="true" />
+                    <ApprovalSmallIcon className="approval-mini-icon" />
                   </button>
 
                   {approvalMenuOpen ? (
@@ -3109,38 +4610,69 @@ function App() {
             </div>
 
             <div className="composer-subbar-right">
-              <div
-                className={`context-ring ${contextProgress === null ? "is-empty" : ""}`}
-                style={{ ["--context-progress" as string]: String(contextRingProgress) }}
-                aria-label={contextPercent === null ? "Context 使用率暂不可用" : `Context 使用率 ${contextPercent}%`}
-                title={
-                  contextPercent === null
-                    ? "当前还没有可用的上下文使用量数据"
-                    : activeContextUsage?.context_window
-                      ? `Context 使用率 ${contextPercent}% (${activeContextUsage.estimated_tokens}/${activeContextUsage.context_window} tokens)`
-                      : `已估算 ${activeContextUsage?.estimated_tokens ?? 0} tokens`
-                }
-              >
-                <span>{contextPercent === null ? "--" : `${contextPercent}%`}</span>
-              </div>
+              {showContextMeter ? (
+                <div className="context-meter">
+                  <div
+                    className={`context-ring ${contextProgress === null ? "is-empty" : ""}`}
+                    style={{ ["--context-progress" as string]: String(contextRingProgress) }}
+                    aria-label={contextPercent === null ? "Context 使用率暂不可用" : `Context 使用率 ${contextPercent}%`}
+                    title={
+                      contextPercent === null
+                        ? "当前还没有已确认的上下文使用量数据"
+                        : `已确认 Context 使用率 ${contextPercent}% (${activeContextUsage?.confirmed_prompt_tokens ?? 0}/${activeContextUsage?.effective_context_window ?? 0} tokens)${
+                            contextMetaSecondary ? `\n${contextMetaSecondary}` : ""
+                          }${contextMetaDetail ? `\n${contextMetaDetail}` : ""}`
+                    }
+                  >
+                    <span>{contextPercent === null ? "--" : `${contextPercent}%`}</span>
+                  </div>
+                  {hasContextMeta ? (
+                    <div className="context-meter-meta" aria-hidden="true">
+                      {contextMetaSecondary ? (
+                        <span
+                          className={`context-meter-secondary ${
+                            activeContextUsage?.context_irreducible || activeContextUsage?.projected_over_limit ? "warn" : ""
+                          }`}
+                        >
+                          {contextMetaSecondary}
+                        </span>
+                      ) : null}
+                      {contextMetaDetail ? <span className="context-meter-detail">{contextMetaDetail}</span> : null}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
 
               <button
                 type="button"
-                className="send-trigger send-trigger-inline"
-                onClick={() => void submitComposer()}
-                disabled={(!composerValue.trim() && composerAttachments.length === 0) || sendingMessage}
-                aria-label="发送"
+                className={`send-trigger send-trigger-inline ${sendingMessage ? "is-running" : ""}`}
+                onClick={() => {
+                  if (sendingMessage) {
+                    void stopActiveComposerRun();
+                    return;
+                  }
+                  void submitComposer();
+                }}
+                disabled={stoppingMessage || (!sendingMessage && isComposerEmpty)}
+                aria-label={sendingMessage ? (stoppingMessage ? "正在停止当前任务" : "停止当前任务") : "发送"}
+                title={sendingMessage ? (stoppingMessage ? "正在停止当前任务" : "点击立即停止当前任务") : "发送"}
               >
-                <svg viewBox="0 0 20 20" aria-hidden="true">
-                  <path
-                    d="M5.25 14.75 14.75 5.25M7 5.25h7.75V13"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
+                {sendingMessage ? (
+                  <svg viewBox="0 0 20 20" aria-hidden="true">
+                    <rect x="5.25" y="5.25" width="9.5" height="9.5" rx="2.4" fill="currentColor" />
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 20 20" aria-hidden="true">
+                    <path
+                      d="M5.25 14.75 14.75 5.25M7 5.25h7.75V13"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                )}
               </button>
             </div>
           </div>
@@ -3152,6 +4684,7 @@ function App() {
   return (
     <div
       className={`screen-shell ${dragging ? "is-resizing" : ""}`}
+      data-theme={uiTheme}
       style={{
         gridTemplateColumns: isMobile ? "1fr" : `${leftWidth}px ${HANDLE_WIDTH}px minmax(0, 1fr)`
       }}
@@ -3159,10 +4692,10 @@ function App() {
       <aside className="left-rail">
         <div className="brand">
           <div className="brand-logo">
-            <img src={logo} alt="Newman logo" className="brand-logo-image" />
+            <img src={logo} alt="NewMan logo" className="brand-logo-image" />
           </div>
           <div className="brand-copy">
-            <h1>Newman</h1>
+            <h1>NewMan</h1>
           </div>
         </div>
 
@@ -3184,8 +4717,13 @@ function App() {
         <section className="rail-section">
           <div className="rail-section-head">
             <span>会话</span>
-            <button type="button" className="icon-action" aria-label="新建会话" onClick={() => void createDraftSession()}>
-              +
+            <button
+              type="button"
+              className="session-create-button"
+              aria-label="新建会话"
+              onClick={() => void createDraftSession()}
+            >
+              <span className="session-create-button-mark" aria-hidden="true" />
             </button>
           </div>
 
@@ -3361,11 +4899,11 @@ function App() {
               <div className="chat-empty-state">
                 <div className="chat-empty-brand">
                   <div className="chat-empty-brand-mark">
-                    <img src={logo} alt="Newman logo" className="chat-empty-brand-image" />
+                    <img src={logo} alt="NewMan logo" className="chat-empty-brand-image" />
                   </div>
                   <div className="chat-empty-brand-copy">
                     <h2>
-                      <span className="chat-empty-brand-name">Newman</span>
+                      <span className="chat-empty-brand-name">NewMan</span>
                       <span className="chat-empty-brand-for">for</span>
                       <span className="chat-empty-brand-cn">牛马</span>
                     </h2>
@@ -3382,7 +4920,6 @@ function App() {
                 className="conversation-pane conversation-pane-floating"
               >
                 {chatError ? <div className="workspace-alert error">{chatError}</div> : null}
-                {chatNotice ? <div className="workspace-alert success">{chatNotice}</div> : null}
                 {chatLoading ? <div className="workspace-empty">正在加载会话内容...</div> : null}
 
                 {!chatLoading ? (
@@ -3391,32 +4928,249 @@ function App() {
 
                     {displayTurns.map((turn) => {
                       const answerCopy = resolveAnswerCopy(turn.answer, turn.status);
-                      const answerTags = buildAnswerTags(turn.answer, turn.status);
                       const showAnswerBubble = shouldRenderAnswerBubble(turn);
+                      const showAssistantMessageMeta = shouldRenderAssistantMessageMeta(turn);
+                      const assistantCopyValue =
+                        turn.answer?.content.trim() ? turn.answer.content : turn.answer?.phase === "failed" ? answerCopy : null;
+                      const visibleThinkingNode = turn.timeline.find(
+                        (node) => node.kind === "thinking" && node.state === "running" && turn.isLive
+                      );
+                      const hasVisibleThinkingNode = Boolean(visibleThinkingNode);
+                      const visibleTimelineNodes = turn.timeline.filter((node) => node.kind !== "thinking");
+                      const shouldShowTimelineStack = visibleTimelineNodes.length > 0 || hasVisibleThinkingNode;
                       return (
                         <div key={turn.id} className={`turn-block ${turn.isLive ? "live" : ""}`}>
                           <div className="user-row">
                             <div className="turn-user-stack">
-                              <div className={`user-bubble ${turn.userMessage.attachments.length > 0 ? "has-attachments" : ""}`}>
-                                <MessageContent
-                                  apiBase={apiBase}
-                                  variant="user"
-                                  content={turn.userMessage.content}
-                                  attachments={turn.userMessage.attachments}
-                                />
-                              </div>
+                              <MessageHoverShell
+                                shellClassName="user"
+                                align="end"
+                                timestamp={turn.userMessage.createdAt}
+                                copyValue={turn.userMessage.content}
+                                copyLabel="用户输入"
+                              >
+                                <div className={`user-bubble ${turn.userMessage.attachments.length > 0 ? "has-attachments" : ""}`}>
+                                  <MessageContent
+                                    apiBase={apiBase}
+                                    variant="user"
+                                    content={turn.userMessage.content}
+                                    attachments={turn.userMessage.attachments}
+                                  />
+                                </div>
+                              </MessageHoverShell>
                             </div>
                           </div>
 
-                          {turn.timeline.length > 0 ? (
+                          {shouldShowTimelineStack ? (
                             <div className="timeline-stack trace-turn-column">
-                              {turn.timeline.map((node) => {
-                                if (node.kind === "thinking") {
-                                  if (node.state !== "running" || !turn.isLive) {
-                                    return null;
-                                  }
+                              {visibleTimelineNodes.map((node, index) => {
+                                if (node.kind === "system_meta") {
+                                  const systemHasHead = index > 0;
+                                  const systemHasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
                                   return (
-                                    <div key={node.id} className="thinking-logo-row" aria-label="Thinking">
+                                    <div key={node.id} className="timeline-system-row">
+                                      <div
+                                        className={`timeline-primary-marker rail-only ${systemHasHead ? "has-head" : ""} ${
+                                          systemHasTail ? "has-tail" : ""
+                                        }`}
+                                      />
+                                      <div className="timeline-system-meta" role="status" aria-live="polite">
+                                        <span className="timeline-system-meta-text">{node.primaryText}</span>
+                                      </div>
+                                    </div>
+                                  );
+                                }
+
+                                if (node.kind === "approval" && node.approval) {
+                                  const expanded = isTimelineExpanded(node);
+                                  const markerIcon = resolveTimelineNodeIcon(node);
+                                  const hasHead = index > 0;
+                                  const hasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
+                                  const payloadPreview = buildApprovalPayloadPreview(node.approval);
+                                  const payloadLabel = buildApprovalPayloadLabel(node.approval);
+                                  const isActivePendingApproval =
+                                    pendingApproval?.approval_request_id === node.approval.approvalRequestId;
+                                  const showPendingActions = node.state === "pending";
+                                  const showResolvedDetail = !showPendingActions && Boolean(payloadPreview);
+                                  const detailCardClass = node.approval.tool === "terminal" ? "terminal" : "generic";
+
+                                  return (
+                                    <article
+                                      key={node.id}
+                                      className={`timeline-node ${expanded ? "expanded" : ""} state-${node.state} kind-${node.kind}`}
+                                    >
+                                      <div className={`timeline-primary-marker ${hasHead ? "has-head" : ""} ${hasTail ? "has-tail" : ""}`}>
+                                        <span className="timeline-marker-icon-wrap" aria-hidden="true">
+                                          <TimelineMarkerIcon name={markerIcon} className="timeline-marker-icon" />
+                                        </span>
+                                      </div>
+
+                                      <div className="timeline-primary-copy">
+                                        <div className="timeline-approval-primary">
+                                          <p className="timeline-primary-text">{node.primaryText}</p>
+                                          {!showPendingActions ? (
+                                            <span className={`timeline-approval-status-tag state-${node.state}`}>
+                                              {buildApprovalStateLabel(node.state)}
+                                            </span>
+                                          ) : null}
+                                        </div>
+
+                                        {showPendingActions ? (
+                                          <div className="timeline-approval-action-row">
+                                            <button
+                                              type="button"
+                                              className="timeline-approval-button ghost"
+                                              onClick={() => void resolveApproval("reject", node.approval?.approvalRequestId ?? null)}
+                                              disabled={approvalActionLoading !== null || !isActivePendingApproval}
+                                            >
+                                              {approvalActionLoading === "reject" && isActivePendingApproval ? "拒绝中..." : "拒绝"}
+                                            </button>
+                                            <button
+                                              type="button"
+                                              className="timeline-approval-button solid"
+                                              onClick={() => void resolveApproval("approve", node.approval?.approvalRequestId ?? null)}
+                                              disabled={approvalActionLoading !== null || !isActivePendingApproval}
+                                            >
+                                              {approvalActionLoading === "approve" && isActivePendingApproval ? "允许中..." : "允许继续"}
+                                            </button>
+                                          </div>
+                                        ) : null}
+
+                                        {approvalError && showPendingActions && isActivePendingApproval ? (
+                                          <div className="workspace-alert error timeline-approval-error">{approvalError}</div>
+                                        ) : null}
+
+                                        {showResolvedDetail ? (
+                                          <button
+                                            type="button"
+                                            className={`timeline-tool-toggle ${expanded ? "expanded" : ""}`}
+                                            onClick={() => toggleTimelineNode(node)}
+                                            aria-expanded={expanded}
+                                            aria-controls={`timeline-panel-${node.id}`}
+                                          >
+                                            <span className="timeline-tool-toggle-label">查看参数</span>
+                                          </button>
+                                        ) : null}
+
+                                        {showResolvedDetail ? (
+                                          <div
+                                            id={`timeline-panel-${node.id}`}
+                                            className={`timeline-secondary-region ${expanded ? "expanded" : ""}`}
+                                            aria-hidden={!expanded}
+                                          >
+                                            <div className="timeline-secondary-region-inner">
+                                              <div className="timeline-secondary-list">
+                                                <article className={`timeline-secondary-card ${detailCardClass}`}>
+                                                  <div className="timeline-secondary-head">
+                                                    <div className="timeline-secondary-head-main">
+                                                      <div className="timeline-secondary-label-row">
+                                                        <span className="timeline-secondary-label">{payloadLabel}</span>
+                                                        <span className="timeline-secondary-time-inline">{node.time}</span>
+                                                      </div>
+                                                    </div>
+                                                  </div>
+                                                  <div className="timeline-secondary-result-wrap">
+                                                    <pre
+                                                      className={`timeline-secondary-result ${
+                                                        detailCardClass === "terminal" ? "terminal" : ""
+                                                      }`}
+                                                    >
+                                                      {payloadPreview}
+                                                    </pre>
+                                                  </div>
+                                                </article>
+                                              </div>
+                                            </div>
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    </article>
+                                  );
+                                }
+
+                                const expanded = isTimelineExpanded(node);
+                                const markerIcon = resolveTimelineNodeIcon(node);
+                                const hasHead = index > 0;
+                                const hasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
+                                return (
+                                  <article
+                                    key={node.id}
+                                    className={`timeline-node ${expanded ? "expanded" : ""} state-${node.state} kind-${node.kind}`}
+                                  >
+                                    <div className={`timeline-primary-marker ${hasHead ? "has-head" : ""} ${hasTail ? "has-tail" : ""}`}>
+                                      <span className="timeline-marker-icon-wrap" aria-hidden="true">
+                                        <TimelineMarkerIcon name={markerIcon} className="timeline-marker-icon" />
+                                      </span>
+                                    </div>
+
+                                    <div className="timeline-primary-copy">
+                                      <p className="timeline-primary-text">{node.primaryText}</p>
+
+                                      {node.secondaryItems.length > 0 ? (
+                                        <button
+                                          type="button"
+                                          className={`timeline-tool-toggle ${expanded ? "expanded" : ""}`}
+                                          onClick={() => toggleTimelineNode(node)}
+                                          aria-expanded={expanded}
+                                          aria-controls={`timeline-panel-${node.id}`}
+                                        >
+                                          <span className="timeline-tool-toggle-label">{buildTimelineToolSummary(node)}</span>
+                                        </button>
+                                      ) : null}
+
+                                      {node.secondaryItems.length > 0 ? (
+                                        <div
+                                          id={`timeline-panel-${node.id}`}
+                                          className={`timeline-secondary-region ${expanded ? "expanded" : ""}`}
+                                          aria-hidden={!expanded}
+                                        >
+                                          <div className="timeline-secondary-region-inner">
+                                            <div className="timeline-secondary-list">
+                                              {node.secondaryItems.map((item) => {
+                                                const resultText = buildTimelineSecondaryResultText(item);
+                                                return (
+                                                  <article
+                                                    key={item.id}
+                                                    className={`timeline-secondary-card ${item.cardType}`}
+                                                  >
+                                                    <div className="timeline-secondary-head">
+                                                      <div className="timeline-secondary-head-main">
+                                                        <div className="timeline-secondary-label-row">
+                                                          <span className="timeline-secondary-label">{item.label}</span>
+                                                          <span className="timeline-secondary-time-inline">{item.detail.time}</span>
+                                                        </div>
+                                                      </div>
+                                                    </div>
+                                                    <div className="timeline-secondary-result-wrap">
+                                                      {item.cardType === "terminal" && item.command ? (
+                                                        <pre className="timeline-terminal-command">{`$ ${item.command}`}</pre>
+                                                      ) : null}
+                                                      <pre className={`timeline-secondary-result ${item.cardType === "terminal" ? "terminal" : ""}`}>
+                                                        {resultText}
+                                                      </pre>
+                                                    </div>
+                                                  </article>
+                                                );
+                                              })}
+                                            </div>
+                                          </div>
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  </article>
+                                );
+                              })}
+
+                              {visibleThinkingNode ? (
+                                <article className="timeline-node timeline-thinking-node" aria-label="Thinking">
+                                  <div
+                                    className={`timeline-primary-marker rail-only ${
+                                      visibleTimelineNodes.length > 0 ? "has-head" : ""
+                                    }`}
+                                  />
+
+                                  <div className="timeline-primary-copy timeline-thinking-copy">
+                                    <div className="thinking-logo-row">
                                       <img src={logo} alt="" className="thinking-inline-logo" />
                                       <div className="thinking-inline-copy">
                                         <span className="thinking-inline-word">thinking</span>
@@ -3427,122 +5181,26 @@ function App() {
                                         </span>
                                       </div>
                                     </div>
-                                  );
-                                }
-
-                                const expanded = isTimelineExpanded(node);
-                                const timelineHint = "查看执行过程";
-                                return (
-                                  <article
-                                    key={node.id}
-                                    className={`timeline-node ${expanded ? "expanded" : ""} state-${node.state} kind-${node.kind}`}
-                                  >
-                                    <button
-                                      type="button"
-                                      className="timeline-primary-button"
-                                      onClick={() => toggleTimelineNode(node)}
-                                    >
-                                      <div className="timeline-primary-marker">
-                                        <span className="timeline-static-dot" />
-                                      </div>
-                                      <div className="timeline-primary-copy">
-                                        <div className="timeline-primary-meta">
-                                          <span className="timeline-primary-time">{node.time}</span>
-                                          <span className="timeline-primary-hint">{timelineHint}</span>
-                                        </div>
-                                        <p className="timeline-primary-text">{node.primaryText}</p>
-                                      </div>
-                                      <span className={`timeline-chevron ${expanded ? "expanded" : ""}`} aria-hidden="true">
-                                        ▾
-                                      </span>
-                                    </button>
-
-                                    {expanded ? (
-                                      <div className="timeline-secondary-list">
-                                        {node.secondaryItems.map((item) => {
-                                          const outputExpanded = isSecondaryOutputExpanded(item);
-                                          const outputLines = item.output ? item.output.split("\n") : [];
-                                          const visibleOutput =
-                                            item.output && !outputExpanded ? outputLines.slice(0, 10).join("\n") : item.output;
-
-                                          return (
-                                            <article
-                                              key={item.id}
-                                              className={`timeline-secondary-card ${item.cardType}`}
-                                            >
-                                              <div className="timeline-secondary-head">
-                                                <div className="timeline-secondary-head-main">
-                                                  <div className="timeline-secondary-label-row">
-                                                    <span className="timeline-secondary-label">{item.label}</span>
-                                                    <span className={`status-tag ${item.statusTone}`}>{item.statusLabel}</span>
-                                                  </div>
-                                                  <p className="timeline-secondary-subtitle">{item.subtitle}</p>
-                                                </div>
-                                              </div>
-
-                                              {item.cardType === "terminal" ? (
-                                                <div className="timeline-terminal-body">
-                                                  <div className="timeline-terminal-shelltag">Shell</div>
-                                                  <div className="timeline-terminal-command">$ {item.command || item.subtitle}</div>
-                                                  {visibleOutput ? <pre className="timeline-terminal-output">{visibleOutput}</pre> : null}
-                                                  {item.output && item.outputLineCount > 10 ? (
-                                                    <button
-                                                      type="button"
-                                                      className="timeline-output-toggle"
-                                                      onClick={() => toggleSecondaryOutput(item)}
-                                                    >
-                                                      {outputExpanded ? "收起输出" : "已运行命令 ⌄"}
-                                                    </button>
-                                                  ) : null}
-                                                </div>
-                                              ) : (
-                                                <>
-                                                  {item.meta.length > 0 ? (
-                                                    <div className="timeline-secondary-meta-row">
-                                                      {item.meta.map((metaItem) => (
-                                                        <span key={`${item.id}-${metaItem}`} className="timeline-secondary-meta">
-                                                          {metaItem}
-                                                        </span>
-                                                      ))}
-                                                    </div>
-                                                  ) : null}
-                                                  {visibleOutput ? <pre className="timeline-secondary-output">{visibleOutput}</pre> : null}
-                                                  {item.output && item.outputLineCount > 10 ? (
-                                                    <button
-                                                      type="button"
-                                                      className="timeline-output-toggle"
-                                                      onClick={() => toggleSecondaryOutput(item)}
-                                                    >
-                                                      {outputExpanded ? "收起详情" : "展开更多"}
-                                                    </button>
-                                                  ) : null}
-                                                </>
-                                              )}
-                                            </article>
-                                          );
-                                        })}
-                                      </div>
-                                    ) : null}
-                                  </article>
-                                );
-                              })}
+                                  </div>
+                                </article>
+                              ) : null}
                             </div>
                           ) : null}
 
                           {showAnswerBubble ? (
                             <div className="trace-row">
-                              <div className="trace-bubble wide final answer-bubble">
-                                {answerTags.length > 0 ? (
-                                  <div className="trace-tags answer-tags">
-                                    {answerTags.map((tag) => (
-                                      <span key={`${turn.id}-${tag.label}`} className={`status-tag ${tag.tone}`}>
-                                        {tag.label}
-                                      </span>
-                                    ))}
-                                  </div>
-                                ) : null}
-                                <MessageContent apiBase={apiBase} variant="assistant" content={answerCopy} className="trace-copy" />
-                              </div>
+                              <MessageHoverShell
+                                shellClassName="assistant"
+                                align="start"
+                                timestamp={turn.answer?.createdAt ?? turn.userMessage.createdAt}
+                                copyValue={showAssistantMessageMeta ? assistantCopyValue : null}
+                                copyLabel="回复"
+                                showMeta={showAssistantMessageMeta && Boolean(turn.answer)}
+                              >
+                                <div className="trace-bubble wide final answer-bubble">
+                                  <MessageContent apiBase={apiBase} variant="assistant" content={answerCopy} className="trace-copy" />
+                                </div>
+                              </MessageHoverShell>
                             </div>
                           ) : null}
                         </div>
@@ -3558,51 +5216,49 @@ function App() {
         ) : null}
 
         {activePage === "skills" ? (
-          <section className="workspace-page">
-            <div className="workspace-page-head">
-              <div>
-                <p className="workspace-eyebrow">Skills Workspace</p>
-                <h2>管理可用 Skills，并维持当前工作台可解释性</h2>
-                <div className="workspace-page-meta">
-                  <span className="workspace-pill">{skills.length} 个 Skill</span>
-                  <span className="workspace-pill subtle">Skill 是说明书，不是直接执行器</span>
-                </div>
-              </div>
-              <div className="workspace-page-actions">
-                <button
-                  type="button"
-                  className="workspace-secondary-button"
-                  onClick={() => void loadSkillsWorkspace()}
-                  disabled={skillsLoading}
-                >
-                  刷新列表
-                </button>
-              </div>
-            </div>
-
+          <section className="workspace-page skills-workspace-page">
             {skillsError ? <div className="workspace-alert error">{skillsError}</div> : null}
             {skillSaveNotice ? <div className="workspace-alert success">{skillSaveNotice}</div> : null}
 
-            <div className="workspace-grid">
-              <article className="workspace-card">
-                <div className="workspace-card-head">
-                  <div>
-                    <h3>可用 Skill</h3>
-                    <p>左侧挑选，右侧查看 `SKILL.md`、依赖工具和使用限制。</p>
+            <div className="skills-workspace-shell">
+              <aside className="skills-browser-pane">
+                <div className="skills-browser-pane-head">
+                  <div className="skills-browser-actions">
+                    <button
+                      type="button"
+                      className={`skills-toolbar-button primary ${showSkillImportPanel ? "active" : ""}`}
+                      onClick={() => {
+                        setShowSkillImportPanel((current) => !current);
+                        setSkillSaveNotice(null);
+                      }}
+                    >
+                      <PlusSmallIcon className="skills-toolbar-button-icon" />
+                      <span>{showSkillImportPanel ? "收起导入" : "导入 Skill"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="skills-toolbar-button"
+                      onClick={() => void refreshSkillsWorkspace()}
+                      disabled={skillsLoading}
+                    >
+                      <RefreshSmallIcon className="skills-toolbar-button-icon" />
+                      <span>{skillsLoading ? "刷新中..." : "刷新列表"}</span>
+                    </button>
                   </div>
-                </div>
 
-                <div className="workspace-card-body workspace-card-scroll">
-                  <div className="skill-import-block">
-                    <label className="workspace-field-label" htmlFor="skill-import-path">
-                      手动导入 Skill 文件夹
-                    </label>
-                    <div className="skill-import-row">
+                  {showSkillImportPanel ? (
+                    <div className="skill-import-inline">
                       <input
                         id="skill-import-path"
                         className="workspace-text-input"
                         value={skillImportPath}
                         onChange={(event) => setSkillImportPath(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" && skillImportPath.trim()) {
+                            event.preventDefault();
+                            void importSkill();
+                          }
+                        }}
                         placeholder="例如 skills/my_custom_skill"
                       />
                       <button
@@ -3611,48 +5267,92 @@ function App() {
                         onClick={() => void importSkill()}
                         disabled={skillImporting || !skillImportPath.trim()}
                       >
-                        {skillImporting ? "导入中..." : "导入"}
+                        {skillImporting ? "导入中..." : "确认导入"}
                       </button>
-                    </div>
-                  </div>
-
-                  {skillsLoading ? <div className="workspace-empty">正在加载 Skills...</div> : null}
-
-                  {!skillsLoading ? (
-                    <div className="workspace-list">
-                      {skills.length === 0 ? <div className="workspace-empty">当前还没有可用 Skill。</div> : null}
-                      {skills.map((skill) => (
-                        <button
-                          key={`${skill.source}-${skill.name}-${skill.path}`}
-                          type="button"
-                          className={`skills-item ${selectedSkillName === skill.name ? "active" : ""}`}
-                          onClick={() => {
-                            setSelectedSkillName(skill.name);
-                            setSkillSaveNotice(null);
-                          }}
-                        >
-                          <div className="skills-item-head">
-                            <strong>{skill.name}</strong>
-                            <span className={`workspace-pill ${skill.source === "system" ? "accent" : "subtle"}`}>
-                              {skillSourceLabel(skill)}
-                            </span>
-                          </div>
-                          <p>{skill.description || skill.summary || "暂无简介"}</p>
-                          <div className="skills-item-meta">
-                            <span>{skill.when_to_use || "未填写 when_to_use"}</span>
-                          </div>
-                        </button>
-                      ))}
                     </div>
                   ) : null}
                 </div>
-              </article>
 
-              <article className="workspace-card">
-                <div className="workspace-card-head">
-                  <div>
-                    <h3>{skillDetail?.name || selectedSkillName || "Skill 详情"}</h3>
-                    <p>{skillDetail ? skillDetail.path : "选择一个 Skill 后查看详情、编辑内容并保存。"}</p>
+                <div className="skills-browser-pane-body">
+                  {skillsLoading ? <div className="workspace-empty">正在加载 Skills...</div> : null}
+
+                  {!skillsLoading ? (
+                    <div className="skills-tree-list">
+                      {skills.length === 0 ? <div className="workspace-empty">当前还没有可用 Skill。</div> : null}
+                      {skills.map((skill) => {
+                        const isSelected = selectedSkillName === skill.name;
+                        const isExpanded = Boolean(expandedSkillNames[skill.name]);
+                        const nodeEntries = isSelected
+                          ? selectedSkillTreeEntries
+                          : orderSkillWorkspaceEntries(skillTreeEntriesByName[skill.name] ?? [], skill.path);
+                        const nodeError = skillTreeErrors[skill.name] ?? null;
+                        const nodeLoading = isSelected ? selectedSkillTreeLoading : Boolean(skillTreeLoadingByName[skill.name]);
+                        const skillDirectoryPath = getSkillDirectoryPath(skill.path);
+
+                        return (
+                          <article
+                            key={`${skill.source}-${skill.name}-${skill.path}`}
+                            className={`skill-tree-item ${isSelected ? "active" : ""} ${isExpanded ? "expanded" : ""}`}
+                          >
+                            <button
+                              type="button"
+                              className="skill-tree-trigger"
+                              onClick={() => {
+                                setSelectedSkillName(skill.name);
+                                setSkillDocumentView("preview");
+                                setSkillSaveNotice(null);
+                                const nextExpanded = isSelected ? !isExpanded : true;
+                                setExpandedSkillNames((current) => ({
+                                  ...current,
+                                  [skill.name]: nextExpanded
+                                }));
+                                if (
+                                  nextExpanded &&
+                                  !Object.prototype.hasOwnProperty.call(skillTreeEntriesByName, skill.name) &&
+                                  !skillTreeLoadingByName[skill.name]
+                                ) {
+                                  void loadSkillDirectoryEntries(skill.name, skillDirectoryPath);
+                                }
+                              }}
+                              aria-expanded={isExpanded}
+                              title={skill.description || skill.summary || skill.name}
+                            >
+                              <span className="skill-tree-icon-shell" aria-hidden="true">
+                                <SkillSidebarIcon className="skill-tree-icon" />
+                              </span>
+                              <span className="skill-tree-copy">
+                                <strong>{skill.name}</strong>
+                              </span>
+                              <span className={`skill-tree-chevron ${isExpanded ? "expanded" : ""}`} aria-hidden="true">
+                                <ChevronStrokeIcon className="skill-tree-chevron-icon" />
+                              </span>
+                            </button>
+
+                            {isExpanded ? (
+                              <div className="skill-tree-children">
+                                {nodeLoading ? <div className="skill-tree-node muted">正在读取 Skill 目录...</div> : null}
+                                {!nodeLoading && nodeError ? <div className="skill-tree-node muted">{nodeError}</div> : null}
+                                {!nodeLoading && !nodeError ? renderSkillTreeNodes(skill, nodeEntries) : null}
+                                {!nodeLoading && !nodeError && nodeEntries.length === 0 ? (
+                                  <div className="skill-tree-node muted">该 Skill 目录下暂无可展示项。</div>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </article>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                </div>
+              </aside>
+
+              <section className="skills-detail-pane">
+                <div className="skills-detail-pane-head">
+                  <div className="skills-detail-title">
+                    <h3>{skillDetail?.name || selectedSkillName || "选择一个 Skill"}</h3>
+                    <p className="skills-detail-path">
+                      {skillDetail ? skillDetail.path : "选择一个 Skill 后查看并编辑 SKILL.md。"}
+                    </p>
                   </div>
                   <div className="workspace-inline-actions">
                     <button
@@ -3674,40 +5374,27 @@ function App() {
                   </div>
                 </div>
 
-                <div className="workspace-card-body workspace-card-scroll">
+                <div className="skills-detail-pane-body">
                   {skillDetailLoading ? <div className="workspace-empty">正在加载 Skill 详情...</div> : null}
 
                   {!skillDetailLoading && !skillDetail ? (
-                    <div className="workspace-empty">先从左侧选择一个 Skill，或导入新的 Skill 文件夹。</div>
+                    <div className="workspace-empty skills-empty-state">先从左侧选择一个 Skill，或导入新的 Skill 文件夹。</div>
                   ) : null}
 
                   {!skillDetailLoading && skillDetail ? (
-                    <>
-                      <div className="workspace-info-grid">
-                        <div className="workspace-mini-card">
-                          <span className="workspace-mini-label">来源</span>
+                    <div className="skills-detail-scroll">
+                      <div className="skills-summary-strip">
+                        <div className="skills-summary-field">
+                          <span>来源</span>
                           <strong>{skillSourceLabel(skillDetail)}</strong>
                         </div>
-                        <div className="workspace-mini-card">
-                          <span className="workspace-mini-label">当前状态</span>
-                          <strong>{skillDetail.available ? "当前可用" : "当前不可用"}</strong>
-                        </div>
-                        <div className="workspace-mini-card">
-                          <span className="workspace-mini-label">目录</span>
-                          <strong>{skillDetail.directory_path}</strong>
-                        </div>
-                        <div className="workspace-mini-card">
-                          <span className="workspace-mini-label">编辑权限</span>
-                          <strong>{skillDetail.readonly ? "只读" : "可编辑"}</strong>
+                        <div className="skills-summary-field">
+                          <span>目录</span>
+                          <strong title={skillDetail.directory_path}>{skillDetail.directory_path}</strong>
                         </div>
                       </div>
 
-                      <div className="workspace-detail-block">
-                        <span className="workspace-field-label">作用说明</span>
-                        <p className="workspace-copy">{skillDetail.description || skillDetail.summary || "暂无简介"}</p>
-                      </div>
-
-                      <div className="workspace-detail-block">
+                      <div className="skills-detail-section">
                         <span className="workspace-field-label">依赖 Tool</span>
                         <div className="workspace-pill-row">
                           {skillDetail.tool_dependencies.length === 0 ? (
@@ -3722,35 +5409,94 @@ function App() {
                         </div>
                       </div>
 
-                      <div className="workspace-detail-block">
+                      <div className="skills-detail-section">
                         <span className="workspace-field-label">使用限制</span>
                         <p className="workspace-copy">
                           {skillDetail.usage_limits_summary || "暂未提取到明确限制，可直接查看下方 SKILL.md。"}
                         </p>
                       </div>
 
-                      <div className="workspace-detail-block">
-                        <span className="workspace-field-label">SKILL.md</span>
-                        <textarea
-                          className="workspace-editor"
-                          value={skillDraft}
-                          onChange={(event) => {
-                            setSkillDraft(event.target.value);
-                            setSkillSaveNotice(null);
-                          }}
-                          spellCheck={false}
-                          disabled={skillDetail.readonly}
-                        />
-                        <span className="workspace-tiny-note">
-                          {skillDetail.readonly
-                            ? "插件内置 Skill 当前只读，可查看但不能直接修改。"
-                            : "保存后会立即刷新 Skill 列表，后续会话会使用新版本说明。"}
-                        </span>
+                      <div className="skills-markdown-panel">
+                        <div className="skills-markdown-panel-head">
+                          <div>
+                            <span className="workspace-field-label">SKILL.md</span>
+                            <p className="skills-markdown-panel-copy">预览排版或切换到源码编辑，整体交互参照原生文档查看器。</p>
+                          </div>
+                          <div className="skills-view-toggle" role="tablist" aria-label="Skill document view switcher">
+                            <button
+                              type="button"
+                              className={skillDocumentView === "preview" ? "active" : ""}
+                              onClick={() => setSkillDocumentView("preview")}
+                              aria-pressed={skillDocumentView === "preview"}
+                              title="预览"
+                            >
+                              <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <path
+                                  d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6-10-6-10-6Z"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="1.7"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                                <circle cx="12" cy="12" r="3.1" fill="none" stroke="currentColor" strokeWidth="1.7" />
+                              </svg>
+                            </button>
+                            <button
+                              type="button"
+                              className={skillDocumentView === "edit" ? "active" : ""}
+                              onClick={() => setSkillDocumentView("edit")}
+                              aria-pressed={skillDocumentView === "edit"}
+                              title="编辑"
+                              disabled={skillDetail.readonly}
+                            >
+                              <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <path
+                                  d="m4 18 4.2-1 9.4-9.4a1.8 1.8 0 0 0-2.6-2.6L5.6 14.4 4.6 18.6 9 17.6"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="1.7"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                                <path
+                                  d="M13.8 6.2 17.8 10.2"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="1.7"
+                                  strokeLinecap="round"
+                                />
+                              </svg>
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className={`skills-markdown-surface ${skillDocumentView === "edit" ? "editing" : "previewing"}`}>
+                          {skillDocumentView === "preview" ? (
+                            <div className="skills-markdown-render">
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{skillDraft}</ReactMarkdown>
+                            </div>
+                          ) : (
+                            <textarea
+                              className="workspace-editor skills-editor"
+                              value={skillDraft}
+                              onChange={(event) => {
+                                setSkillDraft(event.target.value);
+                                setSkillSaveNotice(null);
+                              }}
+                              spellCheck={false}
+                              disabled={skillDetail.readonly}
+                            />
+                          )}
+                        </div>
+                        {!skillDetail.readonly ? (
+                          <span className="workspace-tiny-note">保存后会立即刷新 Skill 列表。</span>
+                        ) : null}
                       </div>
-                    </>
+                    </div>
                   ) : null}
                 </div>
-              </article>
+              </section>
             </div>
           </section>
         ) : null}
@@ -3932,14 +5678,20 @@ function App() {
         ) : null}
 
         {activePage === "settings" ? (
-          <section className="workspace-page">
+          <section className="workspace-page settings-page">
             <div className="workspace-page-head">
               <div>
-                <p className="workspace-eyebrow">Settings / Plugins</p>
-                <h2>集中查看插件状态、启停结果和加载异常</h2>
+                <p className="workspace-eyebrow">Settings / Theme / Plugins</p>
+                <h2>集中切换界面主题、编辑项目配置，并查看插件状态与加载异常</h2>
                 <div className="workspace-page-meta">
+                  <span className="workspace-pill accent">
+                    当前主题 {uiThemeOptions.find((option) => option.id === uiTheme)?.label ?? "原版暖白"}
+                  </span>
                   <span className="workspace-pill">{plugins.filter((plugin) => plugin.enabled).length} 个已启用插件</span>
                   <span className="workspace-pill subtle">{pluginErrors.length} 条加载告警</span>
+                  <span className="workspace-pill subtle">
+                    workspace {projectConfigEffectiveWorkspace ? extractName(projectConfigEffectiveWorkspace) : "读取中"}
+                  </span>
                 </div>
                 <p className="workspace-tiny-note">聊天中心区已启用 MiSans，字体资源来自 Xiaomi HyperOS 官方 CDN。</p>
               </div>
@@ -3955,10 +5707,144 @@ function App() {
               </div>
             </div>
 
+            {configError ? <div className="workspace-alert error">{configError}</div> : null}
+            {configNotice ? <div className="workspace-alert success">{configNotice}</div> : null}
             {pluginsError ? <div className="workspace-alert error">{pluginsError}</div> : null}
             {pluginsNotice ? <div className="workspace-alert success">{pluginsNotice}</div> : null}
 
             <div className="workspace-stack">
+              <article className="workspace-card">
+                <div className="workspace-card-head">
+                  <div>
+                    <h3>界面主题</h3>
+                    <p>保留当前原版配色，同时新增一套按参考图提炼的主题，可随时切换。</p>
+                  </div>
+                </div>
+
+                <div className="workspace-card-body">
+                  <div className="theme-grid">
+                    {uiThemeOptions.map((option) => {
+                      const active = option.id === uiTheme;
+                      return (
+                        <button
+                          key={option.id}
+                          type="button"
+                          className={`theme-card ${active ? "active" : ""}`}
+                          onClick={() => setUiTheme(option.id)}
+                          aria-pressed={active}
+                        >
+                          <div className={`theme-card-preview ${option.previewClass}`} aria-hidden="true">
+                            <span className="theme-preview-rail" />
+                            <span className="theme-preview-stage" />
+                            <span className="theme-preview-panel theme-preview-panel-hero" />
+                            <span className="theme-preview-panel theme-preview-panel-body" />
+                          </div>
+
+                          <div className="theme-card-copy">
+                            <p className="theme-card-kicker">{option.kicker}</p>
+                            <div className="theme-card-headline">
+                              <strong>{option.label}</strong>
+                              <span className={`workspace-pill ${active ? "accent" : "subtle"}`}>{active ? "当前使用" : "点击切换"}</span>
+                            </div>
+                            <p>{option.description}</p>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </article>
+
+              <article className="workspace-card">
+                <div className="workspace-card-head">
+                  <div>
+                    <h3>项目配置</h3>
+                    <p>{projectConfigPath || "正在定位 newman.yaml"}</p>
+                  </div>
+                  <div className="workspace-inline-actions">
+                    <button
+                      type="button"
+                      className="workspace-secondary-button"
+                      onClick={() => void saveProjectConfig()}
+                      disabled={configLoading || configSaving || !hasProjectConfigChanges}
+                    >
+                      {configSaving ? "保存中..." : "保存配置"}
+                    </button>
+                    <button
+                      type="button"
+                      className="workspace-primary-button"
+                      onClick={() => void reloadProjectConfig()}
+                      disabled={configLoading || configReloading || configSaving}
+                    >
+                      {configReloading ? "Reload 中..." : "Reload 生效"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="workspace-card-body">
+                  {configLoading ? <div className="workspace-empty">正在加载 newman.yaml...</div> : null}
+
+                  {!configLoading ? (
+                    <>
+                      <div className="workspace-info-grid">
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">当前生效 workspace</span>
+                          <strong>{projectConfigEffectiveWorkspace || "未识别"}</strong>
+                        </div>
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">编辑状态</span>
+                          <strong>{hasProjectConfigChanges ? "有未保存修改" : "磁盘内容已同步"}</strong>
+                        </div>
+                      </div>
+
+                      <div className="workspace-detail-block">
+                        <span className="workspace-field-label">生效顺序</span>
+                        <p className="workspace-copy">
+                          {projectConfigSourcePriority.length > 0
+                            ? projectConfigSourcePriority.join(" > ")
+                            : "environment > ~/.newman/config.yaml > newman.yaml > defaults.yaml"}
+                        </p>
+                      </div>
+
+                      <div className="workspace-detail-block">
+                        <span className="workspace-field-label">说明</span>
+                        <p className="workspace-copy">
+                          保存只会写回项目根目录的 <code>newman.yaml</code>。点击 Reload 后，新的 runtime、scheduler 和 channels
+                          才会切到这份配置。
+                        </p>
+                      </div>
+
+                      {configWarnings.length > 0 ? (
+                        <div className="workspace-detail-block">
+                          <span className="workspace-field-label">重载提示</span>
+                          <div className="workspace-list">
+                            {configWarnings.map((warning) => (
+                              <div key={warning} className="workspace-list-row static">
+                                <p className="workspace-row-copy">{warning}</p>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      <div className="workspace-detail-block">
+                        <span className="workspace-field-label">newman.yaml</span>
+                        <textarea
+                          className="workspace-editor"
+                          value={projectConfigDraft}
+                          onChange={(event) => {
+                            setProjectConfigDraft(event.target.value);
+                            setConfigNotice(null);
+                            setConfigError(null);
+                          }}
+                          spellCheck={false}
+                        />
+                      </div>
+                    </>
+                  ) : null}
+                </div>
+              </article>
+
               <article className="workspace-card">
                 <div className="workspace-card-head">
                   <div>

@@ -24,3 +24,4 @@ class ToolExecutionResult:
     retryable: bool = False
     attempt_count: int = 1
     metadata: dict[str, Any] = field(default_factory=dict)
+    persisted_output: str | None = None

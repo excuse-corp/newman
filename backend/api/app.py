@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,6 +10,7 @@ from backend.api.middleware.request_id import request_id_middleware
 from backend.api.routes.approvals import router as approvals_router
 from backend.api.routes.audit import router as audit_router
 from backend.api.routes.channels import router as channels_router
+from backend.api.routes.config import router as config_router
 from backend.api.routes.knowledge import router as knowledge_router
 from backend.api.routes.mcp import router as mcp_router
 from backend.api.routes.messages import router as messages_router
@@ -28,6 +31,8 @@ def create_app() -> FastAPI:
     settings = get_settings()
     log_settings_report()
     app = FastAPI(title="Newman API", version="0.6.0")
+    app.state.project_root = Path(__file__).resolve().parents[2]
+    app.state.active_message_runs = {}
     app.state.settings = settings
     app.state.runtime = NewmanRuntime(settings)
     app.state.scheduler = SchedulerEngine(app.state.runtime.scheduler_store, app.state.runtime)
@@ -47,6 +52,7 @@ def create_app() -> FastAPI:
     app.include_router(messages_router)
     app.include_router(approvals_router)
     app.include_router(audit_router)
+    app.include_router(config_router)
     app.include_router(knowledge_router)
     app.include_router(workspace_router)
     app.include_router(plugins_router)

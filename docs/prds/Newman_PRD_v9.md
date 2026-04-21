@@ -266,7 +266,7 @@ Foundation Layer
 
 #### 决定 B：Stable Context 文件化
 
-Stable Context 由固定文件和配置拼接而成，避免隐藏 prompt 逻辑。
+Stable Context 由固定文件和工具概览拼接而成，避免隐藏 prompt 逻辑。
 
 #### 决定 C：权限前置
 
@@ -341,8 +341,6 @@ Prompt 拼接使用三层模型：
 - `USER.md`
 - `SKILLS_SNAPSHOT.md`
 - 工具列表
-- 审批策略
-- workspace 路径
 
 规则：
 

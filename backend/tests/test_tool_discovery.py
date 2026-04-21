@@ -36,7 +36,7 @@ class ToolDiscoveryTests(unittest.TestCase):
                             description="dynamic test tool",
                             input_schema={"type": "object"},
                             risk_level="low",
-                            requires_approval=False,
+                            approval_behavior="safe",
                             timeout_seconds=5,
                         )
 

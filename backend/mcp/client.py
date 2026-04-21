@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import threading
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -18,8 +19,9 @@ class MCPClientError(RuntimeError):
 
 
 class StdioSession:
-    def __init__(self, server: MCPServerConfig):
+    def __init__(self, server: MCPServerConfig, workspace: Path | None = None):
         self.server = server
+        self.workspace = workspace.resolve() if workspace is not None else None
         self._process: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
 
@@ -73,6 +75,8 @@ class StdioSession:
             raise MCPClientError(f"MCP stdio server {self.server.name} missing command")
         environment = dict(os.environ)
         environment.update(self.server.env)
+        if self.workspace is not None:
+            environment.setdefault("NEWMAN_RUNTIME_WORKSPACE", str(self.workspace))
         self._process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -81,14 +85,15 @@ class StdioSession:
             text=True,
             bufsize=1,
             env=environment,
+            cwd=str(self.workspace) if self.workspace is not None else None,
         )
         return self._process
 
 
 class MCPClient:
-    def __init__(self, server: MCPServerConfig):
+    def __init__(self, server: MCPServerConfig, workspace: Path | None = None):
         self.server = server
-        self._stdio: StdioSession | None = StdioSession(server) if server.transport == "stdio" else None
+        self._stdio: StdioSession | None = StdioSession(server, workspace) if server.transport == "stdio" else None
         self.signature = server.model_dump_json()
 
     def close(self) -> None:
