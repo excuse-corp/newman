@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
+import { highlightCode } from "./codeHighlight";
 
 export type ChatAttachment = {
   id: string;
@@ -14,13 +15,34 @@ export type ChatAttachment = {
   sizeBytes?: number | null;
 };
 
+export type HtmlPreviewPayload = {
+  content: string;
+  title: string;
+};
+
 type MessageContentProps = {
   apiBase: string;
   variant: "assistant" | "user";
   content: string;
   attachments?: ChatAttachment[];
   className?: string;
+  onOpenHtmlPreview?: (payload: HtmlPreviewPayload) => void;
+  deferCodeBlocksUntilComplete?: boolean;
 };
+
+type AttachmentPreviewState = {
+  attachment: ChatAttachment;
+  src: string;
+} | null;
+
+const EMPTY_ATTACHMENTS: ChatAttachment[] = [];
+
+function sameStringArray(left: string[], right: string[]) {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((item, index) => item === right[index]);
+}
 
 const markdownSchema = {
   ...defaultSchema,
@@ -122,47 +144,51 @@ function buildAttachmentUrl(apiBase: string, attachment: ChatAttachment) {
   if (!attachment.path) {
     return null;
   }
-  const url = new URL(`${apiBase}/api/workspace/file-content`);
+  const url = new URL(`${apiBase}/api/workspace/upload-content`);
   url.searchParams.set("path", attachment.path);
   return url.toString();
 }
 
-function renderAttachmentGrid(apiBase: string, attachments: ChatAttachment[]) {
-  if (attachments.length === 0) {
-    return null;
-  }
+function AttachmentPreviewDialog({
+  attachment,
+  src,
+  onClose,
+}: {
+  attachment: ChatAttachment;
+  src: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onClose]);
 
   return (
-    <div className={joinClassNames("chat-attachment-grid", attachments.length === 1 ? "single" : "multi")}>
-      {attachments.map((attachment) => {
-        const src = buildAttachmentUrl(apiBase, attachment);
-        if (!src) {
-          return (
-            <div key={attachment.id} className="chat-attachment-card fallback">
-              <div className="chat-attachment-fallback">{attachment.filename}</div>
-            </div>
-          );
-        }
-
-        return (
-          <a
-            key={attachment.id}
-            className="chat-attachment-card"
-            href={src}
-            target="_blank"
-            rel="noreferrer"
-            title={attachment.summary || attachment.filename}
-          >
-            <img
-              className="chat-attachment-image"
-              src={src}
-              alt={attachment.summary || attachment.filename}
-              loading="lazy"
-            />
-            <span className="chat-attachment-caption">{attachment.filename}</span>
-          </a>
-        );
-      })}
+    <div className="chat-image-preview-backdrop" role="presentation" onClick={onClose}>
+      <div
+        className="chat-image-preview-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`图片预览：${attachment.filename}`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <button type="button" className="chat-image-preview-close" onClick={onClose} aria-label="关闭图片预览">
+          关闭
+        </button>
+        <img className="chat-image-preview-image" src={src} alt={attachment.summary || attachment.filename} />
+        <div className="chat-image-preview-meta">
+          <strong>{attachment.filename}</strong>
+          {attachment.summary ? <span>{attachment.summary}</span> : null}
+        </div>
+      </div>
     </div>
   );
 }
@@ -210,6 +236,46 @@ function formatCodeLanguageLabel(language: string | null) {
     .join(" ");
 }
 
+function buildDeferredCodeBlockPlaceholder(fenceLanguage: string | null) {
+  if (!fenceLanguage) {
+    return "代码块生成中，回复完成后自动展示。";
+  }
+  const languageLabel = formatCodeLanguageLabel(fenceLanguage);
+  return `${languageLabel} 代码块生成中，回复完成后自动展示。`;
+}
+
+function stripFencedCodeBlocksForStreaming(content: string) {
+  const lines = content.split("\n");
+  const nextLines: string[] = [];
+  let insideFence = false;
+  let deferredFenceLanguage: string | null = null;
+
+  for (const line of lines) {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("```")) {
+      if (!insideFence) {
+        deferredFenceLanguage = trimmed.slice(3).trim().toLowerCase() || null;
+        if (nextLines.length > 0 && nextLines[nextLines.length - 1] !== "") {
+          nextLines.push("");
+        }
+        nextLines.push(`> ${buildDeferredCodeBlockPlaceholder(deferredFenceLanguage)}`);
+        nextLines.push("");
+        insideFence = true;
+      } else {
+        insideFence = false;
+        deferredFenceLanguage = null;
+      }
+      continue;
+    }
+
+    if (!insideFence) {
+      nextLines.push(line);
+    }
+  }
+
+  return nextLines.join("\n").trimEnd();
+}
+
 function extractNodeText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") {
     return String(node);
@@ -223,7 +289,51 @@ function extractNodeText(node: ReactNode): string {
   return "";
 }
 
-function MarkdownCodeBlock({ children }: ComponentProps<"pre">) {
+function buildHtmlPreviewTitle(markup: string) {
+  const titleMatch = markup.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (titleMatch?.[1]) {
+    const normalized = titleMatch[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  const headingMatch = markup.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  if (headingMatch?.[1]) {
+    const normalized = headingMatch[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return "HTML 实时预览";
+}
+
+function PreviewEyeIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 16 16"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <path
+        d="M1.5 8c1.55-2.44 3.72-3.67 6.5-3.67 2.78 0 4.95 1.23 6.5 3.67-1.55 2.44-3.72 3.67-6.5 3.67-2.78 0-4.95-1.23-6.5-3.67Z"
+        stroke="currentColor"
+        strokeWidth="1.2"
+      />
+      <circle cx="8" cy="8" r="2.1" stroke="currentColor" strokeWidth="1.2" />
+    </svg>
+  );
+}
+
+function MarkdownCodeBlock({
+  children,
+  onOpenHtmlPreview,
+}: ComponentProps<"pre"> & {
+  onOpenHtmlPreview?: (payload: HtmlPreviewPayload) => void;
+}) {
   const timeoutRef = useRef<number | null>(null);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const childNodes = Children.toArray(children);
@@ -245,6 +355,8 @@ function MarkdownCodeBlock({ children }: ComponentProps<"pre">) {
 
   const language = extractCodeLanguage(codeChild.props.className);
   const codeText = extractNodeText(codeChild.props.children).replace(/\n$/, "");
+  const { language: prismLanguage, html: highlightedCode } = highlightCode(codeText, language);
+  const canPreviewHtml = Boolean(onOpenHtmlPreview) && language === "html";
 
   const handleCopy = async () => {
     try {
@@ -268,16 +380,36 @@ function MarkdownCodeBlock({ children }: ComponentProps<"pre">) {
     <div className="chat-code-block">
       <div className="chat-code-block-head">
         <span className="chat-code-block-language">{formatCodeLanguageLabel(language)}</span>
-        <button
-          type="button"
-          className={`chat-code-block-copy ${copyState !== "idle" ? `is-${copyState}` : ""}`}
-          onClick={handleCopy}
-        >
-          {copyState === "copied" ? "已复制" : copyState === "failed" ? "复制失败" : "复制代码"}
-        </button>
+        <div className="chat-code-block-actions">
+          {canPreviewHtml ? (
+            <button
+              type="button"
+              className="chat-code-block-action"
+              onClick={() =>
+                onOpenHtmlPreview?.({
+                  content: codeText,
+                  title: buildHtmlPreviewTitle(codeText),
+                })
+              }
+            >
+              <PreviewEyeIcon className="chat-code-block-action-icon" />
+              <span>预览</span>
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className={`chat-code-block-action chat-code-block-copy ${copyState !== "idle" ? `is-${copyState}` : ""}`}
+            onClick={handleCopy}
+          >
+            {copyState === "copied" ? "已复制" : copyState === "failed" ? "复制失败" : "复制代码"}
+          </button>
+        </div>
       </div>
       <pre className="chat-code-block-pre">
-        <code className={codeChild.props.className}>{codeText}</code>
+        <code
+          className={prismLanguage ? `language-${prismLanguage}` : codeChild.props.className}
+          dangerouslySetInnerHTML={{ __html: highlightedCode }}
+        />
       </pre>
     </div>
   );
@@ -287,18 +419,78 @@ export default function MessageContent({
   apiBase,
   variant,
   content,
-  attachments = [],
+  attachments = EMPTY_ATTACHMENTS,
   className,
+  onOpenHtmlPreview,
+  deferCodeBlocksUntilComplete = false,
 }: MessageContentProps) {
   const hasText = Boolean(content.trim());
   const hasAttachments = attachments.length > 0;
+  const [preview, setPreview] = useState<AttachmentPreviewState>(null);
+  const [failedAttachmentIds, setFailedAttachmentIds] = useState<string[]>([]);
+  const renderedAssistantContent =
+    variant === "assistant" && deferCodeBlocksUntilComplete ? stripFencedCodeBlocksForStreaming(content) : content;
+
+  useEffect(() => {
+    setFailedAttachmentIds((current) => {
+      const next = current.filter((id) => attachments.some((attachment) => attachment.id === id));
+      return sameStringArray(current, next) ? current : next;
+    });
+  }, [attachments]);
 
   if (variant === "user") {
     return (
-      <div className={joinClassNames("chat-message-content", "user", className)}>
-        {hasText ? <p className="chat-message-text">{renderUserText(content)}</p> : null}
-        {hasAttachments ? renderAttachmentGrid(apiBase, attachments) : null}
-      </div>
+      <>
+        <div className={joinClassNames("chat-message-content", "user", className)}>
+          {hasText ? <p className="chat-message-text">{renderUserText(content)}</p> : null}
+          {hasAttachments ? (
+            <div className="chat-attachment-grid" aria-label="已上传图片">
+              {attachments.map((attachment) => {
+                const src = buildAttachmentUrl(apiBase, attachment);
+                if (!src) {
+                  return (
+                    <div key={attachment.id} className="chat-attachment-card fallback" title={attachment.filename}>
+                      <div className="chat-attachment-fallback">{attachment.filename.slice(0, 1).toUpperCase()}</div>
+                    </div>
+                  );
+                }
+
+                return (
+                  <button
+                    key={attachment.id}
+                    type="button"
+                    className="chat-attachment-card"
+                    title={attachment.summary || attachment.filename}
+                    aria-label={`预览图片 ${attachment.filename}`}
+                    onClick={() => setPreview({ attachment, src })}
+                  >
+                    {failedAttachmentIds.includes(attachment.id) ? (
+                      <span className="chat-attachment-fallback">{attachment.filename.slice(0, 1).toUpperCase()}</span>
+                    ) : (
+                      <img
+                        className="chat-attachment-image"
+                        src={src}
+                        alt={attachment.summary || attachment.filename}
+                        loading="lazy"
+                        onError={() =>
+                          setFailedAttachmentIds((current) => (current.includes(attachment.id) ? current : [...current, attachment.id]))
+                        }
+                      />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
+        </div>
+        {preview ? (
+          <AttachmentPreviewDialog
+            attachment={preview.attachment}
+            src={preview.src}
+            onClose={() => setPreview(null)}
+          />
+        ) : null}
+      </>
     );
   }
 
@@ -310,10 +502,10 @@ export default function MessageContent({
           rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSchema]]}
           components={{
             a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
-            pre: ({ node: _node, ...props }) => <MarkdownCodeBlock {...props} />,
+            pre: ({ node: _node, ...props }) => <MarkdownCodeBlock {...props} onOpenHtmlPreview={onOpenHtmlPreview} />,
           }}
         >
-          {content}
+          {renderedAssistantContent}
         </ReactMarkdown>
       </div>
     </div>

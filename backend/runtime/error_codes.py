@@ -135,6 +135,14 @@ TOOL_ERROR_MAP = {
         "fatal",
         "Stop and correct the request shape or required parameters before retrying.",
     ),
+    "empty_response": ErrorDescriptor(
+        "NEWMAN-TOOL-015",
+        "warning",
+        "medium",
+        "主模型响应异常",
+        "recoverable",
+        "Retry the request; if it keeps returning no content, inspect the gateway and streaming response path.",
+    ),
 }
 
 DEFAULT_TOOL_ERROR = ErrorDescriptor(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Awaitable, Callable
 from uuid import uuid4
@@ -25,7 +26,15 @@ from backend.providers.base import ProviderError, ProviderResponse, TokenUsage
 from backend.providers.multimodal import MultimodalAnalyzer
 from backend.providers.factory import build_provider
 from backend.rag.service import KnowledgeBaseService
+from backend.runtime.collaboration_mode import (
+    PLAN_COLLABORATION_MODE,
+    get_collaboration_mode,
+    get_plan_draft,
+    get_session_plan,
+    is_tool_allowed_in_mode,
+)
 from backend.runtime.feedback_writer import FeedbackWriter
+from backend.runtime.message_rendering import get_normalized_user_content
 from backend.runtime.prompt_assembler import PromptAssembler
 from backend.runtime.result_normalizer import normalize_result
 from backend.runtime.session_task import SessionTask
@@ -40,7 +49,14 @@ from backend.tools.orchestrator import ToolOrchestrator
 from backend.tools.approval_policy import DEFAULT_TURN_APPROVAL_MODE, TurnApprovalMode
 from backend.tools.discovery import BuiltinToolContext, load_builtin_tools
 from backend.tools.permission_context import PermissionContext
-from backend.tools.provider_exposure import infer_provider_tool_groups
+from backend.tools.provider_exposure import (
+    CORE_TOOL_GROUP,
+    EDITING_TOOL_GROUP,
+    EXECUTION_TOOL_GROUP,
+    KNOWLEDGE_TOOL_GROUP,
+    NETWORK_TOOL_GROUP,
+    infer_provider_tool_groups,
+)
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import ToolRouter, analyze_terminal_command
 from backend.tools.result import ToolExecutionResult
@@ -72,6 +88,111 @@ def _build_tool_message_output(result: ToolExecutionResult) -> str:
 
     outputs = [part for part in [result.stdout.strip(), result.stderr.strip()] if part]
     return "\n".join(outputs)
+
+
+def _repair_schema_value(value: object, schema: object) -> object:
+    if not isinstance(schema, dict):
+        return value
+
+    schema_type = schema.get("type")
+    if schema_type == "object" or (
+        not schema_type and any(key in schema for key in ("properties", "required", "additionalProperties"))
+    ):
+        source = value if isinstance(value, dict) else {}
+        properties = schema.get("properties")
+        known_properties = properties if isinstance(properties, dict) else {}
+        repaired: dict[str, object] = {}
+
+        if schema.get("additionalProperties") is not False:
+            for key, item in source.items():
+                if key not in known_properties:
+                    repaired[key] = item
+
+        for key, child_schema in known_properties.items():
+            if key in source:
+                repaired[key] = _repair_schema_value(source[key], child_schema)
+
+        for key in schema.get("required", []):
+            if not isinstance(key, str) or key in repaired:
+                continue
+            repaired[key] = _schema_placeholder(known_properties.get(key, {}))
+        return repaired
+
+    if schema_type == "array":
+        items_schema = schema.get("items")
+        source_items = value if isinstance(value, list) else []
+        repaired_items = [
+            _repair_schema_value(item, items_schema) if isinstance(items_schema, dict) else item
+            for item in source_items
+        ]
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int):
+            while len(repaired_items) < min_items:
+                repaired_items.append(_schema_placeholder(items_schema if isinstance(items_schema, dict) else {}))
+        return repaired_items
+
+    if schema_type == "string":
+        if isinstance(value, str):
+            min_length = schema.get("minLength")
+            if isinstance(min_length, int) and len(value) < min_length:
+                return "x" * min_length
+            enum_values = schema.get("enum")
+            if isinstance(enum_values, list) and enum_values and value not in enum_values:
+                first = enum_values[0]
+                return str(first) if isinstance(first, str) else value
+            return value
+        return _schema_placeholder(schema)
+
+    if schema_type == "boolean":
+        return value if isinstance(value, bool) else bool(schema.get("default", False))
+
+    if schema_type == "integer":
+        return value if isinstance(value, int) and not isinstance(value, bool) else int(schema.get("default", 0) or 0)
+
+    if schema_type == "number":
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        default = schema.get("default", 0)
+        if isinstance(default, (int, float)) and not isinstance(default, bool):
+            return default
+        return 0
+
+    return value
+
+
+def _schema_placeholder(schema: object) -> object:
+    if not isinstance(schema, dict):
+        return ""
+
+    default = schema.get("default")
+    if default is not None:
+        return default
+
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and enum_values:
+        return enum_values[0]
+
+    schema_type = schema.get("type")
+    if schema_type == "object":
+        return _repair_schema_value({}, schema)
+    if schema_type == "array":
+        min_items = schema.get("minItems")
+        items_schema = schema.get("items") if isinstance(schema.get("items"), dict) else {}
+        required_count = min_items if isinstance(min_items, int) and min_items > 0 else 0
+        return [_schema_placeholder(items_schema) for _ in range(required_count)]
+    if schema_type == "boolean":
+        return False
+    if schema_type == "integer":
+        return 0
+    if schema_type == "number":
+        return 0
+    if schema_type == "null":
+        return None
+
+    min_length = schema.get("minLength")
+    if isinstance(min_length, int) and min_length > 0:
+        return "x" * min_length
+    return ""
 
 
 class NewmanRuntime:
@@ -207,6 +328,7 @@ class NewmanRuntime:
         request_id: str | None = None,
         turn_id: str | None = None,
         on_turn_created: Callable[[str], None] | None = None,
+        post_user_message: Callable[[SessionTask, SessionMessage, EventEmitter], Awaitable[None]] | None = None,
     ) -> None:
         self.reload_ecosystem()
         resolved_turn_id = turn_id or uuid4().hex
@@ -227,8 +349,10 @@ class NewmanRuntime:
 
         task = SessionTask(session=session, permission_context=PermissionContext(), turn_id=resolved_turn_id)
         turn_emit = self._bind_turn_emitter(emit, task.turn_id)
-        await self._emit_hooks("SessionStart", turn_emit, session_id=session.session_id, content=content)
-        provider_feedback_attempted = False
+        if post_user_message is not None:
+            await post_user_message(task, user_message, turn_emit)
+        current_content = self._current_turn_user_content(task.session, task.turn_id) or content
+        await self._emit_hooks("SessionStart", turn_emit, session_id=session.session_id, content=current_content)
 
         for _ in range(self.settings.runtime.max_tool_depth):
             group_id = task.next_action_group_id()
@@ -238,7 +362,7 @@ class NewmanRuntime:
             provider_tools = self._provider_tools_for_turn(task)
 
             try:
-                response = await self._stream_provider_response(
+                response = await self._stream_provider_response_with_retries(
                     assembled,
                     provider_tools,
                     turn_emit,
@@ -247,20 +371,17 @@ class NewmanRuntime:
                     request_kind="session_turn",
                     counts_toward_context_window=True,
                     group_id=group_id,
-                    emit_answer_started=task.tool_depth > 0,
+                    emit_answer_started_event=task.tool_depth > 0,
                 )
             except ProviderError as exc:
                 result = self._provider_error_result(exc)
-                await self._record_failure_feedback(task, result, turn_emit, request_id=request_id)
-                if exc.retryable and result.recovery_class == "recoverable" and not provider_feedback_attempted:
-                    provider_feedback_attempted = True
-                    continue
-                await self._emit_fatal_error(
+                await self._finalize_provider_error(
                     task,
                     turn_emit,
                     result,
-                    finish_reason="provider_error",
-                    extra={"provider": exc.provider, "status_code": exc.status_code},
+                    request_id=request_id,
+                    provider=exc.provider,
+                    status_code=exc.status_code,
                 )
                 return
 
@@ -270,6 +391,8 @@ class NewmanRuntime:
                 turn_emit,
                 group_id=group_id,
             )
+            for tool_call in response.tool_calls:
+                tool_call.arguments = self._prepare_tool_arguments(task, tool_call.name, tool_call.arguments)
 
             if not response.tool_calls:
                 final_content = response.content or response.commentary
@@ -332,16 +455,6 @@ class NewmanRuntime:
 
             for tool_call in response.tool_calls:
                 task.tool_depth += 1
-                tool = self.router.route(tool_call.name, tool_call.arguments)
-                extra_reasons = self.router.static_checks(tool, tool_call.arguments)
-                await self._emit_hooks(
-                    "PreToolUse",
-                    turn_emit,
-                    session_id=task.session.session_id,
-                    tool=tool_call.name,
-                    arguments=tool_call.arguments,
-                    group_id=group_id,
-                )
                 await turn_emit(
                     "tool_call_started",
                     {
@@ -351,17 +464,38 @@ class NewmanRuntime:
                         "arguments": tool_call.arguments,
                     },
                 )
-                result = await self.orchestrator.execute(
-                    tool,
-                    tool_call.arguments,
-                    task.session.session_id,
-                    turn_emit,
-                    tool_call_id=tool_call.id,
-                    group_id=group_id,
-                    extra_reasons=extra_reasons,
-                    turn_approval_mode=turn_approval_mode,
-                    turn_id=task.turn_id,
-                )
+                disallow_reason = self._tool_disallow_reason_for_task(task, tool_call.name)
+                if disallow_reason is not None:
+                    result = ToolExecutionResult(
+                        success=False,
+                        tool=tool_call.name,
+                        action="execute",
+                        category="permission_error",
+                        summary=disallow_reason,
+                        retryable=False,
+                    )
+                else:
+                    tool = self.router.route(tool_call.name, tool_call.arguments)
+                    extra_reasons = self.router.static_checks(tool, tool_call.arguments)
+                    await self._emit_hooks(
+                        "PreToolUse",
+                        turn_emit,
+                        session_id=task.session.session_id,
+                        tool=tool_call.name,
+                        arguments=tool_call.arguments,
+                        group_id=group_id,
+                    )
+                    result = await self.orchestrator.execute(
+                        tool,
+                        tool_call.arguments,
+                        task.session.session_id,
+                        turn_emit,
+                        tool_call_id=tool_call.id,
+                        group_id=group_id,
+                        extra_reasons=extra_reasons,
+                        turn_approval_mode=turn_approval_mode,
+                        turn_id=task.turn_id,
+                    )
                 result = normalize_result(result)
                 metadata_updates = result.metadata.get("session_metadata_updates")
                 if isinstance(metadata_updates, dict):
@@ -401,6 +535,24 @@ class NewmanRuntime:
                         {
                             "session_id": task.session.session_id,
                             "plan": plan_payload,
+                            "summary": result.summary,
+                        },
+                    )
+                if collaboration_mode_payload := result.metadata.get("collaboration_mode"):
+                    await turn_emit(
+                        "collaboration_mode_changed",
+                        {
+                            "session_id": task.session.session_id,
+                            "collaboration_mode": collaboration_mode_payload,
+                            "summary": result.summary,
+                        },
+                    )
+                if plan_draft_payload := result.metadata.get("plan_draft"):
+                    await turn_emit(
+                        "plan_draft_updated",
+                        {
+                            "session_id": task.session.session_id,
+                            "plan_draft": plan_draft_payload,
                             "summary": result.summary,
                         },
                     )
@@ -476,7 +628,7 @@ class NewmanRuntime:
         request_kind: str,
         counts_toward_context_window: bool,
         group_id: str | None = None,
-        emit_answer_started: bool = False,
+        emit_answer_started_event: bool = False,
     ) -> ProviderResponse:
         content_parts: list[str] = []
         thinking_parts: list[str] = []
@@ -489,7 +641,6 @@ class NewmanRuntime:
         commentary_complete_pending = False
         answer_visible = False
         answer_started_emitted = False
-        buffer_answer_until_done = emit_answer_started and bool(tools)
 
         async def flush_commentary(*, force: bool = False, delta: str | None = None) -> None:
             nonlocal commentary_visible, commentary_complete_pending
@@ -530,14 +681,12 @@ class NewmanRuntime:
                 commentary_complete_pending = False
 
         async def consume_parse_event(event) -> None:
-            nonlocal commentary_complete_pending, answer_visible, answer_started_emitted
+            nonlocal commentary_complete_pending, answer_started_emitted, answer_visible
             if event.kind == "answer" and event.text:
                 content_parts.append(event.text)
                 if not "".join(content_parts).strip():
                     return
-                if buffer_answer_until_done:
-                    return
-                if emit_answer_started and not answer_started_emitted:
+                if emit_answer_started_event and not answer_started_emitted:
                     answer_started_emitted = True
                     await emit(
                         "answer_started",
@@ -593,6 +742,7 @@ class NewmanRuntime:
                 if answer_visible:
                     content_parts.clear()
                     answer_visible = False
+                    answer_started_emitted = False
                     await emit(
                         "assistant_delta",
                         {
@@ -617,25 +767,6 @@ class NewmanRuntime:
                     usage = chunk.usage
         for event in parser.flush():
             await consume_parse_event(event)
-        if buffer_answer_until_done and not tool_calls and "".join(content_parts).strip():
-            if emit_answer_started and not answer_started_emitted:
-                answer_started_emitted = True
-                await emit(
-                    "answer_started",
-                    {
-                        "group_id": group_id,
-                        "model": self.settings.provider.model,
-                    },
-                )
-            answer_visible = True
-            await emit(
-                "assistant_delta",
-                {
-                    "content": "".join(content_parts),
-                    "delta": "".join(content_parts),
-                    "model": self.settings.provider.model,
-                },
-            )
         await flush_commentary(force=bool(tool_calls))
         response = ProviderResponse(
             content="".join(content_parts),
@@ -669,6 +800,77 @@ class NewmanRuntime:
             response,
         )
         return response
+
+    async def _stream_provider_response_with_retries(
+        self,
+        assembled: list[dict[str, object]],
+        tools: list[dict[str, object]],
+        emit: EventEmitter,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        request_kind: str,
+        counts_toward_context_window: bool,
+        group_id: str | None = None,
+        emit_answer_started_event: bool = False,
+    ) -> ProviderResponse:
+        max_attempts = self._provider_max_attempts()
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await self._stream_provider_response(
+                    assembled,
+                    tools,
+                    emit,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    request_kind=request_kind,
+                    counts_toward_context_window=counts_toward_context_window,
+                    group_id=group_id,
+                    emit_answer_started_event=emit_answer_started_event,
+                )
+                self._raise_for_empty_provider_response(response)
+                return response
+            except ProviderError as exc:
+                details = dict(exc.details)
+                details["attempt_count"] = attempt
+                details["max_attempts"] = max_attempts
+                exc.details = details
+                result = self._provider_error_result(exc)
+                if not exc.retryable or result.recovery_class != "recoverable" or attempt >= max_attempts:
+                    raise
+                delay = self._provider_retry_backoff_seconds(attempt)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        raise ProviderError(
+            self.settings.provider.type,
+            "upstream_error",
+            "主模型重试后仍然无法返回有效响应",
+            True,
+        )
+
+    def _provider_max_attempts(self) -> int:
+        retry_attempts = getattr(self.settings.runtime, "tool_retry_attempts", 0)
+        return max(1, int(retry_attempts) + 1)
+
+    def _provider_retry_backoff_seconds(self, attempt: int) -> float:
+        base_delay = max(0.0, float(getattr(self.settings.runtime, "tool_retry_backoff_seconds", 0.0)))
+        return base_delay * (2 ** max(0, attempt - 1))
+
+    def _raise_for_empty_provider_response(self, response: ProviderResponse) -> None:
+        if response.tool_calls:
+            return
+        if response.content.strip() or response.commentary.strip():
+            return
+        raise ProviderError(
+            self.settings.provider.type,
+            "empty_response",
+            "主模型本次返回空响应，流式响应可能被提前结束或被上游/网关截断",
+            True,
+            details={
+                "finish_reason": response.finish_reason,
+                "model": response.model or self.settings.provider.model,
+            },
+        )
 
     async def _ensure_tool_response_commentary(
         self,
@@ -842,7 +1044,7 @@ class NewmanRuntime:
                 turn_id=task.turn_id,
                 request_kind="tool_limit_finalize",
                 counts_toward_context_window=True,
-                emit_answer_started=task.tool_depth > 0,
+                emit_answer_started_event=task.tool_depth > 0,
             )
             final_content = response.content.strip()
         except ProviderError:
@@ -896,6 +1098,38 @@ class NewmanRuntime:
         *,
         request_id: str | None = None,
     ) -> None:
+        if result.error_code == "NEWMAN-TOOL-005" or result.category == "user_rejected":
+            final_content = self._build_fatal_tool_fallback_message(result)
+            assistant_message = SessionMessage(
+                id=uuid4().hex,
+                role="assistant",
+                content=final_content,
+                metadata=self._build_message_metadata(
+                    task.turn_id,
+                    request_id,
+                    extra={"finish_reason": "approval_rejected"},
+                ),
+            )
+            task.session.messages.append(assistant_message)
+            self.session_store.save(task.session)
+            await emit(
+                "final_response",
+                {
+                    "session_id": task.session.session_id,
+                    "content": final_content,
+                    "finish_reason": "approval_rejected",
+                    "message_id": assistant_message.id,
+                    "created_at": assistant_message.created_at,
+                },
+            )
+            await self._emit_hooks(
+                "SessionEnd",
+                emit,
+                session_id=task.session.session_id,
+                finish_reason="approval_rejected",
+            )
+            return
+
         instruction = (
             "刚才的工具调用已经确认失败。禁止继续调用任何工具，也不要重复同一个失败动作。"
             "如果不依赖该工具，你仍然可以基于现有上下文直接回答用户原问题，请直接给出最终回答。"
@@ -933,7 +1167,7 @@ class NewmanRuntime:
                 turn_id=task.turn_id,
                 request_kind="fatal_tool_finalize",
                 counts_toward_context_window=True,
-                emit_answer_started=task.tool_depth > 0,
+                emit_answer_started_event=task.tool_depth > 0,
             )
             final_content = response.content.strip()
             if response.tool_calls or self._contains_raw_tool_call_markup(final_content):
@@ -975,6 +1209,62 @@ class NewmanRuntime:
             finish_reason="fatal_tool_error",
         )
 
+    async def _finalize_provider_error(
+        self,
+        task: SessionTask,
+        emit: EventEmitter,
+        result: ToolExecutionResult,
+        *,
+        request_id: str | None = None,
+        provider: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        max_attempts_raw = result.metadata.get("max_attempts")
+        max_attempts = int(max_attempts_raw) if isinstance(max_attempts_raw, int | float) else None
+        final_content = self._build_provider_failure_message(
+            result,
+            attempt_count=result.attempt_count if result.attempt_count > 0 else None,
+            max_attempts=max_attempts,
+        )
+        assistant_message = SessionMessage(
+            id=uuid4().hex,
+            role="assistant",
+            content=final_content,
+            metadata=self._build_message_metadata(
+                task.turn_id,
+                request_id,
+                extra={"finish_reason": "provider_error"},
+            ),
+        )
+        task.session.messages.append(assistant_message)
+        self.session_store.save(task.session)
+        await emit(
+            "final_response",
+            {
+                "session_id": task.session.session_id,
+                "content": final_content,
+                "finish_reason": "provider_error",
+                "message_id": assistant_message.id,
+                "created_at": assistant_message.created_at,
+            },
+        )
+        extra: dict[str, object] = {}
+        if provider:
+            extra["provider"] = provider
+        if status_code is not None:
+            extra["status_code"] = status_code
+        if result.attempt_count > 0:
+            extra["attempt_count"] = result.attempt_count
+        if max_attempts is not None:
+            extra["max_attempts"] = max_attempts
+        await self._emit_fatal_error(
+            task,
+            emit,
+            result,
+            finish_reason="provider_error",
+            extra=extra,
+        )
+
     def _contains_raw_tool_call_markup(self, text: str) -> bool:
         normalized = text.strip()
         if not normalized:
@@ -995,6 +1285,62 @@ class NewmanRuntime:
         if result.recommended_next_step:
             lines.append(f"建议：{result.recommended_next_step}")
         lines.append("如果你愿意，我可以先不依赖这个工具，直接基于现有上下文继续回答。")
+        return "\n".join(lines)
+
+    def _build_provider_failure_message(
+        self,
+        result: ToolExecutionResult,
+        *,
+        attempt_count: int | None = None,
+        max_attempts: int | None = None,
+    ) -> str:
+        if result.category == "empty_response":
+            headline = "主模型本次响应异常，未返回任何内容，当前无法继续。"
+        elif result.category in {"timeout_error", "network_error", "upstream_error"}:
+            headline = "主模型连接失败，当前无法继续。"
+        elif result.category == "response_parse_error":
+            headline = "主模型响应异常，当前无法继续。"
+        elif result.category == "auth_error":
+            headline = "主模型认证失败，当前无法继续。"
+        elif result.category == "configuration_error":
+            headline = "主模型配置无效，当前无法继续。"
+        else:
+            headline = "主模型调用失败，当前无法继续。"
+
+        lines = [headline]
+        retries = max(0, (attempt_count or 0) - 1)
+        if retries > 0:
+            if result.category == "empty_response":
+                if max_attempts and attempt_count == max_attempts:
+                    lines.append(f"已重试 {retries} 次，本次请求仍然没有拿到有效响应。")
+                else:
+                    lines.append(f"已重试 {retries} 次。")
+            elif max_attempts and attempt_count == max_attempts:
+                lines.append(f"已重试 {retries} 次，仍然无法恢复主模型连接。")
+            else:
+                lines.append(f"已重试 {retries} 次。")
+
+        reason = (result.frontend_message or "").strip()
+        summary = result.summary.strip()
+        if result.category != "empty_response":
+            if reason:
+                lines.append(f"原因：{reason}")
+            if summary and summary != reason:
+                lines.append(f"详情：{summary}")
+
+        if result.category == "empty_response":
+            lines.append("建议：稍后重试；如果持续出现，请检查网关日志、流式转发链路，确认响应没有被提前截断。")
+        elif result.category in {"timeout_error", "network_error", "upstream_error"}:
+            lines.append("建议：稍后重试；如果持续失败，请检查主模型服务状态、网关和网络连通性。")
+        elif result.category == "auth_error":
+            lines.append("建议：检查主模型 API Key 或上游鉴权配置后再试。")
+        elif result.category == "configuration_error":
+            lines.append("建议：检查主模型 endpoint、模型名和运行配置后再试。")
+        elif result.category == "response_parse_error":
+            lines.append("建议：检查上游流式返回格式，确认没有提前截断或返回非法 JSON。")
+        elif result.recommended_next_step:
+            lines.append(f"建议：{result.recommended_next_step}")
+
         return "\n".join(lines)
 
     def _compose_tool_call_assistant_content(self, response: ProviderResponse) -> str:
@@ -1028,10 +1374,10 @@ class NewmanRuntime:
             if message.role != "user":
                 continue
             if message.metadata.get("turn_id") == turn_id:
-                return message.content
+                return get_normalized_user_content(message)
         for message in reversed(session.messages):
             if message.role == "user":
-                return message.content
+                return get_normalized_user_content(message)
         return ""
 
     def _assemble_task_messages(
@@ -1041,19 +1387,208 @@ class NewmanRuntime:
         checkpoint=None,
     ) -> list[dict]:
         resolved_checkpoint = checkpoint if checkpoint is not None else self.checkpoints.get(task.session.session_id)
-        return self.prompt_assembler.assemble(
+        messages = self.prompt_assembler.assemble(
             task.session,
             self._tools_overview(),
             resolved_checkpoint,
             tool_message_overrides=task.transient_tool_messages,
         )
+        return self._sanitize_provider_replay_messages(messages)
 
     def _provider_tools_for_turn(self, task: SessionTask) -> list[dict[str, object]]:
         user_content = self._current_turn_user_content(task.session, task.turn_id)
-        active_groups = infer_provider_tool_groups(user_content)
-        return self.registry.tools_for_provider(task.permission_context, active_groups=active_groups)
+        mode = get_collaboration_mode(task.session).mode
+        plan_missing = mode == PLAN_COLLABORATION_MODE and get_session_plan(task.session) is None
+        if mode == PLAN_COLLABORATION_MODE:
+            provider_tools = self.registry.tools_for_provider(
+                task.permission_context,
+                active_groups={
+                    CORE_TOOL_GROUP,
+                    EDITING_TOOL_GROUP,
+                    EXECUTION_TOOL_GROUP,
+                    KNOWLEDGE_TOOL_GROUP,
+                    NETWORK_TOOL_GROUP,
+                },
+            )
+        else:
+            active_groups = infer_provider_tool_groups(user_content)
+            provider_tools = self.registry.tools_for_provider(task.permission_context, active_groups=active_groups)
+        filtered_tools = [
+            schema
+            for schema in provider_tools
+            if is_tool_allowed_in_mode(str(schema.get("function", {}).get("name", "")), mode)
+        ]
+        if plan_missing:
+            return [
+                schema
+                for schema in filtered_tools
+                if str(schema.get("function", {}).get("name", "")) == "update_plan"
+            ]
+        existing_names = {
+            str(schema.get("function", {}).get("name", ""))
+            for schema in filtered_tools
+            if isinstance(schema, dict)
+        }
+        registry_get = getattr(self.registry, "get", None)
+        if callable(registry_get):
+            for tool_name in sorted(self._history_referenced_tool_names(task.session)):
+                if tool_name in existing_names or not is_tool_allowed_in_mode(tool_name, mode):
+                    continue
+                if not task.permission_context.can_expose(tool_name):
+                    continue
+                try:
+                    tool = self.registry.get(tool_name)
+                except KeyError:
+                    continue
+                filtered_tools.append(tool.to_provider_schema())
+                existing_names.add(tool_name)
+        return filtered_tools
+
+    def _is_tool_allowed_for_task(self, task: SessionTask, tool_name: str) -> bool:
+        return self._tool_disallow_reason_for_task(task, tool_name) is None
+
+    def _tool_disallow_reason_for_task(self, task: SessionTask, tool_name: str) -> str | None:
+        mode = get_collaboration_mode(task.session).mode
+        if not is_tool_allowed_in_mode(tool_name, mode):
+            return f"{tool_name} 在当前 {mode} 模式下不可用"
+        if mode == PLAN_COLLABORATION_MODE and tool_name != "update_plan" and get_session_plan(task.session) is None:
+            return f"当前处于计划模式，必须先调用 update_plan 生成 checklist，然后才能使用 {tool_name}"
+        return None
+
+    def _prepare_tool_arguments(
+        self,
+        task: SessionTask,
+        tool_name: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        prepared = dict(arguments)
+        if tool_name == "exit_plan_mode":
+            markdown = str(prepared.get("markdown", "")).strip()
+            if not markdown:
+                draft = get_plan_draft(task.session)
+                if draft is not None and draft.markdown.strip():
+                    prepared["markdown"] = draft.markdown
+        return prepared
+
+    def _history_referenced_tool_names(self, session) -> set[str]:
+        tool_names: set[str] = set()
+        for message in session.messages:
+            if message.role != "assistant":
+                continue
+            tool_calls = message.metadata.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for raw_tool_call in tool_calls:
+                if not isinstance(raw_tool_call, dict):
+                    continue
+                name = raw_tool_call.get("name")
+                if isinstance(name, str) and name:
+                    tool_names.add(name)
+        return tool_names
+
+    def _sanitize_provider_replay_messages(self, messages: list[dict]) -> list[dict]:
+        registry = getattr(self, "registry", None)
+        registry_get = getattr(registry, "get", None)
+        provider_type = str(getattr(getattr(self, "settings", None), "provider", None).type) if getattr(getattr(self, "settings", None), "provider", None) is not None else ""
+        sanitize_tool_calls = callable(registry_get)
+
+        sanitized_messages: list[dict] = []
+        seen_system_message = False
+        for message in messages:
+            if message.get("role") == "system":
+                if not seen_system_message:
+                    seen_system_message = True
+                elif provider_type == "openai_compatible":
+                    sanitized_messages.append(
+                        {
+                            **message,
+                            "role": "user",
+                            "content": f"Runtime system note:\n\n{message.get('content', '')}",
+                        }
+                    )
+                    continue
+
+            if not sanitize_tool_calls:
+                sanitized_messages.append(message)
+                continue
+            if message.get("role") != "assistant":
+                sanitized_messages.append(message)
+                continue
+            raw_tool_calls = message.get("tool_calls")
+            if not isinstance(raw_tool_calls, list) or not raw_tool_calls:
+                sanitized_messages.append(message)
+                continue
+
+            next_tool_calls: list[dict[str, object]] = []
+            message_changed = False
+            for raw_tool_call in raw_tool_calls:
+                if not isinstance(raw_tool_call, dict):
+                    continue
+                next_tool_call = dict(raw_tool_call)
+                function_payload = raw_tool_call.get("function")
+                if not isinstance(function_payload, dict):
+                    next_tool_calls.append(next_tool_call)
+                    continue
+
+                next_function_payload = dict(function_payload)
+                tool_name = next_function_payload.get("name")
+                arguments_raw = next_function_payload.get("arguments")
+                repaired_arguments = self._repair_tool_arguments_for_provider_replay(tool_name, arguments_raw)
+                if repaired_arguments is not None:
+                    next_function_payload["arguments"] = json.dumps(repaired_arguments, ensure_ascii=False)
+                    message_changed = True
+                next_tool_call["function"] = next_function_payload
+                next_tool_calls.append(next_tool_call)
+
+            if message_changed:
+                next_message = dict(message)
+                next_message["tool_calls"] = next_tool_calls
+                sanitized_messages.append(next_message)
+            else:
+                sanitized_messages.append(message)
+        return sanitized_messages
+
+    def _repair_tool_arguments_for_provider_replay(
+        self,
+        tool_name: object,
+        arguments_raw: object,
+    ) -> dict[str, object] | None:
+        if not isinstance(tool_name, str) or not tool_name:
+            return None
+
+        registry = getattr(self, "registry", None)
+        if registry is None:
+            return None
+        try:
+            tool = registry.get(tool_name)
+        except KeyError:
+            return None
+
+        parsed_arguments: object
+        if isinstance(arguments_raw, str):
+            try:
+                parsed_arguments = json.loads(arguments_raw) if arguments_raw.strip() else {}
+            except JSONDecodeError:
+                parsed_arguments = {}
+        else:
+            parsed_arguments = arguments_raw
+
+        if not isinstance(parsed_arguments, dict):
+            parsed_arguments = {}
+        if tool.validate_arguments(parsed_arguments) is None:
+            return None
+
+        repaired = _repair_schema_value(parsed_arguments, tool.meta.input_schema)
+        if not isinstance(repaired, dict):
+            return None
+        if tool.validate_arguments(repaired) is not None:
+            return None
+        return repaired
 
     def _provider_error_result(self, error: ProviderError) -> ToolExecutionResult:
+        attempt_count_raw = error.details.get("attempt_count")
+        attempt_count = int(attempt_count_raw) if isinstance(attempt_count_raw, int | float) else 1
+        max_attempts_raw = error.details.get("max_attempts")
         result = ToolExecutionResult(
             success=False,
             tool=f"provider:{error.provider}",
@@ -1070,7 +1605,10 @@ class NewmanRuntime:
                 ensure_ascii=False,
             ),
             retryable=error.retryable,
+            attempt_count=attempt_count,
         )
+        if isinstance(max_attempts_raw, int | float):
+            result.metadata["max_attempts"] = int(max_attempts_raw)
         return normalize_result(result)
 
     async def _emit_fatal_error(
@@ -1096,6 +1634,11 @@ class NewmanRuntime:
         }
         if extra:
             payload.update(extra)
+        if result.attempt_count > 0 and "attempt_count" not in payload:
+            payload["attempt_count"] = result.attempt_count
+        max_attempts = result.metadata.get("max_attempts")
+        if isinstance(max_attempts, int | float) and "max_attempts" not in payload:
+            payload["max_attempts"] = int(max_attempts)
         await emit("error", payload)
         await self._emit_hooks(
             "SessionEnd",

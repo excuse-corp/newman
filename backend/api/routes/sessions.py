@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -14,6 +15,13 @@ from backend.memory.compressor import (
     split_session_messages,
     summarize_messages,
 )
+from backend.runtime.collaboration_mode import (
+    build_collaboration_mode_payload,
+    build_plan_draft_payload,
+    get_approved_plan,
+    get_collaboration_mode,
+    get_plan_draft,
+)
 from backend.sessions.models import SessionMessage, SessionSummary
 
 
@@ -26,6 +34,14 @@ class CreateSessionRequest(BaseModel):
 
 class UpdateSessionRequest(BaseModel):
     title: str
+
+
+class UpdateCollaborationModeRequest(BaseModel):
+    mode: Literal["default", "plan"]
+
+
+class UpdatePlanDraftRequest(BaseModel):
+    markdown: str
 
 
 @router.post("")
@@ -89,9 +105,14 @@ async def get_session(session_id: str, request: Request):
     runtime = request.app.state.runtime
     session = runtime.session_store.get(session_id)
     checkpoint = runtime.checkpoints.get(session_id)
+    plan_draft = get_plan_draft(session)
+    approved_plan = get_approved_plan(session)
     return {
         "session": session,
         "plan": session.metadata.get("plan"),
+        "collaboration_mode": get_collaboration_mode(session).model_dump(mode="json"),
+        "plan_draft": plan_draft.model_dump(mode="json") if plan_draft else None,
+        "approved_plan": approved_plan.model_dump(mode="json") if approved_plan else None,
         "checkpoint": checkpoint,
         "context_usage": _build_context_usage(runtime, session, checkpoint),
     }
@@ -237,6 +258,55 @@ async def update_session(session_id: str, payload: UpdateSessionRequest, request
         "session_id": session.session_id,
         "title": session.title,
         "updated_at": session.updated_at,
+    }
+
+
+@router.patch("/{session_id}/collaboration-mode")
+async def update_collaboration_mode(session_id: str, payload: UpdateCollaborationModeRequest, request: Request):
+    runtime = request.app.state.runtime
+    session = runtime.session_store.get(session_id)
+    mode_payload = build_collaboration_mode_payload(payload.mode, source="manual")
+    session.metadata["collaboration_mode"] = mode_payload
+    runtime.session_store.save(session)
+    return {
+        "updated": True,
+        "session_id": session_id,
+        "collaboration_mode": mode_payload,
+    }
+
+
+@router.get("/{session_id}/plan-draft")
+async def get_session_plan_draft(session_id: str, request: Request):
+    runtime = request.app.state.runtime
+    session = runtime.session_store.get(session_id)
+    draft = get_plan_draft(session)
+    return {
+        "session_id": session_id,
+        "plan_draft": draft.model_dump(mode="json") if draft else None,
+    }
+
+
+@router.put("/{session_id}/plan-draft")
+async def update_session_plan_draft(session_id: str, payload: UpdatePlanDraftRequest, request: Request):
+    runtime = request.app.state.runtime
+    session = runtime.session_store.get(session_id)
+    markdown = payload.markdown.strip()
+    if not markdown:
+        session.metadata.pop("plan_draft", None)
+        runtime.session_store.save(session)
+        return {
+            "updated": True,
+            "session_id": session_id,
+            "plan_draft": None,
+        }
+
+    draft_payload = build_plan_draft_payload(markdown, status="draft")
+    session.metadata["plan_draft"] = draft_payload
+    runtime.session_store.save(session)
+    return {
+        "updated": True,
+        "session_id": session_id,
+        "plan_draft": draft_payload,
     }
 
 

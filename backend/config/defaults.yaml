@@ -9,8 +9,6 @@ server:
   cors_origins:
     - "http://localhost:3000"
     - "http://localhost:5173"
-    - "http://localhost:6123"
-    - "http://127.0.0.1:6123"
     - "http://localhost:7775"
     - "http://127.0.0.1:7775"
 

@@ -299,24 +299,98 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 
 ### 5.2 它不保留什么
 
-主对话 prompt 并不会把每条消息的全部字段都注入进去。像这些字段通常不会进入主模型上下文：
+主对话 prompt 并不会把每条消息的全部字段都原样注入进去。像这些字段通常不会直接进入主模型上下文：
 
 - `id`
 - `created_at`
-- 大多数 `metadata`
 - `request_id`
 - `turn_id`
-- 附件列表结构
+- 大部分原始 `metadata` 键值
+- 原始附件路径等审计字段
 
-真正进入主模型的只有以下几类：
+但这里有一个现在很重要的例外：
 
-#### 普通 `user` / `assistant` / `system`
+- `role=user` 且带附件 / `multimodal_parse` 的消息，不会简单用 `message.content` 直传 provider
+- 它会先经过 `backend/runtime/message_rendering.py` 渲染成一条增强版用户消息
+
+真正进入主模型的主要是以下几类：
+
+#### 普通 `assistant` / `system`
 
 直接变成：
 
 ```json
 {"role": "...", "content": "..."}
 ```
+
+#### `user`
+
+普通纯文本 user message 仍然直接映射成：
+
+```json
+{"role": "user", "content": "..."}
+```
+
+但如果该条 user message 带有附件元数据或 `metadata.multimodal_parse`，则 provider 实际看到的是一段渲染后的增强文本，而不是 session 中原始 `content` 的裸值。
+
+例如 session 中保存的是：
+
+```json
+{
+  "role": "user",
+  "content": "帮我看看这张图里的报错是什么意思",
+  "metadata": {
+    "original_content": "帮我看看这张图里的报错是什么意思",
+    "attachments": [
+      {
+        "filename": "error.png",
+        "content_type": "image/png",
+        "summary": "设置页保存后出现 TypeError 报错截图"
+      }
+    ],
+    "multimodal_parse": {
+      "status": "completed",
+      "task_intent": "debug_screenshot",
+      "key_facts": ["保存动作后立即报错", "截图中包含 TypeError"],
+      "ocr_text": ["TypeError: Cannot read properties of undefined"],
+      "uncertainties": ["仅凭截图无法确认根因在前端还是后端"],
+      "normalized_user_input": "请结合截图中的报错，解释原因并指出优先排查的文件或模块。"
+    }
+  }
+}
+```
+
+主模型最终拿到的大致会是：
+
+```md
+## User Original Request
+帮我看看这张图里的报错是什么意思
+
+## Uploaded Attachments
+- error.png (image/png)
+
+## Attachment Observations
+- error.png (image/png): 设置页保存后出现 TypeError 报错截图
+
+## Multimodal Parse
+- Task intent: debug_screenshot
+- Key facts:
+  - 保存动作后立即报错
+  - 截图中包含 TypeError
+- OCR text:
+  - TypeError: Cannot read properties of undefined
+- Uncertainties:
+  - 仅凭截图无法确认根因在前端还是后端
+
+## Normalized User Input
+请结合截图中的报错，解释原因并指出优先排查的文件或模块。
+```
+
+也就是说：
+
+- transcript 保留的是用户原话
+- provider 看到的是“原话 + 附件信息 + 多模态解析 + 归一化请求”的增强版文本
+- 失败时也不会丢 turn，只是把渲染内容降级为“原话 + 附件 + 失败提示”
 
 #### `assistant` 且带 `metadata.tool_calls`
 
@@ -396,7 +470,13 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 
 用户请求一进来，先被写成一条 `SessionMessage(role="user")` 放进 session。
 
-如果有图片上传，还会先做图片分析，然后把分析摘要拼进用户消息正文。
+如果有图片上传，当前实现会按下面顺序处理：
+
+1. 先把附件保存到 `backend_data/uploads/chat/{session_id}/`
+2. 立刻把当前 user turn 以“原始文本 + 附件 metadata”写进 session
+3. 再调用 `models.multimodal` 做图文联合解析
+4. 解析结果回写到 `metadata.multimodal_parse`
+5. 主模型组 prompt 时，再把这条 user message 渲染成增强版文本
 
 例如原始用户输入：
 
@@ -404,19 +484,35 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 帮我看下这张图
 ```
 
-如果上传了 `error.png`，分析结果是“终端截图显示 PostgreSQL 连接失败”，那么真正进 session 的用户消息正文会变成：
+如果上传了 `error.png`，session 中保存的大致会是：
 
-```md
-帮我看下这张图
-
-## Uploaded Images
-- error.png: 终端截图显示 PostgreSQL 连接失败
+```json
+{
+  "role": "user",
+  "content": "帮我看下这张图",
+  "metadata": {
+    "original_content": "帮我看下这张图",
+    "attachments": [
+      {
+        "filename": "error.png",
+        "content_type": "image/png",
+        "summary": "终端截图显示 PostgreSQL 连接失败",
+        "analysis_status": "completed"
+      }
+    ],
+    "multimodal_parse": {
+      "status": "completed",
+      "normalized_user_input": "请结合截图里的报错分析 PostgreSQL 连接失败的可能原因。"
+    }
+  }
+}
 ```
 
 注意：
 
-- 图片摘要会进入 `content`
-- 附件文件路径、content_type 等更多细节只在 metadata 里，不会直接进入主模型 prompt
+- `content` 现在保留用户原话，不再把附件摘要直接拼进去
+- 附件路径、解析状态、结构化图文理解结果都留在 `metadata`
+- 真正进入主模型 prompt 的增强版文本，是在 `PromptAssembler` 阶段现组装的，不是提前改写 transcript
 
 ### 7.2 然后先做一次 `_maybe_checkpoint()`
 
@@ -758,17 +854,20 @@ tools = []
 1. 先塞 1 条大的 system message：`commentary guardrail + stable context`
 2. 再按需塞 1 条 checkpoint system message
 3. 再把当前 `session.messages` 逐条转成 chat messages
-4. 同时把可见工具以独立 `tools schema` 传给 provider
+4. 其中 `user` 消息会在必要时先经过多模态渲染增强
+5. 同时把可见工具以独立 `tools schema` 传给 provider
 
 如果本轮已经发生工具调用、压缩、checkpoint restore、fatal error 或工具上限收口，这些变化会先写回 session，再参与下一次 prompt 组装。
 
 ## 17. 相关源码
 
 - [backend/runtime/prompt_assembler.py](/root/newman/backend/runtime/prompt_assembler.py)
+- [backend/runtime/message_rendering.py](/root/newman/backend/runtime/message_rendering.py)
 - [backend/memory/stable_context.py](/root/newman/backend/memory/stable_context.py)
 - [backend/runtime/run_loop.py](/root/newman/backend/runtime/run_loop.py)
 - [backend/api/routes/messages.py](/root/newman/backend/api/routes/messages.py)
 - [backend/api/routes/sessions.py](/root/newman/backend/api/routes/sessions.py)
+- [backend/providers/multimodal.py](/root/newman/backend/providers/multimodal.py)
 - [backend/providers/openai_compatible.py](/root/newman/backend/providers/openai_compatible.py)
 - [backend/providers/anthropic_compatible.py](/root/newman/backend/providers/anthropic_compatible.py)
 - [backend_data/memory/Newman.md](/root/newman/backend_data/memory/Newman.md)

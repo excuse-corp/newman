@@ -19,6 +19,7 @@ class ToolMeta:
     risk_level: Literal["low", "medium", "high", "critical"]
     timeout_seconds: int
     approval_behavior: ApprovalBehavior = "safe"
+    force_user_confirmation: bool = False
     requires_approval: bool | None = None
     allowed_paths: list[str] | None = None
     provider_group: str = "core"

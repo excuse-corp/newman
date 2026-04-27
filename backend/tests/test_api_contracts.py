@@ -54,14 +54,18 @@ from fastapi.testclient import TestClient
 from backend.api.middleware.error_handler import install_error_handlers
 from backend.api.routes.approvals import router as approvals_router
 from backend.api.routes.config import router as config_router
+from backend.api.routes.knowledge import router as knowledge_router
 from backend.api.routes.messages import ActiveSessionRun, router as messages_router
 from backend.api.routes.plugins import router as plugins_router
 from backend.api.routes.sessions import router as sessions_router
 from backend.api.routes.skills import router as skills_router
 from backend.api.routes.tools import router as tools_router
 from backend.api.routes.workspace import router as workspace_router
+from backend.config.schema import AppConfig
 from backend.config.loader import reload_settings
 from backend.plugin_runtime.service import PluginService
+from backend.providers.base import ProviderError
+from backend.rag.models import KnowledgeDocument
 from backend.sessions.models import SessionMessage
 from backend.sessions.session_store import SessionStore
 from backend.skill_runtime.registry import SkillRegistry
@@ -78,8 +82,42 @@ class _DummySessionStore:
 
 
 class _DummyMultimodalAnalyzer:
-    async def analyze_images(self, content: str, paths: list[Path]) -> list[dict]:
-        return [{"summary": f"image:{path.name}"} for path in paths]
+    def __init__(self, *, should_fail: bool = False):
+        self.should_fail = should_fail
+
+    async def parse_user_input(
+        self,
+        content: str,
+        paths: list[Path],
+        *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> dict:
+        if self.should_fail:
+            raise ProviderError("openai_compatible", "timeout_error", "OpenAI-compatible request timed out", True)
+        return {
+            "schema_version": "v1",
+            "status": "completed",
+            "parser_provider": "openai_compatible",
+            "parser_model": "dummy-mm",
+            "normalized_user_input": "结合图片理解用户意图",
+            "task_intent": "describe_uploaded_images",
+            "key_facts": [f"image:{path.name}" for path in paths],
+            "ocr_text": [],
+            "uncertainties": [],
+            "attachment_summaries": [f"image:{path.name}" for path in paths],
+        }
+
+    async def analyze_images(
+        self,
+        content: str,
+        paths: list[Path],
+        *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> list[dict]:
+        parsed = await self.parse_user_input(content, paths, session_id=session_id, turn_id=turn_id)
+        return [{"summary": summary} for summary in parsed["attachment_summaries"]]
 
 
 class _DummyMessageRuntime:
@@ -98,6 +136,7 @@ class _DummyMessageRuntime:
         request_id: str | None = None,
         turn_id: str | None = None,
         on_turn_created=None,
+        post_user_message=None,
     ) -> None:
         self.calls.append(
             {
@@ -110,6 +149,60 @@ class _DummyMessageRuntime:
         )
         if callable(on_turn_created):
             on_turn_created(turn_id or "dummy-turn")
+        await emit(
+            "final_response",
+            {
+                "session_id": session_id,
+                "content": "ok",
+                "finish_reason": "stop",
+            },
+        )
+
+
+class _PersistingMessageRuntime:
+    def __init__(self, session_store: SessionStore, multimodal_analyzer: _DummyMultimodalAnalyzer):
+        self.session_store = session_store
+        self.multimodal_analyzer = multimodal_analyzer
+        self.settings = SimpleNamespace(models=SimpleNamespace(multimodal=SimpleNamespace(timeout=120)))
+
+    async def handle_message(
+        self,
+        session_id: str,
+        content: str,
+        emit,
+        user_metadata: dict[str, object] | None = None,
+        turn_approval_mode: str = "manual",
+        request_id: str | None = None,
+        turn_id: str | None = None,
+        on_turn_created=None,
+        post_user_message=None,
+    ) -> None:
+        resolved_turn_id = turn_id or "dummy-turn"
+        message = SessionMessage(
+            id=resolved_turn_id,
+            role="user",
+            content=content,
+            metadata={
+                "turn_id": resolved_turn_id,
+                **({"request_id": request_id} if request_id else {}),
+                **(user_metadata or {}),
+            },
+        )
+        session = self.session_store.append_message(session_id, message)
+        if callable(on_turn_created):
+            on_turn_created(resolved_turn_id)
+        task = SimpleNamespace(session=session, turn_id=resolved_turn_id)
+        if callable(post_user_message):
+            await post_user_message(task, message, emit)
+
+        assistant = SessionMessage(
+            id=f"assistant-{resolved_turn_id}",
+            role="assistant",
+            content="ok",
+            metadata={"turn_id": resolved_turn_id},
+        )
+        session.messages.append(assistant)
+        self.session_store.save(session)
         await emit(
             "final_response",
             {
@@ -136,6 +229,17 @@ class _DummyRegistry:
 class _DummyMCPRegistry:
     def build_tools(self, plugin_configs=None):
         return []
+
+
+class _DummyContextProvider:
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat_stream should not be called in this test")
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
 
 
 class _SkillRuntime:
@@ -181,6 +285,13 @@ def _write_config_project(root: Path, project_config: str) -> None:
 
 
 class MessageRouteTests(unittest.TestCase):
+    def _parse_sse_events(self, response) -> list[dict]:
+        return [
+            json.loads(line.removeprefix("data: ").strip())
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+
     def test_messages_json_parses_approval_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -228,6 +339,67 @@ class MessageRouteTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(runtime.calls[0]["turn_approval_mode"], "manual")
             self.assertEqual(runtime.calls[0]["user_metadata"]["approval_mode"], "manual")
+
+    def test_messages_with_image_updates_user_message_after_analysis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="image-turn")
+            runtime = _PersistingMessageRuntime(session_store, _DummyMultimodalAnalyzer())
+            settings = SimpleNamespace(paths=SimpleNamespace(audit_dir=root / "audit", data_dir=root / "data"))
+            client = TestClient(_build_app(messages_router, runtime=runtime, settings=settings))
+
+            response = client.post(
+                f"/api/sessions/{session.session_id}/messages",
+                data={"content": "看看这张图"},
+                files={"images": ("demo.png", b"fake-png", "image/png")},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            saved = session_store.get(session.session_id)
+            self.assertEqual(saved.messages[0].role, "user")
+            self.assertEqual(saved.messages[0].content, "看看这张图")
+            self.assertEqual(saved.messages[0].metadata["original_content"], "看看这张图")
+            self.assertEqual(saved.messages[0].metadata["attachments"][0]["analysis_status"], "completed")
+            self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["status"], "completed")
+            self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["normalized_user_input"], "结合图片理解用户意图")
+            self.assertEqual(saved.messages[-1].role, "assistant")
+
+            events = self._parse_sse_events(response)
+            processed = next(payload for payload in events if payload["event"] == "attachment_processed")
+            self.assertTrue(processed["data"]["ok"])
+
+    def test_messages_with_image_timeout_keeps_turn_and_records_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="image-timeout")
+            runtime = _PersistingMessageRuntime(session_store, _DummyMultimodalAnalyzer(should_fail=True))
+            settings = SimpleNamespace(paths=SimpleNamespace(audit_dir=root / "audit", data_dir=root / "data"))
+            client = TestClient(_build_app(messages_router, runtime=runtime, settings=settings))
+
+            response = client.post(
+                f"/api/sessions/{session.session_id}/messages",
+                data={"content": "看看这张图"},
+                files={"images": ("demo.png", b"fake-png", "image/png")},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            saved = session_store.get(session.session_id)
+            self.assertEqual(saved.messages[0].role, "user")
+            self.assertEqual(saved.messages[0].content, "看看这张图")
+            self.assertEqual(saved.messages[0].metadata["attachments"][0]["analysis_status"], "failed")
+            self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["status"], "failed")
+            self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["frontend_message"], "图片预解析超时，已跳过图片内容解析")
+            self.assertEqual(saved.messages[1].role, "system")
+            self.assertEqual(saved.messages[1].metadata["type"], "attachment_analysis_warning")
+            self.assertEqual(saved.messages[-1].role, "assistant")
+
+            events = self._parse_sse_events(response)
+            processed = next(payload for payload in events if payload["event"] == "attachment_processed")
+            self.assertFalse(processed["data"]["ok"])
+            self.assertEqual(processed["data"]["category"], "timeout_error")
+            self.assertTrue(any(payload["event"] == "final_response" for payload in events))
 
     def test_interrupt_route_persists_turn_interrupted_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -768,6 +940,110 @@ class WorkspaceRouteTests(unittest.TestCase):
             self.assertIsNotNone(payload["latest_updated_at"])
             self.assertIn("updated_at", payload["files"]["memory"])
             self.assertIn("updated_at", payload["files"]["user"])
+
+
+class KnowledgeRouteTests(unittest.TestCase):
+    def test_document_detail_returns_preview_markdown(self) -> None:
+        document = KnowledgeDocument(
+            document_id="doc-1",
+            title="demo.md",
+            source_path="/tmp/demo.md",
+            stored_path="/tmp/stored-demo.md",
+            size_bytes=128,
+            content_type="text/markdown",
+            parser="markdown",
+            chunk_count=3,
+            page_count=None,
+        )
+        service = SimpleNamespace(
+            get_document=lambda document_id: document if document_id == "doc-1" else None,
+            build_document_preview=lambda document_id: "# demo.md\n\npreview",
+        )
+
+        with patch("backend.api.routes.knowledge._service", return_value=service):
+            client = TestClient(_build_app(knowledge_router, settings=SimpleNamespace()))
+
+            response = client.get("/api/knowledge/documents/doc-1")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["document"]["document_id"], "doc-1")
+        self.assertIn("preview", payload["preview_markdown"])
+
+
+class SessionRouteTests(unittest.TestCase):
+    def test_session_detail_returns_collaboration_mode_and_plans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_dir = Path(tmp) / "sessions"
+            session_store = SessionStore(sessions_dir)
+            session = session_store.create(title="plan-session")
+            session.metadata.update(
+                {
+                    "collaboration_mode": {
+                        "mode": "plan",
+                        "source": "tool",
+                        "updated_at": "2026-04-22T00:00:00+00:00",
+                    },
+                    "plan_draft": {
+                        "markdown": "# 方案\n\n- 先改后端\n- 再跑测试",
+                        "status": "draft",
+                        "updated_at": "2026-04-22T00:00:00+00:00",
+                    },
+                    "approved_plan": {
+                        "markdown": "1. 先改后端\n2. 再跑测试",
+                        "approved_at": "2026-04-22T00:10:00+00:00",
+                    },
+                }
+            )
+            session_store.save(session)
+
+            runtime = SimpleNamespace(
+                session_store=session_store,
+                checkpoints=SimpleNamespace(get=lambda session_id: None),
+                settings=AppConfig(),
+                provider=_DummyContextProvider(),
+            )
+            client = TestClient(_build_app(sessions_router, runtime=runtime, settings=runtime.settings))
+
+            response = client.get(f"/api/sessions/{session.session_id}")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["collaboration_mode"]["mode"], "plan")
+            self.assertEqual(payload["plan_draft"]["status"], "draft")
+            self.assertIn("先改后端", payload["approved_plan"]["markdown"])
+
+    def test_session_routes_can_update_mode_and_plan_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_dir = Path(tmp) / "sessions"
+            session_store = SessionStore(sessions_dir)
+            session = session_store.create(title="manual-plan")
+
+            runtime = SimpleNamespace(
+                session_store=session_store,
+                checkpoints=SimpleNamespace(get=lambda session_id: None),
+                settings=AppConfig(),
+                provider=_DummyContextProvider(),
+            )
+            client = TestClient(_build_app(sessions_router, runtime=runtime, settings=runtime.settings))
+
+            mode_response = client.patch(
+                f"/api/sessions/{session.session_id}/collaboration-mode",
+                json={"mode": "plan"},
+            )
+            self.assertEqual(mode_response.status_code, 200)
+            self.assertEqual(mode_response.json()["collaboration_mode"]["mode"], "plan")
+
+            draft_response = client.put(
+                f"/api/sessions/{session.session_id}/plan-draft",
+                json={"markdown": "# Draft\n\n- 先确认需求"},
+            )
+            self.assertEqual(draft_response.status_code, 200)
+            self.assertEqual(draft_response.json()["plan_draft"]["status"], "draft")
+
+            get_response = client.get(f"/api/sessions/{session.session_id}/plan-draft")
+            self.assertEqual(get_response.status_code, 200)
+            self.assertIn("先确认需求", get_response.json()["plan_draft"]["markdown"])
 
 
 class SessionEventsRouteTests(unittest.TestCase):

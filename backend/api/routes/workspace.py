@@ -122,6 +122,26 @@ async def get_workspace_file_content(request: Request, path: str):
     return response
 
 
+@router.get("/upload-content")
+async def get_uploaded_file_content(request: Request, path: str):
+    settings = request.app.state.settings
+    target = Path(path).resolve()
+    uploads_root = (settings.paths.data_dir / "uploads" / "chat").resolve()
+    try:
+        target.relative_to(uploads_root)
+    except ValueError as exc:
+        raise ValueError("path 不在允许读取的上传目录内") from exc
+    if not target.exists():
+        raise FileNotFoundError(f"Path not found: {target}")
+    if not target.is_file():
+        raise ValueError("path 必须指向文件")
+
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    response = FileResponse(target, media_type=media_type)
+    response.headers["content-disposition"] = f'inline; filename="{target.name}"'
+    return response
+
+
 def _path_updated_at(path: Path) -> str | None:
     if not path.exists():
         return None

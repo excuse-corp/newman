@@ -41,6 +41,67 @@ class KnowledgeBaseService:
     def list_documents(self) -> list[KnowledgeDocument]:
         return self.store.list_documents()
 
+    def get_document(self, document_id: str) -> KnowledgeDocument | None:
+        return self.store.get_document(document_id)
+
+    def build_document_preview(self, document_id: str, *, max_chunks: int = 8, max_chars: int = 5200) -> str:
+        document = self.store.get_document(document_id)
+        if document is None:
+            raise FileNotFoundError(f"文档不存在: {document_id}")
+
+        chunks = self.store.list_document_chunks(document_id, limit=max_chunks)
+        lines = [
+            f"# {document.title}",
+            "",
+            "> 预览内容基于已入库的解析片段生成，用于快速检查知识文件是否导入正确。",
+            "",
+            "## 文档信息",
+            "",
+            f"- 解析器：`{document.parser}`",
+            f"- 文件类型：`{document.content_type}`",
+            f"- 切片数量：{document.chunk_count}",
+        ]
+
+        if document.page_count is not None:
+            lines.append(f"- 页数：{document.page_count}")
+
+        lines.extend(["", "## Markdown 预览", ""])
+
+        if not chunks:
+            lines.append("当前文档已入库，但暂时没有可展示的解析片段。")
+            return "\n".join(lines)
+
+        remaining = max_chars
+        rendered_count = 0
+        for chunk in chunks:
+            snippet = " ".join(chunk.text.split())
+            if not snippet:
+                continue
+
+            label_parts: list[str] = []
+            if chunk.page_number is not None:
+                label_parts.append(f"第 {chunk.page_number} 页")
+            if chunk.location_label:
+                label_parts.append(str(chunk.location_label))
+            if not label_parts:
+                label_parts.append(f"片段 {chunk.chunk_index + 1}")
+
+            if len(snippet) > remaining:
+                if remaining <= 0:
+                    break
+                snippet = f"{snippet[: max(remaining - 1, 1)].rstrip()}…"
+
+            lines.extend([f"### {' / '.join(label_parts)}", "", snippet, ""])
+            remaining -= len(snippet)
+            rendered_count += 1
+            if remaining <= 0:
+                break
+
+        if document.chunk_count > rendered_count:
+            lines.append(f"_当前仅展示前 {rendered_count} 个片段，完整内容已入库用于检索。_")
+
+        return "\n".join(lines).strip()
+
     async def import_document(self, source_path: str) -> KnowledgeDocument:
         raw_path = Path(source_path)
         source = (self.workspace / raw_path).resolve() if not raw_path.is_absolute() else raw_path.resolve()

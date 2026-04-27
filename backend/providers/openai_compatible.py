@@ -101,6 +101,7 @@ class OpenAICompatibleProvider(BaseProvider):
         except httpx.TimeoutException as exc:
             raise ProviderError("openai_compatible", "timeout_error", "OpenAI-compatible streaming request timed out", True) from exc
         except httpx.HTTPStatusError as exc:
+            await _consume_error_response(exc.response)
             raise _http_error("openai_compatible", exc) from exc
         except httpx.HTTPError as exc:
             raise ProviderError("openai_compatible", "network_error", f"OpenAI-compatible streaming failed: {exc}", True) from exc
@@ -186,13 +187,31 @@ async def _iter_sse_json(response: httpx.Response) -> AsyncIterator[dict[str, An
 
 def _http_error(provider: str, exc: httpx.HTTPStatusError) -> ProviderError:
     status_code = exc.response.status_code
+    details = _response_error_details(exc.response)
     if status_code in {401, 403}:
-        return ProviderError(provider, "auth_error", f"{provider} authentication failed", False, status_code=status_code)
+        return ProviderError(provider, "auth_error", f"{provider} authentication failed", False, status_code=status_code, details=details)
     if status_code == 429:
-        return ProviderError(provider, "rate_limit_error", f"{provider} rate limited", True, status_code=status_code)
+        return ProviderError(provider, "rate_limit_error", f"{provider} rate limited", True, status_code=status_code, details=details)
     if status_code >= 500:
-        return ProviderError(provider, "upstream_error", f"{provider} upstream server error", True, status_code=status_code)
-    return ProviderError(provider, "request_error", f"{provider} request failed with status {status_code}", False, status_code=status_code)
+        return ProviderError(provider, "upstream_error", f"{provider} upstream server error", True, status_code=status_code, details=details)
+    return ProviderError(provider, "request_error", f"{provider} request failed with status {status_code}", False, status_code=status_code, details=details)
+
+
+def _response_error_details(response: httpx.Response) -> dict[str, Any]:
+    try:
+        text = response.text.strip()
+    except httpx.ResponseNotRead:
+        return {}
+    if not text:
+        return {}
+    return {"response_text": text[:2_000]}
+
+
+async def _consume_error_response(response: httpx.Response) -> None:
+    try:
+        await response.aread()
+    except (httpx.StreamError, RuntimeError):
+        return
 
 
 def _build_auth_headers(api_key: str | None) -> dict[str, str]:

@@ -119,6 +119,29 @@ class FakeLevel2Tool(BaseTool):
         )
 
 
+class FakePlanModeTool(BaseTool):
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.meta = ToolMeta(
+            name="enter_plan_mode",
+            description="enter plan mode",
+            input_schema={"type": "object"},
+            risk_level="low",
+            timeout_seconds=5,
+            approval_behavior="confirmable",
+            force_user_confirmation=True,
+        )
+
+    async def run(self, arguments: dict, session_id: str) -> ToolExecutionResult:
+        self.calls.append({"arguments": arguments, "session_id": session_id})
+        return ToolExecutionResult(
+            success=True,
+            tool=self.meta.name,
+            action="execute",
+            summary="plan mode entered",
+        )
+
+
 class TurnApprovalTests(unittest.IsolatedAsyncioTestCase):
     async def test_auto_allow_skips_optional_approval(self):
         approvals = ApprovalManager()
@@ -218,6 +241,37 @@ class TurnApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         self.assertEqual(len(tool.calls), 1)
         self.assertEqual([name for name, _ in events], [])
+
+    async def test_force_user_confirmation_still_prompts_in_auto_allow(self):
+        approvals = ApprovalManager()
+        orchestrator = ToolOrchestrator(AppConfig(), approvals)
+        tool = FakePlanModeTool()
+        events: list[tuple[str, dict]] = []
+
+        async def emit(event: str, data: dict) -> None:
+            events.append((event, data))
+
+        task = asyncio.create_task(
+            orchestrator.execute(
+                tool,
+                {},
+                "session-plan",
+                emit,
+                turn_approval_mode="auto_allow",
+            )
+        )
+
+        await asyncio.sleep(0)
+
+        self.assertEqual(events[0][0], "tool_approval_request")
+        approval_request_id = events[0][1]["approval_request_id"]
+        approvals.resolve(approval_request_id, True)
+
+        result = await task
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(tool.calls), 1)
+        self.assertEqual([name for name, _ in events], ["tool_approval_request", "tool_approval_resolved"])
         self.assertIsNone(approvals.find_for_session("session-auto-manual-required"))
 
     async def test_auto_allow_does_not_bypass_level1_denies(self):

@@ -29,7 +29,7 @@ class SessionRecord(BaseModel):
 
 class PlanStep(BaseModel):
     step: str = Field(..., min_length=1)
-    status: Literal["pending", "in_progress", "completed"]
+    status: Literal["pending", "in_progress", "completed", "blocked", "cancelled"]
 
 
 class SessionPlan(BaseModel):
@@ -44,15 +44,41 @@ class SessionPlan(BaseModel):
         in_progress = [step for step in self.steps if step.status == "in_progress"]
         if len(in_progress) > 1:
             raise ValueError("同一时间只能有一个 in_progress 步骤")
+        blocked = [step for step in self.steps if step.status == "blocked"]
         counts = {
             "total": len(self.steps),
             "completed": sum(1 for step in self.steps if step.status == "completed"),
             "in_progress": len(in_progress),
             "pending": sum(1 for step in self.steps if step.status == "pending"),
+            "blocked": len(blocked),
+            "cancelled": sum(1 for step in self.steps if step.status == "cancelled"),
         }
-        self.current_step = in_progress[0].step if in_progress else None
+        self.current_step = (
+            in_progress[0].step
+            if in_progress
+            else blocked[0].step
+            if blocked
+            else next((step.step for step in self.steps if step.status == "pending"), None)
+        )
         self.progress = counts
         return self
+
+
+class SessionCollaborationMode(BaseModel):
+    mode: Literal["default", "plan"] = "default"
+    source: Literal["manual", "tool"] = "manual"
+    updated_at: str = Field(default_factory=utc_now)
+
+
+class SessionPlanDraft(BaseModel):
+    markdown: str = Field(..., min_length=1)
+    status: Literal["draft", "awaiting_approval", "approved"] = "draft"
+    updated_at: str = Field(default_factory=utc_now)
+
+
+class ApprovedPlan(BaseModel):
+    markdown: str = Field(..., min_length=1)
+    approved_at: str = Field(default_factory=utc_now)
 
 
 class SessionSummary(BaseModel):

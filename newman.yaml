@@ -83,7 +83,7 @@ channels:
     enabled: true
 
 paths:
-  workspace: "."
+  workspace: "/root/newman/test_runtimespace"
   data_dir: "backend_data"
   sessions_dir: "backend_data/sessions"
   memory_dir: "backend_data/memory"

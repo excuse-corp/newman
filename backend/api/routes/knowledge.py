@@ -39,6 +39,19 @@ async def list_documents(request: Request):
     return {"documents": [item.model_dump(mode="json") for item in service.list_documents()]}
 
 
+@router.get("/documents/{document_id}")
+async def get_document_detail(document_id: str, request: Request):
+    service = _service(request)
+    document = service.get_document(document_id)
+    if document is None:
+        raise FileNotFoundError(f"文档不存在: {document_id}")
+
+    return {
+        "document": document.model_dump(mode="json"),
+        "preview_markdown": service.build_document_preview(document_id),
+    }
+
+
 @router.post("/documents/import")
 async def import_document(payload: ImportKnowledgeRequest, request: Request):
     service = _service(request)

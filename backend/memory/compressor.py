@@ -9,6 +9,7 @@ from typing import Any
 from backend.config.schema import ModelConfig
 from backend.config.schema import RuntimeConfig
 from backend.providers.base import BaseProvider, ProviderError, TokenUsage
+from backend.runtime.message_rendering import build_user_message_for_provider
 from backend.sessions.models import CheckpointRecord
 from backend.sessions.models import SessionMessage
 from backend.sessions.models import SessionRecord
@@ -463,6 +464,9 @@ def _provider_message_from_session_message(message: SessionMessage) -> dict[str,
         if isinstance(tool_call_id, str) and tool_call_id:
             payload["tool_call_id"] = tool_call_id
         return payload
+
+    if message.role == "user":
+        return {"role": "user", "content": build_user_message_for_provider(message)}
 
     return {"role": message.role, "content": message.content}
 

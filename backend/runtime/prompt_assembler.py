@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 
 from backend.memory.stable_context import StableContextLoader
+from backend.runtime.collaboration_mode import build_collaboration_mode_prompt
+from backend.runtime.message_rendering import build_user_message_for_provider
 from backend.sessions.models import CheckpointRecord, SessionMessage, SessionRecord
 
 
@@ -27,14 +29,26 @@ class PromptAssembler:
         tool_message_overrides: dict[str, SessionMessage] | None = None,
     ) -> list[dict]:
         stable_context = self.stable_context_loader.build(tools_overview)
-        messages = [{"role": "system", "content": f"{COMMENTARY_SYSTEM_GUARDRAIL}\n\n{stable_context}"}]
+        system_sections = [
+            f"{COMMENTARY_SYSTEM_GUARDRAIL}\n\n{stable_context}",
+            build_collaboration_mode_prompt(session),
+        ]
         overrides = tool_message_overrides or {}
+        failed_tool_call_ids = {
+            str(item.metadata.get("tool_call_id"))
+            for item in session.messages
+            if item.role == "tool"
+            and item.metadata.get("success") is False
+            and isinstance(item.metadata.get("tool_call_id"), str)
+            and str(item.metadata.get("tool_call_id")).strip()
+        }
         has_restored_checkpoint = any(
             item.role == "system" and item.metadata.get("type") == "checkpoint_restore"
             for item in session.messages
         )
         if checkpoint and not has_restored_checkpoint:
-            messages.append({"role": "system", "content": f"## Checkpoint Summary\n{checkpoint.summary}"})
+            system_sections.append(f"## Checkpoint Summary\n{checkpoint.summary}")
+        messages = [{"role": "system", "content": "\n\n".join(system_sections)}]
         for item in session.messages:
             if item.role == "assistant":
                 tool_calls = item.metadata.get("tool_calls")
@@ -43,13 +57,16 @@ class PromptAssembler:
                     for raw_tool_call in tool_calls:
                         if not isinstance(raw_tool_call, dict):
                             continue
+                        tool_call_id = str(raw_tool_call.get("id") or "")
+                        if tool_call_id and tool_call_id in failed_tool_call_ids:
+                            continue
                         name = raw_tool_call.get("name")
                         arguments = raw_tool_call.get("arguments", {})
                         if not isinstance(name, str) or not name:
                             continue
                         provider_tool_calls.append(
                             {
-                                "id": str(raw_tool_call.get("id") or ""),
+                                "id": tool_call_id,
                                 "type": "function",
                                 "function": {
                                     "name": name,
@@ -67,6 +84,8 @@ class PromptAssembler:
                 source_item = item
                 tool_call_id = item.metadata.get("tool_call_id")
                 if isinstance(tool_call_id, str) and tool_call_id:
+                    if tool_call_id in failed_tool_call_ids:
+                        continue
                     override = overrides.get(tool_call_id)
                     if override is not None:
                         source_item = override
@@ -77,5 +96,6 @@ class PromptAssembler:
                 messages.append(message)
                 continue
 
-            messages.append({"role": item.role, "content": item.content})
+            content = build_user_message_for_provider(item) if item.role == "user" else item.content
+            messages.append({"role": item.role, "content": content})
         return messages

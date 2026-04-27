@@ -22,7 +22,10 @@ class UpdatePlanTool(BaseTool):
     def __init__(self):
         self.meta = ToolMeta(
             name="update_plan",
-            description="Create or update the current multi-step plan for this session. Use it for complex tasks, and keep at most one step in_progress.",
+            description=(
+                "Create or update the current multi-step checklist for this session. Use it for complex tasks,"
+                " keep at most one step in_progress, and mark blocked or cancelled work explicitly when needed."
+            ),
             input_schema={
                 "type": "object",
                 "properties": {
@@ -36,7 +39,7 @@ class UpdatePlanTool(BaseTool):
                                 "step": {"type": "string"},
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"],
+                                    "enum": ["pending", "in_progress", "completed", "blocked", "cancelled"],
                                 },
                             },
                             "required": ["step", "status"],

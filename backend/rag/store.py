@@ -81,6 +81,13 @@ class PostgresRAGStore:
             row = cur.fetchone()
         return self._document_from_row(row) if row else None
 
+    def get_document(self, document_id: str) -> KnowledgeDocument | None:
+        self.ensure_schema()
+        with self._connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM rag_documents WHERE document_id = %s", (document_id,))
+            row = cur.fetchone()
+        return self._document_from_row(row) if row else None
+
     def replace_document(self, document: KnowledgeDocument, chunks: list[KnowledgeChunk]) -> None:
         self.ensure_schema()
         with self._connect() as conn:
@@ -159,6 +166,23 @@ class PostgresRAGStore:
                 """,
                 (ids,),
             )
+            rows = cur.fetchall()
+        return [self._chunk_from_row(row) for row in rows]
+
+    def list_document_chunks(self, document_id: str, limit: int | None = None) -> list[KnowledgeChunk]:
+        self.ensure_schema()
+        sql = """
+            SELECT * FROM rag_chunks
+            WHERE document_id = %s
+            ORDER BY chunk_index
+        """
+        params: tuple[object, ...] = (document_id,)
+        if limit is not None:
+            sql += " LIMIT %s"
+            params = (document_id, limit)
+
+        with self._connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, params)
             rows = cur.fetchall()
         return [self._chunk_from_row(row) for row in rows]
 

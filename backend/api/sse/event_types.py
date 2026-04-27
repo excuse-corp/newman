@@ -12,6 +12,8 @@ EVENT_TYPES = [
     "tool_retry_scheduled",
     "hook_triggered",
     "plan_updated",
+    "collaboration_mode_changed",
+    "plan_draft_updated",
     "tool_approval_request",
     "tool_approval_resolved",
     "tool_error_feedback",

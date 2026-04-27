@@ -1,6 +1,6 @@
-# Newman API 文档 v1.4
+# Newman API 文档 v1.5
 
-2026 · Phase 4 基线接口 + Stable Memory 抽取 + 轻量多阶段规划 + Linux 原生沙箱
+2026 · Phase 4 基线接口 + Stable Memory 抽取 + 轻量多阶段规划 + Linux 原生沙箱 + 多模态输入归一化
 
 本文档对应当前已落地的 FastAPI 接口与 SSE 事件协议实现，覆盖：
 
@@ -9,12 +9,15 @@
 - Phase 4：前端工作台所需工作区接口、会话压缩入口、Channels webhook 基线
 - Phase 4.5：轻量多阶段任务规划、文件导航与安全编辑工具
 - Phase 4.6：Linux 原生终端沙箱（bubblewrap）
+- Phase 4.7：图文联合解析与归一化用户输入
 
 代码入口：
 
 - [app.py](/root/newman/backend/api/app.py)
 - [sessions.py](/root/newman/backend/api/routes/sessions.py)
 - [messages.py](/root/newman/backend/api/routes/messages.py)
+- [message_rendering.py](/root/newman/backend/runtime/message_rendering.py)
+- [multimodal.py](/root/newman/backend/providers/multimodal.py)
 - [config.py](/root/newman/backend/api/routes/config.py)
 - [workspace.py](/root/newman/backend/api/routes/workspace.py)
 - [plugins.py](/root/newman/backend/api/routes/plugins.py)
@@ -272,12 +275,46 @@ text/event-stream
       {
         "id": "turn_user_001",
         "role": "user",
-        "content": "帮我检查一下前端 timeline 实现",
+        "content": "帮我看看这张图里的报错是什么意思",
         "created_at": "2026-04-12T08:30:00+00:00",
         "metadata": {
           "approval_mode": "manual",
           "turn_id": "turn_user_001",
-          "request_id": "req_abc123"
+          "request_id": "req_abc123",
+          "original_content": "帮我看看这张图里的报错是什么意思",
+          "input_modalities": ["text", "image"],
+          "attachments": [
+            {
+              "attachment_id": "att_001",
+              "kind": "image",
+              "filename": "error.png",
+              "content_type": "image/png",
+              "path": "/root/newman/backend_data/uploads/chat/1c2030c74d144c40aef2b0e6f59718f5/error.png",
+              "summary": "设置页保存后出现 TypeError 报错截图",
+              "analysis_status": "completed"
+            }
+          ],
+          "multimodal_parse": {
+            "schema_version": "v1",
+            "status": "completed",
+            "parser_provider": "openai_compatible",
+            "parser_model": "qwen-vl-plus",
+            "normalized_user_input": "请结合截图中的报错，解释原因并指出优先排查的文件或模块。",
+            "task_intent": "debug_screenshot",
+            "key_facts": [
+              "保存动作后立即报错",
+              "截图中包含 TypeError"
+            ],
+            "ocr_text": [
+              "TypeError: Cannot read properties of undefined"
+            ],
+            "uncertainties": [
+              "仅凭截图无法确认根因在前端还是后端"
+            ],
+            "attachment_summaries": [
+              "设置页保存后出现 TypeError 报错截图"
+            ]
+          }
         }
       },
       {
@@ -372,6 +409,10 @@ text/event-stream
 - 只有在模型调用 `update_plan` 工具后，`plan` 才会出现。
 - Web chat 回合里的 `session.messages[*].metadata` 现在会尽量补齐 `turn_id`，便于前端把同一轮的用户消息、过程事件和最终回答聚合成一个 turn 容器。
 - 通过 `/api/sessions/{session_id}/messages` 发起的 HTTP 回合，消息元数据通常还会包含 `request_id`；最终 assistant 消息会额外写入 `finish_reason`。
+- 带附件的用户消息现在会保留原始 `content`，并把图片解析结果写入 `metadata.multimodal_parse`；前端展示用户气泡时应优先读取 `metadata.original_content`。
+- `metadata.input_modalities` 表示本轮输入模态集合；当前 web chat 已落地 `text` 与 `image`。
+- `metadata.attachments[*].summary` 是单附件摘要；`metadata.multimodal_parse.normalized_user_input` 是给主模型和工具路由使用的整轮归一化请求，两者不要混用。
+- 若图片预解析失败，`metadata.multimodal_parse.status = "failed"`，并会额外追加一条 `role=system`、`metadata.type = "attachment_analysis_warning"` 的告警消息。
 - `context_usage.effective_context_window` 使用的是“有效上下文窗口”，当前定义为配置的模型 `context_window * 95%`。
 - `context_usage.auto_compact_limit` 是运行时真正用来判断自动压缩的阈值，已经扣除了回答预留、压缩预留和安全缓冲。
 - `context_usage.confirmed_*` 表示最近一次真实模型请求里已确认的 prompt 占用；只有最近一条 `counts_toward_context_window=true` 且 `usage_available=true` 的记录才会填充这些字段。
@@ -619,9 +660,11 @@ text/event-stream
 当上传图片时，后端会：
 
 1. 保存原始图片到 `backend_data/uploads/chat/{session_id}/`
-2. 调用 `models.multimodal` 做图片解析
-3. 将图片解析摘要拼接进本轮用户输入
-4. 把附件信息写入该条 user message 的 `metadata.attachments`
+2. 先把当前 user message 持久化到 session，正文仍保留用户原话
+3. 调用 `models.multimodal` 做“图文联合解析”
+4. 将单图片摘要写入 `metadata.attachments[*].summary`
+5. 将整轮解析结果写入 `metadata.multimodal_parse`
+6. 主模型后续看到的是“原始请求 + 附件信息 + 归一化输入”的增强版消息；session transcript 里仍保留原话
 
 审批模式说明：
 
@@ -630,6 +673,71 @@ text/event-stream
 - `auto_approve_level2` 只影响 Level 2 命中的审批；工具自身 `requires_approval=true` 的 mandatory 审批仍需人工确认
 - 用户发送后即使在前端切换 UI 选项，也不会影响已经开始执行的这一轮
 - 未传 `approval_mode` 时，默认值为 `manual`
+
+多模态解析字段说明：
+
+- `metadata.original_content`: 用户本轮原始文本；当前前端构建 turn 时应优先用它作为 user bubble 文本
+- `metadata.attachments`: 附件列表，包含文件名、路径、摘要、解析状态
+- `metadata.multimodal_parse.schema_version`: 当前固定为 `v1`
+- `metadata.multimodal_parse.status`:
+  - `completed`: 已完成图文联合解析
+  - `failed`: 多模态解析失败，本轮继续按原始文本推进
+- `metadata.multimodal_parse.normalized_user_input`: 面向主模型和工具路由的归一化请求
+- `metadata.multimodal_parse.task_intent`: 对任务类型的简要归类
+- `metadata.multimodal_parse.key_facts`: 与任务最相关的视觉事实
+- `metadata.multimodal_parse.ocr_text`: 从图片里读到的关键文本
+- `metadata.multimodal_parse.uncertainties`: 当前仍无法确认的点
+- `metadata.multimodal_parse.attachment_summaries`: 与附件顺序一一对应的简短摘要
+
+一个带图消息的 user message 示例：
+
+```json
+{
+  "id": "turn_user_001",
+  "role": "user",
+  "content": "帮我看看这张图里的报错是什么意思",
+  "created_at": "2026-04-12T08:30:00+00:00",
+  "metadata": {
+    "approval_mode": "manual",
+    "turn_id": "turn_user_001",
+    "request_id": "req_abc123",
+    "original_content": "帮我看看这张图里的报错是什么意思",
+    "input_modalities": ["text", "image"],
+    "attachments": [
+      {
+        "attachment_id": "att_001",
+        "kind": "image",
+        "filename": "error.png",
+        "content_type": "image/png",
+        "path": "/root/newman/backend_data/uploads/chat/1c2030c74d144c40aef2b0e6f59718f5/error.png",
+        "summary": "设置页保存后出现 TypeError 报错截图",
+        "analysis_status": "completed"
+      }
+    ],
+    "multimodal_parse": {
+      "schema_version": "v1",
+      "status": "completed",
+      "parser_provider": "openai_compatible",
+      "parser_model": "qwen-vl-plus",
+      "normalized_user_input": "请结合截图中的报错，解释原因并指出优先排查的文件或模块。",
+      "task_intent": "debug_screenshot",
+      "key_facts": [
+        "保存动作后立即报错",
+        "截图中包含 TypeError"
+      ],
+      "ocr_text": [
+        "TypeError: Cannot read properties of undefined"
+      ],
+      "uncertainties": [
+        "仅凭截图无法确认根因在前端还是后端"
+      ],
+      "attachment_summaries": [
+        "设置页保存后出现 TypeError 报错截图"
+      ]
+    }
+  }
+}
+```
 
 响应类型：
 
@@ -648,6 +756,15 @@ text/event-stream
 - 插件 hook 会通过 `hook_triggered` 事件回传
 - 结束时统一发送 `stream_completed`
 - 若需要主动停止当前回合，可调用 `POST /api/sessions/{session_id}/interrupt`
+
+多模态失败退化规则：
+
+- 如果 `models.multimodal` 调用超时或失败，后端不会丢弃本轮 user turn
+- 当前 user message 会保留原始 `content`
+- `metadata.attachments[*].analysis_status = "failed"`
+- `metadata.multimodal_parse.status = "failed"`
+- session 中会追加一条 `attachment_analysis_warning` system message
+- SSE 仍会继续返回本轮最终回答，同时发出 `attachment_processed { ok: false }`
 
 工具深度上限说明：
 

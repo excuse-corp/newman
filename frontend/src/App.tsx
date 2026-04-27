@@ -2,14 +2,25 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import logo from "./assets/newman-logo.png";
-import MessageContent, { type ChatAttachment } from "./chat/MessageContent";
+import MessageContent, { type ChatAttachment, type HtmlPreviewPayload } from "./chat/MessageContent";
+import { highlightCode, inferLanguageFromPath } from "./chat/codeHighlight";
+import FilesLibraryPage from "./pages/FilesLibraryPage";
 import "./styles.css";
 
 type WorkspacePage = "chat" | "memory" | "skills" | "files" | "settings";
 type MemoryKey = "memory" | "user";
 type TurnApprovalMode = "manual" | "auto_allow";
+type CollaborationModeName = "default" | "plan";
+type PlanStepStatus = "pending" | "in_progress" | "completed" | "blocked" | "cancelled";
 type UiTheme = "classic" | "coral";
 type StatusTagTone = "blue" | "green" | "orange";
+
+type SessionPlanPayload = {
+  explanation?: string | null;
+  current_step?: string | null;
+  progress?: Record<string, number>;
+  steps?: Array<{ step: string; status: PlanStepStatus | string }>;
+} | null;
 
 type MemoryFile = {
   path: string;
@@ -71,11 +82,20 @@ type SessionRecordDetail = {
 
 type SessionDetailResponse = {
   session: SessionRecordDetail;
-  plan?: {
-    explanation?: string | null;
-    current_step?: string | null;
-    progress?: Record<string, number>;
-    steps?: Array<{ step: string; status: string }>;
+  plan?: SessionPlanPayload;
+  collaboration_mode?: {
+    mode: CollaborationModeName;
+    source: "manual" | "tool";
+    updated_at: string;
+  } | null;
+  plan_draft?: {
+    markdown: string;
+    status: "draft" | "awaiting_approval" | "approved";
+    updated_at: string;
+  } | null;
+  approved_plan?: {
+    markdown: string;
+    approved_at: string;
   } | null;
   context_usage?: {
     effective_context_window: number;
@@ -131,7 +151,7 @@ type TraceEntry = {
   turnId?: string | null;
 };
 
-type SecondaryCardType = "terminal" | "file" | "search" | "network" | "plan" | "generic";
+type SecondaryCardType = "terminal" | "file" | "search" | "network" | "plan" | "attachment" | "generic";
 type TimelineNodeKind = "thinking" | "progress" | "system_meta" | "answer_start" | "approval";
 type TimelineNodeState = "running" | "completed" | "failed" | "pending" | "approved" | "rejected" | "recovering" | "updated";
 type TimelineMarkerIconName =
@@ -162,6 +182,7 @@ type TimelineSecondaryItem = {
   meta: string[];
   command?: string | null;
   output?: string | null;
+  argumentsPayload?: Record<string, unknown> | null;
   outputLineCount: number;
   detail: TraceEntry;
 };
@@ -220,10 +241,33 @@ type LiveTurnState = {
   status: TurnStatus;
 };
 
+type LiveAnswerQueueItem =
+  | {
+      kind: "reset";
+    }
+  | {
+      kind: "delta";
+      delta: string;
+    }
+  | {
+      kind: "snapshot";
+      content: string;
+    };
+
+type PendingFinalAnswer = {
+  localId: string;
+  content: string;
+  finishReason: string | null;
+  assistantMessageId: string | null;
+  createdAt: string | null;
+};
+
 type ComposerAttachment = ChatAttachment & {
   file: File;
   previewUrl: string;
 };
+
+type HtmlPreviewState = HtmlPreviewPayload;
 
 type SkillSummary = {
   name: string;
@@ -377,6 +421,32 @@ const approvalModeMeta: Record<
     helper: "本轮所有需要审批的工具都要你逐个点击确认后才继续。"
   }
 };
+
+type ComposerSlashCommand = {
+  id: "plan";
+  keyword: string;
+  label: string;
+  mode: CollaborationModeName;
+};
+
+function extractComposerSlashQuery(value: string) {
+  const match = value.match(/^\/([^\s\n]*)$/);
+  if (!match) {
+    return null;
+  }
+  return match[1].trim().toLowerCase();
+}
+
+function buildComposerSlashCommands(): ComposerSlashCommand[] {
+  return [
+    {
+      id: "plan",
+      keyword: "plan",
+      label: "计划模式",
+      mode: "plan"
+    }
+  ];
+}
 
 const uiThemeOptions: Array<{
   id: UiTheme;
@@ -535,8 +605,31 @@ function parseMessageAttachments(value: unknown): ChatAttachment[] {
   });
 }
 
+function stripLegacyAttachmentAppendix(content: string) {
+  const markers = [
+    "\n\n## Uploaded Images",
+    "\n\n## Uploaded Attachments",
+    "\n\n## Attachment Observations",
+    "\n\n## Multimodal Parse",
+    "\n\n## Normalized User Input",
+  ];
+  for (const marker of markers) {
+    const markerIndex = content.indexOf(marker);
+    if (markerIndex !== -1) {
+      const stripped = content.slice(0, markerIndex).trimEnd();
+      if (stripped) {
+        return stripped;
+      }
+    }
+  }
+  return content;
+}
+
 function readOriginalMessageContent(metadata: Record<string, unknown>, fallback: string) {
-  return typeof metadata.original_content === "string" ? metadata.original_content : fallback;
+  if (typeof metadata.original_content === "string") {
+    return metadata.original_content;
+  }
+  return stripLegacyAttachmentAppendix(fallback);
 }
 
 function extractName(path: string) {
@@ -628,6 +721,24 @@ const TOOL_SEMANTIC_MAP: Record<
   write_file: { label: "write_file", cardType: "file", runningText: "我先创建对应文件", completedText: "文件我已经创建好了" },
   edit_file: { label: "edit_file", cardType: "file", runningText: "我先修改对应文件", completedText: "文件我已经改好了" },
   update_plan: { label: "update_plan", cardType: "plan", runningText: "我先整理一下执行步骤", completedText: "执行步骤我已经更新了" },
+  enter_plan_mode: {
+    label: "enter_plan_mode",
+    cardType: "plan",
+    runningText: "我先切换到计划模式",
+    completedText: "已经进入计划模式"
+  },
+  update_plan_draft: {
+    label: "update_plan_draft",
+    cardType: "plan",
+    runningText: "我先更新旧版方案草稿",
+    completedText: "旧版方案草稿我已经更新了"
+  },
+  exit_plan_mode: {
+    label: "exit_plan_mode",
+    cardType: "plan",
+    runningText: "我先退出计划模式",
+    completedText: "已经退出计划模式"
+  },
   search_knowledge_base: {
     label: "search_knowledge_base",
     cardType: "search",
@@ -951,6 +1062,51 @@ function ApprovalSmallIcon({ className }: { className?: string }) {
   );
 }
 
+function PlanChecklistStatusIcon({ status, className }: { status: PlanStepStatus; className?: string }) {
+  if (status === "completed") {
+    return (
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+        <circle cx="8" cy="8" r="5.75" />
+        <path d="m5.4 8.1 1.7 1.7 3.5-3.6" />
+      </svg>
+    );
+  }
+
+  if (status === "in_progress") {
+    return (
+      <svg viewBox="0 0 16 16" fill="none" className={className} aria-hidden="true">
+        <circle cx="8" cy="8" r="5.75" stroke="currentColor" strokeWidth={1.4} opacity="0.28" />
+        <circle cx="8" cy="8" r="2.25" fill="currentColor" />
+      </svg>
+    );
+  }
+
+  if (status === "blocked") {
+    return (
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.45} strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+        <path d="M8 2.4 13.1 5.2v5.6L8 13.6l-5.1-2.8V5.2L8 2.4Z" />
+        <path d="M8 5.35v3.2" />
+        <circle cx="8" cy="10.85" r="0.45" fill="currentColor" stroke="none" />
+      </svg>
+    );
+  }
+
+  if (status === "cancelled") {
+    return (
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.45} strokeLinecap="round" className={className} aria-hidden="true">
+        <circle cx="8" cy="8" r="5.75" />
+        <path d="M5.4 5.4 10.6 10.6" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} className={className} aria-hidden="true">
+      <circle cx="8" cy="8" r="5.75" />
+    </svg>
+  );
+}
+
 function RefreshSmallIcon({ className }: { className?: string }) {
   return (
     <svg
@@ -965,6 +1121,41 @@ function RefreshSmallIcon({ className }: { className?: string }) {
     >
       <path d="M13 5.2A5 5 0 1 0 14 8" />
       <path d="M13 2.75v2.75h-2.75" />
+    </svg>
+  );
+}
+
+function EyePanelIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.25}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M1.65 8c1.52-2.39 3.64-3.6 6.35-3.6S12.83 5.61 14.35 8c-1.52 2.39-3.64 3.6-6.35 3.6S3.17 10.39 1.65 8Z" />
+      <circle cx="8" cy="8" r="2.05" />
+    </svg>
+  );
+}
+
+function ClosePanelIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.45}
+      strokeLinecap="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M4 4 12 12" />
+      <path d="M12 4 4 12" />
     </svg>
   );
 }
@@ -1056,8 +1247,7 @@ function resolveTimelineNodeIcon(node: TimelineNode): TimelineMarkerIconName {
   if (toolName === "grep") return "code_search";
   if (toolName === "fetch_url") return "globe";
   if (toolName === "terminal") return "terminal";
-  if (toolName === "update_plan") return "plan";
-  if (toolName === "image_attachment") return "image";
+  if (toolName === "update_plan" || toolName === "enter_plan_mode" || toolName === "update_plan_draft" || toolName === "exit_plan_mode") return "plan";
   if (toolName && toolName.startsWith("mcp__")) return "generic";
 
   if (latestItem?.cardType === "file") return "file";
@@ -1065,6 +1255,7 @@ function resolveTimelineNodeIcon(node: TimelineNode): TimelineMarkerIconName {
   if (latestItem?.cardType === "network") return "globe";
   if (latestItem?.cardType === "terminal") return "terminal";
   if (latestItem?.cardType === "plan") return "plan";
+  if (latestItem?.cardType === "attachment") return "image";
 
   return "generic";
 }
@@ -1338,6 +1529,39 @@ function buildTimelineSecondaryResultText(item: TimelineSecondaryItem) {
   return "本次调用没有返回可展示的结果。";
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function buildTimelineCodePreview(toolName: string | null | undefined, rawText: string, source?: unknown) {
+  let content = rawText;
+  let language: string | null = null;
+
+  if (toolName === "write_file" && isRecord(source)) {
+    const path = typeof source.path === "string" ? source.path : null;
+    const fileContent = typeof source.content === "string" ? source.content.trim() : "";
+    if (fileContent) {
+      content = fileContent;
+      language = inferLanguageFromPath(path);
+    }
+  } else if ((toolName === "exit_plan_mode" || toolName === "update_plan_draft") && isRecord(source)) {
+    const markdown = typeof source.markdown === "string" ? source.markdown.trim() : "";
+    if (markdown) {
+      content = markdown;
+      language = "markdown";
+    }
+  } else if (toolName === "terminal") {
+    language = "bash";
+  }
+
+  const highlighted = highlightCode(content, language);
+  return {
+    content,
+    language: highlighted.language,
+    html: highlighted.html,
+  };
+}
+
 function buildTraceDetail(
   id: string,
   type: TraceEntry["type"],
@@ -1506,6 +1730,12 @@ function resolveApprovalTargetLabel(request: ApprovalRequestLike) {
 }
 
 function buildApprovalActionText(toolName: string, argumentsPayload: Record<string, unknown>) {
+  if (toolName === "enter_plan_mode") {
+    return "进入计划模式";
+  }
+  if (toolName === "exit_plan_mode") {
+    return "退出计划模式";
+  }
   const target = resolveApprovalTargetLabel({
     tool: toolName,
     arguments: argumentsPayload,
@@ -1543,6 +1773,12 @@ function buildApprovalPrompt(request: ApprovalRequestLike) {
 
 function buildApprovalSupportCopy(request: ApprovalRequestLike) {
   const normalizedReason = request.reason?.trim() ?? "";
+  if (request.tool === "enter_plan_mode") {
+    return "确认后我会切换到计划模式，先拆出待办清单，再按步骤执行并持续更新进度。";
+  }
+  if (request.tool === "exit_plan_mode") {
+    return "确认后我会退出计划模式。";
+  }
   if (normalizedReason && !isMachineApprovalReason(normalizedReason)) {
     return "确认后我会继续执行这一步；如果拒绝，本次调用会立即停止。";
   }
@@ -1553,6 +1789,12 @@ function buildApprovalSupportCopy(request: ApprovalRequestLike) {
 }
 
 function buildApprovalPayloadLabel(request: ApprovalRequestLike) {
+  if (request.tool === "enter_plan_mode") {
+    return "切换说明";
+  }
+  if (request.tool === "exit_plan_mode") {
+    return "计划内容";
+  }
   if (request.tool === "terminal") {
     const command = typeof request.arguments.command === "string" ? request.arguments.command.trim() : "";
     if (command) {
@@ -1563,10 +1805,24 @@ function buildApprovalPayloadLabel(request: ApprovalRequestLike) {
 }
 
 function buildApprovalPayloadPreview(request: ApprovalRequestLike) {
+  if (request.tool === "enter_plan_mode") {
+    const reason = typeof request.arguments.reason === "string" ? request.arguments.reason.trim() : "";
+    return reason || "准备进入计划模式";
+  }
+  if (request.tool === "exit_plan_mode") {
+    const markdown = typeof request.arguments.markdown === "string" ? request.arguments.markdown.trim() : "";
+    return markdown || stringifyForPanel(request.arguments);
+  }
   if (request.tool === "terminal") {
     const command = typeof request.arguments.command === "string" ? request.arguments.command.trim() : "";
     if (command) {
       return command;
+    }
+  }
+  if (request.tool === "write_file") {
+    const content = typeof request.arguments.content === "string" ? request.arguments.content.trim() : "";
+    if (content) {
+      return content;
     }
   }
   return stringifyForPanel(request.arguments);
@@ -1640,6 +1896,53 @@ function buildPlanSubtitle(plan: unknown) {
   return "计划已更新";
 }
 
+function normalizePlanStepStatus(status: string | null | undefined): PlanStepStatus {
+  if (status === "in_progress" || status === "completed" || status === "blocked" || status === "cancelled") {
+    return status;
+  }
+  return "pending";
+}
+
+function getPlanSteps(plan: SessionPlanPayload) {
+  if (!plan?.steps || !Array.isArray(plan.steps)) {
+    return [];
+  }
+  return plan.steps
+    .filter((step): step is { step: string; status: PlanStepStatus | string } => Boolean(step && typeof step.step === "string"))
+    .map((step, index) => ({
+      id: `plan-step-${index}`,
+      index,
+      step: step.step,
+      status: normalizePlanStepStatus(step.status)
+    }));
+}
+
+function getPlanProgress(plan: SessionPlanPayload) {
+  const steps = getPlanSteps(plan);
+  if (plan?.progress && typeof plan.progress === "object") {
+    return {
+      total: typeof plan.progress.total === "number" ? plan.progress.total : steps.length,
+      completed: typeof plan.progress.completed === "number" ? plan.progress.completed : steps.filter((step) => step.status === "completed").length,
+      inProgress: typeof plan.progress.in_progress === "number" ? plan.progress.in_progress : steps.filter((step) => step.status === "in_progress").length,
+      blocked: typeof plan.progress.blocked === "number" ? plan.progress.blocked : steps.filter((step) => step.status === "blocked").length,
+      pending: typeof plan.progress.pending === "number" ? plan.progress.pending : steps.filter((step) => step.status === "pending").length,
+      cancelled: typeof plan.progress.cancelled === "number" ? plan.progress.cancelled : steps.filter((step) => step.status === "cancelled").length
+    };
+  }
+  return {
+    total: steps.length,
+    completed: steps.filter((step) => step.status === "completed").length,
+    inProgress: steps.filter((step) => step.status === "in_progress").length,
+    blocked: steps.filter((step) => step.status === "blocked").length,
+    pending: steps.filter((step) => step.status === "pending").length,
+    cancelled: steps.filter((step) => step.status === "cancelled").length
+  };
+}
+
+function hasIncompletePlanSteps(plan: SessionPlanPayload) {
+  return getPlanSteps(plan).some((step) => step.status !== "completed" && step.status !== "cancelled");
+}
+
 function buildToolSecondaryMeta(
   toolName: string | null | undefined,
   eventData: Record<string, unknown>,
@@ -1703,6 +2006,7 @@ function buildToolSecondaryItem(
     meta: buildToolSecondaryMeta(toolName, eventData, output),
     command,
     output,
+    argumentsPayload: extractEventArguments(eventData),
     outputLineCount: countOutputLines(output),
     detail: buildTraceDetail(
       detailId,
@@ -1930,25 +2234,34 @@ function buildAttachmentSecondaryItem(parentId: string, event: SessionEventPaylo
       : [];
   const count = typeof eventData.count === "number" ? eventData.count : files.length;
   const isProcessed = event.event === "attachment_processed";
-  const status = isProcessed ? { label: "已完成", tone: "green" as StatusTagTone } : { label: "处理中", tone: "blue" as StatusTagTone };
+  const isFailed =
+    eventData.ok === false ||
+    files.some((item) => item.analysis_status === "failed" || (typeof item.analysis_error === "string" && item.analysis_error));
+  const status = isFailed
+    ? { label: "失败", tone: "orange" as StatusTagTone }
+    : isProcessed
+      ? { label: "已完成", tone: "green" as StatusTagTone }
+      : { label: "处理中", tone: "blue" as StatusTagTone };
   const subtitle =
     files
       .map((item) => {
         const filename = typeof item.filename === "string" ? item.filename : "图片";
         const summary = typeof item.summary === "string" && item.summary ? item.summary : null;
-        return summary ? `${filename}: ${summary}` : filename;
+        const error = typeof item.analysis_error === "string" && item.analysis_error ? item.analysis_error : null;
+        return summary ? `${filename}: ${summary}` : error ? `${filename}: ${error}` : filename;
       })
       .join("\n") || `${count} 张图片`;
   const detailId = `secondary:attachment:${parentId}`;
+  const summary = isFailed ? "图片预解析失败，已跳过图片内容解析" : isProcessed ? "图片预解析已完成" : `已接收 ${count} 张图片`;
 
   return {
     id: detailId,
     parentId,
-    state: isProcessed ? "completed" : "running",
-    label: "Images",
-    toolName: "image_attachment",
-    cardType: "generic",
-    subtitle: isProcessed ? "图片预解析已完成" : `已接收 ${count} 张图片`,
+    state: isFailed ? "failed" : isProcessed ? "completed" : "running",
+    label: "图片预解析",
+    toolName: null,
+    cardType: "attachment",
+    subtitle: summary,
     statusLabel: status.label,
     statusTone: status.tone,
     meta: count > 0 ? [`${count} 张图片`] : ["图片附件"],
@@ -1960,7 +2273,7 @@ function buildAttachmentSecondaryItem(parentId: string, event: SessionEventPaylo
       formatEventTime(event.ts),
       "attachment",
       "图片附件",
-      isProcessed ? "图片预解析已完成" : `已接收 ${count} 张图片`,
+      summary,
       eventData,
       {
         output: subtitle,
@@ -2016,6 +2329,24 @@ function refreshProgressGroupNode(
     detailSummary || primaryText,
     eventData,
   );
+}
+
+function resolveProgressNodePrimaryText(
+  node: TimelineNode | null,
+  eventName: SessionEventPayload["event"],
+  proposedText: string
+) {
+  const normalized = proposedText.trim();
+  if (!node) {
+    return normalized;
+  }
+  if (!normalized) {
+    return node.primaryText;
+  }
+  if (eventName === "commentary_delta" || eventName === "commentary_complete") {
+    return node.secondaryItems.length > 0 ? node.primaryText : normalized;
+  }
+  return node.primaryText || normalized;
 }
 
 function applyTurnIdToNode(node: TimelineNode, turnId: string) {
@@ -2154,6 +2485,31 @@ function buildTimelineNodes(
       return;
     }
 
+    if (event.event === "collaboration_mode_changed") {
+      const modePayload =
+        "collaboration_mode" in eventData && eventData.collaboration_mode && typeof eventData.collaboration_mode === "object"
+          ? (eventData.collaboration_mode as Record<string, unknown>)
+          : null;
+      const mode = modePayload && modePayload.mode === "plan" ? "plan" : "default";
+      const fallback = mode === "plan" ? "已进入计划模式" : "已回到默认执行模式";
+      const summary = typeof eventData.summary === "string" && eventData.summary ? eventData.summary : fallback;
+      nodes.push(buildSystemMetaNode(event, summary));
+      return;
+    }
+
+    if (event.event === "plan_draft_updated") {
+      const draftPayload =
+        "plan_draft" in eventData && eventData.plan_draft && typeof eventData.plan_draft === "object"
+          ? (eventData.plan_draft as Record<string, unknown>)
+          : null;
+      const status = draftPayload && typeof draftPayload.status === "string" ? draftPayload.status : "draft";
+      const fallback =
+        status === "approved" ? "规划草案已批准" : status === "awaiting_approval" ? "规划草案待确认" : "规划草案已更新";
+      const summary = typeof eventData.summary === "string" && eventData.summary ? eventData.summary : fallback;
+      nodes.push(buildSystemMetaNode(event, summary));
+      return;
+    }
+
     if (event.event === "thinking_delta" || event.event === "thinking_complete") {
       const content = typeof eventData.content === "string" ? eventData.content : "";
       const nextNode = buildThinkingNode(
@@ -2244,15 +2600,22 @@ function buildTimelineNodes(
         "我先继续处理这一步"
       );
       commentaryByGroupId.set(groupId, commentary);
-      const node = ensureProgressNode(groupId, event, commentary);
-      refreshProgressGroupNode(node, event, commentary, commentary);
+      const existingNode = progressNodeByGroupId.get(groupId) ?? null;
+      const primaryText = resolveProgressNodePrimaryText(existingNode, event.event, commentary);
+      const node = ensureProgressNode(groupId, event, primaryText);
+      refreshProgressGroupNode(node, event, primaryText, commentary);
       return;
     }
 
     if (event.event === "attachment_received" || event.event === "attachment_processed") {
       const attachmentCount = typeof eventData.count === "number" ? eventData.count : 0;
       const groupId = `attachment:${event.request_id ?? "current"}`;
-      const primaryText = event.event === "attachment_processed" ? "图片预解析已完成" : `已接收 ${attachmentCount} 张图片`;
+      const primaryText =
+        event.event === "attachment_processed"
+          ? eventData.ok === false
+            ? "图片预解析失败，已跳过解析"
+            : "图片预解析已完成"
+          : `已接收 ${attachmentCount} 张图片`;
       const node = ensureProgressNode(groupId, event, primaryText);
       const item = buildAttachmentSecondaryItem(node.id, event);
       upsertProgressSecondaryItem(node, item);
@@ -2273,13 +2636,17 @@ function buildTimelineNodes(
       }
       const toolOutput = resolveToolOutput(toolCallId);
       const primaryText =
-        commentaryByGroupId.get(groupId) ||
-        resolveProgressPrimaryText(
-          "tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null,
-          "running",
-          eventData,
-          toolOutput,
-          userPrompt
+        resolveProgressNodePrimaryText(
+          progressNodeByGroupId.get(groupId) ?? null,
+          event.event,
+          commentaryByGroupId.get(groupId) ||
+            resolveProgressPrimaryText(
+              "tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null,
+              "running",
+              eventData,
+              toolOutput,
+              userPrompt
+            )
         );
       const node = ensureProgressNode(groupId, event, primaryText);
       const item = buildToolSecondaryItem(node.id, event, "running", toolOutput, userPrompt);
@@ -2296,8 +2663,18 @@ function buildTimelineNodes(
         return;
       }
       const primaryText =
-        commentaryByGroupId.get(groupId) ||
-        resolveProgressPrimaryText("tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null, "running", eventData, toolOutput, userPrompt);
+        resolveProgressNodePrimaryText(
+          progressNodeByGroupId.get(groupId) ?? null,
+          event.event,
+          commentaryByGroupId.get(groupId) ||
+            resolveProgressPrimaryText(
+              "tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null,
+              "running",
+              eventData,
+              toolOutput,
+              userPrompt
+            )
+        );
       const node = ensureProgressNode(groupId, event, primaryText);
       const item = buildToolSecondaryItem(node.id, event, "running", toolOutput, userPrompt);
       upsertProgressSecondaryItem(node, item);
@@ -2316,8 +2693,18 @@ function buildTimelineNodes(
       }
       const nextState = Boolean(eventData.success) ? "completed" : "failed";
       const primaryText =
-        commentaryByGroupId.get(groupId) ||
-        resolveProgressPrimaryText("tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null, nextState, eventData, toolOutput, userPrompt);
+        resolveProgressNodePrimaryText(
+          progressNodeByGroupId.get(groupId) ?? null,
+          event.event,
+          commentaryByGroupId.get(groupId) ||
+            resolveProgressPrimaryText(
+              "tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null,
+              nextState,
+              eventData,
+              toolOutput,
+              userPrompt
+            )
+        );
       const node = ensureProgressNode(groupId, event, primaryText);
       const item = buildToolSecondaryItem(node.id, event, nextState, toolOutput, userPrompt);
       upsertProgressSecondaryItem(node, item);
@@ -2334,8 +2721,12 @@ function buildTimelineNodes(
         return;
       }
       const primaryText =
-        commentaryByGroupId.get(groupId) ||
-        summarizeCommentaryContent(typeof eventData.message === "string" ? eventData.message : "", "我先继续处理这一步");
+        resolveProgressNodePrimaryText(
+          progressNodeByGroupId.get(groupId) ?? null,
+          event.event,
+          commentaryByGroupId.get(groupId) ||
+            summarizeCommentaryContent(typeof eventData.message === "string" ? eventData.message : "", "我先继续处理这一步")
+        );
       const node = ensureProgressNode(groupId, event, primaryText);
       const item = buildSkillSecondaryItem(node.id, event);
       upsertProgressSecondaryItem(node, item);
@@ -2669,11 +3060,12 @@ function buildLiveTurn(liveTurn: LiveTurnState, sessionEvents: SessionEventPaylo
   ).map((node) => applyTurnIdToNode(node, turnId));
   const thinkingTs = parseTimestamp(liveTurn.userMessage.createdAt) ?? Date.now();
   const hasRunningThinking = timeline.some(isRunningThinkingNode);
+  const hasAnswerStart = timeline.some((node) => node.kind === "answer_start");
   const shouldShowThinking =
     liveTurn.status === "running" &&
     (liveTurn.answer.phase === "waiting" || liveTurn.answer.phase === "streaming") &&
-    !liveTurn.answer.content.trim() &&
-    !hasRunningThinking;
+    !hasRunningThinking &&
+    !hasAnswerStart;
   const nextTimeline = shouldShowThinking
     ? [...timeline, applyTurnIdToNode(buildThinkingNode(thinkingTs, null, "running", "当前思路"), turnId)]
     : timeline;
@@ -2706,10 +3098,6 @@ function hasSystemMetaNode(turn: ChatTurn) {
   return turn.timeline.some((node) => node.kind === "system_meta");
 }
 
-function hasPendingApprovalNode(turn: ChatTurn) {
-  return turn.timeline.some((node) => node.kind === "approval" && node.state === "pending");
-}
-
 function resolveAnswerCopy(answer: TurnAnswer | null, status: TurnStatus) {
   if (answer && answer.content.trim()) {
     return answer.content;
@@ -2734,40 +3122,22 @@ function resolveAnswerCopy(answer: TurnAnswer | null, status: TurnStatus) {
 
 function shouldRenderAnswerBubble(turn: ChatTurn) {
   if (!turn.answer) {
-    if (turn.status === "needs_approval" && hasPendingApprovalNode(turn)) {
-      return false;
-    }
-    if (turn.status === "failed" && hasSystemMetaNode(turn)) {
-      return false;
-    }
-    return turn.status !== "completed";
+    return false;
   }
 
   if (turn.status === "failed" && !turn.answer.content.trim() && hasSystemMetaNode(turn)) {
     return false;
   }
 
-  if (turn.answer.content.trim()) {
-    return true;
+  if (turn.answer.phase === "persisted" || turn.answer.phase === "finalizing") {
+    return Boolean(turn.answer.content.trim());
   }
 
   if (turn.answer.phase === "failed") {
-    return true;
+    return Boolean(turn.answer.content.trim()) || Boolean(turn.answer.errorMessage);
   }
 
-  if (turn.status === "needs_approval" && hasPendingApprovalNode(turn)) {
-    return false;
-  }
-
-  if (turn.status === "needs_approval") {
-    return true;
-  }
-
-  if (turn.isLive && turn.status === "running" && turn.timeline.some((node) => node.kind === "progress")) {
-    return false;
-  }
-
-  return !turn.isLive || !turn.timeline.some(isRunningThinkingNode);
+  return false;
 }
 
 function shouldRenderAssistantMessageMeta(turn: ChatTurn) {
@@ -2824,6 +3194,8 @@ function App() {
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState(() => window.localStorage.getItem("newman-active-session-id") ?? "");
   const [activeSessionDetail, setActiveSessionDetail] = useState<SessionRecordDetail | null>(null);
+  const [activePlan, setActivePlan] = useState<SessionPlanPayload>(null);
+  const [activeCollaborationMode, setActiveCollaborationMode] = useState<SessionDetailResponse["collaboration_mode"]>(null);
   const [activeContextUsage, setActiveContextUsage] = useState<SessionDetailResponse["context_usage"]>(null);
   const [sessionEvents, setSessionEvents] = useState<SessionEventPayload[]>([]);
   const [liveSessionEvents, setLiveSessionEvents] = useState<SessionEventPayload[]>([]);
@@ -2902,16 +3274,204 @@ function App() {
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [approvalActionLoading, setApprovalActionLoading] = useState<null | "approve" | "reject">(null);
   const [approvalError, setApprovalError] = useState<string | null>(null);
+  const [planModeUpdating, setPlanModeUpdating] = useState(false);
+  const [composerFocused, setComposerFocused] = useState(false);
   const [composerValue, setComposerValue] = useState("");
+  const [pendingComposerMode, setPendingComposerMode] = useState<CollaborationModeName | null>(null);
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [turnApprovalMode, setTurnApprovalMode] = useState<TurnApprovalMode>("manual");
+  const [htmlPreview, setHtmlPreview] = useState<HtmlPreviewState | null>(null);
   const conversationPaneRef = useRef<HTMLElement | null>(null);
   const composerFileInputRef = useRef<HTMLInputElement | null>(null);
+  const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
   const activeMessageControllerRef = useRef<AbortController | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const attachmentPreviewUrlsRef = useRef<string[]>([]);
   const liveAttachmentUrlsRef = useRef<string[]>([]);
+  const liveAnswerQueueRef = useRef<LiveAnswerQueueItem[]>([]);
+  const liveAnswerFlushFrameRef = useRef<number | null>(null);
+  const pendingFinalAnswerRef = useRef<PendingFinalAnswer | null>(null);
+  const liveAnswerDrainPromiseRef = useRef<Promise<void> | null>(null);
+  const liveAnswerDrainResolverRef = useRef<(() => void) | null>(null);
+
+  const resolveLiveAnswerDrain = () => {
+    const resolver = liveAnswerDrainResolverRef.current;
+    liveAnswerDrainResolverRef.current = null;
+    liveAnswerDrainPromiseRef.current = null;
+    if (resolver) {
+      resolver();
+    }
+  };
+
+  const ensureLiveAnswerDrainPromise = () => {
+    if (!liveAnswerDrainPromiseRef.current) {
+      liveAnswerDrainPromiseRef.current = new Promise<void>((resolve) => {
+        liveAnswerDrainResolverRef.current = resolve;
+      });
+    }
+    return liveAnswerDrainPromiseRef.current;
+  };
+
+  const resetLiveAnswerStreaming = () => {
+    if (liveAnswerFlushFrameRef.current !== null) {
+      window.cancelAnimationFrame(liveAnswerFlushFrameRef.current);
+      liveAnswerFlushFrameRef.current = null;
+    }
+    liveAnswerQueueRef.current = [];
+    pendingFinalAnswerRef.current = null;
+    resolveLiveAnswerDrain();
+  };
+
+  const maybeFinalizeLiveAnswer = (targetLocalId: string) => {
+    const pendingFinal = pendingFinalAnswerRef.current;
+    if (!pendingFinal || pendingFinal.localId !== targetLocalId) {
+      if (liveAnswerQueueRef.current.length === 0) {
+        resolveLiveAnswerDrain();
+      }
+      return;
+    }
+    pendingFinalAnswerRef.current = null;
+    setLiveTurn((currentTurn) => {
+      if (!currentTurn || currentTurn.localId !== targetLocalId) {
+        return currentTurn;
+      }
+      return {
+        ...currentTurn,
+        status: "completed",
+        answer: {
+          ...currentTurn.answer,
+          phase: "finalizing",
+          content: pendingFinal.content || currentTurn.answer.content,
+          finishReason: pendingFinal.finishReason ?? currentTurn.answer.finishReason,
+          assistantMessageId: pendingFinal.assistantMessageId ?? currentTurn.answer.assistantMessageId,
+          createdAt: pendingFinal.createdAt ?? currentTurn.answer.createdAt
+        }
+      };
+    });
+    resolveLiveAnswerDrain();
+  };
+
+  const scheduleLiveAnswerFlush = (targetLocalId: string) => {
+    if (liveAnswerFlushFrameRef.current !== null) {
+      return;
+    }
+    ensureLiveAnswerDrainPromise();
+    liveAnswerFlushFrameRef.current = window.requestAnimationFrame(() => {
+      liveAnswerFlushFrameRef.current = null;
+
+      const queue = liveAnswerQueueRef.current;
+      if (queue.length === 0) {
+        maybeFinalizeLiveAnswer(targetLocalId);
+        return;
+      }
+
+      let consumed = 0;
+      let deltaText = "";
+      let reset = false;
+      let snapshotContent: string | null = null;
+      const maxCharsPerFrame = 28;
+
+      while (queue.length > 0) {
+        const nextItem = queue[0];
+        if (nextItem.kind === "reset") {
+          reset = true;
+          deltaText = "";
+          snapshotContent = null;
+          queue.shift();
+          consumed += 1;
+          continue;
+        }
+        if (nextItem.kind === "snapshot") {
+          snapshotContent = nextItem.content;
+          queue.shift();
+          consumed += 1;
+          break;
+        }
+        if (consumed > 0 && deltaText.length >= maxCharsPerFrame) {
+          break;
+        }
+        deltaText += nextItem.delta;
+        queue.shift();
+        consumed += 1;
+        if (deltaText.length >= maxCharsPerFrame) {
+          break;
+        }
+      }
+
+      if (consumed > 0) {
+        setLiveTurn((currentTurn) => {
+          if (!currentTurn || currentTurn.localId !== targetLocalId) {
+            return currentTurn;
+          }
+          const baseContent = reset ? "" : currentTurn.answer.content;
+          const nextContent = snapshotContent !== null ? snapshotContent : `${baseContent}${deltaText}`;
+          return {
+            ...currentTurn,
+            status: "running",
+            answer: {
+              ...currentTurn.answer,
+              phase: nextContent ? "streaming" : "waiting",
+              content: nextContent
+            }
+          };
+        });
+      }
+
+      if (queue.length > 0) {
+        scheduleLiveAnswerFlush(targetLocalId);
+        return;
+      }
+      maybeFinalizeLiveAnswer(targetLocalId);
+    });
+  };
+
+  const enqueueLiveAnswerEvent = (targetLocalId: string, payload: SessionEventPayload) => {
+    if (payload.event === "assistant_delta") {
+      if (payload.data.reset === true) {
+        liveAnswerQueueRef.current.push({
+          kind: "reset"
+        });
+      } else if (typeof payload.data.delta === "string" && payload.data.delta) {
+        liveAnswerQueueRef.current.push({
+          kind: "delta",
+          delta: payload.data.delta
+        });
+      } else if (typeof payload.data.content === "string") {
+        liveAnswerQueueRef.current.push({
+          kind: "snapshot",
+          content: payload.data.content
+        });
+      }
+      scheduleLiveAnswerFlush(targetLocalId);
+      return;
+    }
+
+    if (payload.event === "final_response") {
+      pendingFinalAnswerRef.current = {
+        localId: targetLocalId,
+        content: typeof payload.data.content === "string" ? payload.data.content : "",
+        finishReason: typeof payload.data.finish_reason === "string" ? payload.data.finish_reason : null,
+        assistantMessageId: typeof payload.data.message_id === "string" ? payload.data.message_id : null,
+        createdAt: typeof payload.data.created_at === "string" ? payload.data.created_at : null
+      };
+      if (liveAnswerQueueRef.current.length === 0) {
+        maybeFinalizeLiveAnswer(targetLocalId);
+      } else {
+        ensureLiveAnswerDrainPromise();
+      }
+    }
+  };
+
+  const waitForLiveAnswerDrain = async (targetLocalId: string) => {
+    if (liveAnswerQueueRef.current.length === 0) {
+      maybeFinalizeLiveAnswer(targetLocalId);
+    }
+    if (liveAnswerQueueRef.current.length === 0 && !pendingFinalAnswerRef.current) {
+      return;
+    }
+    await ensureLiveAnswerDrainPromise();
+  };
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -2942,6 +3502,33 @@ function App() {
   }, [leftWidth]);
 
   useEffect(() => {
+    if (activePage !== "chat") {
+      setHtmlPreview(null);
+    }
+  }, [activePage]);
+
+  useEffect(() => {
+    setHtmlPreview(null);
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    if (!htmlPreview) {
+      return;
+    }
+
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") {
+        setHtmlPreview(null);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [htmlPreview]);
+
+  useEffect(() => {
     return () => {
       attachmentPreviewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
       attachmentPreviewUrlsRef.current = [];
@@ -2952,6 +3539,7 @@ function App() {
     return () => {
       activeMessageControllerRef.current?.abort();
       activeMessageControllerRef.current = null;
+      resetLiveAnswerStreaming();
     };
   }, []);
 
@@ -3074,6 +3662,8 @@ function App() {
       }
 
       setActiveSessionDetail(detail.session);
+      setActivePlan(detail.plan ?? null);
+      setActiveCollaborationMode(detail.collaboration_mode ?? null);
       setActiveContextUsage(detail.context_usage ?? null);
       setSessionEvents(dedupeSessionEvents(nextEvents));
       setChatSessions((currentSessions) =>
@@ -3103,6 +3693,118 @@ function App() {
     }
   }
 
+  async function syncSessionCollaborationMode(
+    nextMode: CollaborationModeName,
+    options?: { createSessionIfMissing?: boolean }
+  ) {
+    const createSessionIfMissing = options?.createSessionIfMissing ?? true;
+    let sessionId = activeSessionIdRef.current;
+
+    if (!sessionId) {
+      if (!createSessionIfMissing) {
+        return false;
+      }
+      sessionId = await ensureSession();
+      if (!sessionId) {
+        return false;
+      }
+    }
+
+    const data = await fetchJson<{ updated: boolean; collaboration_mode: NonNullable<SessionDetailResponse["collaboration_mode"]> }>(
+      `${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/collaboration-mode`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ mode: nextMode })
+      }
+    );
+    setActiveCollaborationMode(data.collaboration_mode);
+    return true;
+  }
+
+  async function updateSessionCollaborationMode(
+    nextMode: CollaborationModeName,
+    options?: { createSessionIfMissing?: boolean; preserveComposerOverride?: boolean }
+  ) {
+    if (nextMode === "default" && currentCollaborationMode === "plan" && hasIncompletePlanSteps(activePlan)) {
+      const confirmed = window.confirm("当前计划还有未完成事项，仍要退出计划模式吗？");
+      if (!confirmed) {
+        return false;
+      }
+    }
+
+    setPlanModeUpdating(true);
+    setChatError(null);
+    setChatNotice(null);
+    if (!options?.preserveComposerOverride) {
+      setPendingComposerMode(nextMode);
+    }
+
+    try {
+      const updated = await syncSessionCollaborationMode(nextMode, {
+        createSessionIfMissing: options?.createSessionIfMissing ?? true
+      });
+      if (!updated) {
+        if (!options?.preserveComposerOverride) {
+          setPendingComposerMode(null);
+        }
+        return false;
+      }
+      setChatNotice(nextMode === "plan" ? "已切换到计划模式" : "已切回默认模式");
+      return true;
+    } catch (error) {
+      if (!options?.preserveComposerOverride) {
+        setPendingComposerMode(null);
+      }
+      setChatError(error instanceof Error ? error.message : "切换模式失败");
+      return false;
+    } finally {
+      setPlanModeUpdating(false);
+    }
+  }
+
+  async function selectComposerSlashCommand(command: ComposerSlashCommand) {
+    setComposerValue("");
+    setPendingComposerMode(command.mode);
+    if (activeSessionIdRef.current) {
+      await updateSessionCollaborationMode(command.mode, {
+        createSessionIfMissing: false,
+        preserveComposerOverride: true
+      });
+    }
+    requestAnimationFrame(() => {
+      composerTextareaRef.current?.focus();
+    });
+  }
+
+  async function removeComposerModeToken() {
+    if ((pendingComposerMode ?? currentCollaborationMode) !== "plan") {
+      return;
+    }
+
+    if (pendingComposerMode === "plan" && currentCollaborationMode !== "plan") {
+      setPendingComposerMode(null);
+      requestAnimationFrame(() => {
+        composerTextareaRef.current?.focus();
+      });
+      return;
+    }
+
+    setPendingComposerMode("default");
+    const updated = await updateSessionCollaborationMode("default", {
+      createSessionIfMissing: false,
+      preserveComposerOverride: true
+    });
+    if (!updated) {
+      setPendingComposerMode(null);
+    }
+    requestAnimationFrame(() => {
+      composerTextareaRef.current?.focus();
+    });
+  }
+
   useEffect(() => {
     const controller = new AbortController();
     void loadChatSessions(controller.signal);
@@ -3111,7 +3813,10 @@ function App() {
 
   useEffect(() => {
     if (!activeSessionId) {
+      resetLiveAnswerStreaming();
       setActiveSessionDetail(null);
+      setActivePlan(null);
+      setActiveCollaborationMode(null);
       setActiveContextUsage(null);
       setSessionEvents([]);
       setLiveSessionEvents([]);
@@ -3121,7 +3826,10 @@ function App() {
     }
 
     const controller = new AbortController();
+    resetLiveAnswerStreaming();
     setActiveSessionDetail(null);
+    setActivePlan(null);
+    setActiveCollaborationMode(null);
     setActiveContextUsage(null);
     setSessionEvents([]);
     setLiveSessionEvents([]);
@@ -3161,6 +3869,15 @@ function App() {
       window.clearInterval(timer);
     };
   }, [activePage, activeSessionId, apiBase]);
+
+  useEffect(() => {
+    if (!pendingComposerMode) {
+      return;
+    }
+    if ((activeCollaborationMode?.mode ?? "default") === pendingComposerMode) {
+      setPendingComposerMode(null);
+    }
+  }, [activeCollaborationMode, pendingComposerMode]);
 
   useEffect(() => {
     if (!pendingApproval) return;
@@ -3450,22 +4167,6 @@ function App() {
     }
   }
 
-  useEffect(() => {
-    if (activePage !== "files") return;
-
-    const controller = new AbortController();
-    void loadWorkspaceBrowser(workspacePath, controller.signal);
-    return () => controller.abort();
-  }, [activePage, apiBase, workspacePath]);
-
-  useEffect(() => {
-    if (activePage !== "files") return;
-
-    const controller = new AbortController();
-    void loadKnowledgeDocuments(controller.signal);
-    return () => controller.abort();
-  }, [activePage, apiBase]);
-
   async function loadProjectConfig(signal?: AbortSignal) {
     setConfigLoading(true);
     setConfigError(null);
@@ -3519,6 +4220,31 @@ function App() {
   }, [activePage, apiBase]);
 
   const isMobile = viewportWidth <= 820;
+  const normalizedHtmlPreviewContent = useMemo(() => {
+    if (!htmlPreview) {
+      return "";
+    }
+
+    const markup = htmlPreview.content.trim();
+    if (!markup) {
+      return "";
+    }
+
+    if (/<html[\s>]/i.test(markup) || /<!doctype html/i.test(markup)) {
+      return markup;
+    }
+
+    return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+${markup}
+  </body>
+</html>`;
+  }, [htmlPreview]);
   const liveTurnLocalId = liveTurn?.localId ?? null;
   const liveTurnRequestId = liveTurn?.requestId ?? null;
   const liveTurnServerTurnId = liveTurn?.serverTurnId ?? null;
@@ -3562,6 +4288,25 @@ function App() {
       : null;
   const hasContextMeta = Boolean(contextMetaSecondary || contextMetaDetail);
   const activeApprovalMode = approvalModeMeta[turnApprovalMode];
+  const currentCollaborationMode = activeCollaborationMode?.mode ?? "default";
+  const composerDisplayMode = pendingComposerMode ?? currentCollaborationMode;
+  const activePlanSteps = getPlanSteps(activePlan);
+  const activePlanProgress = getPlanProgress(activePlan);
+  const showComposerPlanTray = composerDisplayMode === "plan" && activePlanSteps.length > 0;
+  const slashCommandQuery = extractComposerSlashQuery(composerValue);
+  const availableSlashCommands =
+    composerDisplayMode === "plan"
+      ? []
+      : buildComposerSlashCommands().filter((command) =>
+          slashCommandQuery === null ? false : !slashCommandQuery || command.keyword.includes(slashCommandQuery)
+        );
+  const showComposerSlashMenu =
+    composerFocused &&
+    slashCommandQuery !== null &&
+    !sendingMessage &&
+    !stoppingMessage &&
+    !planModeUpdating &&
+    availableSlashCommands.length > 0;
   const hasMemoryChanges =
     memoryDrafts.memory !== memoryFiles.memory.content || memoryDrafts.user !== memoryFiles.user.content;
   const hasSkillChanges = Boolean(skillDetail && skillDraft !== skillDetail.content);
@@ -3575,8 +4320,6 @@ function App() {
   const selectedSkillTreeError = selectedSkillName ? skillTreeErrors[selectedSkillName] ?? null : null;
   const selectedSkillTreeLoading = Boolean(selectedSkillName && skillTreeLoadingByName[selectedSkillName]);
   const hasProjectConfigChanges = projectConfigDraft !== projectConfigContent;
-  const currentWorkspaceLabel = workspaceView ? formatPathLabel(workspaceView.path, workspaceRootPath) : ".";
-  const isWorkspaceRoot = Boolean(workspaceView && workspaceRootPath && workspaceView.path === workspaceRootPath);
 
   const renderSkillTreeNodes = (skill: SkillSummary, entries: WorkspaceEntry[], depth = 0): ReactNode =>
     entries.map((entry) => {
@@ -3718,6 +4461,7 @@ function App() {
       messageCount: 0,
       hasConversation: false
     };
+    activeSessionIdRef.current = data.session_id;
     setChatSessions((currentSessions) => [nextSession, ...currentSessions]);
     setActiveSessionId(data.session_id);
     return data.session_id;
@@ -3867,6 +4611,7 @@ function App() {
   const submitComposer = async () => {
     const trimmed = composerValue.trim();
     if ((!trimmed && composerAttachments.length === 0) || sendingMessage) return;
+    const desiredCollaborationMode = pendingComposerMode ?? currentCollaborationMode;
 
     setChatError(null);
     setChatNotice(null);
@@ -3886,10 +4631,22 @@ function App() {
       if (controller.signal.aborted) {
         return;
       }
+
+      if (desiredCollaborationMode !== currentCollaborationMode) {
+        const synced = await updateSessionCollaborationMode(desiredCollaborationMode, {
+          createSessionIfMissing: false,
+          preserveComposerOverride: true
+        });
+        if (!synced || controller.signal.aborted) {
+          return;
+        }
+      }
+
       scrollConversationToBottom();
       const createdAt = new Date().toISOString();
       const liveTurnLocalId = `live-turn-${Date.now()}`;
       const attachmentSnapshot = composerAttachments.map(({ file: _file, ...attachment }) => attachment);
+      resetLiveAnswerStreaming();
       setLiveTurn({
         sessionId,
         localId: liveTurnLocalId,
@@ -3982,37 +4739,44 @@ function App() {
           return;
         }
 
-        setLiveSessionEvents((currentEvents) => [...currentEvents, payload]);
-        if (payload.event === "error") {
-          setChatError(typeof payload.data.message === "string" ? payload.data.message : "消息流执行失败");
+        const payloadTurnId = readTurnId(payload.data);
+        if (payload.event === "assistant_delta" || payload.event === "final_response") {
+          enqueueLiveAnswerEvent(liveTurnLocalId, payload);
         }
-
+        if (payload.event === "error") {
+          resetLiveAnswerStreaming();
+        }
+        setLiveSessionEvents((currentEvents) => [...currentEvents, payload]);
+        if (payload.event === "collaboration_mode_changed") {
+          const modePayload =
+            "collaboration_mode" in payload.data && payload.data.collaboration_mode && typeof payload.data.collaboration_mode === "object"
+              ? (payload.data.collaboration_mode as NonNullable<SessionDetailResponse["collaboration_mode"]>)
+              : null;
+          if (modePayload) {
+            setActiveCollaborationMode(modePayload);
+          }
+        }
+        if (payload.event === "plan_updated") {
+          const planPayload =
+            "plan" in payload.data && payload.data.plan && typeof payload.data.plan === "object"
+              ? (payload.data.plan as NonNullable<SessionPlanPayload>)
+              : null;
+          setActivePlan(planPayload);
+        }
         setLiveTurn((currentTurn) => {
           if (!currentTurn || currentTurn.localId !== liveTurnLocalId) {
             return currentTurn;
           }
 
+          const nextServerTurnId = currentTurn.serverTurnId ?? payloadTurnId;
           const nextTurn = {
             ...currentTurn,
             requestId: currentTurn.requestId ?? payload.request_id ?? null,
-            serverTurnId: currentTurn.serverTurnId ?? readTurnId(payload.data)
+            serverTurnId: nextServerTurnId
           };
 
           if (payload.event === "assistant_delta") {
-            const isReset = payload.data.reset === true;
-            return {
-              ...nextTurn,
-              status: "running",
-              answer: {
-                ...nextTurn.answer,
-                phase: isReset ? "waiting" : "streaming",
-                content: isReset
-                  ? ""
-                  : typeof payload.data.content === "string"
-                    ? payload.data.content
-                    : nextTurn.answer.content
-              }
-            };
+            return nextTurn;
           }
 
           if (
@@ -4029,20 +4793,7 @@ function App() {
           }
 
           if (payload.event === "final_response") {
-            return {
-              ...nextTurn,
-              status: "completed",
-              answer: {
-                ...nextTurn.answer,
-                phase: "finalizing",
-                content: typeof payload.data.content === "string" ? payload.data.content : nextTurn.answer.content,
-                finishReason:
-                  typeof payload.data.finish_reason === "string" ? payload.data.finish_reason : nextTurn.answer.finishReason,
-                assistantMessageId:
-                  typeof payload.data.message_id === "string" ? payload.data.message_id : nextTurn.answer.assistantMessageId,
-                createdAt: typeof payload.data.created_at === "string" ? payload.data.created_at : nextTurn.answer.createdAt
-              }
-            };
+            return nextTurn;
           }
 
           if (payload.event === "tool_approval_request") {
@@ -4076,6 +4827,7 @@ function App() {
           return nextTurn;
         });
       });
+      await waitForLiveAnswerDrain(liveTurnLocalId);
       finishStreamingState();
 
       await loadChatSessions(undefined, sessionId);
@@ -4084,12 +4836,15 @@ function App() {
         setLiveSessionEvents([]);
         setLiveTurn((currentTurn) => (currentTurn && currentTurn.localId === liveTurnLocalId ? null : currentTurn));
       }
+      resetLiveAnswerStreaming();
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) {
+        resetLiveAnswerStreaming();
         return;
       }
       const message = error instanceof Error ? error.message : "发送消息失败";
       setChatError(message);
+      resetLiveAnswerStreaming();
       setLiveTurn((currentTurn) =>
         currentTurn
           ? {
@@ -4134,9 +4889,37 @@ function App() {
   };
 
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Escape" && showComposerSlashMenu) {
+      event.preventDefault();
+      setComposerValue("");
+      return;
+    }
+
+    if (
+      event.key === "Backspace" &&
+      !composerValue &&
+      composerDisplayMode === "plan" &&
+      !sendingMessage &&
+      !stoppingMessage &&
+      !planModeUpdating
+    ) {
+      event.preventDefault();
+      void removeComposerModeToken();
+      return;
+    }
+
     if (event.key !== "Enter" || event.shiftKey) {
       return;
     }
+
+    if (slashCommandQuery !== null) {
+      event.preventDefault();
+      if (availableSlashCommands[0]) {
+        void selectComposerSlashCommand(availableSlashCommands[0]);
+      }
+      return;
+    }
+
     event.preventDefault();
     void submitComposer();
   };
@@ -4436,10 +5219,6 @@ function App() {
     }
   };
 
-  const refreshFilesWorkspace = async () => {
-    await Promise.all([loadWorkspaceBrowser(workspacePath), loadKnowledgeDocuments()]);
-  };
-
   const refreshSkillsWorkspace = async () => {
     setSkillTreeEntriesByName({});
     setSkillTreeErrors({});
@@ -4491,9 +5270,51 @@ function App() {
     }
   };
 
+  const renderComposerPlanTray = (variant: "footer" | "hero") => {
+    if (!showComposerPlanTray || variant !== "footer") {
+      return null;
+    }
+
+    const progressLabel = `${activePlanProgress.completed}/${activePlanProgress.total} 已完成`;
+
+    return (
+      <aside className="composer-plan-tray footer" aria-label="当前执行清单">
+        <div className="composer-plan-tray-head">
+          <span className="composer-plan-tray-kicker">任务清单</span>
+          <div className="composer-plan-tray-meta">
+            <span className="composer-plan-tray-progress">{progressLabel}</span>
+          </div>
+        </div>
+
+        <div className="composer-plan-tray-list" role="list" aria-label="当前执行清单">
+          {activePlanSteps.map((step) => (
+            <div key={step.id} className={`composer-plan-item status-${step.status}`} role="listitem">
+              <span className="composer-plan-item-icon" aria-hidden="true">
+                <PlanChecklistStatusIcon status={step.status} className="composer-plan-item-icon-svg" />
+              </span>
+              <span className="composer-plan-item-index">{String(step.index + 1).padStart(2, "0")}</span>
+              <span className="composer-plan-item-text" title={step.step}>
+                {step.step}
+              </span>
+              {step.status === "in_progress" ? <span className="composer-plan-item-chip">进行中</span> : null}
+              {step.status === "blocked" ? <span className="composer-plan-item-chip blocked">阻塞</span> : null}
+            </div>
+          ))}
+        </div>
+      </aside>
+    );
+  };
+
   const renderChatComposer = (variant: "footer" | "hero") => {
     const isHero = variant === "hero";
-    const shellClassName = variant === "hero" ? "composer-shell composer-shell-hero" : "composer-shell composer-shell-footer";
+    const showPlanSidecar = showComposerPlanTray && variant === "footer";
+    const shellClassName = [
+      "composer-shell",
+      variant === "hero" ? "composer-shell-hero" : "composer-shell-footer",
+      showPlanSidecar ? "composer-shell-with-plan" : ""
+    ]
+      .filter(Boolean)
+      .join(" ");
     const inputClassName = variant === "hero" ? "composer-input composer-input-hero" : "composer-input";
     const isComposerEmpty = !composerValue.trim() && composerAttachments.length === 0;
     const showContextMeter = !isHero;
@@ -4511,170 +5332,220 @@ function App() {
             tabIndex={-1}
           />
 
-          <textarea
-            className={inputClassName}
-            value={composerValue}
-            onChange={(event) => setComposerValue(event.target.value)}
-            onKeyDown={handleComposerKeyDown}
-            aria-label="message composer"
-            placeholder={
-              stoppingMessage
-                ? "正在停止当前任务，请稍候…"
-                : sendingMessage
-                  ? "当前正在执行，点击右侧按钮可立即停止…"
-                  : "输入你的任务，可附图片；按 Enter 发送，Shift + Enter 换行"
-            }
-            rows={3}
-            disabled={sendingMessage || stoppingMessage}
-          />
-
-          {composerAttachments.length > 0 ? (
-            <div className="composer-attachments" aria-label="已选择的图片">
-              {composerAttachments.map((attachment) => (
-                <div key={attachment.id} className="composer-attachment-chip">
-                  <img className="composer-attachment-thumb" src={attachment.previewUrl} alt={attachment.filename} />
-                  <div className="composer-attachment-meta">
-                    <span className="composer-attachment-name">{attachment.filename}</span>
-                    <span className="composer-attachment-size">
-                      {typeof attachment.sizeBytes === "number" ? formatBytes(attachment.sizeBytes) : "图片"}
+          <div className={`composer-layout ${showPlanSidecar ? "with-plan-sidecar" : ""}`}>
+            <div className={`composer-pane composer-pane-main ${showPlanSidecar ? "has-plan-sidecar" : ""}`}>
+              {composerDisplayMode === "plan" ? (
+                <div className="composer-mode-token-row">
+                  <button
+                    type="button"
+                    className="composer-mode-token"
+                    title="当前处于 Plan mode，删除标签可退出"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => {
+                      void removeComposerModeToken();
+                    }}
+                    disabled={sendingMessage || stoppingMessage || planModeUpdating}
+                  >
+                    <span className="composer-mode-token-icon" aria-hidden="true">
+                      <TimelineMarkerIcon name="plan" className="composer-mode-token-icon-svg" />
                     </span>
-                  </div>
-                  <button
-                    type="button"
-                    className="composer-attachment-remove"
-                    aria-label={`移除 ${attachment.filename}`}
-                    onClick={() => removeComposerAttachment(attachment.id)}
-                  >
-                    ×
+                    <span className="composer-mode-token-label">计划模式</span>
+                    <span className="composer-mode-token-remove" aria-hidden="true">
+                      ×
+                    </span>
                   </button>
                 </div>
-              ))}
-            </div>
-          ) : null}
+              ) : null}
 
-          <div className="composer-subbar">
-            <div className="composer-subbar-left">
-              <button
-                type="button"
-                className="composer-action-button attach-trigger"
-                aria-label="添加附件"
-                onClick={() => composerFileInputRef.current?.click()}
+              <textarea
+                ref={composerTextareaRef}
+                className={inputClassName}
+                value={composerValue}
+                onChange={(event) => setComposerValue(event.target.value)}
+                onKeyDown={handleComposerKeyDown}
+                onFocus={() => setComposerFocused(true)}
+                onBlur={() => setComposerFocused(false)}
+                aria-label="message composer"
+                placeholder={
+                  stoppingMessage
+                    ? "正在停止当前任务，请稍候…"
+                    : sendingMessage
+                      ? "当前正在执行，点击右侧按钮可立即停止…"
+                      : "输入你的任务，可附图片；按 Enter 发送，Shift + Enter 换行"
+                }
+                rows={3}
                 disabled={sendingMessage || stoppingMessage}
-              >
-                <span className="session-create-button-mark" aria-hidden="true" />
-              </button>
+              />
 
-              {!isHero ? (
-                <div
-                  className={`approval-mini approval-mini-inline ${approvalMenuOpen ? "open" : ""}`}
-                  onClick={(event) => event.stopPropagation()}
-                >
+              {showComposerSlashMenu ? (
+                <div className="composer-command-menu" role="menu" aria-label="命令菜单">
+                  {availableSlashCommands.map((command) => (
+                    <button
+                      key={command.id}
+                      type="button"
+                      className="composer-command-item"
+                      role="menuitem"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => {
+                        void selectComposerSlashCommand(command);
+                      }}
+                    >
+                      <span className="composer-command-item-icon" aria-hidden="true">
+                        <TimelineMarkerIcon name="plan" className="composer-command-item-icon-svg" />
+                      </span>
+                      <span className="composer-command-item-label">{command.label}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+
+              {composerAttachments.length > 0 ? (
+                <div className="composer-attachments" aria-label="已选择的图片">
+                  {composerAttachments.map((attachment) => (
+                    <div key={attachment.id} className="composer-attachment-chip">
+                      <img className="composer-attachment-thumb" src={attachment.previewUrl} alt={attachment.filename} title={attachment.filename} />
+                      <button
+                        type="button"
+                        className="composer-attachment-remove"
+                        aria-label={`移除 ${attachment.filename}`}
+                        title={`移除 ${attachment.filename}`}
+                        onClick={() => removeComposerAttachment(attachment.id)}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              <div className="composer-subbar">
+                <div className="composer-subbar-left">
                   <button
                     type="button"
-                    className="composer-action-button approval-mini-trigger"
-                    title={activeApprovalMode.helper}
-                    aria-haspopup="menu"
-                    aria-expanded={approvalMenuOpen}
-                    aria-label="选择本轮审批策略"
-                    onClick={() => setApprovalMenuOpen((current) => !current)}
+                    className="composer-action-button attach-trigger"
+                    aria-label="添加附件"
+                    onClick={() => composerFileInputRef.current?.click()}
+                    disabled={sendingMessage || stoppingMessage || planModeUpdating}
                   >
-                    <ApprovalSmallIcon className="approval-mini-icon" />
+                    <span className="session-create-button-mark" aria-hidden="true" />
                   </button>
 
-                  {approvalMenuOpen ? (
-                    <div className="approval-mini-menu" role="menu">
-                      {(Object.entries(approvalModeMeta) as Array<[TurnApprovalMode, (typeof approvalModeMeta)[TurnApprovalMode]]>).map(
-                        ([mode, meta]) => (
-                          <button
-                            key={mode}
-                            type="button"
-                            className={`approval-mini-option ${turnApprovalMode === mode ? "active" : ""}`}
-                            role="menuitemradio"
-                            aria-checked={turnApprovalMode === mode}
-                            onClick={() => {
-                              setTurnApprovalMode(mode);
-                              setApprovalMenuOpen(false);
-                            }}
-                          >
-                            <span className="approval-mini-option-copy">{meta.label}</span>
-                            <span className="approval-mini-option-check" aria-hidden="true">
-                              {turnApprovalMode === mode ? "✓" : ""}
-                            </span>
-                          </button>
-                        )
-                      )}
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
-            </div>
+                  {!isHero ? (
+                    <div
+                      className={`approval-mini approval-mini-inline ${approvalMenuOpen ? "open" : ""}`}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <button
+                        type="button"
+                        className="composer-action-button approval-mini-trigger"
+                        title={activeApprovalMode.helper}
+                        aria-haspopup="menu"
+                        aria-expanded={approvalMenuOpen}
+                        aria-label="选择本轮审批策略"
+                        disabled={planModeUpdating}
+                        onClick={() => setApprovalMenuOpen((current) => !current)}
+                      >
+                        <ApprovalSmallIcon className="approval-mini-icon" />
+                      </button>
 
-            <div className="composer-subbar-right">
-              {showContextMeter ? (
-                <div className="context-meter">
-                  <div
-                    className={`context-ring ${contextProgress === null ? "is-empty" : ""}`}
-                    style={{ ["--context-progress" as string]: String(contextRingProgress) }}
-                    aria-label={contextPercent === null ? "Context 使用率暂不可用" : `Context 使用率 ${contextPercent}%`}
-                    title={
-                      contextPercent === null
-                        ? "当前还没有已确认的上下文使用量数据"
-                        : `已确认 Context 使用率 ${contextPercent}% (${activeContextUsage?.confirmed_prompt_tokens ?? 0}/${activeContextUsage?.effective_context_window ?? 0} tokens)${
-                            contextMetaSecondary ? `\n${contextMetaSecondary}` : ""
-                          }${contextMetaDetail ? `\n${contextMetaDetail}` : ""}`
-                    }
-                  >
-                    <span>{contextPercent === null ? "--" : `${contextPercent}%`}</span>
-                  </div>
-                  {hasContextMeta ? (
-                    <div className="context-meter-meta" aria-hidden="true">
-                      {contextMetaSecondary ? (
-                        <span
-                          className={`context-meter-secondary ${
-                            activeContextUsage?.context_irreducible || activeContextUsage?.projected_over_limit ? "warn" : ""
-                          }`}
-                        >
-                          {contextMetaSecondary}
-                        </span>
+                      {approvalMenuOpen ? (
+                        <div className="approval-mini-menu" role="menu">
+                          {(Object.entries(approvalModeMeta) as Array<[TurnApprovalMode, (typeof approvalModeMeta)[TurnApprovalMode]]>).map(
+                            ([mode, meta]) => (
+                              <button
+                                key={mode}
+                                type="button"
+                                className={`approval-mini-option ${turnApprovalMode === mode ? "active" : ""}`}
+                                role="menuitemradio"
+                                aria-checked={turnApprovalMode === mode}
+                                onClick={() => {
+                                  setTurnApprovalMode(mode);
+                                  setApprovalMenuOpen(false);
+                                }}
+                              >
+                                <span className="approval-mini-option-copy">{meta.label}</span>
+                                <span className="approval-mini-option-check" aria-hidden="true">
+                                  {turnApprovalMode === mode ? "✓" : ""}
+                                </span>
+                              </button>
+                            )
+                          )}
+                        </div>
                       ) : null}
-                      {contextMetaDetail ? <span className="context-meter-detail">{contextMetaDetail}</span> : null}
                     </div>
                   ) : null}
                 </div>
-              ) : null}
 
-              <button
-                type="button"
-                className={`send-trigger send-trigger-inline ${sendingMessage ? "is-running" : ""}`}
-                onClick={() => {
-                  if (sendingMessage) {
-                    void stopActiveComposerRun();
-                    return;
-                  }
-                  void submitComposer();
-                }}
-                disabled={stoppingMessage || (!sendingMessage && isComposerEmpty)}
-                aria-label={sendingMessage ? (stoppingMessage ? "正在停止当前任务" : "停止当前任务") : "发送"}
-                title={sendingMessage ? (stoppingMessage ? "正在停止当前任务" : "点击立即停止当前任务") : "发送"}
-              >
-                {sendingMessage ? (
-                  <svg viewBox="0 0 20 20" aria-hidden="true">
-                    <rect x="5.25" y="5.25" width="9.5" height="9.5" rx="2.4" fill="currentColor" />
-                  </svg>
-                ) : (
-                  <svg viewBox="0 0 20 20" aria-hidden="true">
-                    <path
-                      d="M5.25 14.75 14.75 5.25M7 5.25h7.75V13"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.8"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
-                )}
-              </button>
+                <div className="composer-subbar-right">
+                  {showContextMeter ? (
+                    <div className="context-meter">
+                      <div
+                        className={`context-ring ${contextProgress === null ? "is-empty" : ""}`}
+                        style={{ ["--context-progress" as string]: String(contextRingProgress) }}
+                        aria-label={contextPercent === null ? "Context 使用率暂不可用" : `Context 使用率 ${contextPercent}%`}
+                        title={
+                          contextPercent === null
+                            ? "当前还没有已确认的上下文使用量数据"
+                            : `已确认 Context 使用率 ${contextPercent}% (${activeContextUsage?.confirmed_prompt_tokens ?? 0}/${activeContextUsage?.effective_context_window ?? 0} tokens)${
+                                contextMetaSecondary ? `\n${contextMetaSecondary}` : ""
+                              }${contextMetaDetail ? `\n${contextMetaDetail}` : ""}`
+                        }
+                      >
+                        <span>{contextPercent === null ? "--" : `${contextPercent}%`}</span>
+                      </div>
+                      {hasContextMeta ? (
+                        <div className="context-meter-meta" aria-hidden="true">
+                          {contextMetaSecondary ? (
+                            <span
+                              className={`context-meter-secondary ${
+                                activeContextUsage?.context_irreducible || activeContextUsage?.projected_over_limit ? "warn" : ""
+                              }`}
+                            >
+                              {contextMetaSecondary}
+                            </span>
+                          ) : null}
+                          {contextMetaDetail ? <span className="context-meter-detail">{contextMetaDetail}</span> : null}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  <button
+                    type="button"
+                    className={`send-trigger send-trigger-inline ${sendingMessage ? "is-running" : ""}`}
+                    onClick={() => {
+                      if (sendingMessage) {
+                        void stopActiveComposerRun();
+                        return;
+                      }
+                      void submitComposer();
+                    }}
+                    disabled={stoppingMessage || planModeUpdating || (!sendingMessage && isComposerEmpty)}
+                    aria-label={sendingMessage ? (stoppingMessage ? "正在停止当前任务" : "停止当前任务") : "发送"}
+                    title={sendingMessage ? (stoppingMessage ? "正在停止当前任务" : "点击立即停止当前任务") : "发送"}
+                  >
+                    {sendingMessage ? (
+                      <svg viewBox="0 0 20 20" aria-hidden="true">
+                        <rect x="5.25" y="5.25" width="9.5" height="9.5" rx="2.4" fill="currentColor" />
+                      </svg>
+                    ) : (
+                      <svg viewBox="0 0 20 20" aria-hidden="true">
+                        <path
+                          d="M5.25 14.75 14.75 5.25M7 5.25h7.75V13"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    )}
+                  </button>
+                </div>
+              </div>
             </div>
+
+            {showPlanSidecar ? renderComposerPlanTray(variant) : null}
           </div>
         </div>
       </div>
@@ -4914,86 +5785,198 @@ function App() {
               </div>
             </section>
           ) : (
-            <div className="chat-stage">
-              <section
-                ref={conversationPaneRef}
-                className="conversation-pane conversation-pane-floating"
-              >
-                {chatError ? <div className="workspace-alert error">{chatError}</div> : null}
-                {chatLoading ? <div className="workspace-empty">正在加载会话内容...</div> : null}
+            <div className={`chat-stage ${htmlPreview ? "with-html-preview" : ""}`}>
+              <div className="chat-stage-main">
+                <section
+                  ref={conversationPaneRef}
+                  className="conversation-pane conversation-pane-floating"
+                >
+                  {chatError ? <div className="workspace-alert error">{chatError}</div> : null}
+                  {chatLoading ? (
+                    <div
+                      className="chat-session-loading"
+                      role="status"
+                      aria-live="polite"
+                      aria-label="正在加载会话内容"
+                    >
+                      <span className="chat-session-loading-spinner" aria-hidden="true" />
+                    </div>
+                  ) : null}
 
-                {!chatLoading ? (
-                  <>
-                    {displayTurns.length === 0 ? <div className="workspace-empty">这个会话还没有内容，直接开始提需求就行。</div> : null}
+                  {!chatLoading ? (
+                    <>
+                      {displayTurns.length === 0 ? <div className="workspace-empty">这个会话还没有内容，直接开始提需求就行。</div> : null}
 
-                    {displayTurns.map((turn) => {
-                      const answerCopy = resolveAnswerCopy(turn.answer, turn.status);
-                      const showAnswerBubble = shouldRenderAnswerBubble(turn);
-                      const showAssistantMessageMeta = shouldRenderAssistantMessageMeta(turn);
-                      const assistantCopyValue =
-                        turn.answer?.content.trim() ? turn.answer.content : turn.answer?.phase === "failed" ? answerCopy : null;
-                      const visibleThinkingNode = turn.timeline.find(
-                        (node) => node.kind === "thinking" && node.state === "running" && turn.isLive
-                      );
-                      const hasVisibleThinkingNode = Boolean(visibleThinkingNode);
-                      const visibleTimelineNodes = turn.timeline.filter((node) => node.kind !== "thinking");
-                      const shouldShowTimelineStack = visibleTimelineNodes.length > 0 || hasVisibleThinkingNode;
-                      return (
-                        <div key={turn.id} className={`turn-block ${turn.isLive ? "live" : ""}`}>
-                          <div className="user-row">
-                            <div className="turn-user-stack">
-                              <MessageHoverShell
-                                shellClassName="user"
-                                align="end"
-                                timestamp={turn.userMessage.createdAt}
-                                copyValue={turn.userMessage.content}
-                                copyLabel="用户输入"
-                              >
-                                <div className={`user-bubble ${turn.userMessage.attachments.length > 0 ? "has-attachments" : ""}`}>
-                                  <MessageContent
-                                    apiBase={apiBase}
-                                    variant="user"
-                                    content={turn.userMessage.content}
-                                    attachments={turn.userMessage.attachments}
-                                  />
-                                </div>
-                              </MessageHoverShell>
+                      {displayTurns.map((turn) => {
+                        const answerCopy = resolveAnswerCopy(turn.answer, turn.status);
+                        const showAnswerBubble = shouldRenderAnswerBubble(turn);
+                        const showAssistantMessageMeta = shouldRenderAssistantMessageMeta(turn);
+                        const assistantCopyValue =
+                          turn.answer?.content.trim() ? turn.answer.content : turn.answer?.phase === "failed" ? answerCopy : null;
+                        const visibleThinkingNode = turn.timeline.find(
+                          (node) => node.kind === "thinking" && node.state === "running" && turn.isLive
+                        );
+                        const hasVisibleThinkingNode = Boolean(visibleThinkingNode);
+                        const visibleTimelineNodes = turn.timeline.filter((node) => node.kind !== "thinking");
+                        const shouldShowTimelineStack = visibleTimelineNodes.length > 0 || hasVisibleThinkingNode;
+                        return (
+                          <div key={turn.id} className={`turn-block ${turn.isLive ? "live" : ""}`}>
+                            <div className="user-row">
+                              <div className="turn-user-stack">
+                                <MessageHoverShell
+                                  shellClassName="user"
+                                  align="end"
+                                  timestamp={turn.userMessage.createdAt}
+                                  copyValue={turn.userMessage.content}
+                                  copyLabel="用户输入"
+                                >
+                                  <div className={`user-bubble ${turn.userMessage.attachments.length > 0 ? "has-attachments" : ""}`}>
+                                    <MessageContent
+                                      apiBase={apiBase}
+                                      variant="user"
+                                      content={turn.userMessage.content}
+                                      attachments={turn.userMessage.attachments}
+                                    />
+                                  </div>
+                                </MessageHoverShell>
+                              </div>
                             </div>
-                          </div>
 
-                          {shouldShowTimelineStack ? (
-                            <div className="timeline-stack trace-turn-column">
-                              {visibleTimelineNodes.map((node, index) => {
-                                if (node.kind === "system_meta") {
-                                  const systemHasHead = index > 0;
-                                  const systemHasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
-                                  return (
-                                    <div key={node.id} className="timeline-system-row">
-                                      <div
-                                        className={`timeline-primary-marker rail-only ${systemHasHead ? "has-head" : ""} ${
-                                          systemHasTail ? "has-tail" : ""
-                                        }`}
-                                      />
-                                      <div className="timeline-system-meta" role="status" aria-live="polite">
-                                        <span className="timeline-system-meta-text">{node.primaryText}</span>
+                            {shouldShowTimelineStack ? (
+                              <div className="timeline-stack trace-turn-column">
+                                {visibleTimelineNodes.map((node, index) => {
+                                  if (node.kind === "system_meta") {
+                                    const systemHasHead = index > 0;
+                                    const systemHasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
+                                    return (
+                                      <div key={node.id} className="timeline-system-row">
+                                        <div
+                                          className={`timeline-primary-marker rail-only ${systemHasHead ? "has-head" : ""} ${
+                                            systemHasTail ? "has-tail" : ""
+                                          }`}
+                                        />
+                                        <div className="timeline-system-meta" role="status" aria-live="polite">
+                                          <span className="timeline-system-meta-text">{node.primaryText}</span>
+                                        </div>
                                       </div>
-                                    </div>
-                                  );
-                                }
+                                    );
+                                  }
 
-                                if (node.kind === "approval" && node.approval) {
+                                  if (node.kind === "approval" && node.approval) {
+                                    const expanded = isTimelineExpanded(node);
+                                    const markerIcon = resolveTimelineNodeIcon(node);
+                                    const hasHead = index > 0;
+                                    const hasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
+                                    const payloadPreview = buildApprovalPayloadPreview(node.approval);
+                                    const payloadCodePreview = buildTimelineCodePreview(
+                                      node.approval.tool,
+                                      payloadPreview,
+                                      node.approval.arguments
+                                    );
+                                    const payloadLabel = buildApprovalPayloadLabel(node.approval);
+                                    const isActivePendingApproval =
+                                      pendingApproval?.approval_request_id === node.approval.approvalRequestId;
+                                    const showPendingActions = node.state === "pending";
+                                    const showResolvedDetail = !showPendingActions && Boolean(payloadPreview);
+                                    const detailCardClass = node.approval.tool === "terminal" ? "terminal" : "generic";
+
+                                    return (
+                                      <article
+                                        key={node.id}
+                                        className={`timeline-node ${expanded ? "expanded" : ""} state-${node.state} kind-${node.kind}`}
+                                      >
+                                        <div className={`timeline-primary-marker ${hasHead ? "has-head" : ""} ${hasTail ? "has-tail" : ""}`}>
+                                          <span className="timeline-marker-icon-wrap" aria-hidden="true">
+                                            <TimelineMarkerIcon name={markerIcon} className="timeline-marker-icon" />
+                                          </span>
+                                        </div>
+
+                                        <div className="timeline-primary-copy">
+                                          <div className="timeline-approval-primary">
+                                            <p className="timeline-primary-text">{node.primaryText}</p>
+                                            {!showPendingActions ? (
+                                              <span className={`timeline-approval-status-tag state-${node.state}`}>
+                                                {buildApprovalStateLabel(node.state)}
+                                              </span>
+                                            ) : null}
+                                          </div>
+
+                                          {showPendingActions ? (
+                                            <div className="timeline-approval-action-row">
+                                              <button
+                                                type="button"
+                                                className="timeline-approval-button ghost"
+                                                onClick={() => void resolveApproval("reject", node.approval?.approvalRequestId ?? null)}
+                                                disabled={approvalActionLoading !== null || !isActivePendingApproval}
+                                              >
+                                                {approvalActionLoading === "reject" && isActivePendingApproval ? "拒绝中..." : "拒绝"}
+                                              </button>
+                                              <button
+                                                type="button"
+                                                className="timeline-approval-button solid"
+                                                onClick={() => void resolveApproval("approve", node.approval?.approvalRequestId ?? null)}
+                                                disabled={approvalActionLoading !== null || !isActivePendingApproval}
+                                              >
+                                                {approvalActionLoading === "approve" && isActivePendingApproval ? "允许中..." : "允许继续"}
+                                              </button>
+                                            </div>
+                                          ) : null}
+
+                                          {approvalError && showPendingActions && isActivePendingApproval ? (
+                                            <div className="workspace-alert error timeline-approval-error">{approvalError}</div>
+                                          ) : null}
+
+                                          {showResolvedDetail ? (
+                                            <button
+                                              type="button"
+                                              className={`timeline-tool-toggle ${expanded ? "expanded" : ""}`}
+                                              onClick={() => toggleTimelineNode(node)}
+                                              aria-expanded={expanded}
+                                              aria-controls={`timeline-panel-${node.id}`}
+                                            >
+                                              <span className="timeline-tool-toggle-label">查看参数</span>
+                                            </button>
+                                          ) : null}
+
+                                          {showResolvedDetail ? (
+                                            <div
+                                              id={`timeline-panel-${node.id}`}
+                                              className={`timeline-secondary-region ${expanded ? "expanded" : ""}`}
+                                              aria-hidden={!expanded}
+                                            >
+                                              <div className="timeline-secondary-region-inner">
+                                                <div className="timeline-secondary-list">
+                                                  <article className={`timeline-secondary-card ${detailCardClass}`}>
+                                                    <div className="timeline-secondary-head">
+                                                      <div className="timeline-secondary-head-main">
+                                                        <div className="timeline-secondary-label-row">
+                                                          <span className="timeline-secondary-label">{payloadLabel}</span>
+                                                          <span className="timeline-secondary-time-inline">{node.time}</span>
+                                                        </div>
+                                                      </div>
+                                                    </div>
+                                                    <div className="timeline-secondary-result-wrap timeline-code-block">
+                                                      <pre className={`timeline-secondary-result timeline-code-block-pre ${detailCardClass === "terminal" ? "terminal" : ""}`}>
+                                                        <code
+                                                          className={payloadCodePreview.language ? `language-${payloadCodePreview.language}` : undefined}
+                                                          dangerouslySetInnerHTML={{ __html: payloadCodePreview.html }}
+                                                        />
+                                                      </pre>
+                                                    </div>
+                                                  </article>
+                                                </div>
+                                              </div>
+                                            </div>
+                                          ) : null}
+                                        </div>
+                                      </article>
+                                    );
+                                  }
+
                                   const expanded = isTimelineExpanded(node);
                                   const markerIcon = resolveTimelineNodeIcon(node);
                                   const hasHead = index > 0;
                                   const hasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
-                                  const payloadPreview = buildApprovalPayloadPreview(node.approval);
-                                  const payloadLabel = buildApprovalPayloadLabel(node.approval);
-                                  const isActivePendingApproval =
-                                    pendingApproval?.approval_request_id === node.approval.approvalRequestId;
-                                  const showPendingActions = node.state === "pending";
-                                  const showResolvedDetail = !showPendingActions && Boolean(payloadPreview);
-                                  const detailCardClass = node.approval.tool === "terminal" ? "terminal" : "generic";
-
                                   return (
                                     <article
                                       key={node.id}
@@ -5006,41 +5989,9 @@ function App() {
                                       </div>
 
                                       <div className="timeline-primary-copy">
-                                        <div className="timeline-approval-primary">
-                                          <p className="timeline-primary-text">{node.primaryText}</p>
-                                          {!showPendingActions ? (
-                                            <span className={`timeline-approval-status-tag state-${node.state}`}>
-                                              {buildApprovalStateLabel(node.state)}
-                                            </span>
-                                          ) : null}
-                                        </div>
+                                        <p className="timeline-primary-text">{node.primaryText}</p>
 
-                                        {showPendingActions ? (
-                                          <div className="timeline-approval-action-row">
-                                            <button
-                                              type="button"
-                                              className="timeline-approval-button ghost"
-                                              onClick={() => void resolveApproval("reject", node.approval?.approvalRequestId ?? null)}
-                                              disabled={approvalActionLoading !== null || !isActivePendingApproval}
-                                            >
-                                              {approvalActionLoading === "reject" && isActivePendingApproval ? "拒绝中..." : "拒绝"}
-                                            </button>
-                                            <button
-                                              type="button"
-                                              className="timeline-approval-button solid"
-                                              onClick={() => void resolveApproval("approve", node.approval?.approvalRequestId ?? null)}
-                                              disabled={approvalActionLoading !== null || !isActivePendingApproval}
-                                            >
-                                              {approvalActionLoading === "approve" && isActivePendingApproval ? "允许中..." : "允许继续"}
-                                            </button>
-                                          </div>
-                                        ) : null}
-
-                                        {approvalError && showPendingActions && isActivePendingApproval ? (
-                                          <div className="workspace-alert error timeline-approval-error">{approvalError}</div>
-                                        ) : null}
-
-                                        {showResolvedDetail ? (
+                                        {node.secondaryItems.length > 0 ? (
                                           <button
                                             type="button"
                                             className={`timeline-tool-toggle ${expanded ? "expanded" : ""}`}
@@ -5048,11 +5999,11 @@ function App() {
                                             aria-expanded={expanded}
                                             aria-controls={`timeline-panel-${node.id}`}
                                           >
-                                            <span className="timeline-tool-toggle-label">查看参数</span>
+                                            <span className="timeline-tool-toggle-label">{buildTimelineToolSummary(node)}</span>
                                           </button>
                                         ) : null}
 
-                                        {showResolvedDetail ? (
+                                        {node.secondaryItems.length > 0 ? (
                                           <div
                                             id={`timeline-panel-${node.id}`}
                                             className={`timeline-secondary-region ${expanded ? "expanded" : ""}`}
@@ -5060,25 +6011,44 @@ function App() {
                                           >
                                             <div className="timeline-secondary-region-inner">
                                               <div className="timeline-secondary-list">
-                                                <article className={`timeline-secondary-card ${detailCardClass}`}>
-                                                  <div className="timeline-secondary-head">
-                                                    <div className="timeline-secondary-head-main">
-                                                      <div className="timeline-secondary-label-row">
-                                                        <span className="timeline-secondary-label">{payloadLabel}</span>
-                                                        <span className="timeline-secondary-time-inline">{node.time}</span>
-                                                      </div>
-                                                    </div>
-                                                  </div>
-                                                  <div className="timeline-secondary-result-wrap">
-                                                    <pre
-                                                      className={`timeline-secondary-result ${
-                                                        detailCardClass === "terminal" ? "terminal" : ""
-                                                      }`}
+                                                {node.secondaryItems.map((item) => {
+                                                  const resultText = buildTimelineSecondaryResultText(item);
+                                                  const resultCodePreview = buildTimelineCodePreview(
+                                                    item.toolName,
+                                                    resultText,
+                                                    item.argumentsPayload
+                                                  );
+                                                  return (
+                                                    <article
+                                                      key={item.id}
+                                                      className={`timeline-secondary-card ${item.cardType}`}
                                                     >
-                                                      {payloadPreview}
-                                                    </pre>
-                                                  </div>
-                                                </article>
+                                                      <div className="timeline-secondary-head">
+                                                        <div className="timeline-secondary-head-main">
+                                                          <div className="timeline-secondary-label-row">
+                                                            <span className="timeline-secondary-label">{item.label}</span>
+                                                            <span className="timeline-secondary-time-inline">{item.detail.time}</span>
+                                                          </div>
+                                                        </div>
+                                                      </div>
+                                                      <div className="timeline-secondary-result-wrap timeline-code-block">
+                                                        {item.cardType === "terminal" && item.command ? (
+                                                          <pre className="timeline-terminal-command">{`$ ${item.command}`}</pre>
+                                                        ) : null}
+                                                        <pre
+                                                          className={`timeline-secondary-result timeline-code-block-pre ${
+                                                            item.cardType === "terminal" ? "terminal" : ""
+                                                          }`}
+                                                        >
+                                                          <code
+                                                            className={resultCodePreview.language ? `language-${resultCodePreview.language}` : undefined}
+                                                            dangerouslySetInnerHTML={{ __html: resultCodePreview.html }}
+                                                          />
+                                                        </pre>
+                                                      </div>
+                                                    </article>
+                                                  );
+                                                })}
                                               </div>
                                             </div>
                                           </div>
@@ -5086,131 +6056,107 @@ function App() {
                                       </div>
                                     </article>
                                   );
-                                }
+                                })}
 
-                                const expanded = isTimelineExpanded(node);
-                                const markerIcon = resolveTimelineNodeIcon(node);
-                                const hasHead = index > 0;
-                                const hasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
-                                return (
-                                  <article
-                                    key={node.id}
-                                    className={`timeline-node ${expanded ? "expanded" : ""} state-${node.state} kind-${node.kind}`}
-                                  >
-                                    <div className={`timeline-primary-marker ${hasHead ? "has-head" : ""} ${hasTail ? "has-tail" : ""}`}>
-                                      <span className="timeline-marker-icon-wrap" aria-hidden="true">
-                                        <TimelineMarkerIcon name={markerIcon} className="timeline-marker-icon" />
-                                      </span>
-                                    </div>
+                                {visibleThinkingNode ? (
+                                  <article className="timeline-node timeline-thinking-node" aria-label="Thinking">
+                                    <div
+                                      className={`timeline-primary-marker rail-only ${
+                                        visibleTimelineNodes.length > 0 ? "has-head" : ""
+                                      }`}
+                                    />
 
-                                    <div className="timeline-primary-copy">
-                                      <p className="timeline-primary-text">{node.primaryText}</p>
-
-                                      {node.secondaryItems.length > 0 ? (
-                                        <button
-                                          type="button"
-                                          className={`timeline-tool-toggle ${expanded ? "expanded" : ""}`}
-                                          onClick={() => toggleTimelineNode(node)}
-                                          aria-expanded={expanded}
-                                          aria-controls={`timeline-panel-${node.id}`}
-                                        >
-                                          <span className="timeline-tool-toggle-label">{buildTimelineToolSummary(node)}</span>
-                                        </button>
-                                      ) : null}
-
-                                      {node.secondaryItems.length > 0 ? (
-                                        <div
-                                          id={`timeline-panel-${node.id}`}
-                                          className={`timeline-secondary-region ${expanded ? "expanded" : ""}`}
-                                          aria-hidden={!expanded}
-                                        >
-                                          <div className="timeline-secondary-region-inner">
-                                            <div className="timeline-secondary-list">
-                                              {node.secondaryItems.map((item) => {
-                                                const resultText = buildTimelineSecondaryResultText(item);
-                                                return (
-                                                  <article
-                                                    key={item.id}
-                                                    className={`timeline-secondary-card ${item.cardType}`}
-                                                  >
-                                                    <div className="timeline-secondary-head">
-                                                      <div className="timeline-secondary-head-main">
-                                                        <div className="timeline-secondary-label-row">
-                                                          <span className="timeline-secondary-label">{item.label}</span>
-                                                          <span className="timeline-secondary-time-inline">{item.detail.time}</span>
-                                                        </div>
-                                                      </div>
-                                                    </div>
-                                                    <div className="timeline-secondary-result-wrap">
-                                                      {item.cardType === "terminal" && item.command ? (
-                                                        <pre className="timeline-terminal-command">{`$ ${item.command}`}</pre>
-                                                      ) : null}
-                                                      <pre className={`timeline-secondary-result ${item.cardType === "terminal" ? "terminal" : ""}`}>
-                                                        {resultText}
-                                                      </pre>
-                                                    </div>
-                                                  </article>
-                                                );
-                                              })}
-                                            </div>
-                                          </div>
+                                    <div className="timeline-primary-copy timeline-thinking-copy">
+                                      <div className="thinking-logo-row">
+                                        <img src={logo} alt="" className="thinking-inline-logo" />
+                                        <div className="thinking-inline-copy">
+                                          <span className="thinking-inline-word">thinking</span>
+                                          <span className="thinking-inline-dots" aria-hidden="true">
+                                            <span className="thinking-inline-dot dot-one">.</span>
+                                            <span className="thinking-inline-dot dot-two">.</span>
+                                            <span className="thinking-inline-dot dot-three">.</span>
+                                          </span>
                                         </div>
-                                      ) : null}
-                                    </div>
-                                  </article>
-                                );
-                              })}
-
-                              {visibleThinkingNode ? (
-                                <article className="timeline-node timeline-thinking-node" aria-label="Thinking">
-                                  <div
-                                    className={`timeline-primary-marker rail-only ${
-                                      visibleTimelineNodes.length > 0 ? "has-head" : ""
-                                    }`}
-                                  />
-
-                                  <div className="timeline-primary-copy timeline-thinking-copy">
-                                    <div className="thinking-logo-row">
-                                      <img src={logo} alt="" className="thinking-inline-logo" />
-                                      <div className="thinking-inline-copy">
-                                        <span className="thinking-inline-word">thinking</span>
-                                        <span className="thinking-inline-dots" aria-hidden="true">
-                                          <span className="thinking-inline-dot dot-one">.</span>
-                                          <span className="thinking-inline-dot dot-two">.</span>
-                                          <span className="thinking-inline-dot dot-three">.</span>
-                                        </span>
                                       </div>
                                     </div>
+                                  </article>
+                                ) : null}
+                              </div>
+                            ) : null}
+
+                            {showAnswerBubble ? (
+                              <div className="trace-row">
+                                <MessageHoverShell
+                                  shellClassName="assistant"
+                                  align="start"
+                                  timestamp={turn.answer?.createdAt ?? turn.userMessage.createdAt}
+                                  copyValue={showAssistantMessageMeta ? assistantCopyValue : null}
+                                  copyLabel="回复"
+                                  showMeta={showAssistantMessageMeta && Boolean(turn.answer)}
+                                >
+                                  <div className="trace-bubble wide final answer-bubble">
+                                    <MessageContent
+                                      apiBase={apiBase}
+                                      variant="assistant"
+                                      content={answerCopy}
+                                      className="trace-copy"
+                                      onOpenHtmlPreview={setHtmlPreview}
+                                      deferCodeBlocksUntilComplete={turn.isLive && turn.status === "running"}
+                                    />
                                   </div>
-                                </article>
-                              ) : null}
-                            </div>
-                          ) : null}
+                                </MessageHoverShell>
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </>
+                  ) : null}
+                </section>
 
-                          {showAnswerBubble ? (
-                            <div className="trace-row">
-                              <MessageHoverShell
-                                shellClassName="assistant"
-                                align="start"
-                                timestamp={turn.answer?.createdAt ?? turn.userMessage.createdAt}
-                                copyValue={showAssistantMessageMeta ? assistantCopyValue : null}
-                                copyLabel="回复"
-                                showMeta={showAssistantMessageMeta && Boolean(turn.answer)}
-                              >
-                                <div className="trace-bubble wide final answer-bubble">
-                                  <MessageContent apiBase={apiBase} variant="assistant" content={answerCopy} className="trace-copy" />
-                                </div>
-                              </MessageHoverShell>
-                            </div>
-                          ) : null}
-                        </div>
-                      );
-                    })}
-                  </>
-                ) : null}
-              </section>
+                <footer className="composer-bar composer-bar-floating">{renderChatComposer("footer")}</footer>
+              </div>
 
-              <footer className="composer-bar composer-bar-floating">{renderChatComposer("footer")}</footer>
+              <aside className={`html-preview-panel ${htmlPreview ? "open" : ""}`} aria-label="HTML 预览面板">
+                <div className="html-preview-panel-inner">
+                  <div className="html-preview-panel-head">
+                    <div className="html-preview-panel-copy">
+                      <span className="html-preview-panel-kicker">
+                        <EyePanelIcon className="html-preview-panel-kicker-icon" />
+                        实时预览
+                      </span>
+                      <h3>{htmlPreview?.title ?? "HTML 实时预览"}</h3>
+                      <p>渲染当前代码块中的 HTML 内容。</p>
+                    </div>
+                    <button
+                      type="button"
+                      className="html-preview-panel-close"
+                      onClick={() => setHtmlPreview(null)}
+                      aria-label="关闭 HTML 预览"
+                    >
+                      <ClosePanelIcon className="html-preview-panel-close-icon" />
+                    </button>
+                  </div>
+
+                  <div className="html-preview-frame-shell">
+                    <div className="html-preview-frame-topbar">
+                      <span className="html-preview-frame-badge">HTML</span>
+                      <span className="html-preview-frame-title">{htmlPreview?.title ?? "HTML 实时预览"}</span>
+                    </div>
+                    <div className="html-preview-frame-stage">
+                      {htmlPreview ? (
+                        <iframe
+                          className="html-preview-iframe"
+                          title={htmlPreview.title}
+                          srcDoc={normalizedHtmlPreviewContent}
+                          sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
+                          referrerPolicy="no-referrer"
+                        />
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              </aside>
             </div>
           )
         ) : null}
@@ -5502,179 +6448,7 @@ function App() {
         ) : null}
 
         {activePage === "files" ? (
-          <section className="workspace-page">
-            <div className="workspace-page-head">
-              <div>
-                <p className="workspace-eyebrow">Files Workspace</p>
-                <h2>浏览当前工作区和最近导入资料，快速定位上下文文件</h2>
-                <div className="workspace-page-meta">
-                  <span className="workspace-pill">{workspaceRootPath ? extractName(workspaceRootPath) : "workspace"}</span>
-                  <span className="workspace-pill subtle">{knowledgeDocuments.length} 份知识资料</span>
-                </div>
-              </div>
-              <div className="workspace-page-actions">
-                <button
-                  type="button"
-                  className="workspace-secondary-button"
-                  onClick={() => void refreshFilesWorkspace()}
-                  disabled={workspaceLoading || knowledgeLoading}
-                >
-                  刷新内容
-                </button>
-              </div>
-            </div>
-
-            {workspaceError ? <div className="workspace-alert error">{workspaceError}</div> : null}
-            {knowledgeError ? <div className="workspace-alert error">{knowledgeError}</div> : null}
-
-            <div className="files-grid">
-              <article className="workspace-card">
-                <div className="workspace-card-head">
-                  <div>
-                    <h3>工作区浏览</h3>
-                    <p>当前路径：{currentWorkspaceLabel}</p>
-                  </div>
-                  <div className="workspace-inline-actions">
-                    <button
-                      type="button"
-                      className="workspace-secondary-button"
-                      onClick={() => setWorkspacePath(extractParentPath(workspaceView?.path ?? ".", workspaceRootPath))}
-                      disabled={!workspaceView || isWorkspaceRoot}
-                    >
-                      返回上一级
-                    </button>
-                  </div>
-                </div>
-
-                <div className="workspace-card-body workspace-card-scroll">
-                  {workspaceLoading ? <div className="workspace-empty">正在读取工作区...</div> : null}
-
-                  {!workspaceLoading && workspaceView?.type === "dir" ? (
-                    <div className="workspace-list">
-                      {workspaceView.entries.length === 0 ? <div className="workspace-empty">当前目录为空。</div> : null}
-                      {workspaceView.entries.map((entry) => (
-                        <button
-                          key={entry.path}
-                          type="button"
-                          className="workspace-list-row"
-                          onClick={() => setWorkspacePath(entry.path)}
-                        >
-                          <div className="workspace-list-row-main">
-                            <span className={`workspace-item-mark ${entry.type}`}>{entry.type === "dir" ? "DIR" : "FILE"}</span>
-                            <strong>{entry.name}</strong>
-                          </div>
-                          <span className="workspace-row-path">{entry.type === "dir" ? "进入目录" : "查看内容"}</span>
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {!workspaceLoading && workspaceView?.type === "file" ? (
-                    <div className="workspace-file-preview">
-                      <div className="workspace-preview-meta">
-                        <span className="workspace-pill accent">{extractName(workspaceView.path)}</span>
-                        <span className="workspace-pill subtle">{workspaceView.content.length} 字符预览</span>
-                      </div>
-                      <pre>{workspaceView.content}</pre>
-                    </div>
-                  ) : null}
-                </div>
-              </article>
-
-              <div className="workspace-side-column">
-                <article className="workspace-card">
-                  <div className="workspace-card-head">
-                    <div>
-                      <h3>{workspaceView?.type === "file" ? "当前文件摘要" : "当前目录摘要"}</h3>
-                      <p>帮助你快速理解当前工作区上下文。</p>
-                    </div>
-                  </div>
-
-                  <div className="workspace-card-body">
-                    {workspaceView ? (
-                      <>
-                        <div className="workspace-mini-card">
-                          <span className="workspace-mini-label">绝对路径</span>
-                          <strong>{workspaceView.path}</strong>
-                        </div>
-                        <div className="workspace-mini-card">
-                          <span className="workspace-mini-label">当前类型</span>
-                          <strong>{workspaceView.type === "dir" ? "目录" : "文件"}</strong>
-                        </div>
-                        <div className="workspace-mini-card">
-                          <span className="workspace-mini-label">
-                            {workspaceView.type === "dir" ? "条目数量" : "预览大小"}
-                          </span>
-                          <strong>
-                            {workspaceView.type === "dir"
-                              ? `${workspaceView.entries.length} 项`
-                              : `${formatBytes(new Blob([workspaceView.content]).size)}`}
-                          </strong>
-                        </div>
-                      </>
-                    ) : (
-                      <div className="workspace-empty">等待工作区内容加载。</div>
-                    )}
-                  </div>
-                </article>
-
-                <article className="workspace-card">
-                  <div className="workspace-card-head">
-                    <div>
-                      <h3>最近导入资料</h3>
-                      <p>展示解析后的知识文件，便于回到引用源头。</p>
-                    </div>
-                  </div>
-
-                  <div className="workspace-card-body workspace-card-scroll">
-                    {knowledgeLoading ? <div className="workspace-empty">正在加载资料...</div> : null}
-
-                    {!knowledgeLoading ? (
-                      <div className="workspace-list">
-                        {knowledgeDocuments.length === 0 ? <div className="workspace-empty">当前还没有导入资料。</div> : null}
-                        {knowledgeDocuments.map((document) => {
-                          const openPath = isOpenableWorkspacePath(document.source_path, workspaceRootPath)
-                            ? document.source_path
-                            : isOpenableWorkspacePath(document.stored_path, workspaceRootPath)
-                              ? document.stored_path
-                              : null;
-
-                          return (
-                            <div key={document.document_id} className="document-card">
-                              <div className="document-card-head">
-                                <strong>{document.title}</strong>
-                                <span className="workspace-pill subtle">{document.parser}</span>
-                              </div>
-                              <p>{document.source_path}</p>
-                              <div className="document-card-meta">
-                                <span>{document.chunk_count} chunks</span>
-                                <span>{document.page_count ? `${document.page_count} 页` : "单文件"}</span>
-                                <span>{formatDateTime(document.imported_at)}</span>
-                              </div>
-                              <div className="workspace-inline-actions">
-                                <button
-                                  type="button"
-                                  className="workspace-secondary-button"
-                                  onClick={() => {
-                                    if (openPath) {
-                                      setWorkspacePath(openPath);
-                                    }
-                                  }}
-                                  disabled={!openPath}
-                                >
-                                  {openPath ? "在工作区打开" : "不可直接跳转"}
-                                </button>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ) : null}
-                  </div>
-                </article>
-              </div>
-            </div>
-          </section>
+          <FilesLibraryPage apiBase={apiBase} onClose={() => switchPage("chat")} />
         ) : null}
 
         {activePage === "settings" ? (

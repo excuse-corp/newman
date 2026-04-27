@@ -160,6 +160,13 @@ class ApprovalPolicy:
         if tool.meta.approval_behavior == "confirmable":
             decision_reasons = _dedupe_reasons(["requires_approval", *ask_reasons])
 
+        if tool.meta.force_user_confirmation:
+            return ApprovalDecision(
+                action="ask",
+                reasons=_dedupe_reasons(["requires_explicit_confirmation", *decision_reasons]),
+                summary="当前切换需要用户明确确认",
+            )
+
         if turn_approval_mode == "auto_allow":
             return ApprovalDecision(
                 action="allow",
