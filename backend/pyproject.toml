@@ -36,6 +36,7 @@ packages = [
   "backend.api.middleware",
   "backend.api.routes",
   "backend.api.sse",
+  "backend.attachments",
   "backend.channels",
   "backend.config",
   "backend.hooks",

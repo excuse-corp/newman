@@ -4,10 +4,11 @@ import remarkGfm from "remark-gfm";
 import logo from "./assets/newman-logo.png";
 import MessageContent, { type ChatAttachment, type HtmlPreviewPayload } from "./chat/MessageContent";
 import { highlightCode, inferLanguageFromPath } from "./chat/codeHighlight";
+import AutomationsPage from "./pages/AutomationsPage";
 import FilesLibraryPage from "./pages/FilesLibraryPage";
 import "./styles.css";
 
-type WorkspacePage = "chat" | "memory" | "skills" | "files" | "settings";
+type WorkspacePage = "chat" | "automations" | "memory" | "skills" | "files" | "settings";
 type MemoryKey = "memory" | "user";
 type TurnApprovalMode = "manual" | "auto_allow";
 type CollaborationModeName = "default" | "plan";
@@ -61,6 +62,10 @@ type SessionSummaryRecord = {
   created_at: string;
   updated_at: string;
   message_count: number;
+  background?: boolean;
+  scheduled?: boolean;
+  trigger_type?: string | null;
+  source_task_id?: string | null;
 };
 
 type SessionMessageRecord = {
@@ -213,6 +218,7 @@ type TurnMessage = {
 type TurnAnswer = {
   detailId: string;
   content: string;
+  attachments: ChatAttachment[];
   createdAt: string;
   phase: TurnAnswerPhase;
   source: "live" | "session";
@@ -254,9 +260,13 @@ type LiveAnswerQueueItem =
       content: string;
     };
 
+const LIVE_ANSWER_MAX_CHARS_PER_FRAME = 28;
+const LIVE_STREAM_BROWSER_YIELD_EVERY_EVENTS = 8;
+
 type PendingFinalAnswer = {
   localId: string;
   content: string;
+  attachments: ChatAttachment[];
   finishReason: string | null;
   assistantMessageId: string | null;
   createdAt: string | null;
@@ -264,7 +274,7 @@ type PendingFinalAnswer = {
 
 type ComposerAttachment = ChatAttachment & {
   file: File;
-  previewUrl: string;
+  previewUrl: string | null;
 };
 
 type HtmlPreviewState = HtmlPreviewPayload;
@@ -294,9 +304,28 @@ type SkillsListResponse = {
 
 type SkillDetailResponse = {
   skill: SkillDetail;
+  import_report?: SkillImportReport;
 };
 
 type SkillDocumentView = "preview" | "edit";
+type SkillImportMode = "upload" | "path";
+
+type SkillUploadItem = {
+  id: string;
+  file: File;
+  relativePath: string;
+};
+
+type SkillImportReport = {
+  mode: string;
+  optimizer: string;
+  source_files: string[];
+  normalized_files: string[];
+  generated_files: string[];
+  warnings: string[];
+  skill_directory: string;
+  file_count: number;
+};
 
 type WorkspaceEntry = {
   name: string;
@@ -324,6 +353,10 @@ type ChatSession = {
   updatedAt: string;
   messageCount: number;
   hasConversation: boolean;
+  background: boolean;
+  scheduled: boolean;
+  triggerType: string | null;
+  sourceTaskId: string | null;
 };
 
 type KnowledgeDocument = {
@@ -400,6 +433,7 @@ type InterruptTurnResponse = {
 
 const navItems: Array<{ id: Exclude<WorkspacePage, "settings">; label: string; hint: string }> = [
   { id: "chat", label: "Chat", hint: "对话" },
+  { id: "automations", label: "Automations", hint: "定时" },
   { id: "memory", label: "Memory", hint: "记忆" },
   { id: "skills", label: "Skills", hint: "技能" },
   { id: "files", label: "Files", hint: "文件" }
@@ -421,6 +455,34 @@ const approvalModeMeta: Record<
     helper: "本轮所有需要审批的工具都要你逐个点击确认后才继续。"
   }
 };
+
+const MAX_COMPOSER_ATTACHMENTS = 5;
+const MAX_COMPOSER_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const COMPOSER_ATTACHMENT_ACCEPT =
+  "image/png,image/jpeg,image/webp,.doc,.docx,.xls,.xlsx,.pdf,.ppt,.pptx,.md,.txt,.json,.html,.htm";
+const COMPOSER_ATTACHMENT_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".doc",
+  ".docx",
+  ".xls",
+  ".xlsx",
+  ".pdf",
+  ".ppt",
+  ".pptx",
+  ".md",
+  ".txt",
+  ".json",
+  ".html",
+  ".htm",
+]);
+const IMAGE_ATTACHMENT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+const SKILL_UPLOAD_ACCEPT = ".md,.py,.jpg,.jpeg,.png";
+const SKILL_UPLOAD_EXTENSIONS = new Set([".md", ".py", ".jpg", ".jpeg", ".png"]);
+const MAX_SKILL_UPLOAD_FILES = 200;
+const MAX_SKILL_UPLOAD_TOTAL_BYTES = 80 * 1024 * 1024;
 
 type ComposerSlashCommand = {
   id: "plan";
@@ -489,7 +551,14 @@ function readStoredNumber(key: string, fallback: number, min: number, max: numbe
 }
 
 function isWorkspacePage(value: string | null): value is WorkspacePage {
-  return value === "chat" || value === "memory" || value === "skills" || value === "files" || value === "settings";
+  return (
+    value === "chat" ||
+    value === "automations" ||
+    value === "memory" ||
+    value === "skills" ||
+    value === "files" ||
+    value === "settings"
+  );
 }
 
 function isUiTheme(value: string | null): value is UiTheme {
@@ -513,7 +582,7 @@ function getApiBase() {
   if (import.meta.env.VITE_API_BASE) {
     return import.meta.env.VITE_API_BASE;
   }
-  return `${window.location.protocol}//${window.location.hostname}:8005`;
+  return window.location.origin;
 }
 
 function formatDateTime(value: string | null | undefined) {
@@ -577,6 +646,28 @@ function makeAttachmentId(seed: string, index: number) {
   return `${seed}:${index}`;
 }
 
+function getAttachmentExtension(filename: string, fallback?: string | null) {
+  if (typeof fallback === "string" && fallback.trim()) {
+    return fallback.trim().toLowerCase().startsWith(".") ? fallback.trim().toLowerCase() : `.${fallback.trim().toLowerCase()}`;
+  }
+  const extension = filename.includes(".") ? `.${filename.split(".").pop()?.toLowerCase() ?? ""}` : "";
+  return extension;
+}
+
+function isImageAttachmentExtension(extension: string) {
+  return IMAGE_ATTACHMENT_EXTENSIONS.has(extension.toLowerCase());
+}
+
+function isImageAttachmentRecord(attachment: Pick<ChatAttachment, "contentType" | "filename" | "extension" | "kind">) {
+  if (attachment.kind === "image") {
+    return true;
+  }
+  if (attachment.contentType.toLowerCase().startsWith("image/")) {
+    return true;
+  }
+  return isImageAttachmentExtension(getAttachmentExtension(attachment.filename, attachment.extension));
+}
+
 function parseMessageAttachments(value: unknown): ChatAttachment[] {
   if (!Array.isArray(value)) {
     return [];
@@ -591,15 +682,26 @@ function parseMessageAttachments(value: unknown): ChatAttachment[] {
       "content_type" in item && typeof item.content_type === "string" && item.content_type
         ? item.content_type
         : "application/octet-stream";
+    const extension =
+      "extension" in item && typeof item.extension === "string" && item.extension ? item.extension : getAttachmentExtension(filename);
     return [
       {
         id: makeAttachmentId("path" in item && typeof item.path === "string" ? item.path : filename, index),
         filename,
         contentType,
+        source: "source" in item && typeof item.source === "string" ? item.source : null,
+        kind: "kind" in item && typeof item.kind === "string" ? item.kind : null,
+        extension,
         path: "path" in item && typeof item.path === "string" ? item.path : null,
         previewUrl: null,
         summary: "summary" in item && typeof item.summary === "string" ? item.summary : null,
-        sizeBytes: null,
+        sizeBytes: "size_bytes" in item && typeof item.size_bytes === "number" ? item.size_bytes : null,
+        workspaceRelativePath:
+          "workspace_relative_path" in item && typeof item.workspace_relative_path === "string" ? item.workspace_relative_path : null,
+        analysisStatus:
+          "analysis_status" in item && typeof item.analysis_status === "string" ? item.analysis_status : null,
+        analysisError:
+          "analysis_error" in item && typeof item.analysis_error === "string" ? item.analysis_error : null,
       },
     ];
   });
@@ -694,6 +796,20 @@ function orderSkillWorkspaceEntries(entries: WorkspaceEntry[], skillFilePath: st
 
 function getSkillDirectoryPath(skillPath: string) {
   return extractParentPath(skillPath, null);
+}
+
+function getSkillUploadRelativePath(file: File) {
+  const maybeDirectoryFile = file as File & { webkitRelativePath?: string };
+  return maybeDirectoryFile.webkitRelativePath || file.name;
+}
+
+function summarizeSkillUploadFiles(files: SkillUploadItem[]) {
+  if (files.length === 0) {
+    return "尚未选择文件";
+  }
+  const totalBytes = files.reduce((sum, item) => sum + item.file.size, 0);
+  const topNames = Array.from(new Set(files.map((item) => item.relativePath.split(/[\\/]/).filter(Boolean)[0] ?? item.file.name)));
+  return `${files.length} 个文件 · ${formatBytes(totalBytes)} · ${topNames.slice(0, 2).join(" / ")}${topNames.length > 2 ? " ..." : ""}`;
 }
 
 const TOOL_SEMANTIC_MAP: Record<
@@ -1040,6 +1156,28 @@ function PlusSmallIcon({ className }: { className?: string }) {
     >
       <path d="M8 3.25v9.5" />
       <path d="M3.25 8h9.5" />
+    </svg>
+  );
+}
+
+function ScheduledSessionIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.35}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <rect x="2.75" y="3.25" width="10.5" height="10" rx="1.25" />
+      <path d="M5 2.25v2" />
+      <path d="M11 2.25v2" />
+      <path d="M2.75 6.25h10.5" />
+      <path d="M5.2 9.2h2.1" />
+      <path d="M5.2 11.35h4.7" />
     </svg>
   );
 }
@@ -1685,8 +1823,16 @@ function mapSessionSummary(record: SessionSummaryRecord): ChatSession {
     title: record.title,
     updatedAt: record.updated_at,
     messageCount: record.message_count,
-    hasConversation: record.message_count > 0
+    hasConversation: record.message_count > 0,
+    background: record.background === true,
+    scheduled: record.scheduled === true,
+    triggerType: typeof record.trigger_type === "string" ? record.trigger_type : null,
+    sourceTaskId: typeof record.source_task_id === "string" ? record.source_task_id : null
   };
+}
+
+function scheduledSessionTitle(title: string) {
+  return title.replace(/^\[Scheduled\]\s*/i, "").trim() || "定时任务";
 }
 
 function formatEventTime(ts: number) {
@@ -2245,38 +2391,43 @@ function buildAttachmentSecondaryItem(parentId: string, event: SessionEventPaylo
   const subtitle =
     files
       .map((item) => {
-        const filename = typeof item.filename === "string" ? item.filename : "图片";
+        const filename = typeof item.filename === "string" ? item.filename : "附件";
         const summary = typeof item.summary === "string" && item.summary ? item.summary : null;
         const error = typeof item.analysis_error === "string" && item.analysis_error ? item.analysis_error : null;
         return summary ? `${filename}: ${summary}` : error ? `${filename}: ${error}` : filename;
       })
-      .join("\n") || `${count} 张图片`;
+      .join("\n") || `${count} 个附件`;
+  const warnings =
+    Array.isArray(eventData.warnings) && eventData.warnings.every((item) => typeof item === "string")
+      ? (eventData.warnings as string[])
+      : [];
+  const output = warnings.length > 0 ? `${subtitle}\n${warnings.join("\n")}` : subtitle;
   const detailId = `secondary:attachment:${parentId}`;
-  const summary = isFailed ? "图片预解析失败，已跳过图片内容解析" : isProcessed ? "图片预解析已完成" : `已接收 ${count} 张图片`;
+  const summary = isFailed ? "附件解析失败，已跳过不可用附件" : isProcessed ? "附件解析已完成" : `已接收 ${count} 个附件`;
 
   return {
     id: detailId,
     parentId,
     state: isFailed ? "failed" : isProcessed ? "completed" : "running",
-    label: "图片预解析",
+    label: "附件解析",
     toolName: null,
     cardType: "attachment",
     subtitle: summary,
     statusLabel: status.label,
     statusTone: status.tone,
-    meta: count > 0 ? [`${count} 张图片`] : ["图片附件"],
-    output: subtitle,
-    outputLineCount: countOutputLines(subtitle),
+    meta: count > 0 ? [`${count} 个附件`] : ["附件"],
+    output,
+    outputLineCount: countOutputLines(output),
     detail: buildTraceDetail(
       detailId,
       "result",
       formatEventTime(event.ts),
       "attachment",
-      "图片附件",
+      "附件",
       summary,
       eventData,
       {
-        output: subtitle,
+        output,
       }
     ),
   };
@@ -2613,9 +2764,9 @@ function buildTimelineNodes(
       const primaryText =
         event.event === "attachment_processed"
           ? eventData.ok === false
-            ? "图片预解析失败，已跳过解析"
-            : "图片预解析已完成"
-          : `已接收 ${attachmentCount} 张图片`;
+            ? "附件解析失败，已跳过不可用附件"
+            : "附件解析已完成"
+          : `已接收 ${attachmentCount} 个附件`;
       const node = ensureProgressNode(groupId, event, primaryText);
       const item = buildAttachmentSecondaryItem(node.id, event);
       upsertProgressSecondaryItem(node, item);
@@ -2832,6 +2983,7 @@ function synthesizeFailedTurnAnswer(turnId: string, events: SessionEventPayload[
     return {
       detailId: `failed:${turnId}:${index}`,
       content,
+      attachments: [],
       createdAt: new Date(event.ts).toISOString(),
       phase: "failed",
       source: "session",
@@ -2955,6 +3107,7 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
     targetTurn.answer = {
       detailId: `assistant:${message.id}`,
       content: message.content,
+      attachments: parseMessageAttachments(message.metadata.attachments),
       createdAt: message.created_at,
       phase: "persisted",
       source: "session",
@@ -3081,6 +3234,27 @@ function buildLiveTurn(liveTurn: LiveTurnState, sessionEvents: SessionEventPaylo
   };
 }
 
+function shouldPersistLiveSessionEvent(event: SessionEventPayload) {
+  if (event.event === "assistant_delta") {
+    return event.data.reset === true;
+  }
+  if (event.event === "final_response") {
+    return false;
+  }
+  return true;
+}
+
+function splitLiveAnswerDelta(delta: string) {
+  if (delta.length <= LIVE_ANSWER_MAX_CHARS_PER_FRAME) {
+    return [delta];
+  }
+  const segments: string[] = [];
+  for (let index = 0; index < delta.length; index += LIVE_ANSWER_MAX_CHARS_PER_FRAME) {
+    segments.push(delta.slice(index, index + LIVE_ANSWER_MAX_CHARS_PER_FRAME));
+  }
+  return segments;
+}
+
 function turnMatchesLiveTurn(turn: ChatTurn, liveTurn: LiveTurnState | null) {
   if (!liveTurn) {
     return false;
@@ -3099,7 +3273,7 @@ function hasSystemMetaNode(turn: ChatTurn) {
 }
 
 function resolveAnswerCopy(answer: TurnAnswer | null, status: TurnStatus) {
-  if (answer && answer.content.trim()) {
+  if (answer && (answer.content.trim() || answer.attachments.length > 0)) {
     return answer.content;
   }
   if (answer?.phase === "failed") {
@@ -3125,16 +3299,22 @@ function shouldRenderAnswerBubble(turn: ChatTurn) {
     return false;
   }
 
+  const hasAttachments = turn.answer.attachments.length > 0;
+
   if (turn.status === "failed" && !turn.answer.content.trim() && hasSystemMetaNode(turn)) {
     return false;
   }
 
   if (turn.answer.phase === "persisted" || turn.answer.phase === "finalizing") {
-    return Boolean(turn.answer.content.trim());
+    return Boolean(turn.answer.content.trim()) || hasAttachments;
   }
 
   if (turn.answer.phase === "failed") {
-    return Boolean(turn.answer.content.trim()) || Boolean(turn.answer.errorMessage);
+    return Boolean(turn.answer.content.trim()) || Boolean(turn.answer.errorMessage) || hasAttachments;
+  }
+
+  if (turn.answer.phase === "streaming") {
+    return Boolean(turn.answer.content.trim()) || hasAttachments;
   }
 
   return false;
@@ -3228,7 +3408,11 @@ function App() {
   const [skillDraft, setSkillDraft] = useState("");
   const [skillDocumentView, setSkillDocumentView] = useState<SkillDocumentView>("preview");
   const [skillSaveNotice, setSkillSaveNotice] = useState<string | null>(null);
+  const [skillImportMode, setSkillImportMode] = useState<SkillImportMode>("upload");
   const [skillImportPath, setSkillImportPath] = useState("");
+  const [skillUploadName, setSkillUploadName] = useState("");
+  const [skillUploadFiles, setSkillUploadFiles] = useState<SkillUploadItem[]>([]);
+  const [skillImportReport, setSkillImportReport] = useState<SkillImportReport | null>(null);
   const [showSkillImportPanel, setShowSkillImportPanel] = useState(false);
   const [skillSaving, setSkillSaving] = useState(false);
   const [skillDeleting, setSkillDeleting] = useState(false);
@@ -3283,6 +3467,8 @@ function App() {
   const [htmlPreview, setHtmlPreview] = useState<HtmlPreviewState | null>(null);
   const conversationPaneRef = useRef<HTMLElement | null>(null);
   const composerFileInputRef = useRef<HTMLInputElement | null>(null);
+  const skillUploadFileInputRef = useRef<HTMLInputElement | null>(null);
+  const skillUploadFolderInputRef = useRef<HTMLInputElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
   const activeMessageControllerRef = useRef<AbortController | null>(null);
@@ -3343,6 +3529,7 @@ function App() {
           ...currentTurn.answer,
           phase: "finalizing",
           content: pendingFinal.content || currentTurn.answer.content,
+          attachments: pendingFinal.attachments.length > 0 ? pendingFinal.attachments : currentTurn.answer.attachments,
           finishReason: pendingFinal.finishReason ?? currentTurn.answer.finishReason,
           assistantMessageId: pendingFinal.assistantMessageId ?? currentTurn.answer.assistantMessageId,
           createdAt: pendingFinal.createdAt ?? currentTurn.answer.createdAt
@@ -3370,7 +3557,6 @@ function App() {
       let deltaText = "";
       let reset = false;
       let snapshotContent: string | null = null;
-      const maxCharsPerFrame = 28;
 
       while (queue.length > 0) {
         const nextItem = queue[0];
@@ -3388,13 +3574,13 @@ function App() {
           consumed += 1;
           break;
         }
-        if (consumed > 0 && deltaText.length >= maxCharsPerFrame) {
+        if (consumed > 0 && deltaText.length >= LIVE_ANSWER_MAX_CHARS_PER_FRAME) {
           break;
         }
         deltaText += nextItem.delta;
         queue.shift();
         consumed += 1;
-        if (deltaText.length >= maxCharsPerFrame) {
+        if (deltaText.length >= LIVE_ANSWER_MAX_CHARS_PER_FRAME) {
           break;
         }
       }
@@ -3433,9 +3619,11 @@ function App() {
           kind: "reset"
         });
       } else if (typeof payload.data.delta === "string" && payload.data.delta) {
-        liveAnswerQueueRef.current.push({
-          kind: "delta",
-          delta: payload.data.delta
+        splitLiveAnswerDelta(payload.data.delta).forEach((delta) => {
+          liveAnswerQueueRef.current.push({
+            kind: "delta",
+            delta
+          });
         });
       } else if (typeof payload.data.content === "string") {
         liveAnswerQueueRef.current.push({
@@ -3451,6 +3639,7 @@ function App() {
       pendingFinalAnswerRef.current = {
         localId: targetLocalId,
         content: typeof payload.data.content === "string" ? payload.data.content : "",
+        attachments: parseMessageAttachments(payload.data.attachments),
         finishReason: typeof payload.data.finish_reason === "string" ? payload.data.finish_reason : null,
         assistantMessageId: typeof payload.data.message_id === "string" ? payload.data.message_id : null,
         createdAt: typeof payload.data.created_at === "string" ? payload.data.created_at : null
@@ -4319,6 +4508,8 @@ ${markup}
     : [];
   const selectedSkillTreeError = selectedSkillName ? skillTreeErrors[selectedSkillName] ?? null : null;
   const selectedSkillTreeLoading = Boolean(selectedSkillName && skillTreeLoadingByName[selectedSkillName]);
+  const skillUploadSummary = summarizeSkillUploadFiles(skillUploadFiles);
+  const skillUploadDirectoryInputProps = { webkitdirectory: "", directory: "" };
   const hasProjectConfigChanges = projectConfigDraft !== projectConfigContent;
 
   const renderSkillTreeNodes = (skill: SkillSummary, entries: WorkspaceEntry[], depth = 0): ReactNode =>
@@ -4459,7 +4650,11 @@ ${markup}
       title: data.title,
       updatedAt: new Date().toISOString(),
       messageCount: 0,
-      hasConversation: false
+      hasConversation: false,
+      background: false,
+      scheduled: false,
+      triggerType: null,
+      sourceTaskId: null
     };
     activeSessionIdRef.current = data.session_id;
     setChatSessions((currentSessions) => [nextSession, ...currentSessions]);
@@ -4475,6 +4670,7 @@ ${markup}
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
+    let pendingBrowserYieldEvents = 0;
 
     try {
       while (true) {
@@ -4496,6 +4692,15 @@ ${markup}
 
           const payload = JSON.parse(dataLines.join("\n")) as SessionEventPayload;
           onEvent(payload);
+          if (payload.event === "assistant_delta" || payload.event === "final_response") {
+            pendingBrowserYieldEvents += 1;
+            if (pendingBrowserYieldEvents >= LIVE_STREAM_BROWSER_YIELD_EVERY_EVENTS) {
+              pendingBrowserYieldEvents = 0;
+              await new Promise<void>((resolve) => {
+                window.requestAnimationFrame(() => resolve());
+              });
+            }
+          }
         }
 
         if (done) {
@@ -4513,25 +4718,53 @@ ${markup}
     }
 
     setChatError(null);
-    setComposerAttachments((current) => [
-      ...current,
-      ...files
-        .filter((file) => file.type === "image/png" || file.type === "image/jpeg")
-        .map((file, index) => {
-          const previewUrl = URL.createObjectURL(file);
-          attachmentPreviewUrlsRef.current.push(previewUrl);
-          return {
-            id: makeAttachmentId(`${file.name}:${file.lastModified}:${file.size}`, current.length + index),
-            file,
-            filename: file.name,
-            contentType: file.type || "application/octet-stream",
-            previewUrl,
-            path: null,
-            summary: null,
-            sizeBytes: file.size,
-          };
-        }),
-    ]);
+    if (composerAttachments.length + files.length > MAX_COMPOSER_ATTACHMENTS) {
+      setChatError("一次最多上传 5 个附件，请移除多余文件后重试");
+      return;
+    }
+
+    const additions: ComposerAttachment[] = [];
+    let nextError: string | null = null;
+    files.forEach((file) => {
+      const extension = getAttachmentExtension(file.name);
+      if (!COMPOSER_ATTACHMENT_EXTENSIONS.has(extension)) {
+        nextError ??= `《${file.name}》格式不支持。支持图片、Word、Excel、PDF、PPT、MD、TXT、JSON、HTML`;
+        return;
+      }
+      if (file.size === 0) {
+        nextError ??= `《${file.name}》为空文件，无法上传`;
+        return;
+      }
+      if (file.size > MAX_COMPOSER_ATTACHMENT_BYTES) {
+        nextError ??= `《${file.name}》超过 20MB，无法上传`;
+        return;
+      }
+      const previewUrl = isImageAttachmentExtension(extension) ? URL.createObjectURL(file) : null;
+      if (previewUrl) {
+        attachmentPreviewUrlsRef.current.push(previewUrl);
+      }
+      additions.push({
+        id: makeAttachmentId(`${file.name}:${file.lastModified}:${file.size}`, composerAttachments.length + additions.length),
+        file,
+        filename: file.name,
+        contentType: file.type || "application/octet-stream",
+        kind: isImageAttachmentExtension(extension) ? "image" : null,
+        extension,
+        previewUrl,
+        path: null,
+        summary: null,
+        sizeBytes: file.size,
+        workspaceRelativePath: null,
+        analysisStatus: null,
+        analysisError: null,
+      });
+    });
+    if (additions.length > 0) {
+      setComposerAttachments((current) => [...current, ...additions]);
+    }
+    if (nextError) {
+      setChatError(nextError);
+    }
   };
 
   const handleComposerFileChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -4541,6 +4774,73 @@ ${markup}
     }
     appendComposerAttachments(files);
     event.target.value = "";
+  };
+
+  const appendSkillUploadFiles = (files: File[]) => {
+    if (files.length === 0) return;
+
+    setSkillsError(null);
+    setSkillSaveNotice(null);
+    setSkillImportReport(null);
+
+    const currentByPath = new Map(skillUploadFiles.map((item) => [item.relativePath.toLowerCase(), item]));
+    const additions: SkillUploadItem[] = [];
+    let nextError: string | null = null;
+    let totalBytes = skillUploadFiles.reduce((sum, item) => sum + item.file.size, 0);
+
+    files.forEach((file) => {
+      const relativePath = getSkillUploadRelativePath(file);
+      const extension = getAttachmentExtension(relativePath).toLowerCase();
+      if (!SKILL_UPLOAD_EXTENSIONS.has(extension)) {
+        nextError ??= `《${relativePath}》格式不支持，仅支持 MD、Python、JPG、PNG`;
+        return;
+      }
+      if (file.size === 0) {
+        nextError ??= `《${relativePath}》为空文件，无法上传`;
+        return;
+      }
+      totalBytes += file.size;
+      if (totalBytes > MAX_SKILL_UPLOAD_TOTAL_BYTES) {
+        nextError ??= "本次 Skill 上传总大小超过 80MB";
+        return;
+      }
+      const key = relativePath.toLowerCase();
+      if (currentByPath.has(key) || additions.some((item) => item.relativePath.toLowerCase() === key)) {
+        nextError ??= `《${relativePath}》已在待装载列表中`;
+        return;
+      }
+      additions.push({
+        id: makeAttachmentId(`${relativePath}:${file.lastModified}:${file.size}`, skillUploadFiles.length + additions.length),
+        file,
+        relativePath
+      });
+    });
+
+    if (skillUploadFiles.length + additions.length > MAX_SKILL_UPLOAD_FILES) {
+      setSkillsError(`一次最多上传 ${MAX_SKILL_UPLOAD_FILES} 个 Skill 文件`);
+      return;
+    }
+    if (additions.length > 0) {
+      setSkillUploadFiles((current) => [...current, ...additions]);
+    }
+    if (nextError) {
+      setSkillsError(nextError);
+    }
+  };
+
+  const handleSkillUploadFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    appendSkillUploadFiles(Array.from(event.target.files ?? []));
+    event.target.value = "";
+  };
+
+  const removeSkillUploadFile = (itemId: string) => {
+    setSkillUploadFiles((current) => current.filter((item) => item.id !== itemId));
+    setSkillImportReport(null);
+  };
+
+  const clearSkillUploadFiles = () => {
+    setSkillUploadFiles([]);
+    setSkillImportReport(null);
   };
 
   const removeComposerAttachment = (attachmentId: string) => {
@@ -4590,6 +4890,7 @@ ${markup}
                 ...currentTurn.answer,
                 phase: "failed",
                 errorMessage: data.message || "当前任务已停止",
+                attachments: [],
                 content: ""
               }
             }
@@ -4663,6 +4964,7 @@ ${markup}
         answer: {
           detailId: `live-answer:${liveTurnLocalId}`,
           content: "",
+          attachments: [],
           createdAt,
           phase: "waiting",
           source: "live",
@@ -4698,7 +5000,7 @@ ${markup}
                 body.append("content", trimmed);
               }
               composerAttachments.forEach((attachment) => {
-                body.append("images", attachment.file, attachment.filename);
+                body.append("attachments", attachment.file, attachment.filename);
               });
               body.append("approval_mode", turnApprovalMode);
               return fetch(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
@@ -4746,7 +5048,19 @@ ${markup}
         if (payload.event === "error") {
           resetLiveAnswerStreaming();
         }
-        setLiveSessionEvents((currentEvents) => [...currentEvents, payload]);
+        if (payload.event === "attachment_processed") {
+          const warnings =
+            Array.isArray(payload.data.warnings) && payload.data.warnings.every((item) => typeof item === "string")
+              ? (payload.data.warnings as string[])
+              : [];
+          if (warnings.length > 0) {
+            const contextBudgetWarning = warnings.find((item) => item.includes("上下文预算"));
+            setChatNotice(contextBudgetWarning ?? warnings[0]);
+          }
+        }
+        if (shouldPersistLiveSessionEvent(payload)) {
+          setLiveSessionEvents((currentEvents) => [...currentEvents, payload]);
+        }
         if (payload.event === "collaboration_mode_changed") {
           const modePayload =
             "collaboration_mode" in payload.data && payload.data.collaboration_mode && typeof payload.data.collaboration_mode === "object"
@@ -4776,6 +5090,9 @@ ${markup}
           };
 
           if (payload.event === "assistant_delta") {
+            if (nextTurn.requestId === currentTurn.requestId && nextTurn.serverTurnId === currentTurn.serverTurnId) {
+              return currentTurn;
+            }
             return nextTurn;
           }
 
@@ -4819,6 +5136,7 @@ ${markup}
                 ...nextTurn.answer,
                 phase: "failed",
                 errorMessage: message,
+                attachments: [],
                 content: nextTurn.answer.content || message
               }
             };
@@ -4854,6 +5172,7 @@ ${markup}
                 ...currentTurn.answer,
                 phase: "failed",
                 errorMessage: message,
+                attachments: [],
                 content: currentTurn.answer.content || message
               }
             }
@@ -5097,6 +5416,7 @@ ${markup}
     setSkillImporting(true);
     setSkillsError(null);
     setSkillSaveNotice(null);
+    setSkillImportReport(null);
 
     try {
       const data = await fetchJson<SkillDetailResponse>(`${apiBase}/api/skills/import`, {
@@ -5112,6 +5432,42 @@ ${markup}
       await loadSkillsWorkspace(undefined, data.skill.name);
     } catch (error) {
       setSkillsError(error instanceof Error ? error.message : "Skill 导入失败");
+    } finally {
+      setSkillImporting(false);
+    }
+  };
+
+  const uploadSkill = async () => {
+    if (skillUploadFiles.length === 0) return;
+
+    setSkillImporting(true);
+    setSkillsError(null);
+    setSkillSaveNotice(null);
+    setSkillImportReport(null);
+
+    try {
+      const formData = new FormData();
+      const trimmedName = skillUploadName.trim();
+      if (trimmedName) {
+        formData.append("skill_name", trimmedName);
+      }
+      formData.append("optimize_with_llm", "true");
+      skillUploadFiles.forEach((item) => {
+        formData.append("files", item.file, item.relativePath);
+      });
+
+      const data = await fetchJson<SkillDetailResponse>(`${apiBase}/api/skills/upload`, {
+        method: "POST",
+        body: formData
+      });
+      setSkillUploadFiles([]);
+      setSkillUploadName("");
+      setShowSkillImportPanel(false);
+      setSkillImportReport(data.import_report ?? null);
+      setSkillSaveNotice(`已装载 ${data.skill.name}`);
+      await loadSkillsWorkspace(undefined, data.skill.name);
+    } catch (error) {
+      setSkillsError(error instanceof Error ? error.message : "Skill 上传装载失败");
     } finally {
       setSkillImporting(false);
     }
@@ -5220,6 +5576,7 @@ ${markup}
   };
 
   const refreshSkillsWorkspace = async () => {
+    setSkillImportReport(null);
     setSkillTreeEntriesByName({});
     setSkillTreeErrors({});
     setSkillTreeLoadingByName({});
@@ -5326,7 +5683,7 @@ ${markup}
             ref={composerFileInputRef}
             className="composer-file-input"
             type="file"
-            accept="image/png,image/jpeg"
+            accept={COMPOSER_ATTACHMENT_ACCEPT}
             multiple
             onChange={handleComposerFileChange}
             tabIndex={-1}
@@ -5371,7 +5728,7 @@ ${markup}
                     ? "正在停止当前任务，请稍候…"
                     : sendingMessage
                       ? "当前正在执行，点击右侧按钮可立即停止…"
-                      : "输入你的任务，可附图片；按 Enter 发送，Shift + Enter 换行"
+                      : "输入你的任务，可附附件；按 Enter 发送，Shift + Enter 换行"
                 }
                 rows={3}
                 disabled={sendingMessage || stoppingMessage}
@@ -5400,10 +5757,25 @@ ${markup}
               ) : null}
 
               {composerAttachments.length > 0 ? (
-                <div className="composer-attachments" aria-label="已选择的图片">
+                <div className="composer-attachments" aria-label="已选择的附件">
                   {composerAttachments.map((attachment) => (
-                    <div key={attachment.id} className="composer-attachment-chip">
-                      <img className="composer-attachment-thumb" src={attachment.previewUrl} alt={attachment.filename} title={attachment.filename} />
+                    <div
+                      key={attachment.id}
+                      className={`composer-attachment-chip ${isImageAttachmentRecord(attachment) ? "image" : "file"}`}
+                    >
+                      {isImageAttachmentRecord(attachment) && attachment.previewUrl ? (
+                        <img className="composer-attachment-thumb" src={attachment.previewUrl} alt={attachment.filename} title={attachment.filename} />
+                      ) : (
+                        <div className="composer-attachment-file" title={attachment.filename}>
+                          <span className="composer-attachment-badge">
+                            {getAttachmentExtension(attachment.filename, attachment.extension).replace(/^\./, "").toUpperCase() || "FILE"}
+                          </span>
+                          <strong className="composer-attachment-name">{attachment.filename}</strong>
+                          {typeof attachment.sizeBytes === "number" ? (
+                            <span className="composer-attachment-size">{formatBytes(attachment.sizeBytes)}</span>
+                          ) : null}
+                        </div>
+                      )}
                       <button
                         type="button"
                         className="composer-attachment-remove"
@@ -5603,27 +5975,37 @@ ${markup}
 
           <div className="session-list">
             {!sessionsLoading && chatSessions.length === 0 ? <div className="workspace-empty">当前还没有会话，点击右上角开始。</div> : null}
-            {chatSessions.map((session) => (
-              <div
-                key={session.id}
-                className={`session-row ${activeSessionId === session.id ? "active" : ""} ${
-                  openSessionMenuId === session.id ? "menu-open" : ""
-                }`}
-              >
-                <button
-                  type="button"
-                  className="session-main"
-                  onClick={() => {
-                    setActiveSessionId(session.id);
-                    setOpenSessionMenuId(null);
-                    switchPage("chat");
-                  }}
-                  aria-current={activeSessionId === session.id && activePage === "chat" ? "page" : undefined}
+            {chatSessions.map((session) => {
+              const displayTitle = session.scheduled ? scheduledSessionTitle(session.title) : session.title;
+              return (
+                <div
+                  key={session.id}
+                  className={`session-row ${activeSessionId === session.id ? "active" : ""} ${
+                    openSessionMenuId === session.id ? "menu-open" : ""
+                  }`}
                 >
-                  <span className="session-title">{session.title}</span>
-                </button>
+                  <button
+                    type="button"
+                    className="session-main"
+                    onClick={() => {
+                      setActiveSessionId(session.id);
+                      setOpenSessionMenuId(null);
+                      switchPage("chat");
+                    }}
+                    aria-current={activeSessionId === session.id && activePage === "chat" ? "page" : undefined}
+                  >
+                    <span className={`session-title ${session.scheduled ? "scheduled" : ""}`}>
+                      {session.scheduled ? <ScheduledSessionIcon className="session-scheduled-icon" /> : null}
+                      <span className="session-title-text">{displayTitle}</span>
+                    </span>
+                    {!session.scheduled && session.background ? (
+                      <span className="session-meta-line">
+                        <span className="session-tag muted">后台</span>
+                      </span>
+                    ) : null}
+                  </button>
 
-                <div className="session-actions">
+                  <div className="session-actions">
                   <button
                     type="button"
                     className="session-more"
@@ -5641,6 +6023,24 @@ ${markup}
 
                   {openSessionMenuId === session.id ? (
                     <div className="session-menu" role="menu" onClick={(event) => event.stopPropagation()}>
+                      <button
+                        type="button"
+                        className="session-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setActiveSessionId(session.id);
+                          setOpenSessionMenuId(null);
+                          switchPage("automations");
+                        }}
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path
+                            d="M7 2v3M17 2v3M4 7h16M6 4h12a2 2 0 0 1 2 2v11a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3V6a2 2 0 0 1 2-2Zm2 6h3v3H8v-3Zm5 0h3v3h-3v-3Zm-5 5h3v2H8v-2Zm5 0h3v2h-3v-2Z"
+                            fill="currentColor"
+                          />
+                        </svg>
+                        <span>定时任务</span>
+                      </button>
                       <button
                         type="button"
                         className="session-menu-item"
@@ -5671,9 +6071,10 @@ ${markup}
                       </button>
                     </div>
                   ) : null}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </section>
 
@@ -6099,6 +6500,7 @@ ${markup}
                                       apiBase={apiBase}
                                       variant="assistant"
                                       content={answerCopy}
+                                      attachments={turn.answer?.attachments ?? []}
                                       className="trace-copy"
                                       onOpenHtmlPreview={setHtmlPreview}
                                       deferCodeBlocksUntilComplete={turn.isLive && turn.status === "running"}
@@ -6161,6 +6563,21 @@ ${markup}
           )
         ) : null}
 
+        {activePage === "automations" ? (
+          <AutomationsPage
+            apiBase={apiBase}
+            sessions={chatSessions}
+            activeSession={chatSessions.find((session) => session.id === activeSessionId) ?? null}
+            onRefreshSessions={async (preferredSessionId) => {
+              await loadChatSessions(undefined, preferredSessionId)
+            }}
+            onOpenSession={(sessionId) => {
+              setActiveSessionId(sessionId)
+              switchPage("chat")
+            }}
+          />
+        ) : null}
+
         {activePage === "skills" ? (
           <section className="workspace-page skills-workspace-page">
             {skillsError ? <div className="workspace-alert error">{skillsError}</div> : null}
@@ -6194,27 +6611,154 @@ ${markup}
 
                   {showSkillImportPanel ? (
                     <div className="skill-import-inline">
-                      <input
-                        id="skill-import-path"
-                        className="workspace-text-input"
-                        value={skillImportPath}
-                        onChange={(event) => setSkillImportPath(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" && skillImportPath.trim()) {
-                            event.preventDefault();
-                            void importSkill();
-                          }
-                        }}
-                        placeholder="例如 skills/my_custom_skill"
-                      />
-                      <button
-                        type="button"
-                        className="workspace-primary-button"
-                        onClick={() => void importSkill()}
-                        disabled={skillImporting || !skillImportPath.trim()}
-                      >
-                        {skillImporting ? "导入中..." : "确认导入"}
-                      </button>
+                      <div className="skill-import-mode-toggle" role="tablist" aria-label="Skill import mode">
+                        <button
+                          type="button"
+                          className={skillImportMode === "upload" ? "active" : ""}
+                          onClick={() => {
+                            setSkillImportMode("upload");
+                            setSkillsError(null);
+                          }}
+                          aria-pressed={skillImportMode === "upload"}
+                        >
+                          上传装载
+                        </button>
+                        <button
+                          type="button"
+                          className={skillImportMode === "path" ? "active" : ""}
+                          onClick={() => {
+                            setSkillImportMode("path");
+                            setSkillsError(null);
+                          }}
+                          aria-pressed={skillImportMode === "path"}
+                        >
+                          路径导入
+                        </button>
+                      </div>
+
+                      {skillImportMode === "upload" ? (
+                        <div className="skill-upload-loader">
+                          <input
+                            ref={skillUploadFileInputRef}
+                            className="visually-hidden"
+                            type="file"
+                            multiple
+                            accept={SKILL_UPLOAD_ACCEPT}
+                            onChange={handleSkillUploadFileChange}
+                          />
+                          <input
+                            ref={skillUploadFolderInputRef}
+                            className="visually-hidden"
+                            type="file"
+                            multiple
+                            accept={SKILL_UPLOAD_ACCEPT}
+                            onChange={handleSkillUploadFileChange}
+                            {...skillUploadDirectoryInputProps}
+                          />
+                          <input
+                            className="workspace-text-input"
+                            value={skillUploadName}
+                            onChange={(event) => setSkillUploadName(event.target.value)}
+                            placeholder="skill id（可选）"
+                          />
+                          <div className="skill-upload-dropzone">
+                            <div className="skill-upload-dropzone-copy">
+                              <strong>{skillUploadSummary}</strong>
+                              <span>MD / Python / JPG / PNG</span>
+                            </div>
+                            <div className="skill-upload-actions">
+                              <button
+                                type="button"
+                                className="skills-toolbar-button"
+                                onClick={() => skillUploadFileInputRef.current?.click()}
+                                disabled={skillImporting}
+                              >
+                                <SkillFileIcon className="skills-toolbar-button-icon" />
+                                <span>文件</span>
+                              </button>
+                              <button
+                                type="button"
+                                className="skills-toolbar-button"
+                                onClick={() => skillUploadFolderInputRef.current?.click()}
+                                disabled={skillImporting}
+                              >
+                                <SkillFolderIcon className="skills-toolbar-button-icon" />
+                                <span>文件夹</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          {skillUploadFiles.length > 0 ? (
+                            <div className="skill-upload-file-list">
+                              {skillUploadFiles.slice(0, 5).map((item) => (
+                                <div className="skill-upload-file-row" key={item.id}>
+                                  <span>{item.relativePath}</span>
+                                  <strong>{formatBytes(item.file.size)}</strong>
+                                  <button type="button" onClick={() => removeSkillUploadFile(item.id)} disabled={skillImporting}>
+                                    移除
+                                  </button>
+                                </div>
+                              ))}
+                              {skillUploadFiles.length > 5 ? (
+                                <div className="skill-upload-file-row muted">还有 {skillUploadFiles.length - 5} 个文件</div>
+                              ) : null}
+                            </div>
+                          ) : null}
+
+                          <div className="skill-import-submit-row">
+                            <button
+                              type="button"
+                              className="workspace-secondary-button"
+                              onClick={clearSkillUploadFiles}
+                              disabled={skillImporting || skillUploadFiles.length === 0}
+                            >
+                              清空
+                            </button>
+                            <button
+                              type="button"
+                              className="workspace-primary-button"
+                              onClick={() => void uploadSkill()}
+                              disabled={skillImporting || skillUploadFiles.length === 0}
+                            >
+                              {skillImporting ? "装载中..." : "装载 Skill"}
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="skill-import-path-row">
+                          <input
+                            id="skill-import-path"
+                            className="workspace-text-input"
+                            value={skillImportPath}
+                            onChange={(event) => setSkillImportPath(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" && skillImportPath.trim()) {
+                                event.preventDefault();
+                                void importSkill();
+                              }
+                            }}
+                            placeholder="例如 imports/my_custom_skill"
+                          />
+                          <button
+                            type="button"
+                            className="workspace-primary-button"
+                            onClick={() => void importSkill()}
+                            disabled={skillImporting || !skillImportPath.trim()}
+                          >
+                            {skillImporting ? "导入中..." : "确认导入"}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ) : null}
+
+                  {skillImportReport ? (
+                    <div className="skill-import-report">
+                      <strong>{skillImportReport.optimizer === "llm" ? "LLM 已优化" : "已完成装载"}</strong>
+                      <span>
+                        {skillImportReport.file_count} 个源文件 · {skillImportReport.normalized_files.length} 个目录文件
+                      </span>
+                      {skillImportReport.warnings.length > 0 ? <span>{skillImportReport.warnings[0]}</span> : null}
                     </div>
                   ) : null}
                 </div>
@@ -6467,7 +7011,7 @@ ${markup}
                     workspace {projectConfigEffectiveWorkspace ? extractName(projectConfigEffectiveWorkspace) : "读取中"}
                   </span>
                 </div>
-                <p className="workspace-tiny-note">聊天中心区已启用 MiSans，字体资源来自 Xiaomi HyperOS 官方 CDN。</p>
+                <p className="workspace-tiny-note">界面默认使用系统字体栈，首页标题像素字改为本地 Ark Pixel，不再依赖外链字体服务。</p>
               </div>
               <div className="workspace-page-actions">
                 <button

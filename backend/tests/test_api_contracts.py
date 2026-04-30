@@ -360,9 +360,12 @@ class MessageRouteTests(unittest.TestCase):
             self.assertEqual(saved.messages[0].role, "user")
             self.assertEqual(saved.messages[0].content, "看看这张图")
             self.assertEqual(saved.messages[0].metadata["original_content"], "看看这张图")
-            self.assertEqual(saved.messages[0].metadata["attachments"][0]["analysis_status"], "completed")
+            self.assertEqual(saved.messages[0].metadata["attachments"][0]["analysis_status"], "parsed")
+            self.assertEqual(saved.messages[0].metadata["attachment_analysis"]["status"], "completed")
             self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["status"], "completed")
             self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["normalized_user_input"], "结合图片理解用户意图")
+            self.assertIn("/user_uploads/chat/", saved.messages[0].metadata["attachments"][0]["path"])
+            self.assertTrue(Path(saved.messages[0].metadata["attachments"][0]["parsed_markdown_path"]).exists())
             self.assertEqual(saved.messages[-1].role, "assistant")
 
             events = self._parse_sse_events(response)
@@ -389,8 +392,9 @@ class MessageRouteTests(unittest.TestCase):
             self.assertEqual(saved.messages[0].role, "user")
             self.assertEqual(saved.messages[0].content, "看看这张图")
             self.assertEqual(saved.messages[0].metadata["attachments"][0]["analysis_status"], "failed")
+            self.assertEqual(saved.messages[0].metadata["attachment_analysis"]["status"], "failed")
             self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["status"], "failed")
-            self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["frontend_message"], "图片预解析超时，已跳过图片内容解析")
+            self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["frontend_message"], "附件解析超时，已跳过图片内容解析")
             self.assertEqual(saved.messages[1].role, "system")
             self.assertEqual(saved.messages[1].metadata["type"], "attachment_analysis_warning")
             self.assertEqual(saved.messages[-1].role, "assistant")
@@ -400,6 +404,77 @@ class MessageRouteTests(unittest.TestCase):
             self.assertFalse(processed["data"]["ok"])
             self.assertEqual(processed["data"]["category"], "timeout_error")
             self.assertTrue(any(payload["event"] == "final_response" for payload in events))
+
+    def test_messages_with_text_attachment_saves_to_runtime_workspace_and_parses_before_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="text-attachment")
+            runtime = _PersistingMessageRuntime(session_store, _DummyMultimodalAnalyzer())
+            settings = SimpleNamespace(
+                paths=SimpleNamespace(
+                    audit_dir=root / "audit",
+                    data_dir=root / "data",
+                    workspace=root / "runtime-workspace",
+                )
+            )
+            client = TestClient(_build_app(messages_router, runtime=runtime, settings=settings))
+
+            response = client.post(
+                f"/api/sessions/{session.session_id}/messages",
+                data={"content": "总结附件"},
+                files={"attachments": ("notes.txt", b"line one\n\nline two\n", "text/plain")},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            saved = session_store.get(session.session_id)
+            attachment = saved.messages[0].metadata["attachments"][0]
+            self.assertEqual(attachment["kind"], "text")
+            self.assertEqual(attachment["analysis_status"], "parsed")
+            self.assertTrue(str(attachment["path"]).startswith(str((root / "runtime-workspace").resolve())))
+            self.assertTrue(Path(attachment["parsed_markdown_path"]).exists())
+            self.assertEqual(saved.messages[0].metadata["attachment_analysis"]["status"], "completed")
+            self.assertNotIn("multimodal_parse", saved.messages[0].metadata)
+            self.assertEqual(saved.messages[-1].role, "assistant")
+
+            events = self._parse_sse_events(response)
+            received = next(payload for payload in events if payload["event"] == "attachment_received")
+            processed = next(payload for payload in events if payload["event"] == "attachment_processed")
+            self.assertEqual(received["data"]["count"], 1)
+            self.assertTrue(processed["data"]["ok"])
+
+    def test_messages_with_large_attachment_emits_context_budget_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="large-attachment")
+            runtime = _PersistingMessageRuntime(session_store, _DummyMultimodalAnalyzer())
+            settings = SimpleNamespace(
+                paths=SimpleNamespace(
+                    audit_dir=root / "audit",
+                    data_dir=root / "data",
+                    workspace=root / "runtime-workspace",
+                )
+            )
+            client = TestClient(_build_app(messages_router, runtime=runtime, settings=settings))
+            large_text = ("A" * 13_500).encode("utf-8")
+
+            response = client.post(
+                f"/api/sessions/{session.session_id}/messages",
+                data={"content": "总结附件"},
+                files={"attachments": ("notes.txt", large_text, "text/plain")},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            saved = session_store.get(session.session_id)
+            warnings = saved.messages[0].metadata["attachment_analysis"]["warnings"]
+            self.assertTrue(warnings)
+            self.assertIn("仅注入部分片段", warnings[0])
+
+            events = self._parse_sse_events(response)
+            processed = next(payload for payload in events if payload["event"] == "attachment_processed")
+            self.assertIn("warnings", processed["data"])
+            self.assertTrue(processed["data"]["warnings"])
 
     def test_interrupt_route_persists_turn_interrupted_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -645,6 +720,35 @@ class SkillsRouteTests(unittest.TestCase):
 
             missing_skill = client.post("/api/skills/import", json={"source_path": "imports/broken"})
             self.assertEqual(missing_skill.status_code, 400)
+
+            uploaded = client.post(
+                "/api/skills/upload",
+                data={"skill_name": "sales-helper", "optimize_with_llm": "false"},
+                files=[
+                    ("files", ("notes.md", b"# Sales Helper\n\nReview pipeline notes.", "text/markdown")),
+                    ("files", ("tools/analyze.py", b"import requests\n\nprint('ok')\n", "text/x-python")),
+                    ("files", ("images/chart.png", b"\x89PNG\r\n\x1a\nmock", "image/png")),
+                ],
+            )
+            self.assertEqual(uploaded.status_code, 200)
+            self.assertTrue((skills_dir / "sales-helper" / "SKILL.md").exists())
+            self.assertTrue((skills_dir / "sales-helper" / "scripts" / "tools" / "analyze.py").exists())
+            self.assertTrue((skills_dir / "sales-helper" / "assets" / "images" / "chart.png").exists())
+            self.assertTrue((skills_dir / "sales-helper" / "scripts" / "run_python.py").exists())
+            self.assertTrue((skills_dir / "sales-helper" / "requirements.txt").exists())
+            uploaded_payload = uploaded.json()
+            self.assertEqual(uploaded_payload["skill"]["name"], "sales-helper")
+            self.assertEqual(uploaded_payload["import_report"]["file_count"], 3)
+            self.assertIn("scripts/run_python.py", uploaded_payload["import_report"]["generated_files"])
+            self.assertIn("Python Runtime", uploaded_payload["skill"]["content"])
+            self.assertIn("requests", (skills_dir / "sales-helper" / "requirements.txt").read_text(encoding="utf-8"))
+
+            rejected_upload = client.post(
+                "/api/skills/upload",
+                data={"skill_name": "bad-skill"},
+                files=[("files", ("notes.txt", b"not allowed", "text/plain"))],
+            )
+            self.assertEqual(rejected_upload.status_code, 400)
 
             updated = client.put("/api/skills/writer", json={"content": "# Updated\n\nUse `search_files`.\n"})
             self.assertEqual(updated.status_code, 200)
@@ -940,6 +1044,21 @@ class WorkspaceRouteTests(unittest.TestCase):
             self.assertIsNotNone(payload["latest_updated_at"])
             self.assertIn("updated_at", payload["files"]["memory"])
             self.assertIn("updated_at", payload["files"]["user"])
+
+    def test_attachment_content_reads_runtime_workspace_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "runtime-workspace"
+            attachment = workspace / "user_uploads" / "chat" / "session-1" / "turn-1" / "originals" / "att.txt"
+            attachment.parent.mkdir(parents=True, exist_ok=True)
+            attachment.write_text("hello attachment", encoding="utf-8")
+            settings = SimpleNamespace(paths=SimpleNamespace(memory_dir=root / "memory", workspace=workspace, data_dir=root / "data"))
+            client = TestClient(_build_app(workspace_router, settings=settings))
+
+            response = client.get("/api/workspace/attachment-content", params={"path": str(attachment)})
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.text, "hello attachment")
 
 
 class KnowledgeRouteTests(unittest.TestCase):

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import re
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Literal
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from backend.config.schema import AppConfig
@@ -34,7 +36,7 @@ from backend.runtime.collaboration_mode import (
     is_tool_allowed_in_mode,
 )
 from backend.runtime.feedback_writer import FeedbackWriter
-from backend.runtime.message_rendering import get_normalized_user_content
+from backend.runtime.message_rendering import get_attachment_analysis, get_normalized_user_content
 from backend.runtime.prompt_assembler import PromptAssembler
 from backend.runtime.result_normalizer import normalize_result
 from backend.runtime.session_task import SessionTask
@@ -80,6 +82,21 @@ COMMENTARY_FALLBACK_SYSTEM_PROMPT = """你负责把内部思考压缩成一条�
 """
 
 RAW_TOOL_CALL_MARKUP_RE = re.compile(r"<(?:[\w.-]+:)?tool_call\b", re.IGNORECASE)
+MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\n]+)\)")
+HTML_IMAGE_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+HTML_IMAGE_ATTR_RE = re.compile(r"\b(src|alt)=(['\"])(.*?)\2", re.IGNORECASE)
+DIRECT_IMAGE_SOURCE_PREFIXES = ("http://", "https://", "data:image/", "blob:")
+IMAGE_ATTACHMENT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"})
+ATTACHMENT_FIRST_REPLY_BLOCKED_TOOLS = frozenset(
+    {
+        "read_file",
+        "read_file_range",
+        "list_dir",
+        "list_files",
+        "search_files",
+        "grep",
+    }
+)
 
 
 def _build_tool_message_output(result: ToolExecutionResult) -> str:
@@ -88,6 +105,38 @@ def _build_tool_message_output(result: ToolExecutionResult) -> str:
 
     outputs = [part for part in [result.stdout.strip(), result.stderr.strip()] if part]
     return "\n".join(outputs)
+
+
+def _normalize_markdown_image_destination(raw_destination: str) -> str | None:
+    destination = raw_destination.strip()
+    if not destination:
+        return None
+    if destination.startswith("<"):
+        closing_index = destination.find(">")
+        if closing_index != -1:
+            return destination[1:closing_index].strip() or None
+    if " " in destination and not destination.startswith("data:image/"):
+        destination = destination.split(" ", 1)[0].strip()
+    return destination or None
+
+
+def _extract_assistant_image_references(content: str) -> list[tuple[str, str | None]]:
+    references: list[tuple[str, str | None]] = []
+    for alt_text, raw_destination in MARKDOWN_IMAGE_RE.findall(content):
+        destination = _normalize_markdown_image_destination(raw_destination)
+        if destination:
+            references.append((destination, alt_text.strip() or None))
+
+    for tag_match in HTML_IMAGE_TAG_RE.finditer(content):
+        attributes = {
+            name.lower(): value.strip()
+            for name, _quote, value in HTML_IMAGE_ATTR_RE.findall(tag_match.group(0))
+            if value.strip()
+        }
+        source = attributes.get("src")
+        if source:
+            references.append((source, attributes.get("alt") or None))
+    return references
 
 
 def _repair_schema_value(value: object, schema: object) -> object:
@@ -329,6 +378,7 @@ class NewmanRuntime:
         turn_id: str | None = None,
         on_turn_created: Callable[[str], None] | None = None,
         post_user_message: Callable[[SessionTask, SessionMessage, EventEmitter], Awaitable[None]] | None = None,
+        scheduler_run_mode: Literal["interactive", "unattended"] = "interactive",
     ) -> None:
         self.reload_ecosystem()
         resolved_turn_id = turn_id or uuid4().hex
@@ -396,27 +446,19 @@ class NewmanRuntime:
 
             if not response.tool_calls:
                 final_content = response.content or response.commentary
-                assistant_message = SessionMessage(
-                    id=uuid4().hex,
-                    role="assistant",
-                    content=final_content,
-                    metadata=self._build_message_metadata(
-                        task.turn_id,
-                        request_id,
-                        extra={"finish_reason": response.finish_reason},
-                    ),
+                assistant_message = self._build_assistant_message(
+                    task,
+                    final_content,
+                    request_id=request_id,
+                    finish_reason=response.finish_reason,
                 )
                 task.session.messages.append(assistant_message)
                 self.session_store.save(task.session)
-                await turn_emit(
-                    "final_response",
-                    {
-                        "session_id": task.session.session_id,
-                        "content": final_content,
-                        "finish_reason": response.finish_reason,
-                        "message_id": assistant_message.id,
-                        "created_at": assistant_message.created_at,
-                    },
+                await self._emit_final_response_message(
+                    turn_emit,
+                    task,
+                    assistant_message,
+                    finish_reason=response.finish_reason,
                 )
                 if self.memory_extractor.looks_like_explicit_persistence_signal(content):
                     self.schedule_user_memory_extraction(task.session.session_id, "explicit_user_request")
@@ -495,6 +537,7 @@ class NewmanRuntime:
                         extra_reasons=extra_reasons,
                         turn_approval_mode=turn_approval_mode,
                         turn_id=task.turn_id,
+                        scheduler_run_mode=scheduler_run_mode,
                     )
                 result = normalize_result(result)
                 metadata_updates = result.metadata.get("session_metadata_updates")
@@ -1061,27 +1104,19 @@ class NewmanRuntime:
                 "如果你要我继续往下处理，请直接输入“继续”。"
             )
 
-        assistant_message = SessionMessage(
-            id=uuid4().hex,
-            role="assistant",
-            content=final_content,
-            metadata=self._build_message_metadata(
-                task.turn_id,
-                request_id,
-                extra={"finish_reason": "tool_limit_reached"},
-            ),
+        assistant_message = self._build_assistant_message(
+            task,
+            final_content,
+            request_id=request_id,
+            finish_reason="tool_limit_reached",
         )
         task.session.messages.append(assistant_message)
         self.session_store.save(task.session)
-        await emit(
-            "final_response",
-            {
-                "session_id": task.session.session_id,
-                "content": final_content,
-                "finish_reason": "tool_limit_reached",
-                "message_id": assistant_message.id,
-                "created_at": assistant_message.created_at,
-            },
+        await self._emit_final_response_message(
+            emit,
+            task,
+            assistant_message,
+            finish_reason="tool_limit_reached",
         )
         await self._emit_hooks(
             "SessionEnd",
@@ -1100,27 +1135,19 @@ class NewmanRuntime:
     ) -> None:
         if result.error_code == "NEWMAN-TOOL-005" or result.category == "user_rejected":
             final_content = self._build_fatal_tool_fallback_message(result)
-            assistant_message = SessionMessage(
-                id=uuid4().hex,
-                role="assistant",
-                content=final_content,
-                metadata=self._build_message_metadata(
-                    task.turn_id,
-                    request_id,
-                    extra={"finish_reason": "approval_rejected"},
-                ),
+            assistant_message = self._build_assistant_message(
+                task,
+                final_content,
+                request_id=request_id,
+                finish_reason="approval_rejected",
             )
             task.session.messages.append(assistant_message)
             self.session_store.save(task.session)
-            await emit(
-                "final_response",
-                {
-                    "session_id": task.session.session_id,
-                    "content": final_content,
-                    "finish_reason": "approval_rejected",
-                    "message_id": assistant_message.id,
-                    "created_at": assistant_message.created_at,
-                },
+            await self._emit_final_response_message(
+                emit,
+                task,
+                assistant_message,
+                finish_reason="approval_rejected",
             )
             await self._emit_hooks(
                 "SessionEnd",
@@ -1180,27 +1207,19 @@ class NewmanRuntime:
         if not final_content:
             final_content = self._build_fatal_tool_fallback_message(result)
 
-        assistant_message = SessionMessage(
-            id=uuid4().hex,
-            role="assistant",
-            content=final_content,
-            metadata=self._build_message_metadata(
-                task.turn_id,
-                request_id,
-                extra={"finish_reason": finish_reason},
-            ),
+        assistant_message = self._build_assistant_message(
+            task,
+            final_content,
+            request_id=request_id,
+            finish_reason=finish_reason,
         )
         task.session.messages.append(assistant_message)
         self.session_store.save(task.session)
-        await emit(
-            "final_response",
-            {
-                "session_id": task.session.session_id,
-                "content": final_content,
-                "finish_reason": finish_reason,
-                "message_id": assistant_message.id,
-                "created_at": assistant_message.created_at,
-            },
+        await self._emit_final_response_message(
+            emit,
+            task,
+            assistant_message,
+            finish_reason=finish_reason,
         )
         await self._emit_hooks(
             "SessionEnd",
@@ -1226,27 +1245,19 @@ class NewmanRuntime:
             attempt_count=result.attempt_count if result.attempt_count > 0 else None,
             max_attempts=max_attempts,
         )
-        assistant_message = SessionMessage(
-            id=uuid4().hex,
-            role="assistant",
-            content=final_content,
-            metadata=self._build_message_metadata(
-                task.turn_id,
-                request_id,
-                extra={"finish_reason": "provider_error"},
-            ),
+        assistant_message = self._build_assistant_message(
+            task,
+            final_content,
+            request_id=request_id,
+            finish_reason="provider_error",
         )
         task.session.messages.append(assistant_message)
         self.session_store.save(task.session)
-        await emit(
-            "final_response",
-            {
-                "session_id": task.session.session_id,
-                "content": final_content,
-                "finish_reason": "provider_error",
-                "message_id": assistant_message.id,
-                "created_at": assistant_message.created_at,
-            },
+        await self._emit_final_response_message(
+            emit,
+            task,
+            assistant_message,
+            finish_reason="provider_error",
         )
         extra: dict[str, object] = {}
         if provider:
@@ -1370,15 +1381,44 @@ class NewmanRuntime:
         return " ".join(text.replace("\n", " ").split()).strip()
 
     def _current_turn_user_content(self, session, turn_id: str) -> str:
-        for message in reversed(session.messages):
-            if message.role != "user":
-                continue
-            if message.metadata.get("turn_id") == turn_id:
-                return get_normalized_user_content(message)
+        current_turn_message = self._current_turn_user_message(session, turn_id)
+        if current_turn_message is not None:
+            return get_normalized_user_content(current_turn_message)
         for message in reversed(session.messages):
             if message.role == "user":
                 return get_normalized_user_content(message)
         return ""
+
+    def _current_turn_user_message(self, session, turn_id: str) -> SessionMessage | None:
+        for message in reversed(session.messages):
+            if message.role != "user":
+                continue
+            if message.metadata.get("turn_id") == turn_id:
+                return message
+        return None
+
+    def _turn_has_parsed_attachment_context(self, session, turn_id: str) -> bool:
+        current_turn_message = self._current_turn_user_message(session, turn_id)
+        if current_turn_message is None:
+            return False
+        payload = get_attachment_analysis(current_turn_message)
+        if not payload:
+            return False
+        status = str(payload.get("status") or "").strip()
+        if status not in {"completed", "partial"}:
+            return False
+        summaries = payload.get("attachment_summaries")
+        if not isinstance(summaries, list):
+            return False
+        for item in summaries:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("status") or "").strip() == "parsed":
+                return True
+        return False
+
+    def _should_block_file_browsing_tools_for_attachment_turn(self, task: SessionTask) -> bool:
+        return task.tool_depth == 0 and self._turn_has_parsed_attachment_context(task.session, task.turn_id or "")
 
     def _assemble_task_messages(
         self,
@@ -1442,6 +1482,12 @@ class NewmanRuntime:
                     continue
                 filtered_tools.append(tool.to_provider_schema())
                 existing_names.add(tool_name)
+        if self._should_block_file_browsing_tools_for_attachment_turn(task):
+            filtered_tools = [
+                schema
+                for schema in filtered_tools
+                if str(schema.get("function", {}).get("name", "")) not in ATTACHMENT_FIRST_REPLY_BLOCKED_TOOLS
+            ]
         return filtered_tools
 
     def _is_tool_allowed_for_task(self, task: SessionTask, tool_name: str) -> bool:
@@ -1800,6 +1846,122 @@ class NewmanRuntime:
         if extra:
             metadata.update(extra)
         return metadata
+
+    def _resolve_assistant_image_path(self, raw_source: str) -> Path | None:
+        source = raw_source.strip()
+        if not source:
+            return None
+        if source.startswith(DIRECT_IMAGE_SOURCE_PREFIXES):
+            return None
+        if source.startswith("file://"):
+            source = unquote(urlparse(source).path)
+        else:
+            source = unquote(source)
+        if not source:
+            return None
+
+        candidate = Path(source)
+        if not candidate.is_absolute():
+            workspace = getattr(getattr(self.settings, "paths", None), "workspace", None)
+            if not isinstance(workspace, Path):
+                return None
+            candidate = Path(workspace) / candidate
+
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return None
+        if not resolved.exists() or not resolved.is_file():
+            return None
+
+        content_type = mimetypes.guess_type(resolved.name)[0] or ""
+        if not content_type.startswith("image/") and resolved.suffix.lower() not in IMAGE_ATTACHMENT_SUFFIXES:
+            return None
+        return resolved
+
+    def _workspace_relative_path(self, target: Path) -> str | None:
+        workspace = getattr(getattr(self.settings, "paths", None), "workspace", None)
+        if not isinstance(workspace, Path):
+            return None
+        try:
+            return str(target.relative_to(Path(workspace).resolve()))
+        except ValueError:
+            return None
+
+    def _build_assistant_attachments(self, content: str) -> list[dict[str, object]]:
+        attachments: list[dict[str, object]] = []
+        seen_paths: set[str] = set()
+
+        for source, alt_text in _extract_assistant_image_references(content):
+            path = self._resolve_assistant_image_path(source)
+            if path is None:
+                continue
+
+            path_key = str(path)
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+
+            summary = (alt_text or "").strip()
+            attachments.append(
+                {
+                    "attachment_id": uuid4().hex,
+                    "source": "assistant_output",
+                    "kind": "image",
+                    "filename": path.name,
+                    "extension": path.suffix.lower(),
+                    "content_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                    "size_bytes": path.stat().st_size,
+                    "path": str(path),
+                    "workspace_relative_path": self._workspace_relative_path(path),
+                    "summary": summary,
+                    "analysis_status": "completed",
+                }
+            )
+        return attachments
+
+    def _build_assistant_message(
+        self,
+        task: SessionTask,
+        content: str,
+        *,
+        request_id: str | None,
+        finish_reason: str,
+    ) -> SessionMessage:
+        attachments = self._build_assistant_attachments(content)
+        extra: dict[str, object] = {"finish_reason": finish_reason}
+        if attachments:
+            extra["attachments"] = attachments
+        return SessionMessage(
+            id=uuid4().hex,
+            role="assistant",
+            content=content,
+            metadata=self._build_message_metadata(
+                task.turn_id,
+                request_id,
+                extra=extra,
+            ),
+        )
+
+    async def _emit_final_response_message(
+        self,
+        emit: EventEmitter,
+        task: SessionTask,
+        assistant_message: SessionMessage,
+        *,
+        finish_reason: str,
+    ) -> None:
+        payload: dict[str, object] = {
+            "session_id": task.session.session_id,
+            "content": assistant_message.content,
+            "finish_reason": finish_reason,
+            "message_id": assistant_message.id,
+            "created_at": assistant_message.created_at,
+        }
+        attachments = assistant_message.metadata.get("attachments")
+        if isinstance(attachments, list) and attachments:
+            payload["attachments"] = attachments
+        await emit("final_response", payload)
 
     def _build_tool_session_message(
         self,

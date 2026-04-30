@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from time import perf_counter
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Literal
 
 from backend.config.schema import AppConfig
 from backend.runtime.retry_policy import RetryPolicy
@@ -37,6 +37,7 @@ class ToolOrchestrator:
         extra_reasons: list[str] | None = None,
         turn_approval_mode: TurnApprovalMode = DEFAULT_TURN_APPROVAL_MODE,
         turn_id: str | None = None,
+        scheduler_run_mode: Literal["interactive", "unattended"] = "interactive",
     ) -> ToolExecutionResult:
         validation_error = tool.validate_arguments(arguments)
         if validation_error is not None:
@@ -86,6 +87,24 @@ class ToolOrchestrator:
                     "timeout_seconds": self.settings.approval.timeout_seconds,
                 },
             )
+            if scheduler_run_mode == "unattended":
+                self.approvals.discard(request.approval_request_id)
+                await emit(
+                    "tool_approval_resolved",
+                    {
+                        "approval_request_id": request.approval_request_id,
+                        "tool": tool.meta.name,
+                        "approved": False,
+                    },
+                )
+                return ToolExecutionResult(
+                    success=False,
+                    tool=tool.meta.name,
+                    action="approval",
+                    category="user_rejected",
+                    summary="当前为无人值守定时任务，无法等待人工审批",
+                    retryable=False,
+                )
             try:
                 approved = await self.approvals.wait(request.approval_request_id, self.settings.approval.timeout_seconds)
             except asyncio.TimeoutError:

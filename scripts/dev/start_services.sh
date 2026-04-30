@@ -38,9 +38,14 @@ start_service \
   "${FRONTEND_COMMAND}" \
   "http://127.0.0.1:${FRONTEND_PORT}"
 
+PRIMARY_IP="$(primary_ipv4_address || true)"
+
 echo
 echo "Services are running in the background."
-echo "Frontend: http://127.0.0.1:${FRONTEND_PORT}"
+echo "Frontend bind: http://${FRONTEND_HOST}:${FRONTEND_PORT}"
+if [[ "${FRONTEND_HOST}" == "0.0.0.0" && -n "${PRIMARY_IP}" ]]; then
+  echo "Frontend LAN: http://${PRIMARY_IP}:${FRONTEND_PORT}"
+fi
 echo "Backend API: http://127.0.0.1:${BACKEND_PORT}"
 echo "Backend Docs: http://127.0.0.1:${BACKEND_PORT}/docs"
 echo "PostgreSQL: 127.0.0.1:${PG_PORT} (database=newman)"

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
+from backend.plugin_runtime.skill_loader import SkillImportLoader, UploadedSkillFile
 from backend.tools.workspace_fs import build_path_access_policy, ensure_readable_path
 
 
@@ -38,6 +40,39 @@ async def import_skill(payload: ImportSkillRequest, request: Request):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     runtime.reload_ecosystem()
     return {"skill": _build_skill_detail(runtime, skill.name)}
+
+
+@router.post("/upload")
+async def upload_skill(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    skill_name: str | None = Form(None),
+    optimize_with_llm: bool = Form(True),
+):
+    runtime = request.app.state.runtime
+    provider_config = getattr(request.app.state.settings, "provider", None)
+    provider = getattr(runtime, "provider", None)
+    uploaded_files = [
+        UploadedSkillFile(filename=file.filename or "", content=await file.read())
+        for file in files
+    ]
+    loader = SkillImportLoader(provider=provider, provider_config=provider_config)
+    with tempfile.TemporaryDirectory(prefix="newman-skill-upload-") as tmp:
+        prepared_dir, report = await loader.prepare_upload(
+            uploaded_files,
+            Path(tmp),
+            requested_name=skill_name,
+            optimize_with_llm=optimize_with_llm,
+        )
+        try:
+            skill = runtime.plugin_service.import_system_skill(prepared_dir)
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    runtime.reload_ecosystem()
+    detail = _build_skill_detail(runtime, skill.name)
+    report.skill_directory = detail["directory_path"]
+    return {"skill": detail, "import_report": report.model_dump()}
 
 
 @router.get("/{skill_name}")

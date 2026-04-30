@@ -9,10 +9,16 @@ export type ChatAttachment = {
   id: string;
   filename: string;
   contentType: string;
+  source?: string | null;
+  kind?: string | null;
+  extension?: string | null;
   path?: string | null;
   previewUrl?: string | null;
   summary?: string | null;
   sizeBytes?: number | null;
+  workspaceRelativePath?: string | null;
+  analysisStatus?: string | null;
+  analysisError?: string | null;
 };
 
 export type HtmlPreviewPayload = {
@@ -62,6 +68,7 @@ const markdownSchema = {
     ...defaultSchema.attributes,
     a: [...(defaultSchema.attributes?.a ?? []), "target", "rel"],
     code: [...(defaultSchema.attributes?.code ?? []), ["className", /^language-/]],
+    img: [...(defaultSchema.attributes?.img ?? []), "src", "alt", "title"],
     th: [...(defaultSchema.attributes?.th ?? []), "align"],
     td: [...(defaultSchema.attributes?.td ?? []), "align"],
   },
@@ -69,6 +76,8 @@ const markdownSchema = {
 
 const URL_TOKEN_REGEX = /(https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+)/g;
 const URL_TRAILING_PUNCTUATION = /[),.;!?，。；：！？、】【」』》〉）]+$/u;
+const MARKDOWN_IMAGE_SOURCE_REGEX = /!\[[^\]]*\]\(([^)\n]+)\)/g;
+const HTML_IMAGE_SOURCE_REGEX = /<img\b[^>]*\bsrc=(['"])(.*?)\1[^>]*>/gi;
 
 function joinClassNames(...values: Array<string | null | undefined | false>) {
   return values.filter(Boolean).join(" ");
@@ -137,6 +146,12 @@ function renderUserText(content: string) {
   });
 }
 
+function buildWorkspaceFileUrl(apiBase: string, path: string) {
+  const url = new URL(`${apiBase}/api/workspace/file-content`);
+  url.searchParams.set("path", path);
+  return url.toString();
+}
+
 function buildAttachmentUrl(apiBase: string, attachment: ChatAttachment) {
   if (attachment.previewUrl) {
     return attachment.previewUrl;
@@ -144,9 +159,222 @@ function buildAttachmentUrl(apiBase: string, attachment: ChatAttachment) {
   if (!attachment.path) {
     return null;
   }
-  const url = new URL(`${apiBase}/api/workspace/upload-content`);
+  const useAttachmentContentRoute = attachment.source === "user_upload" || attachment.source === "parser_output";
+  const url = new URL(
+    `${apiBase}${useAttachmentContentRoute ? "/api/workspace/attachment-content" : "/api/workspace/file-content"}`,
+  );
   url.searchParams.set("path", attachment.path);
   return url.toString();
+}
+
+function decodePathToken(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function normalizeImageSourceForMatch(source: string) {
+  const trimmed = source.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed.startsWith("file://")) {
+    try {
+      return decodeURIComponent(new URL(trimmed).pathname).replace(/\\/g, "/");
+    } catch {
+      return decodePathToken(trimmed.slice("file://".length)).replace(/\\/g, "/");
+    }
+  }
+  if (trimmed.startsWith("<") && trimmed.endsWith(">")) {
+    return decodePathToken(trimmed.slice(1, -1).trim()).replace(/\\/g, "/");
+  }
+  const withoutTitle = trimmed.includes(" ") && !trimmed.startsWith("data:image/") ? trimmed.split(" ", 1)[0] : trimmed;
+  return decodePathToken(withoutTitle).replace(/\\/g, "/");
+}
+
+function extractFilenameFromSource(source: string) {
+  const normalized = normalizeImageSourceForMatch(source);
+  if (!normalized) {
+    return "image";
+  }
+  const sanitized = normalized.split(/[?#]/, 1)[0];
+  const segments = sanitized.split("/").filter(Boolean);
+  return segments[segments.length - 1] || "image";
+}
+
+function isDirectImageSource(source: string) {
+  return /^(https?:\/\/|data:image\/|blob:)/i.test(source.trim());
+}
+
+function collectContentImageSources(content: string) {
+  const sources = new Set<string>();
+  for (const match of content.matchAll(MARKDOWN_IMAGE_SOURCE_REGEX)) {
+    const source = normalizeImageSourceForMatch(match[1] ?? "");
+    if (source) {
+      sources.add(source);
+    }
+  }
+  for (const match of content.matchAll(HTML_IMAGE_SOURCE_REGEX)) {
+    const source = normalizeImageSourceForMatch(match[2] ?? "");
+    if (source) {
+      sources.add(source);
+    }
+  }
+  return sources;
+}
+
+function findAttachmentByImageSource(source: string, attachments: ChatAttachment[]) {
+  const normalizedSource = normalizeImageSourceForMatch(source);
+  if (!normalizedSource) {
+    return null;
+  }
+  const normalizedFilename = extractFilenameFromSource(normalizedSource);
+  const filenameOnlySource = !normalizedSource.includes("/") && !normalizedSource.includes(":");
+  return (
+    attachments.find((attachment) => {
+      const candidates = [
+        attachment.path ? normalizeImageSourceForMatch(attachment.path) : "",
+        attachment.workspaceRelativePath ? normalizeImageSourceForMatch(attachment.workspaceRelativePath) : "",
+        normalizeImageSourceForMatch(attachment.filename),
+      ].filter(Boolean);
+      return candidates.includes(normalizedSource) || (filenameOnlySource && candidates.includes(normalizedFilename));
+    }) ?? null
+  );
+}
+
+function buildMarkdownImageUrl(apiBase: string, source: string, attachment: ChatAttachment | null) {
+  if (attachment) {
+    return buildAttachmentUrl(apiBase, attachment);
+  }
+  const normalizedSource = normalizeImageSourceForMatch(source);
+  if (!normalizedSource) {
+    return null;
+  }
+  if (isDirectImageSource(normalizedSource)) {
+    return normalizedSource;
+  }
+  return buildWorkspaceFileUrl(apiBase, normalizedSource);
+}
+
+function getAttachmentExtension(attachment: ChatAttachment) {
+  if (attachment.extension) {
+    return attachment.extension.replace(/^\./, "").toUpperCase();
+  }
+  const suffix = attachment.filename.split(".").pop()?.trim().toLowerCase() ?? "";
+  return suffix ? suffix.toUpperCase() : "FILE";
+}
+
+function isImageAttachment(attachment: ChatAttachment) {
+  const contentType = attachment.contentType.toLowerCase();
+  if (contentType.startsWith("image/")) {
+    return true;
+  }
+  const extension = (attachment.extension ?? `.${attachment.filename.split(".").pop() ?? ""}`).toLowerCase();
+  return extension === ".png" || extension === ".jpg" || extension === ".jpeg" || extension === ".webp";
+}
+
+function AttachmentFileCard({
+  attachment,
+  href,
+  tone = "user",
+}: {
+  attachment: ChatAttachment;
+  href: string | null;
+  tone?: "assistant" | "user";
+}) {
+  const cardTitle = attachment.summary || attachment.analysisError || attachment.filename;
+  const content = (
+    <>
+      <span className="chat-attachment-file-badge">{getAttachmentExtension(attachment)}</span>
+      <strong className="chat-attachment-file-name">{attachment.filename}</strong>
+    </>
+  );
+
+  if (!href) {
+    return (
+      <div className={joinClassNames("chat-attachment-file", tone === "assistant" && "assistant")} title={cardTitle}>
+        {content}
+      </div>
+    );
+  }
+
+  return (
+    <a
+      className={joinClassNames("chat-attachment-file", tone === "assistant" && "assistant")}
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      title={cardTitle}
+      aria-label={`打开附件 ${attachment.filename}`}
+    >
+      {content}
+    </a>
+  );
+}
+
+function AttachmentGallery({
+  apiBase,
+  attachments,
+  failedAttachmentIds,
+  onPreview,
+  onAttachmentError,
+  tone = "user",
+  ariaLabel,
+}: {
+  apiBase: string;
+  attachments: ChatAttachment[];
+  failedAttachmentIds: string[];
+  onPreview: (attachment: ChatAttachment, src: string) => void;
+  onAttachmentError: (attachmentId: string) => void;
+  tone?: "assistant" | "user";
+  ariaLabel: string;
+}) {
+  return (
+    <div className={joinClassNames("chat-attachment-grid", tone === "assistant" && "assistant")} aria-label={ariaLabel}>
+      {attachments.map((attachment) => {
+        const src = buildAttachmentUrl(apiBase, attachment);
+        if (!isImageAttachment(attachment)) {
+          return <AttachmentFileCard key={attachment.id} attachment={attachment} href={src} tone={tone} />;
+        }
+        if (!src) {
+          return (
+            <div
+              key={attachment.id}
+              className={joinClassNames("chat-attachment-card", "fallback", tone === "assistant" && "assistant")}
+              title={attachment.filename}
+            >
+              <div className="chat-attachment-fallback">{attachment.filename.slice(0, 1).toUpperCase()}</div>
+            </div>
+          );
+        }
+
+        return (
+          <button
+            key={attachment.id}
+            type="button"
+            className={joinClassNames("chat-attachment-card", tone === "assistant" && "assistant")}
+            title={attachment.summary || attachment.filename}
+            aria-label={`预览图片 ${attachment.filename}`}
+            onClick={() => onPreview(attachment, src)}
+          >
+            {failedAttachmentIds.includes(attachment.id) ? (
+              <span className="chat-attachment-fallback">{attachment.filename.slice(0, 1).toUpperCase()}</span>
+            ) : (
+              <img
+                className="chat-attachment-image"
+                src={src}
+                alt={attachment.summary || attachment.filename}
+                loading="lazy"
+                onError={() => onAttachmentError(attachment.id)}
+              />
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 function AttachmentPreviewDialog({
@@ -415,6 +643,57 @@ function MarkdownCodeBlock({
   );
 }
 
+function MarkdownImage({
+  apiBase,
+  src,
+  alt,
+  attachments,
+  onPreview,
+}: {
+  apiBase: string;
+  src?: string;
+  alt?: string;
+  attachments: ChatAttachment[];
+  onPreview: (attachment: ChatAttachment, src: string) => void;
+}) {
+  const [failed, setFailed] = useState(false);
+  const source = src ?? "";
+  const attachment = findAttachmentByImageSource(source, attachments);
+  const resolvedSrc = buildMarkdownImageUrl(apiBase, source, attachment);
+  const previewAttachment =
+    attachment ??
+    ({
+      id: `inline:${source}`,
+      filename: extractFilenameFromSource(source),
+      contentType: "image/*",
+      kind: "image",
+      previewUrl: resolvedSrc,
+      summary: alt?.trim() || null,
+    } satisfies ChatAttachment);
+
+  if (!resolvedSrc || failed) {
+    return <span className="chat-inline-image-fallback">{alt?.trim() || previewAttachment.filename}</span>;
+  }
+
+  return (
+    <button
+      type="button"
+      className="chat-markdown-image-button"
+      onClick={() => onPreview(previewAttachment, resolvedSrc)}
+      title={previewAttachment.summary || previewAttachment.filename}
+      aria-label={`预览图片 ${previewAttachment.filename}`}
+    >
+      <img
+        className="chat-markdown-image"
+        src={resolvedSrc}
+        alt={alt || previewAttachment.filename}
+        loading="lazy"
+        onError={() => setFailed(true)}
+      />
+    </button>
+  );
+}
+
 export default function MessageContent({
   apiBase,
   variant,
@@ -430,6 +709,18 @@ export default function MessageContent({
   const [failedAttachmentIds, setFailedAttachmentIds] = useState<string[]>([]);
   const renderedAssistantContent =
     variant === "assistant" && deferCodeBlocksUntilComplete ? stripFencedCodeBlocksForStreaming(content) : content;
+  const referencedImageSources = variant === "assistant" ? collectContentImageSources(content) : new Set<string>();
+  const assistantLooseAttachments =
+    variant === "assistant"
+      ? attachments.filter((attachment) => {
+          const candidates = [
+            attachment.path ? normalizeImageSourceForMatch(attachment.path) : "",
+            attachment.workspaceRelativePath ? normalizeImageSourceForMatch(attachment.workspaceRelativePath) : "",
+            normalizeImageSourceForMatch(attachment.filename),
+          ].filter(Boolean);
+          return !candidates.some((candidate) => referencedImageSources.has(candidate));
+        })
+      : EMPTY_ATTACHMENTS;
 
   useEffect(() => {
     setFailedAttachmentIds((current) => {
@@ -444,43 +735,16 @@ export default function MessageContent({
         <div className={joinClassNames("chat-message-content", "user", className)}>
           {hasText ? <p className="chat-message-text">{renderUserText(content)}</p> : null}
           {hasAttachments ? (
-            <div className="chat-attachment-grid" aria-label="已上传图片">
-              {attachments.map((attachment) => {
-                const src = buildAttachmentUrl(apiBase, attachment);
-                if (!src) {
-                  return (
-                    <div key={attachment.id} className="chat-attachment-card fallback" title={attachment.filename}>
-                      <div className="chat-attachment-fallback">{attachment.filename.slice(0, 1).toUpperCase()}</div>
-                    </div>
-                  );
-                }
-
-                return (
-                  <button
-                    key={attachment.id}
-                    type="button"
-                    className="chat-attachment-card"
-                    title={attachment.summary || attachment.filename}
-                    aria-label={`预览图片 ${attachment.filename}`}
-                    onClick={() => setPreview({ attachment, src })}
-                  >
-                    {failedAttachmentIds.includes(attachment.id) ? (
-                      <span className="chat-attachment-fallback">{attachment.filename.slice(0, 1).toUpperCase()}</span>
-                    ) : (
-                      <img
-                        className="chat-attachment-image"
-                        src={src}
-                        alt={attachment.summary || attachment.filename}
-                        loading="lazy"
-                        onError={() =>
-                          setFailedAttachmentIds((current) => (current.includes(attachment.id) ? current : [...current, attachment.id]))
-                        }
-                      />
-                    )}
-                  </button>
-                );
-              })}
-            </div>
+            <AttachmentGallery
+              apiBase={apiBase}
+              attachments={attachments}
+              failedAttachmentIds={failedAttachmentIds}
+              onPreview={(attachment, src) => setPreview({ attachment, src })}
+              onAttachmentError={(attachmentId) =>
+                setFailedAttachmentIds((current) => (current.includes(attachmentId) ? current : [...current, attachmentId]))
+              }
+              ariaLabel="已上传附件"
+            />
           ) : null}
         </div>
         {preview ? (
@@ -495,19 +759,52 @@ export default function MessageContent({
   }
 
   return (
-    <div className={joinClassNames("chat-message-content", "assistant", className)}>
-      <div className="chat-markdown-body">
-        <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
-          rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSchema]]}
-          components={{
-            a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
-            pre: ({ node: _node, ...props }) => <MarkdownCodeBlock {...props} onOpenHtmlPreview={onOpenHtmlPreview} />,
-          }}
-        >
-          {renderedAssistantContent}
-        </ReactMarkdown>
+    <>
+      <div className={joinClassNames("chat-message-content", "assistant", className)}>
+        {hasText ? (
+          <div className="chat-markdown-body">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSchema]]}
+              components={{
+                a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
+                img: ({ node: _node, ...props }) => (
+                  <MarkdownImage
+                    apiBase={apiBase}
+                    src={typeof props.src === "string" ? props.src : undefined}
+                    alt={typeof props.alt === "string" ? props.alt : undefined}
+                    attachments={attachments}
+                    onPreview={(attachment, src) => setPreview({ attachment, src })}
+                  />
+                ),
+                pre: ({ node: _node, ...props }) => <MarkdownCodeBlock {...props} onOpenHtmlPreview={onOpenHtmlPreview} />,
+              }}
+            >
+              {renderedAssistantContent}
+            </ReactMarkdown>
+          </div>
+        ) : null}
+        {assistantLooseAttachments.length > 0 ? (
+          <AttachmentGallery
+            apiBase={apiBase}
+            attachments={assistantLooseAttachments}
+            failedAttachmentIds={failedAttachmentIds}
+            onPreview={(attachment, src) => setPreview({ attachment, src })}
+            onAttachmentError={(attachmentId) =>
+              setFailedAttachmentIds((current) => (current.includes(attachmentId) ? current : [...current, attachmentId]))
+            }
+            tone="assistant"
+            ariaLabel="回复附件"
+          />
+        ) : null}
       </div>
-    </div>
+      {preview ? (
+        <AttachmentPreviewDialog
+          attachment={preview.attachment}
+          src={preview.src}
+          onClose={() => setPreview(null)}
+        />
+      ) : null}
+    </>
   );
 }

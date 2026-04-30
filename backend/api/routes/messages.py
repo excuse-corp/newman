@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,18 +11,14 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import UploadFile
 
+from backend.attachments import AttachmentService
 from backend.api.sse.event_emitter import build_event_payload, format_sse_payload
-from backend.providers.base import ProviderError
 from backend.runtime.message_rendering import build_user_message_title
-from backend.runtime.error_codes import resolve_tool_error
 from backend.sessions.models import SessionMessage
 from backend.tools.approval_policy import normalize_turn_approval_mode
 
 
 router = APIRouter(prefix="/api/sessions", tags=["messages"])
-
-ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png"}
-ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
 @dataclass
@@ -49,17 +45,22 @@ async def send_message(session_id: str, request: Request):
             _clear_active_session_run(active_runs, session_id, existing)
         else:
             raise HTTPException(status_code=409, detail="当前会话已有任务在运行，请先等待完成或停止")
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is not None and getattr(scheduler, "has_active_scheduler_session", None):
+        if scheduler.has_active_scheduler_session(session_id):
+            raise HTTPException(status_code=409, detail="当前会话已有定时任务在运行，请先等待完成")
 
     content, uploads, approval_mode = await _parse_request_payload(request)
     if not content.strip() and not uploads:
-        raise ValueError("content 不能为空，或者至少上传一张图片")
+        raise ValueError("content 不能为空，或者至少上传一个附件")
     provisional_turn_id = uuid4().hex
 
     async def event_stream():
         queue: asyncio.Queue[bytes] = asyncio.Queue()
         settings = request.app.state.settings
         audit_path = Path(settings.paths.audit_dir) / f"{session_id}.log"
-        upload_dir = settings.paths.data_dir / "uploads" / "chat" / session_id
+        workspace_root = Path(getattr(settings.paths, "workspace", settings.paths.data_dir / "runtime_workspace")).resolve()
+        attachment_service = AttachmentService(workspace_root, runtime.multimodal_analyzer)
         stream_failed = False
         stream_closed = False
         active_run: ActiveSessionRun | None = None
@@ -79,12 +80,12 @@ async def send_message(session_id: str, request: Request):
         async def run_worker() -> None:
             nonlocal stream_failed
             try:
-                saved_attachments = await _save_uploads(upload_dir, uploads)
+                saved_attachments = await attachment_service.save_uploads(session_id, provisional_turn_id, uploads) if uploads else []
                 metadata = {
-                    "attachments": _serialize_attachments(saved_attachments),
+                    "attachments": attachment_service.serialize(saved_attachments),
                     "approval_mode": approval_mode,
                     "original_content": content,
-                    "input_modalities": _infer_input_modalities(content, saved_attachments),
+                    "input_modalities": _infer_input_modalities(content, attachment_service.serialize(saved_attachments)),
                 }
 
                 post_user_message = None
@@ -95,111 +96,51 @@ async def send_message(session_id: str, request: Request):
                             "attachment_received",
                             {
                                 "count": len(saved_attachments),
-                                "files": [
-                                    {"filename": item["filename"], "content_type": item["content_type"]}
-                                    for item in saved_attachments
-                                ],
+                                "files": attachment_service.build_event_files(saved_attachments),
                                 "turn_id": task.turn_id,
                             },
                         )
-                        try:
-                            parsed = await runtime.multimodal_analyzer.parse_user_input(
-                                content,
-                                [Path(item["path"]) for item in saved_attachments],
-                                session_id=session_id,
-                                turn_id=task.turn_id,
-                            )
-                        except ProviderError as exc:
-                            failure = _build_attachment_analysis_failure(exc, runtime)
-                            _mark_attachments_as_failed(saved_attachments, failure["frontend_message"])
-                            _apply_multimodal_parse_to_user_message(
-                                user_message,
-                                content,
-                                saved_attachments,
-                                _build_failed_multimodal_parse(failure, runtime),
-                            )
-                            _maybe_refresh_session_title(task.session, user_message)
-                            task.session.messages.append(
-                                SessionMessage(
-                                    id=uuid4().hex,
-                                    role="system",
-                                    content=_build_attachment_analysis_warning(saved_attachments, failure),
-                                    metadata={
-                                        "type": "attachment_analysis_warning",
-                                        "turn_id": task.turn_id,
-                                        **({"request_id": request_id} if request_id else {}),
-                                        **failure,
-                                    },
-                                )
-                            )
-                            runtime.session_store.save(task.session)
-                            await emit_turn(
-                                "attachment_processed",
-                                {
-                                    "count": len(saved_attachments),
-                                    "files": _build_attachment_event_files(saved_attachments),
-                                    "ok": False,
-                                    "turn_id": task.turn_id,
-                                    **failure,
-                                },
-                            )
-                            return
-                        except Exception as exc:
-                            failure = _build_attachment_analysis_failure(exc, runtime)
-                            _mark_attachments_as_failed(saved_attachments, failure["frontend_message"])
-                            _apply_multimodal_parse_to_user_message(
-                                user_message,
-                                content,
-                                saved_attachments,
-                                _build_failed_multimodal_parse(failure, runtime),
-                            )
-                            _maybe_refresh_session_title(task.session, user_message)
-                            task.session.messages.append(
-                                SessionMessage(
-                                    id=uuid4().hex,
-                                    role="system",
-                                    content=_build_attachment_analysis_warning(saved_attachments, failure),
-                                    metadata={
-                                        "type": "attachment_analysis_warning",
-                                        "turn_id": task.turn_id,
-                                        **({"request_id": request_id} if request_id else {}),
-                                        **failure,
-                                    },
-                                )
-                            )
-                            runtime.session_store.save(task.session)
-                            await emit_turn(
-                                "attachment_processed",
-                                {
-                                    "count": len(saved_attachments),
-                                    "files": _build_attachment_event_files(saved_attachments),
-                                    "ok": False,
-                                    "turn_id": task.turn_id,
-                                    **failure,
-                                },
-                            )
-                            return
-
-                        attachment_summaries = parsed.get("attachment_summaries")
-                        if not isinstance(attachment_summaries, list):
-                            attachment_summaries = []
-                        for index, item in enumerate(saved_attachments):
-                            summary = ""
-                            if index < len(attachment_summaries):
-                                summary = str(attachment_summaries[index]).strip()
-                            item["summary"] = summary or "未获得可用图片分析结果。"
-                            item["analysis_status"] = "completed"
-                            item.pop("analysis_error", None)
-                        _apply_multimodal_parse_to_user_message(user_message, content, saved_attachments, parsed)
+                        attachment_analysis, multimodal_parse, multimodal_failure = await attachment_service.analyze_attachments(
+                            content,
+                            saved_attachments,
+                            session_id=session_id,
+                            turn_id=task.turn_id,
+                        )
+                        _apply_attachment_parse_to_user_message(
+                            user_message,
+                            content,
+                            attachment_service.serialize(saved_attachments),
+                            attachment_analysis,
+                            multimodal_parse,
+                        )
                         _maybe_refresh_session_title(task.session, user_message)
+                        failed_attachments = [item for item in saved_attachments if item.analysis_status == "failed"]
+                        if failed_attachments:
+                            warning_metadata = {
+                                "type": "attachment_analysis_warning",
+                                "turn_id": task.turn_id,
+                                **({"request_id": request_id} if request_id else {}),
+                            }
+                            if multimodal_failure:
+                                warning_metadata.update(multimodal_failure)
+                            task.session.messages.append(
+                                SessionMessage(
+                                    id=uuid4().hex,
+                                    role="system",
+                                    content=attachment_service.build_failure_warning(saved_attachments),
+                                    metadata=warning_metadata,
+                                )
+                            )
                         runtime.session_store.save(task.session)
                         await emit_turn(
                             "attachment_processed",
                             {
                                 "count": len(saved_attachments),
-                                "files": _build_attachment_event_files(saved_attachments),
-                                "ok": True,
+                                "files": attachment_service.build_event_files(saved_attachments),
+                                "ok": not failed_attachments,
                                 "turn_id": task.turn_id,
+                                "warnings": attachment_analysis.get("warnings", []),
+                                **(multimodal_failure or {}),
                             },
                         )
 
@@ -328,66 +269,28 @@ async def _parse_request_payload(request: Request) -> tuple[str, list[UploadFile
 
     form = await request.form()
     content = str(form.get("content", "")).strip()
-    uploads = [item for item in form.getlist("images") if isinstance(item, UploadFile)]
+    uploads = [item for item in form.getlist("attachments") if isinstance(item, UploadFile)]
+    uploads.extend(item for item in form.getlist("images") if isinstance(item, UploadFile))
     approval_mode = normalize_turn_approval_mode(form.get("approval_mode"))
     return content, uploads, approval_mode
 
 
-async def _save_uploads(upload_dir: Path, uploads: list[UploadFile]) -> list[dict[str, str]]:
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[dict[str, str]] = []
-    for upload in uploads:
-        filename = upload.filename or "image"
-        suffix = Path(filename).suffix.lower()
-        if upload.content_type not in ALLOWED_IMAGE_TYPES or suffix not in ALLOWED_IMAGE_SUFFIXES:
-            raise ValueError(f"仅支持 jpg/png 图片: {filename}")
-        target = upload_dir / f"{uuid4().hex}{suffix}"
-        data = await upload.read()
-        target.write_bytes(data)
-        saved.append(
-            {
-                "attachment_id": uuid4().hex,
-                "kind": "image",
-                "filename": filename,
-                "content_type": upload.content_type or "application/octet-stream",
-                "path": str(target),
-                "summary": "",
-                "analysis_status": "pending",
-            }
-        )
-    return saved
-
-
-def _serialize_attachments(attachments: list[dict[str, str]]) -> list[dict[str, str]]:
-    serialized: list[dict[str, str]] = []
-    for item in attachments:
-        payload = {
-            "attachment_id": item["attachment_id"],
-            "kind": item.get("kind", "image"),
-            "filename": item["filename"],
-            "content_type": item["content_type"],
-            "path": item["path"],
-            "summary": item.get("summary", ""),
-        }
-        if analysis_status := item.get("analysis_status"):
-            payload["analysis_status"] = analysis_status
-        if analysis_error := item.get("analysis_error"):
-            payload["analysis_error"] = analysis_error
-        serialized.append(payload)
-    return serialized
-
-
-def _apply_multimodal_parse_to_user_message(
+def _apply_attachment_parse_to_user_message(
     user_message: SessionMessage,
     original_content: str,
-    attachments: list[dict[str, str]],
-    multimodal_parse: dict[str, object],
+    attachments: list[dict[str, object]],
+    attachment_analysis: dict[str, object],
+    multimodal_parse: dict[str, object] | None = None,
 ) -> None:
     user_message.content = original_content
     user_message.metadata["original_content"] = original_content
     user_message.metadata["input_modalities"] = _infer_input_modalities(original_content, attachments)
-    user_message.metadata["attachments"] = _serialize_attachments(attachments)
-    user_message.metadata["multimodal_parse"] = multimodal_parse
+    user_message.metadata["attachments"] = attachments
+    user_message.metadata["attachment_analysis"] = attachment_analysis
+    if multimodal_parse is not None:
+        user_message.metadata["multimodal_parse"] = multimodal_parse
+    else:
+        user_message.metadata.pop("multimodal_parse", None)
 
 
 def _maybe_refresh_session_title(session, user_message: SessionMessage) -> None:
@@ -406,100 +309,6 @@ def _infer_input_modalities(content: str, attachments: list[dict[str, str]]) -> 
         kinds = {str(item.get("kind") or "image").strip() or "image" for item in attachments if isinstance(item, dict)}
         modalities.extend(sorted(kinds))
     return modalities
-
-
-def _build_attachment_event_files(attachments: list[dict[str, str]]) -> list[dict[str, str]]:
-    files: list[dict[str, str]] = []
-    for item in attachments:
-        payload = {
-            "filename": item["filename"],
-            "summary": item.get("summary", ""),
-        }
-        if analysis_status := item.get("analysis_status"):
-            payload["analysis_status"] = analysis_status
-        if analysis_error := item.get("analysis_error"):
-            payload["analysis_error"] = analysis_error
-        files.append(payload)
-    return files
-
-
-def _mark_attachments_as_failed(attachments: list[dict[str, str]], frontend_message: str) -> None:
-    failure_summary = f"图片预解析失败：{frontend_message}"
-    for item in attachments:
-        item["summary"] = failure_summary
-        item["analysis_status"] = "failed"
-        item["analysis_error"] = frontend_message
-
-
-def _build_attachment_analysis_failure(exc: Exception, runtime) -> dict[str, str]:
-    if isinstance(exc, ProviderError):
-        descriptor = resolve_tool_error(exc.kind, success=False)
-        detail = exc.message
-        category = exc.kind
-        provider = exc.provider
-        status_code = exc.status_code
-    else:
-        descriptor = resolve_tool_error("runtime_exception", success=False)
-        detail = str(exc) or exc.__class__.__name__
-        category = "runtime_exception"
-        provider = "multimodal_analyzer"
-        status_code = None
-
-    frontend_message = "图片预解析超时，已跳过图片内容解析" if category == "timeout_error" else "图片预解析失败，已跳过图片内容解析"
-    timeout_seconds = getattr(getattr(runtime, "settings", None), "models", None)
-    timeout_value = getattr(getattr(timeout_seconds, "multimodal", None), "timeout", None)
-    summary = detail
-    if isinstance(timeout_value, int) and category == "timeout_error":
-        summary = f"{detail} (multimodal timeout={timeout_value}s)"
-
-    return {
-        "category": category,
-        "error_code": descriptor.code,
-        "severity": descriptor.severity,
-        "risk_level": descriptor.risk_level,
-        "recovery_class": "recoverable",
-        "frontend_message": frontend_message,
-        "recommended_next_step": "Continue this round without image context, then inspect the multimodal provider configuration or retry the upload.",
-        "summary": summary,
-        "provider": provider,
-        "status_code": "" if status_code is None else str(status_code),
-    }
-
-
-def _build_failed_multimodal_parse(failure: dict[str, str], runtime) -> dict[str, object]:
-    multimodal_config = getattr(getattr(getattr(runtime, "settings", None), "models", None), "multimodal", None)
-    parser_provider = getattr(multimodal_config, "type", "multimodal_analyzer")
-    parser_model = getattr(multimodal_config, "model", "")
-    return {
-        "schema_version": "v1",
-        "status": "failed",
-        "parser_provider": parser_provider,
-        "parser_model": parser_model,
-        "normalized_user_input": "",
-        "task_intent": "",
-        "key_facts": [],
-        "ocr_text": [],
-        "uncertainties": [failure["frontend_message"]],
-        "attachment_summaries": [],
-        "frontend_message": failure["frontend_message"],
-        "error_code": failure["error_code"],
-        "summary": failure["summary"],
-        "category": failure["category"],
-    }
-
-
-def _build_attachment_analysis_warning(
-    attachments: list[dict[str, str]],
-    failure: dict[str, str],
-) -> str:
-    lines = [
-        "## Uploaded Images Warning",
-        f"图片预解析失败，当前回合不要把这些图片当作已成功读取的上下文。原因：{failure['summary']}",
-        "如果必须依赖图片内容，请提示用户稍后重试，或先检查多模态模型/网络配置。",
-    ]
-    for item in attachments:
-        lines.append(f"- {item['filename']}: {item.get('summary', '').strip()}")
-    return "\n".join(lines)
 
 
 def _ensure_active_session_runs(request: Request) -> dict[str, ActiveSessionRun]:

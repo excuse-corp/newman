@@ -1589,7 +1589,49 @@ multipart/form-data
 - 复制范围不仅包含 `SKILL.md`，也包含同目录下的 `scripts/`、`references/`、`templates/`、依赖清单等资源文件
 - 当前没有单独的“创建空 skill”接口；新增 skill 的受支持方式是先准备一个合法 skill 目录，再通过本接口导入
 
-## 9.14 更新 Skill
+## 9.14 上传装载 Skill
+
+`POST /api/skills/upload`
+
+请求体：`multipart/form-data`
+
+- `files`：一个或多个文件；浏览器文件夹上传时可在 multipart filename 中保留相对路径
+- `skill_name`：可选，指定生成后的 skill id
+- `optimize_with_llm`：可选，默认 `true`；模型不可用时会回退到确定性装载
+
+支持上传格式：
+
+- Markdown：`.md`
+- Python 脚本：`.py`
+- 图片：`.jpg`、`.jpeg`、`.png`
+
+说明：
+
+- 一次上传会装载为一个平台 skill 文件夹
+- 上传内容会被整理为 `SKILL.md`、`references/`、`scripts/`、`assets/`
+- 若缺少 `SKILL.md`，装载器会基于 Markdown 内容生成入口文件并补齐 `name`、`description`、`when_to_use`
+- 若包含 Python 脚本，装载器会生成 `scripts/run_python.py` 和 `requirements.txt`，脚本运行时通过 skill-local `.venv` 隔离依赖
+- 导入完成后会立即刷新 snapshot
+
+响应示例：
+
+```json
+{
+  "skill": {
+    "name": "reviewer",
+    "path": "/root/newman/skills/reviewer/SKILL.md",
+    "directory_path": "/root/newman/skills/reviewer"
+  },
+  "import_report": {
+    "optimizer": "deterministic",
+    "file_count": 3,
+    "generated_files": ["scripts/run_python.py", "requirements.txt"],
+    "warnings": []
+  }
+}
+```
+
+## 9.15 更新 Skill
 
 `PUT /api/skills/{skill_name}`
 
@@ -1607,7 +1649,7 @@ multipart/form-data
 - 当前该接口只会覆盖目标 skill 的 `SKILL.md` 内容，不会修改同目录下的脚本、模板、参考资料或依赖文件
 - 若目标 skill 为 plugin skill 或其他只读来源，接口会返回冲突错误
 
-## 9.15 删除 Skill
+## 9.16 删除 Skill
 
 `DELETE /api/skills/{skill_name}`
 

@@ -296,6 +296,31 @@ class TurnApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tool.calls), 0)
         self.assertEqual(events, [])
 
+    async def test_unattended_scheduler_rejects_approval_immediately(self):
+        approvals = ApprovalManager()
+        orchestrator = ToolOrchestrator(AppConfig(), approvals)
+        tool = FakeWriteTool()
+        events: list[tuple[str, dict]] = []
+
+        async def emit(event: str, data: dict) -> None:
+            events.append((event, data))
+
+        result = await orchestrator.execute(
+            tool,
+            {"path": "/root/newman/demo.txt", "content": "hello"},
+            "session-scheduled",
+            emit,
+            turn_approval_mode="manual",
+            scheduler_run_mode="unattended",
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.category, "user_rejected")
+        self.assertEqual(len(tool.calls), 0)
+        self.assertEqual([name for name, _ in events], ["tool_approval_request", "tool_approval_resolved"])
+        self.assertFalse(events[1][1]["approved"])
+        self.assertIsNone(approvals.find_for_session("session-scheduled"))
+
     async def test_mcp_path_denies_do_not_enter_manual_approval(self):
         approvals = ApprovalManager()
         orchestrator = ToolOrchestrator(AppConfig(), approvals)

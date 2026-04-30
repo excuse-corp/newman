@@ -124,13 +124,31 @@ async def get_workspace_file_content(request: Request, path: str):
 
 @router.get("/upload-content")
 async def get_uploaded_file_content(request: Request, path: str):
+    return _build_attachment_file_response(request, path)
+
+
+@router.get("/attachment-content")
+async def get_attachment_file_content(request: Request, path: str):
+    return _build_attachment_file_response(request, path)
+
+
+def _build_attachment_file_response(request: Request, path: str):
     settings = request.app.state.settings
     target = Path(path).resolve()
-    uploads_root = (settings.paths.data_dir / "uploads" / "chat").resolve()
-    try:
-        target.relative_to(uploads_root)
-    except ValueError as exc:
-        raise ValueError("path 不在允许读取的上传目录内") from exc
+    workspace_root = Path(getattr(settings.paths, "workspace", settings.paths.data_dir / "runtime_workspace")).resolve()
+    allowed_roots = [
+        (settings.paths.data_dir / "uploads" / "chat").resolve(),
+        (workspace_root / "user_uploads").resolve(),
+        (workspace_root / "parser_outputs").resolve(),
+    ]
+    for root in allowed_roots:
+        try:
+            target.relative_to(root)
+            break
+        except ValueError:
+            continue
+    else:
+        raise ValueError("path 不在允许读取的附件目录内")
     if not target.exists():
         raise FileNotFoundError(f"Path not found: {target}")
     if not target.is_file():

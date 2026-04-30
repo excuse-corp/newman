@@ -32,6 +32,18 @@ class SessionStore:
                     created_at=session.created_at,
                     updated_at=session.updated_at,
                     message_count=len(session.messages),
+                    background=bool(session.metadata.get("background")),
+                    scheduled=bool(session.metadata.get("scheduled")),
+                    trigger_type=(
+                        str(session.metadata.get("scheduler_trigger_type"))
+                        if session.metadata.get("scheduler_trigger_type") is not None
+                        else None
+                    ),
+                    source_task_id=(
+                        str(session.metadata.get("scheduler_task_id"))
+                        if session.metadata.get("scheduler_task_id") is not None
+                        else None
+                    ),
                 )
             )
         return items

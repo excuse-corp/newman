@@ -337,10 +337,73 @@ class PromptAssemblerTests(unittest.TestCase):
             self.assertIn("demo.png (image/png)", user_message["content"])
             self.assertIn("## Attachment Context", user_message["content"])
             self.assertIn("不要再说你看不到图片", user_message["content"])
+            self.assertIn("禁止为了理解该附件再次调用 search_files、list_dir、read_file、read_file_range", user_message["content"])
             self.assertIn("## Multimodal Parse", user_message["content"])
             self.assertIn("TypeError", user_message["content"])
             self.assertIn("## Normalized User Input", user_message["content"])
             self.assertIn("请结合截图解释报错并指出优先排查方向。", user_message["content"])
+
+    def test_renders_attachment_analysis_for_document_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp)
+            (memory_dir / "Newman.md").write_text("# Newman\n", encoding="utf-8")
+            (memory_dir / "USER.md").write_text("# USER\n", encoding="utf-8")
+            (memory_dir / "SKILLS_SNAPSHOT.md").write_text("# Skills\n", encoding="utf-8")
+            assembler = PromptAssembler(StableContextLoader(memory_dir))
+            parsed_path = memory_dir / "notes.md"
+            parsed_path.write_text("# notes.txt\n\n这里是解析后的正文内容。\n\n包含明确的任务、风险和负责人。\n", encoding="utf-8")
+
+            session = SessionRecord(
+                session_id="session-1",
+                title="Attachment Prompt",
+                messages=[
+                    SessionMessage(
+                        id="u1",
+                        role="user",
+                        content="总结附件",
+                        metadata={
+                            "original_content": "总结附件",
+                            "attachments": [
+                                {
+                                    "attachment_id": "att-1",
+                                    "kind": "text",
+                                    "filename": "notes.txt",
+                                    "content_type": "text/plain",
+                                    "path": "/tmp/notes.txt",
+                                    "summary": "会议纪要包含排期、风险和负责人。",
+                                    "analysis_status": "parsed",
+                                }
+                            ],
+                            "attachment_analysis": {
+                                "schema_version": "v1",
+                                "status": "completed",
+                                "normalized_user_input": "请基于已解析附件总结重点。",
+                                "attachment_summaries": [
+                                    {
+                                        "attachment_id": "att-1",
+                                        "filename": "notes.txt",
+                                        "summary": "会议纪要包含排期、风险和负责人。",
+                                        "markdown_path": str(parsed_path),
+                                    }
+                                ],
+                                "warnings": [],
+                            },
+                        },
+                    )
+                ],
+            )
+
+            assembled = assembler.assemble(session, "tools", None)
+
+            user_message = assembled[-1]
+            self.assertEqual(user_message["role"], "user")
+            self.assertIn("notes.txt (text/plain)", user_message["content"])
+            self.assertIn("会议纪要包含排期、风险和负责人。", user_message["content"])
+            self.assertIn("请基于已解析附件总结重点。", user_message["content"])
+            self.assertIn("## Parsed Attachment Content", user_message["content"])
+            self.assertIn("这里是解析后的正文内容。", user_message["content"])
+            self.assertIn(f"parsed_markdown={parsed_path}", user_message["content"])
+            self.assertIn("不要把附件文件名当作检索关键词。", user_message["content"])
 
 
 if __name__ == "__main__":

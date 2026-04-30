@@ -104,6 +104,21 @@ class _DummyMultiChunkProvider:
         return 0
 
 
+class _DummyMarkdownImageProvider:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        yield ProviderChunk(type="text", delta=self.content)
+        yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
 class _DummyEmptyStreamProvider:
     def __init__(self) -> None:
         self.calls = 0
@@ -384,6 +399,47 @@ class ProviderFailureHandlingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved.messages[-1].role, "assistant")
             self.assertEqual(saved.messages[-1].content, "恢复成功")
             self.assertEqual([event for event, _ in events if event in {"final_response", "error"}], ["final_response"])
+
+    async def test_final_response_persists_local_markdown_image_as_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            artifacts = workspace / "artifacts"
+            artifacts.mkdir(parents=True)
+            image_path = artifacts / "result.png"
+            image_path.write_bytes(b"\x89PNG\r\n\x1a\nmock")
+
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="image-response")
+            provider = _DummyMarkdownImageProvider("![结果图](artifacts/result.png)")
+            runtime = self._build_runtime(session_store, provider)
+            runtime.settings.paths = SimpleNamespace(workspace=workspace)
+
+            events: list[tuple[str, dict[str, object]]] = []
+
+            async def emit(event: str, data: dict[str, object]) -> None:
+                events.append((event, data))
+
+            await runtime.handle_message(
+                session.session_id,
+                "生成一张图",
+                emit,
+                turn_id="turn-1",
+                request_id="req-1",
+            )
+
+            saved = session_store.get(session.session_id)
+            assistant = saved.messages[-1]
+            attachments = assistant.metadata.get("attachments")
+            self.assertIsInstance(attachments, list)
+            self.assertEqual(len(attachments), 1)
+            attachment = attachments[0]
+            self.assertEqual(attachment["source"], "assistant_output")
+            self.assertEqual(attachment["path"], str(image_path.resolve()))
+            self.assertEqual(attachment["workspace_relative_path"], "artifacts/result.png")
+
+            final_response_payload = next(data for event, data in events if event == "final_response")
+            self.assertEqual(final_response_payload["attachments"], attachments)
 
 
 class FatalToolFinalizeTests(unittest.IsolatedAsyncioTestCase):
@@ -950,6 +1006,34 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             "请结合截图解释报错并给出排查方向。",
         )
 
+    def test_current_turn_user_content_prefers_attachment_analysis_normalized_input(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        session = SessionRecord(
+            session_id="session-1",
+            title="attachments",
+            messages=[
+                SessionMessage(
+                    id="user-1",
+                    role="user",
+                    content="总结附件",
+                    metadata={
+                        "turn_id": "turn-1",
+                        "original_content": "总结附件",
+                        "attachment_analysis": {
+                            "schema_version": "v1",
+                            "status": "completed",
+                            "normalized_user_input": "请基于已解析附件总结重点并指出下一步。",
+                        },
+                    },
+                )
+            ],
+        )
+
+        self.assertEqual(
+            runtime._current_turn_user_content(session, "turn-1"),
+            "请基于已解析附件总结重点并指出下一步。",
+        )
+
     def test_provider_tools_require_update_plan_first_when_plan_missing(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.registry = SimpleNamespace(
@@ -1062,6 +1146,105 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
         self.assertEqual(
             [tool["function"]["name"] for tool in tools],
             ["read_file", "enter_plan_mode"],
+        )
+
+    def test_provider_tools_hide_file_browsing_tools_on_first_attachment_answer(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.registry = SimpleNamespace(
+            tools_for_provider=lambda permission_context, active_groups=None: [
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "function", "function": {"name": "read_file_range"}},
+                {"type": "function", "function": {"name": "list_dir"}},
+                {"type": "function", "function": {"name": "search_files"}},
+                {"type": "function", "function": {"name": "enter_plan_mode"}},
+                {"type": "function", "function": {"name": "update_plan"}},
+            ]
+        )
+
+        task = SessionTask(
+            session=SessionRecord(
+                session_id="session-1",
+                title="attachments",
+                messages=[
+                    SessionMessage(
+                        id="user-1",
+                        role="user",
+                        content="介绍这个架构图",
+                        metadata={
+                            "turn_id": "turn-1",
+                            "original_content": "介绍这个架构图",
+                            "attachment_analysis": {
+                                "schema_version": "v1",
+                                "status": "completed",
+                                "normalized_user_input": "介绍这个架构图",
+                                "attachment_summaries": [
+                                    {
+                                        "attachment_id": "att-1",
+                                        "filename": "diagram.html",
+                                        "status": "parsed",
+                                        "summary": "这里是架构图摘要",
+                                        "markdown_path": "/tmp/diagram.md",
+                                    }
+                                ],
+                                "warnings": [],
+                            },
+                        },
+                    )
+                ],
+            ),
+            permission_context=PermissionContext(),
+            turn_id="turn-1",
+        )
+
+        tools = runtime._provider_tools_for_turn(task)
+
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["enter_plan_mode", "update_plan"],
+        )
+
+    def test_provider_tools_keep_file_browsing_tools_after_attachment_turn_has_already_used_tools(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.registry = SimpleNamespace(
+            tools_for_provider=lambda permission_context, active_groups=None: [
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "function", "function": {"name": "search_files"}},
+            ]
+        )
+
+        task = SessionTask(
+            session=SessionRecord(
+                session_id="session-1",
+                title="attachments",
+                messages=[
+                    SessionMessage(
+                        id="user-1",
+                        role="user",
+                        content="介绍附件并继续处理",
+                        metadata={
+                            "turn_id": "turn-1",
+                            "attachment_analysis": {
+                                "schema_version": "v1",
+                                "status": "completed",
+                                "normalized_user_input": "介绍附件并继续处理",
+                                "attachment_summaries": [
+                                    {"attachment_id": "att-1", "status": "parsed"}
+                                ],
+                            },
+                        },
+                    )
+                ],
+            ),
+            permission_context=PermissionContext(),
+            turn_id="turn-1",
+            tool_depth=1,
+        )
+
+        tools = runtime._provider_tools_for_turn(task)
+
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["read_file", "search_files"],
         )
 
     def test_provider_tools_keep_history_referenced_write_file_for_follow_up_turn(self) -> None:

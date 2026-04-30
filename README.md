@@ -252,7 +252,8 @@ conda activate newman
 
 启动后访问：
 
-- Frontend: `http://127.0.0.1:7775`
+- Frontend bind: `http://0.0.0.0:7775`
+- Frontend LAN: `http://<服务器局域网IP>:7775`
 - Backend API: `http://127.0.0.1:8005`
 - Backend Docs: `http://127.0.0.1:8005/docs`
 - OpenAPI JSON: `http://127.0.0.1:8005/openapi.json`

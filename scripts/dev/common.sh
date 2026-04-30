@@ -18,6 +18,12 @@ PG_PORT="${NEWMAN_PG_PORT:-65437}"
 STARTUP_TIMEOUT_SECONDS="${NEWMAN_STARTUP_TIMEOUT_SECONDS:-30}"
 STOP_TIMEOUT_SECONDS="${NEWMAN_STOP_TIMEOUT_SECONDS:-10}"
 
+primary_ipv4_address() {
+  if command -v hostname >/dev/null 2>&1; then
+    hostname -I 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i !~ /^127\./) { print $i; exit } }'
+  fi
+}
+
 ensure_host_service_control() {
   local pid1_cmd
   pid1_cmd="$(ps -p 1 -o cmd= 2>/dev/null || true)"

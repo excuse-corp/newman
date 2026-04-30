@@ -1,13 +1,19 @@
 @import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap");
-@import url("https://fontsapi.zeoseven.com/925/main/result.css");
-@import url("https://cdn-font.hyperos.mi.com/font/css?family=MiSans_VF:VF:Chinese_Simplify,Latin&display=swap");
+
+@font-face {
+  font-family: "Ark Pixel 12px Prop";
+  src: url("./assets/fonts/ark-pixel/ark-pixel-12px-proportional-zh_cn.ttf.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
 
 :root {
   color-scheme: light;
-  font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Segoe UI", sans-serif;
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Segoe UI", sans-serif;
   font-size: 16px;
-  --ui-font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Segoe UI", sans-serif;
-  --chat-font-family: "MiSans Light", "MiSans VF", "MiSans", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Segoe UI", sans-serif;
+  --ui-font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Segoe UI", sans-serif;
+  --chat-font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Segoe UI", sans-serif;
   --chat-font-weight-light: 300;
   --chat-font-variation-light: "wght" 300;
   --chat-code-inline-bg: rgba(91, 74, 58, 0.08);
@@ -457,12 +463,51 @@ input {
 }
 
 .session-title {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 0.84rem;
   max-width: 100%;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.session-title.scheduled {
+  color: #2f3338;
+}
+
+.session-title-text {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-scheduled-icon {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  color: #7d6d5d;
+}
+
+.session-meta-line {
+  display: flex;
+  min-width: 0;
+  margin-top: 2px;
+}
+
+.session-tag {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: #8c8378;
+  font-size: 0.72rem;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-row.active {
@@ -1290,14 +1335,171 @@ input {
   flex: 0 0 auto;
 }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .skill-import-inline {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
   padding: 14px;
   border: 1px solid #eadfce;
   border-radius: 18px;
   background: linear-gradient(180deg, rgba(249, 244, 236, 0.84) 0%, rgba(255, 255, 255, 0.92) 100%);
+}
+
+.skill-import-mode-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid #e5d8c8;
+  border-radius: 14px;
+  background: rgba(255, 252, 247, 0.9);
+}
+
+.skill-import-mode-toggle button {
+  min-width: 0;
+  min-height: 34px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: #756a5f;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.skill-import-mode-toggle button.active {
+  background: #2f2923;
+  color: #fffaf3;
+  box-shadow: 0 8px 18px rgba(47, 41, 35, 0.12);
+}
+
+.skill-upload-loader,
+.skill-import-path-row {
+  display: grid;
+  gap: 10px;
+}
+
+.skill-import-path-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.skill-upload-dropzone {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px dashed #d7c8b6;
+  border-radius: 14px;
+  background: rgba(255, 253, 249, 0.74);
+}
+
+.skill-upload-dropzone-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.skill-upload-dropzone-copy strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #2b251f;
+  font-size: 0.9rem;
+}
+
+.skill-upload-dropzone-copy span {
+  color: #877c70;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.skill-upload-actions,
+.skill-import-submit-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.skill-upload-actions .skills-toolbar-button {
+  min-height: 38px;
+  border-radius: 12px;
+  padding: 0 10px;
+}
+
+.skill-upload-file-list {
+  display: grid;
+  gap: 6px;
+  max-height: 152px;
+  overflow: auto;
+}
+
+.skill-upload-file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 6px 8px;
+  border: 1px solid rgba(224, 213, 198, 0.78);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.76);
+  color: #4c433a;
+  font-size: 0.78rem;
+}
+
+.skill-upload-file-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-upload-file-row strong {
+  color: #8a7e71;
+  font-size: 0.72rem;
+}
+
+.skill-upload-file-row button {
+  border: 0;
+  background: transparent;
+  color: #8e5d52;
+  font-size: 0.74rem;
+  font-weight: 800;
+}
+
+.skill-upload-file-row.muted {
+  grid-template-columns: 1fr;
+  color: #8a7e71;
+}
+
+.skill-import-report {
+  display: grid;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid rgba(151, 132, 111, 0.18);
+  border-radius: 12px;
+  background: rgba(255, 252, 247, 0.78);
+}
+
+.skill-import-report strong {
+  color: #2f2923;
+  font-size: 0.82rem;
+}
+
+.skill-import-report span {
+  color: #81766b;
+  font-size: 0.76rem;
 }
 
 .skills-tree-list {
@@ -2534,13 +2736,15 @@ input {
   margin: 0;
   color: #171310;
   font-size: clamp(2.25rem, 4.6vw, 3.8rem);
-  font-family: "Ark Pixel 12px Prop latin", "Noto Sans SC", sans-serif;
+  font-family: "Ark Pixel 12px Prop", "Noto Sans SC", sans-serif;
   line-height: 1;
   letter-spacing: 0;
   font-weight: 400;
   display: flex;
   align-items: center;
   gap: 0;
+  -webkit-font-smoothing: none;
+  font-smooth: never;
 }
 
 .chat-empty-brand-name,
@@ -2677,7 +2881,11 @@ input {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  align-items: center;
+  align-items: stretch;
+}
+
+.chat-attachment-grid.assistant {
+  margin-top: 10px;
 }
 
 .chat-attachment-card {
@@ -2695,10 +2903,20 @@ input {
   transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
+.chat-attachment-card.assistant {
+  border-color: rgba(70, 62, 56, 0.12);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.94) 0%, rgba(248, 244, 239, 0.96) 100%);
+}
+
 .chat-attachment-card:hover {
   transform: translateY(-1px);
   border-color: rgba(255, 255, 255, 0.24);
   box-shadow: 0 14px 24px rgba(0, 0, 0, 0.12);
+}
+
+.chat-attachment-card.assistant:hover {
+  border-color: rgba(70, 62, 56, 0.2);
+  box-shadow: 0 14px 24px rgba(17, 17, 17, 0.08);
 }
 
 .chat-attachment-card.fallback {
@@ -2732,6 +2950,71 @@ input {
   line-height: 1;
   color: rgba(255, 253, 248, 0.96);
   background: rgba(255, 255, 255, 0.12);
+}
+
+.chat-attachment-file {
+  min-width: 148px;
+  max-width: 220px;
+  min-height: 58px;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 253, 248, 0.96);
+  text-decoration: none;
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.chat-attachment-file.assistant {
+  border-color: rgba(70, 62, 56, 0.12);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92) 0%, rgba(248, 244, 239, 0.96) 100%);
+  color: #2c261f;
+}
+
+.chat-attachment-file:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.24);
+  box-shadow: 0 14px 24px rgba(0, 0, 0, 0.12);
+}
+
+.chat-attachment-file.assistant:hover {
+  border-color: rgba(70, 62, 56, 0.2);
+  box-shadow: 0 14px 24px rgba(17, 17, 17, 0.08);
+}
+
+.chat-attachment-file-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  color: rgba(255, 253, 248, 0.96);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.chat-attachment-file-name {
+  display: block;
+  color: rgba(255, 253, 248, 0.96);
+  font-size: 0.84rem;
+  line-height: 1.4;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.chat-attachment-file.assistant .chat-attachment-file-badge {
+  background: rgba(18, 18, 20, 0.08);
+  color: #5f564d;
+}
+
+.chat-attachment-file.assistant .chat-attachment-file-name {
+  color: #2c261f;
 }
 
 .chat-image-preview-backdrop {
@@ -3679,6 +3962,46 @@ input {
 
 .chat-markdown-body a:hover {
   text-decoration-color: rgba(65, 68, 75, 0.72);
+}
+
+.chat-markdown-image-button {
+  display: block;
+  width: min(100%, 560px);
+  margin: 14px 0;
+  padding: 0;
+  border: 1px solid rgba(70, 62, 56, 0.12);
+  border-radius: 16px;
+  overflow: hidden;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, rgba(247, 243, 237, 0.94) 100%);
+  box-shadow: 0 14px 28px rgba(17, 17, 17, 0.06);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.chat-markdown-image-button:hover {
+  transform: translateY(-1px);
+  border-color: rgba(70, 62, 56, 0.2);
+  box-shadow: 0 18px 32px rgba(17, 17, 17, 0.08);
+}
+
+.chat-markdown-image {
+  display: block;
+  width: 100%;
+  max-height: min(60vh, 540px);
+  object-fit: contain;
+  background: rgba(244, 239, 232, 0.72);
+}
+
+.chat-inline-image-fallback {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(70, 62, 56, 0.12);
+  border-radius: 999px;
+  background: rgba(248, 244, 239, 0.92);
+  color: #6f6458;
+  font-size: 0.82rem;
+  line-height: 1.2;
 }
 
 .chat-markdown-body code {
@@ -4654,6 +4977,14 @@ input {
   background: rgba(249, 245, 240, 0.94);
 }
 
+.composer-attachment-chip.file {
+  width: auto;
+  height: auto;
+  min-width: 152px;
+  max-width: 228px;
+  padding: 12px 12px 10px;
+}
+
 .composer-attachment-thumb {
   width: 50px;
   height: 50px;
@@ -4661,6 +4992,40 @@ input {
   object-fit: cover;
   background: #efe5d8;
   flex: 0 0 auto;
+}
+
+.composer-attachment-file {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.composer-attachment-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #efe2d2;
+  color: #6f5b49;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.composer-attachment-name {
+  color: #433a31;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.composer-attachment-size {
+  color: #8f8071;
+  font-size: 0.72rem;
+  line-height: 1.2;
 }
 
 .composer-attachment-remove {
@@ -5292,6 +5657,17 @@ input {
   color: var(--theme-rail-text);
 }
 
+.screen-shell[data-theme="coral"] .session-title.scheduled,
+.screen-shell[data-theme="coral"] .session-row:hover .session-title.scheduled,
+.screen-shell[data-theme="coral"] .session-row.active .session-title.scheduled {
+  color: var(--theme-rail-text);
+}
+
+.screen-shell[data-theme="coral"] .session-scheduled-icon,
+.screen-shell[data-theme="coral"] .session-tag {
+  color: var(--theme-rail-muted);
+}
+
 .screen-shell[data-theme="coral"] .session-more {
   color: rgba(229, 217, 206, 0.68);
 }
@@ -5563,6 +5939,19 @@ input {
 .screen-shell[data-theme="coral"] .skill-import-inline {
   border-color: rgba(190, 151, 121, 0.2);
   background: linear-gradient(180deg, rgba(250, 240, 231, 0.96) 0%, rgba(255, 250, 243, 0.98) 100%);
+}
+
+.screen-shell[data-theme="coral"] .skill-import-mode-toggle,
+.screen-shell[data-theme="coral"] .skill-upload-dropzone,
+.screen-shell[data-theme="coral"] .skill-upload-file-row,
+.screen-shell[data-theme="coral"] .skill-import-report {
+  border-color: rgba(190, 151, 121, 0.2);
+  background: rgba(255, 250, 243, 0.84);
+}
+
+.screen-shell[data-theme="coral"] .skill-import-mode-toggle button.active {
+  background: #5b3f35;
+  color: #fff8ef;
 }
 
 .screen-shell[data-theme="coral"] .skill-tree-trigger:hover {
@@ -6331,7 +6720,10 @@ input {
   }
 
   .skills-browser-actions,
-  .skill-import-inline {
+  .skill-import-inline,
+  .skill-import-path-row,
+  .skill-import-submit-row,
+  .skill-upload-actions {
     grid-template-columns: 1fr;
   }
 

@@ -36,6 +36,8 @@ def create_app() -> FastAPI:
     app.state.settings = settings
     app.state.runtime = NewmanRuntime(settings)
     app.state.scheduler = SchedulerEngine(app.state.runtime.scheduler_store, app.state.runtime)
+    if hasattr(app.state.scheduler, "set_session_busy_checker"):
+        app.state.scheduler.set_session_busy_checker(lambda session_id: session_id in app.state.active_message_runs)
     app.state.channels = ChannelService(settings, app.state.runtime)
 
     app.middleware("http")(request_id_middleware)

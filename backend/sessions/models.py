@@ -87,6 +87,10 @@ class SessionSummary(BaseModel):
     created_at: str
     updated_at: str
     message_count: int
+    background: bool = False
+    scheduled: bool = False
+    trigger_type: str | None = None
+    source_task_id: str | None = None
 
 
 class CheckpointRecord(BaseModel):
