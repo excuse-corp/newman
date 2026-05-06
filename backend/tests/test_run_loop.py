@@ -44,8 +44,8 @@ sys.modules.setdefault("psycopg.types", fake_types)
 sys.modules.setdefault("psycopg.types.json", fake_json)
 sys.modules.setdefault("chromadb", fake_chromadb)
 
-from backend.providers.base import ProviderChunk, ProviderError, ProviderResponse, TokenUsage, ToolCall
-from backend.runtime.run_loop import NewmanRuntime
+from backend.providers.base import ProviderChunk, ProviderError, ProviderResponse, TokenUsage, ToolCall, ToolCallDelta
+from backend.runtime.run_loop import NewmanRuntime, _build_tool_event_output_preview
 from backend.runtime.result_normalizer import normalize_result
 from backend.runtime.session_task import SessionTask
 from backend.sessions.models import SessionMessage, SessionRecord
@@ -128,6 +128,33 @@ class _DummyEmptyStreamProvider:
 
     async def chat_stream(self, messages, tools=None, **kwargs):
         self.calls += 1
+        yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
+class _ProviderShouldNotRun:
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("provider chat should not be called")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        raise AssertionError("provider chat_stream should not be called")
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
+class _DummyCommentaryOnlyProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        yield ProviderChunk(type="text", delta="<commentary>我先处理附件</commentary>\n\n")
         yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
 
     def estimate_tokens(self, messages) -> int:
@@ -230,6 +257,63 @@ class _DummyLeakyToolPreambleProvider:
         yield ProviderChunk(
             type="tool_call",
             tool_call=ToolCall(id="tool-1", name="read_file", arguments={"path": "/root/newman/README.md"}),
+        )
+        yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
+class _DummyToolCallDeltaProvider:
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        yield ProviderChunk(
+            type="tool_call_delta",
+            tool_call_delta=ToolCallDelta(
+                index=0,
+                id="tool-1",
+                name="write_file",
+                arguments_delta='{"path":"demo.html","content":"<html>',
+            ),
+        )
+        yield ProviderChunk(
+            type="tool_call_delta",
+            tool_call_delta=ToolCallDelta(
+                index=0,
+                id="tool-1",
+                name="write_file",
+                arguments_delta="x" * 2500,
+            ),
+        )
+        yield ProviderChunk(
+            type="tool_call",
+            tool_call=ToolCall(id="tool-1", name="write_file", arguments={"path": "demo.html", "content": "<html></html>"}),
+        )
+        yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
+class _DummyStructuredLeakyToolPreambleProvider:
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        yield ProviderChunk(
+            type="text",
+            delta=(
+                "老板，我先根据文档内容规划一下架构图的层次结构，然后生成 HTML 文件。\n\n"
+                "## 架构图规划\n"
+                "1. 安全保障层：数据安全、伦理审查、主动防御\n"
+                "2. 组织与制度保障层：组织保障、资金保障、制度保障\n"
+            ),
+        )
+        yield ProviderChunk(
+            type="tool_call",
+            tool_call=ToolCall(id="tool-1", name="write_file", arguments={"path": "/root/newman/diagram.html"}),
         )
         yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
 
@@ -374,6 +458,36 @@ class ProviderFailureHandlingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(error_payload["attempt_count"], 3)
             self.assertEqual(error_payload["max_attempts"], 3)
 
+    async def test_commentary_only_provider_response_is_not_persisted_as_blank_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_store = SessionStore(Path(tmp))
+            session = session_store.create(title="commentary-only-provider")
+            provider = _DummyCommentaryOnlyProvider()
+            runtime = self._build_runtime(session_store, provider)
+
+            events: list[tuple[str, dict[str, object]]] = []
+
+            async def emit(event: str, data: dict[str, object]) -> None:
+                events.append((event, data))
+
+            await runtime.handle_message(
+                session.session_id,
+                "根据附件制作架构图",
+                emit,
+                turn_id="turn-1",
+                request_id="req-1",
+            )
+
+            saved = session_store.get(session.session_id)
+            self.assertEqual(provider.calls, 3)
+            self.assertEqual(saved.messages[-1].role, "assistant")
+            self.assertNotEqual(saved.messages[-1].content, "\n\n")
+            self.assertIn("主模型本次响应异常，未返回任何内容", saved.messages[-1].content)
+            final_response_payload = next(data for event, data in events if event == "final_response")
+            self.assertIn("主模型本次响应异常，未返回任何内容", final_response_payload["content"])
+            error_payload = next(data for event, data in events if event == "error")
+            self.assertEqual(error_payload["category"], "empty_response")
+
     async def test_retryable_provider_error_recovers_before_user_visible_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session_store = SessionStore(Path(tmp))
@@ -440,6 +554,67 @@ class ProviderFailureHandlingTests(unittest.IsolatedAsyncioTestCase):
 
             final_response_payload = next(data for event, data in events if event == "final_response")
             self.assertEqual(final_response_payload["attachments"], attachments)
+
+
+class ContextCompactionGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_irreducible_context_stops_before_provider_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_store = SessionStore(Path(tmp))
+            session = session_store.create(title="irreducible-context")
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.provider = _ProviderShouldNotRun()
+            runtime.usage_store = None
+            runtime.session_store = session_store
+            runtime.hook_manager = _DummyHookManager()
+            runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
+            runtime.settings = SimpleNamespace(
+                provider=SimpleNamespace(
+                    model="dummy-model",
+                    type="mock",
+                    context_window=None,
+                    effective_context_window=None,
+                ),
+                approval=_DummyApproval(),
+                runtime=SimpleNamespace(max_tool_depth=30),
+            )
+            runtime.reload_ecosystem = lambda: None
+            runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
+            runtime._tools_overview = lambda: "tools"
+            runtime._assemble_task_messages = lambda task: [{"role": "user", "content": task.session.messages[-1].content}]
+            runtime._provider_tools_for_turn = lambda task: []
+            runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
+
+            async def fake_maybe_checkpoint(task, emit):
+                task.session.metadata["context_irreducible"] = True
+                task.session.metadata["last_compaction_failure_reason"] = "max_failures_reached"
+                runtime.session_store.save(task.session)
+                return False
+
+            runtime._maybe_checkpoint = fake_maybe_checkpoint
+
+            events: list[tuple[str, dict[str, object]]] = []
+
+            async def emit(event: str, data: dict[str, object]) -> None:
+                events.append((event, data))
+
+            await runtime.handle_message(
+                session.session_id,
+                "继续分析",
+                emit,
+                turn_id="turn-1",
+                request_id="req-1",
+            )
+
+            saved = session_store.get(session.session_id)
+            self.assertEqual(saved.messages[-1].role, "assistant")
+            self.assertEqual(saved.messages[-1].metadata["finish_reason"], "context_irreducible")
+            self.assertIn("自动压缩后仍无法腾出足够空间", saved.messages[-1].content)
+            final_response_payload = next(data for event, data in events if event == "final_response")
+            self.assertEqual(final_response_payload["finish_reason"], "context_irreducible")
+            error_payload = next(data for event, data in events if event == "error")
+            self.assertEqual(error_payload["code"], "NEWMAN-CONTEXT-001")
+            self.assertEqual(error_payload["category"], "context_irreducible")
 
 
 class FatalToolFinalizeTests(unittest.IsolatedAsyncioTestCase):
@@ -762,6 +937,79 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[1][1]["reset"], True)
         self.assertEqual(events[2][1]["content"], "再读取 README 了解产品整体介绍")
 
+    async def test_structured_tool_preamble_is_not_reclaimed_into_commentary(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.provider = _DummyStructuredLeakyToolPreambleProvider()
+        runtime.usage_store = None
+        runtime.settings = SimpleNamespace(
+            provider=SimpleNamespace(
+                model="dummy-model",
+                type="mock",
+                context_window=None,
+                effective_context_window=None,
+            )
+        )
+
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def emit(event: str, data: dict[str, object]) -> None:
+            events.append((event, data))
+
+        response = await runtime._stream_provider_response(
+            [{"role": "system", "content": "test"}],
+            [{"name": "write_file"}],
+            emit,
+            session_id="session-1",
+            turn_id="turn-1",
+            request_kind="session_turn",
+            counts_toward_context_window=True,
+            group_id="turn-1:group:1",
+            emit_answer_started_event=True,
+        )
+
+        self.assertEqual(response.content, "")
+        self.assertEqual(response.commentary, "")
+        self.assertEqual(len(response.tool_calls), 1)
+        self.assertEqual([event for event, _ in events], [])
+
+    async def test_tool_call_argument_deltas_emit_progress_before_tool_call_finishes(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.provider = _DummyToolCallDeltaProvider()
+        runtime.usage_store = None
+        runtime.settings = SimpleNamespace(
+            provider=SimpleNamespace(
+                model="dummy-model",
+                type="mock",
+                context_window=None,
+                effective_context_window=None,
+            )
+        )
+
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def emit(event: str, data: dict[str, object]) -> None:
+            events.append((event, data))
+
+        response = await runtime._stream_provider_response(
+            [{"role": "system", "content": "test"}],
+            [{"name": "write_file"}],
+            emit,
+            session_id="session-1",
+            turn_id="turn-1",
+            request_kind="session_turn",
+            counts_toward_context_window=True,
+            group_id="turn-1:group:1",
+        )
+
+        self.assertEqual(response.content, "")
+        self.assertEqual(len(response.tool_calls), 1)
+        self.assertEqual([event for event, _ in events], ["tool_call_arguments_delta", "tool_call_arguments_delta"])
+        self.assertEqual(events[0][1]["group_id"], "turn-1:group:1")
+        self.assertEqual(events[0][1]["tool_call_id"], "tool-1")
+        self.assertEqual(events[0][1]["tool"], "write_file")
+        self.assertIn("正在准备 write_file 调用参数", events[0][1]["summary"])
+        self.assertGreater(events[1][1]["arguments_bytes"], events[0][1]["arguments_bytes"])
+
     async def test_tool_backed_turn_resets_transient_answer_before_followup_tool_call(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.provider = _DummyLeakyToolPreambleProvider()
@@ -797,11 +1045,9 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(response.tool_calls), 1)
         self.assertEqual(
             [event for event, _ in events],
-            ["answer_started", "assistant_delta", "assistant_delta", "commentary_delta", "commentary_complete"],
+            ["commentary_delta", "commentary_complete"],
         )
-        self.assertEqual(events[1][1]["content"], "再读取 README 了解产品整体介绍")
-        self.assertTrue(events[2][1]["reset"])
-        self.assertEqual(events[3][1]["content"], "再读取 README 了解产品整体介绍")
+        self.assertEqual(events[0][1]["content"], "再读取 README 了解产品整体介绍")
 
     async def test_answer_started_emits_once_when_tool_backed_turn_enters_final_answer(self) -> None:
         runtime = object.__new__(NewmanRuntime)
@@ -889,8 +1135,85 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0][1]["group_id"], "turn-1:group:2")
         self.assertEqual(events[0][1]["event"], "PreToolUse")
 
+    def test_skill_usage_payload_detects_skill_file_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "skills" / "arch-diagram"
+            skill_dir.mkdir(parents=True)
+            skill_path = skill_dir / "SKILL.md"
+            skill_path.write_text("# Architecture Diagram\n", encoding="utf-8")
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.settings = SimpleNamespace(
+                paths=SimpleNamespace(workspace=root),
+                permissions=SimpleNamespace(readable_paths=[], writable_paths=[], protected_paths=[]),
+            )
+            runtime.skill_registry = SimpleNamespace(
+                list_skills=lambda: [
+                    SimpleNamespace(
+                        name="arch-diagram",
+                        path=str(skill_path),
+                        description="Generate interactive architecture diagrams.",
+                        plugin_name=None,
+                    )
+                ]
+            )
+
+            payload = runtime._skill_usage_payload_for_tool_call(
+                "read_file",
+                {"path": "skills/arch-diagram/SKILL.md"},
+            )
+
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            self.assertEqual(payload["skill_name"], "arch-diagram")
+            self.assertIn("arch-diagram Skill", payload["summary"])
+
 
 class ToolResultPersistenceTests(unittest.TestCase):
+    def test_build_assistant_message_attaches_turn_output_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_path = workspace / "diagram.html"
+            output_path.write_text("<!doctype html><html><body>ok</body></html>", encoding="utf-8")
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace))
+            session = SessionRecord(
+                session_id="session-1",
+                title="output file",
+                messages=[
+                    SessionMessage(
+                        id="tool-1",
+                        role="tool",
+                        content="已写入 diagram.html",
+                        metadata={
+                            "turn_id": "turn-1",
+                            "tool": "write_file",
+                            "success": True,
+                            "path": str(output_path),
+                            "summary": "已写入 diagram.html",
+                        },
+                    )
+                ],
+            )
+            task = SessionTask(session=session, permission_context=PermissionContext(), turn_id="turn-1")
+
+            message = runtime._build_assistant_message(
+                task,
+                "文件已生成。",
+                request_id="req-1",
+                finish_reason="stop",
+            )
+
+            attachments = message.metadata.get("attachments")
+            self.assertIsInstance(attachments, list)
+            assert isinstance(attachments, list)
+            self.assertEqual(len(attachments), 1)
+            self.assertEqual(attachments[0]["kind"], "html")
+            self.assertEqual(attachments[0]["filename"], "diagram.html")
+            self.assertEqual(attachments[0]["workspace_relative_path"], "diagram.html")
+
     def test_build_tool_session_message_persists_summary_but_keeps_transient_full_output(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         task = SessionTask(
@@ -975,6 +1298,28 @@ class ToolResultPersistenceTests(unittest.TestCase):
 
         self.assertEqual(message.content, "first line\nwarn line")
         self.assertTrue(message.metadata["content_persisted"])
+
+    def test_tool_event_output_preview_prefers_user_facing_summary(self) -> None:
+        result = ToolExecutionResult(
+            success=True,
+            tool="read_file",
+            action="read",
+            summary="已读取文件 README.md（10 字节）",
+            stdout='{"dataBase64":"UkVBRE1FCg=="}',
+        )
+
+        self.assertEqual(_build_tool_event_output_preview(result), "已读取文件 README.md（10 字节）")
+
+    def test_tool_event_output_preview_falls_back_to_terminal_output(self) -> None:
+        result = ToolExecutionResult(
+            success=False,
+            tool="terminal",
+            action="execute",
+            stdout="first line\n",
+            stderr="warn line\n",
+        )
+
+        self.assertEqual(_build_tool_event_output_preview(result), "first line\nwarn line")
 
 
 class CollaborationModeRuntimeTests(unittest.TestCase):
@@ -1202,6 +1547,71 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             [tool["function"]["name"] for tool in tools],
             ["enter_plan_mode", "update_plan"],
         )
+
+    def test_provider_tools_keep_skill_read_and_write_for_attachment_generation_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_dir = Path(tmp) / "skills" / "arch-diagram"
+            skill_dir.mkdir(parents=True)
+            skill_path = skill_dir / "SKILL.md"
+            skill_path.write_text("Use this skill when the user asks for 架构图 generation.", encoding="utf-8")
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.registry = SimpleNamespace(
+                tools_for_provider=lambda permission_context, active_groups=None: [
+                    {"type": "function", "function": {"name": "read_file"}},
+                    {"type": "function", "function": {"name": "read_file_range"}},
+                    {"type": "function", "function": {"name": "list_dir"}},
+                    {"type": "function", "function": {"name": "search_files"}},
+                    {"type": "function", "function": {"name": "enter_plan_mode"}},
+                    {"type": "function", "function": {"name": "update_plan"}},
+                    {"type": "function", "function": {"name": "write_file"}},
+                ]
+            )
+            runtime.skill_registry = SimpleNamespace(
+                list_skills=lambda: [
+                    SimpleNamespace(
+                        name="arch-diagram",
+                        path=str(skill_path),
+                        description="Generate architecture diagrams.",
+                        when_to_use=None,
+                        summary="",
+                    )
+                ]
+            )
+
+            task = SessionTask(
+                session=SessionRecord(
+                    session_id="session-1",
+                    title="attachments",
+                    messages=[
+                        SessionMessage(
+                            id="user-1",
+                            role="user",
+                            content="根据文档制作一份架构图给我",
+                            metadata={
+                                "turn_id": "turn-1",
+                                "attachment_analysis": {
+                                    "schema_version": "v1",
+                                    "status": "completed",
+                                    "normalized_user_input": "根据文档制作一份架构图给我",
+                                    "attachment_summaries": [
+                                        {"attachment_id": "att-1", "status": "parsed"}
+                                    ],
+                                },
+                            },
+                        )
+                    ],
+                ),
+                permission_context=PermissionContext(),
+                turn_id="turn-1",
+            )
+
+            tools = runtime._provider_tools_for_turn(task)
+
+            self.assertEqual(
+                [tool["function"]["name"] for tool in tools],
+                ["read_file", "enter_plan_mode", "update_plan", "write_file"],
+            )
 
     def test_provider_tools_keep_file_browsing_tools_after_attachment_turn_has_already_used_tools(self) -> None:
         runtime = object.__new__(NewmanRuntime)

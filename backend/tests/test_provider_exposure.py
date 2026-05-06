@@ -22,6 +22,13 @@ class ProviderExposureTests(unittest.TestCase):
         self.assertIn(EDITING_TOOL_GROUP, groups)
         self.assertIn(EXECUTION_TOOL_GROUP, groups)
 
+    def test_generation_request_enables_editing_even_when_doc_context_is_present(self) -> None:
+        groups = infer_provider_tool_groups("根据文档制作一份架构图给我")
+        self.assertIn(CORE_TOOL_GROUP, groups)
+        self.assertIn(KNOWLEDGE_TOOL_GROUP, groups)
+        self.assertIn(EDITING_TOOL_GROUP, groups)
+        self.assertIn(EXECUTION_TOOL_GROUP, groups)
+
     def test_doc_request_enables_knowledge_group(self) -> None:
         groups = infer_provider_tool_groups("根据 PRD 文档和 README 告诉我这个模块做什么")
         self.assertEqual(groups, {CORE_TOOL_GROUP, KNOWLEDGE_TOOL_GROUP})

@@ -80,6 +80,35 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.summary, "缺少必填参数: content")
             self.assertFalse((workspace / "missing.txt").exists())
 
+    async def test_write_file_streams_html_content_before_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+
+            policy = PathAccessPolicy(
+                workspace=workspace,
+                readable_roots=(workspace,),
+                writable_roots=(workspace,),
+                protected_roots=(),
+            )
+            chunks: list[tuple[str, str]] = []
+
+            async def emit_output(stream: str, delta: str) -> None:
+                chunks.append((stream, delta))
+
+            content = "<!doctype html><html><body><h1>Demo</h1></body></html>"
+            result = await WriteFileTool(policy).run_streaming(
+                {"path": "diagram.html", "content": content},
+                "session-5",
+                emit_output=emit_output,
+            )
+
+            self.assertTrue(result.success)
+            self.assertEqual((workspace / "diagram.html").read_text(encoding="utf-8"), content)
+            self.assertEqual("".join(delta for _stream, delta in chunks), content)
+            self.assertTrue(all(stream == "file_content" for stream, _delta in chunks))
+
     async def test_edit_file_can_update_additional_writable_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

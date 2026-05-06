@@ -206,7 +206,14 @@ async def send_message(session_id: str, request: Request):
                 await worker
             _clear_active_session_run(active_runs, session_id, active_run)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/{session_id}/interrupt")

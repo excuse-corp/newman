@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from backend.config.schema import ModelConfig
-from backend.providers.base import BaseProvider, ProviderChunk, ProviderError, ProviderResponse, TokenUsage, ToolCall
+from backend.providers.base import BaseProvider, ProviderChunk, ProviderError, ProviderResponse, TokenUsage, ToolCall, ToolCallDelta
 from backend.providers.token_estimator import estimate_message_tokens
 
 
@@ -88,13 +88,30 @@ class OpenAICompatibleProvider(BaseProvider):
                         for tool_call in delta.get("tool_calls", []) or []:
                             index = int(tool_call.get("index", 0))
                             current = partial_tool_calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                            call_id = None
+                            name = None
+                            arguments_delta = ""
                             if tool_call.get("id"):
-                                current["id"] = str(tool_call["id"])
+                                call_id = str(tool_call["id"])
+                                current["id"] = call_id
                             function = tool_call.get("function") or {}
                             if function.get("name"):
-                                current["name"] = str(function["name"])
+                                name = str(function["name"])
+                                current["name"] = name
                             if function.get("arguments"):
-                                current["arguments"] += str(function["arguments"])
+                                arguments_delta = str(function["arguments"])
+                                current["arguments"] += arguments_delta
+                            if call_id or name or arguments_delta:
+                                yield ProviderChunk(
+                                    type="tool_call_delta",
+                                    tool_call_delta=ToolCallDelta(
+                                        index=index,
+                                        id=current["id"] or call_id,
+                                        name=current["name"] or name,
+                                        arguments_delta=arguments_delta,
+                                    ),
+                                    finish_reason=choice.get("finish_reason"),
+                                )
                         finish_reason = choice.get("finish_reason")
                         if usage and usage.total_tokens > 0:
                             yield ProviderChunk(type="usage", usage=usage, finish_reason=finish_reason)

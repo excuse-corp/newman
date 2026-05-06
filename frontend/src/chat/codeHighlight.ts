@@ -47,6 +47,7 @@ export function inferLanguageFromPath(path: string | null | undefined) {
   }
 
   const lower = path.toLowerCase();
+  if (lower.endsWith(".txt") || lower.endsWith(".log")) return "plaintext";
   if (lower.endsWith(".py")) return "python";
   if (lower.endsWith(".ts")) return "typescript";
   if (lower.endsWith(".tsx")) return "tsx";
@@ -59,6 +60,22 @@ export function inferLanguageFromPath(path: string | null | undefined) {
   if (lower.endsWith(".yaml") || lower.endsWith(".yml")) return "yaml";
   if (lower.endsWith(".sh") || lower.endsWith(".bash")) return "bash";
   if (lower.endsWith(".html") || lower.endsWith(".htm")) return "html";
+  if (lower.endsWith(".xml") || lower.endsWith(".svg")) return "html";
+  if (lower.endsWith(".c") || lower.endsWith(".h")) return "c";
+  if (lower.endsWith(".cc") || lower.endsWith(".cpp") || lower.endsWith(".cxx") || lower.endsWith(".hpp")) return "cpp";
+  if (lower.endsWith(".cs")) return "csharp";
+  if (lower.endsWith(".go")) return "go";
+  if (lower.endsWith(".rs")) return "rust";
+  if (lower.endsWith(".java")) return "java";
+  if (lower.endsWith(".php")) return "php";
+  if (lower.endsWith(".rb")) return "ruby";
+  if (lower.endsWith(".swift")) return "swift";
+  if (lower.endsWith(".kt") || lower.endsWith(".kts")) return "kotlin";
+  if (lower.endsWith(".dart")) return "dart";
+  if (lower.endsWith(".vue")) return "vue";
+  if (lower.endsWith(".svelte")) return "svelte";
+  if (lower.endsWith(".toml")) return "toml";
+  if (lower.endsWith(".ini") || lower.endsWith(".env")) return "plaintext";
   return null;
 }
 

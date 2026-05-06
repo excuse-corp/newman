@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import mimetypes
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
@@ -25,6 +26,10 @@ MEMORY_FILE_MAP = {
     "memory": "MEMORY.md",
     "skills": "SKILLS_SNAPSHOT.md",
 }
+
+
+def _content_disposition(disposition: str, filename: str) -> str:
+    return f"{disposition}; filename*=UTF-8''{quote(filename)}"
 
 
 class UpdateMemoryRequest(BaseModel):
@@ -107,7 +112,7 @@ async def list_workspace_files(request: Request, path: str = "."):
 
 
 @router.get("/file-content")
-async def get_workspace_file_content(request: Request, path: str):
+async def get_workspace_file_content(request: Request, path: str, download: bool = False):
     settings = request.app.state.settings
     policy = build_path_access_policy(settings)
     target = ensure_readable_path(policy, path)
@@ -118,21 +123,22 @@ async def get_workspace_file_content(request: Request, path: str):
 
     media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     response = FileResponse(target, media_type=media_type)
-    response.headers["content-disposition"] = f'inline; filename="{target.name}"'
+    disposition = "attachment" if download else "inline"
+    response.headers["content-disposition"] = _content_disposition(disposition, target.name)
     return response
 
 
 @router.get("/upload-content")
-async def get_uploaded_file_content(request: Request, path: str):
-    return _build_attachment_file_response(request, path)
+async def get_uploaded_file_content(request: Request, path: str, download: bool = False):
+    return _build_attachment_file_response(request, path, download=download)
 
 
 @router.get("/attachment-content")
-async def get_attachment_file_content(request: Request, path: str):
-    return _build_attachment_file_response(request, path)
+async def get_attachment_file_content(request: Request, path: str, download: bool = False):
+    return _build_attachment_file_response(request, path, download=download)
 
 
-def _build_attachment_file_response(request: Request, path: str):
+def _build_attachment_file_response(request: Request, path: str, *, download: bool = False):
     settings = request.app.state.settings
     target = Path(path).resolve()
     workspace_root = Path(getattr(settings.paths, "workspace", settings.paths.data_dir / "runtime_workspace")).resolve()
@@ -156,7 +162,8 @@ def _build_attachment_file_response(request: Request, path: str):
 
     media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     response = FileResponse(target, media_type=media_type)
-    response.headers["content-disposition"] = f'inline; filename="{target.name}"'
+    disposition = "attachment" if download else "inline"
+    response.headers["content-disposition"] = _content_disposition(disposition, target.name)
     return response
 
 

@@ -1,9 +1,20 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ChangeEvent,
+  type ClipboardEvent,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import logo from "./assets/newman-logo.png";
 import MessageContent, { type ChatAttachment, type HtmlPreviewPayload } from "./chat/MessageContent";
-import { highlightCode, inferLanguageFromPath } from "./chat/codeHighlight";
+import { escapeCodeHtml, highlightCode, inferLanguageFromPath } from "./chat/codeHighlight";
 import AutomationsPage from "./pages/AutomationsPage";
 import FilesLibraryPage from "./pages/FilesLibraryPage";
 import "./styles.css";
@@ -277,7 +288,11 @@ type ComposerAttachment = ChatAttachment & {
   previewUrl: string | null;
 };
 
-type HtmlPreviewState = HtmlPreviewPayload;
+type HtmlPreviewState = HtmlPreviewPayload & {
+  source?: "code_block" | "write_file";
+  path?: string | null;
+  streaming?: boolean;
+};
 
 type SkillSummary = {
   name: string;
@@ -309,6 +324,7 @@ type SkillDetailResponse = {
 
 type SkillDocumentView = "preview" | "edit";
 type SkillImportMode = "upload" | "path";
+type HtmlPreviewView = "preview" | "code";
 
 type SkillUploadItem = {
   id: string;
@@ -536,6 +552,10 @@ const uiThemeOptions: Array<{
 const LEFT_MIN = 180;
 const LEFT_MAX = 360;
 const HANDLE_WIDTH = 8;
+const HTML_PREVIEW_MIN = 360;
+const HTML_PREVIEW_MAX = 920;
+const HTML_PREVIEW_DEFAULT = 760;
+const HTML_PREVIEW_MAIN_MIN = 360;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -658,6 +678,55 @@ function isImageAttachmentExtension(extension: string) {
   return IMAGE_ATTACHMENT_EXTENSIONS.has(extension.toLowerCase());
 }
 
+function inferImageExtensionFromContentType(contentType: string) {
+  const normalized = contentType.toLowerCase().split(";", 1)[0].trim();
+  if (normalized === "image/png") return ".png";
+  if (normalized === "image/jpeg" || normalized === "image/jpg") return ".jpg";
+  if (normalized === "image/webp") return ".webp";
+  return null;
+}
+
+function formatClipboardTimestamp(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function normalizeClipboardAttachmentFile(file: File, index: number) {
+  const extension = getAttachmentExtension(file.name).toLowerCase();
+  if (file.name.trim() && COMPOSER_ATTACHMENT_EXTENSIONS.has(extension)) {
+    return file;
+  }
+
+  const inferredExtension = inferImageExtensionFromContentType(file.type);
+  if (!inferredExtension) {
+    return file;
+  }
+
+  const baseName = file.name.trim().replace(/\.[^.]*$/, "") || `clipboard-${formatClipboardTimestamp(new Date())}-${index + 1}`;
+  return new File([file], `${baseName}${inferredExtension}`, {
+    type: file.type,
+    lastModified: file.lastModified || Date.now(),
+  });
+}
+
+function getClipboardImageFiles(clipboardData: DataTransfer) {
+  const itemFiles = Array.from(clipboardData.items ?? [])
+    .filter((item) => item.kind === "file" && item.type.toLowerCase().startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file));
+
+  if (itemFiles.length > 0) {
+    return itemFiles;
+  }
+
+  return Array.from(clipboardData.files ?? []).filter((file) => {
+    if (file.type.toLowerCase().startsWith("image/")) {
+      return true;
+    }
+    return isImageAttachmentExtension(getAttachmentExtension(file.name));
+  });
+}
+
 function isImageAttachmentRecord(attachment: Pick<ChatAttachment, "contentType" | "filename" | "extension" | "kind">) {
   if (attachment.kind === "image") {
     return true;
@@ -705,6 +774,103 @@ function parseMessageAttachments(value: unknown): ChatAttachment[] {
       },
     ];
   });
+}
+
+function inferAttachmentContentType(filename: string, extension: string | null | undefined) {
+  const normalizedExtension = getAttachmentExtension(filename, extension).toLowerCase();
+  const normalized = normalizedExtension.replace(/^\./, "");
+  if (isImageAttachmentExtension(normalizedExtension)) {
+    return normalized === "svg" ? "image/svg+xml" : `image/${normalized === "jpg" ? "jpeg" : normalized}`;
+  }
+  if (normalized === "html" || normalized === "htm") {
+    return "text/html";
+  }
+  if (normalized === "md" || normalized === "markdown") {
+    return "text/markdown";
+  }
+  if (normalized === "txt") {
+    return "text/plain";
+  }
+  if (normalized === "json") {
+    return "application/json";
+  }
+  if (normalized === "pdf") {
+    return "application/pdf";
+  }
+  return "application/octet-stream";
+}
+
+function inferAttachmentKind(filename: string, extension: string | null | undefined, contentType: string) {
+  const normalizedExtension = getAttachmentExtension(filename, extension).toLowerCase();
+  const normalized = normalizedExtension.replace(/^\./, "");
+  if (contentType.startsWith("image/") || isImageAttachmentExtension(normalizedExtension)) {
+    return "image";
+  }
+  if (contentType === "text/html" || normalized === "html" || normalized === "htm") {
+    return "html";
+  }
+  return "document";
+}
+
+function buildOutputAttachmentsFromEvents(events: SessionEventPayload[]) {
+  const attachments: ChatAttachment[] = [];
+  const seen = new Set<string>();
+  events.forEach((event, index) => {
+    if (event.event !== "tool_call_finished") {
+      return;
+    }
+    const tool = typeof event.data.tool === "string" ? event.data.tool : "";
+    if (tool !== "write_file" && tool !== "edit_file") {
+      return;
+    }
+    if (event.data.success !== true) {
+      return;
+    }
+    const path = getEventPathValue(event.data);
+    if (!path || seen.has(path)) {
+      return;
+    }
+    seen.add(path);
+    const filename = extractName(path) || `output-${index + 1}`;
+    const extension = getAttachmentExtension(filename, null);
+    const contentType =
+      typeof event.data.content_type === "string" && event.data.content_type
+        ? event.data.content_type
+        : inferAttachmentContentType(filename, extension);
+    attachments.push({
+      id: makeAttachmentId(path, index),
+      filename,
+      contentType,
+      source: "assistant_output",
+      kind: inferAttachmentKind(filename, extension, contentType),
+      extension,
+      path,
+      previewUrl: null,
+      summary: typeof event.data.summary === "string" ? event.data.summary : "生成文件",
+      sizeBytes: typeof event.data.bytes === "number" ? event.data.bytes : null,
+      workspaceRelativePath: null,
+      analysisStatus: "completed",
+      analysisError: null,
+    });
+  });
+  return attachments;
+}
+
+function mergeChatAttachments(primary: ChatAttachment[], fallback: ChatAttachment[]) {
+  if (fallback.length === 0) {
+    return primary;
+  }
+  const merged = [...primary];
+  const seen = new Set(primary.map((attachment) => attachment.path || attachment.filename));
+  fallback.forEach((attachment) => {
+    const key = attachment.path || attachment.filename;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    merged.push(attachment);
+  });
+  return merged;
 }
 
 function stripLegacyAttachmentAppendix(content: string) {
@@ -1281,6 +1447,24 @@ function EyePanelIcon({ className }: { className?: string }) {
   );
 }
 
+function CodePanelIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.35}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M6.35 4.25 3 8l3.35 3.75" />
+      <path d="m9.65 4.25 3.35 3.75-3.35 3.75" />
+    </svg>
+  );
+}
+
 function ClosePanelIcon({ className }: { className?: string }) {
   return (
     <svg
@@ -1398,17 +1582,6 @@ function resolveTimelineNodeIcon(node: TimelineNode): TimelineMarkerIconName {
   return "generic";
 }
 
-function summarizeUserIntent(userPrompt: string | null | undefined) {
-  if (!userPrompt) {
-    return null;
-  }
-  const normalized = userPrompt.replace(/\s+/g, " ").trim();
-  if (!normalized) {
-    return null;
-  }
-  return `你想了解「${compactString(normalized, 24)}」`;
-}
-
 function formatDuration(durationMs: unknown) {
   if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs <= 0) {
     return null;
@@ -1434,6 +1607,88 @@ function formatCompactPath(path: string | null | undefined) {
   return `${extractName(parent)}/${fileName}`;
 }
 
+function getEventPathValue(eventData: Record<string, unknown>) {
+  const argumentsPayload = extractEventArguments(eventData);
+  const rawPath =
+    (typeof eventData.path === "string" ? eventData.path : null) ??
+    (argumentsPayload && typeof argumentsPayload.path === "string" ? argumentsPayload.path : null);
+  return rawPath?.trim() || null;
+}
+
+function isHtmlPath(path: string | null | undefined) {
+  return Boolean(path && /\.(html|htm)$/i.test(path.split(/[?#]/, 1)[0]));
+}
+
+function looksLikeHtmlMarkup(content: string | null | undefined) {
+  const normalized = (content ?? "").trimStart().toLowerCase();
+  return normalized.startsWith("<!doctype html") || normalized.startsWith("<html") || normalized.includes("<body");
+}
+
+function buildHtmlPreviewTitleFromMarkup(markup: string, fallback = "HTML 实时预览") {
+  const titleMatch = markup.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (titleMatch?.[1]) {
+    const normalized = titleMatch[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    if (normalized) {
+      return compactString(normalized, 48);
+    }
+  }
+
+  const headingMatch = markup.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  if (headingMatch?.[1]) {
+    const normalized = headingMatch[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    if (normalized) {
+      return compactString(normalized, 48);
+    }
+  }
+
+  return fallback;
+}
+
+function patchHtmlPreviewMarkupForSandbox(markup: string) {
+  return markup
+    .replace(/\b(?:window|self|globalThis)\s*\.\s*parent\s*\.\s*document\b/g, "document")
+    .replace(/\b(?:window|self|globalThis)\s*\.\s*top\s*\.\s*document\b/g, "document")
+    .replace(/\bparent\s*\.\s*document\b/g, "document")
+    .replace(/\btop\s*\.\s*document\b/g, "document");
+}
+
+function isHtmlWriteFileEventData(eventData: Record<string, unknown>) {
+  if (eventData.tool !== "write_file") {
+    return false;
+  }
+  const path = getEventPathValue(eventData);
+  if (isHtmlPath(path)) {
+    return true;
+  }
+  const argumentsPayload = extractEventArguments(eventData);
+  const content = argumentsPayload && typeof argumentsPayload.content === "string" ? argumentsPayload.content : null;
+  return looksLikeHtmlMarkup(content);
+}
+
+function extractSkillNameFromPath(path: string | null | undefined) {
+  if (!path) {
+    return null;
+  }
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const parts = normalized.split("/").filter(Boolean);
+  const fileName = parts[parts.length - 1]?.toLowerCase();
+  if (fileName !== "skill.md" || parts.length < 2) {
+    return null;
+  }
+  const skillsIndex = parts.lastIndexOf("skills");
+  if (skillsIndex >= 0 && parts[skillsIndex + 1] && parts[skillsIndex + 1].toLowerCase() !== "skill.md") {
+    return parts[skillsIndex + 1];
+  }
+  return parts[parts.length - 2] || null;
+}
+
+function resolveSkillNameFromEventData(eventData: Record<string, unknown>) {
+  const explicitSkillName = typeof eventData.skill_name === "string" && eventData.skill_name.trim()
+    ? eventData.skill_name.trim()
+    : null;
+  return explicitSkillName ?? extractSkillNameFromPath(getEventPathValue(eventData));
+}
+
 function formatUrlTarget(rawUrl: string | null | undefined) {
   if (!rawUrl) {
     return null;
@@ -1452,6 +1707,31 @@ function compactString(value: string, maxLength = 88) {
     return normalized;
   }
   return `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+const TIMELINE_PRIMARY_TEXT_MAX_CHARS = 96;
+const TIMELINE_STRUCTURED_COPY_RE = /(^|\n)\s*(?:#{1,6}\s+|\d+[.、]\s+|[-*]\s+)/;
+
+function looksStructuredTimelineCopy(raw: string, normalized: string) {
+  if (normalized.length > TIMELINE_PRIMARY_TEXT_MAX_CHARS * 2) {
+    return true;
+  }
+  if (raw.includes("\n") && TIMELINE_STRUCTURED_COPY_RE.test(raw)) {
+    return true;
+  }
+  if (normalized.includes("## ") || normalized.includes("# ")) {
+    return true;
+  }
+  return false;
+}
+
+function isWeakProgressPrimaryText(value: string | null | undefined) {
+  const raw = value ?? "";
+  const normalized = raw.replace(/\s+/g, " ").trim();
+  if (!normalized || normalized === "我先继续处理这一步") {
+    return true;
+  }
+  return looksStructuredTimelineCopy(raw, normalized);
 }
 
 function formatJsonPreview(value: unknown, maxLength = 96) {
@@ -1538,17 +1818,15 @@ function resolveProgressPrimaryText(
   status: "running" | "completed" | "failed",
   eventData: Record<string, unknown>,
   output?: string | null,
-  userPrompt?: string | null
+  _userPrompt?: string | null
 ) {
   const semantic = resolveToolSemantic(toolName);
   const summaryText = typeof eventData.summary_text === "string" ? eventData.summary_text : null;
-  const intentLead = summarizeUserIntent(userPrompt);
+  const target = resolveToolTarget(toolName, eventData);
+  const skillName = resolveSkillNameFromEventData(eventData);
 
-  if (status === "running") {
-    if (summaryText) {
-      return summaryText;
-    }
-    return intentLead ? `${intentLead}，${semantic.runningText}` : semantic.runningText;
+  if (summaryText) {
+    return summaryText;
   }
 
   if (status === "failed") {
@@ -1557,8 +1835,41 @@ function resolveProgressPrimaryText(
       : "这一步暂时没有成功";
   }
 
-  if (summaryText) {
-    return summaryText;
+  if ((toolName === "read_file" || toolName === "read_file_range") && skillName) {
+    return status === "running"
+      ? `我先读取 ${skillName} Skill 说明，确认该按什么流程做`
+      : `已读取 ${skillName} Skill 说明，接下来按这个流程执行`;
+  }
+
+  if (status === "running") {
+    if (toolName === "read_file" || toolName === "read_file_range") {
+      return target ? `我先读取 ${target}，确认里面有哪些可用信息` : semantic.runningText;
+    }
+    if (toolName === "search_files" || toolName === "grep") {
+      return target ? `我先检索 ${target}，定位相关内容` : semantic.runningText;
+    }
+    if (toolName === "list_dir" || toolName === "list_files") {
+      return target ? `我先查看 ${target} 的结构` : semantic.runningText;
+    }
+    if (toolName === "update_plan") {
+      return "我先把已知信息拆成执行步骤";
+    }
+    if (toolName === "write_file") {
+      if (isHtmlWriteFileEventData(eventData)) {
+        return target ? `正在生成 ${target}，预览会随内容更新` : "正在生成 HTML 文件，预览会随内容更新";
+      }
+      return target ? `我正在创建 ${target}` : semantic.runningText;
+    }
+    if (toolName === "edit_file") {
+      return target ? `我正在修改 ${target}` : semantic.runningText;
+    }
+    if (toolName === "fetch_url") {
+      return target ? `我先读取 ${target} 的网页资料` : semantic.runningText;
+    }
+    if (toolName === "terminal") {
+      return "我先运行命令确认当前状态";
+    }
+    return semantic.runningText;
   }
 
   const count = inferResultCount(toolName, output ?? null);
@@ -1572,6 +1883,25 @@ function resolveProgressPrimaryText(
     if (toolName === "search_knowledge_base") {
       return `已找到 ${count} 条知识结果`;
     }
+  }
+
+  if (toolName === "read_file" || toolName === "read_file_range") {
+    return target ? `已从 ${target} 获取到可用信息` : semantic.completedText;
+  }
+  if (toolName === "list_dir" || toolName === "list_files") {
+    return target ? `已确认 ${target} 的结构` : semantic.completedText;
+  }
+  if (toolName === "update_plan") {
+    return "执行步骤我已经整理好了";
+  }
+  if (toolName === "write_file") {
+    if (isHtmlWriteFileEventData(eventData)) {
+      return target ? `HTML 文件已经生成：${target}` : "HTML 文件已经生成";
+    }
+    return target ? `文件已经创建：${target}` : semantic.completedText;
+  }
+  if (toolName === "edit_file") {
+    return target ? `文件已经修改：${target}` : semantic.completedText;
   }
 
   return semantic.completedText;
@@ -1639,10 +1969,27 @@ function buildTimelineToolSummary(node: TimelineNode) {
   return `调用 ${labels[0]} 等 ${labels.length} 个步骤`;
 }
 
-function buildTimelineSecondaryResultText(item: TimelineSecondaryItem) {
+function buildTimelineSecondaryResultText(item: TimelineSecondaryItem, options?: { isTurnRunning?: boolean }) {
   const output = item.output?.trim();
   if (output) {
     return output;
+  }
+
+  if (options?.isTurnRunning) {
+    if (item.state === "pending") {
+      return "等待审批通过后开始执行。";
+    }
+    if (item.state === "recovering") {
+      return "正在恢复执行，请稍后查看结果。";
+    }
+    if (item.state === "running") {
+      return "正在执行中，结果返回后会显示在这里。";
+    }
+  }
+
+  const summary = item.detail.summary.trim();
+  if (summary) {
+    return summary;
   }
 
   if (item.toolName !== "terminal") {
@@ -2085,6 +2432,70 @@ function getPlanProgress(plan: SessionPlanPayload) {
   };
 }
 
+function buildPlanProgressFromRawSteps(steps: Array<{ step: string; status: PlanStepStatus | string }>) {
+  const normalizedSteps = steps.map((step) => normalizePlanStepStatus(step.status));
+  return {
+    total: steps.length,
+    completed: normalizedSteps.filter((status) => status === "completed").length,
+    in_progress: normalizedSteps.filter((status) => status === "in_progress").length,
+    blocked: normalizedSteps.filter((status) => status === "blocked").length,
+    pending: normalizedSteps.filter((status) => status === "pending").length,
+    cancelled: normalizedSteps.filter((status) => status === "cancelled").length,
+  };
+}
+
+function closePlanSteps(plan: SessionPlanPayload): SessionPlanPayload {
+  if (!plan?.steps || !Array.isArray(plan.steps)) {
+    return plan;
+  }
+
+  let changed = false;
+  const steps = plan.steps.map((step) => {
+    const status = normalizePlanStepStatus(step.status);
+    if (status === "completed" || status === "blocked" || status === "cancelled") {
+      return step;
+    }
+    changed = true;
+    return {
+      ...step,
+      status: "completed" as PlanStepStatus,
+    };
+  });
+
+  if (!changed) {
+    return plan;
+  }
+
+  return {
+    ...plan,
+    steps,
+    progress: buildPlanProgressFromRawSteps(steps),
+  };
+}
+
+function shouldClosePlanFromEvents(plan: SessionPlanPayload, events: SessionEventPayload[]) {
+  if (!hasIncompletePlanSteps(plan)) {
+    return false;
+  }
+
+  let latestPlanUpdatedAt = Number.NEGATIVE_INFINITY;
+  let latestFinalResponseAt = Number.NEGATIVE_INFINITY;
+  events.forEach((event) => {
+    if (event.event === "plan_updated") {
+      latestPlanUpdatedAt = Math.max(latestPlanUpdatedAt, event.ts);
+    }
+    if (event.event === "final_response") {
+      latestFinalResponseAt = Math.max(latestFinalResponseAt, event.ts);
+    }
+  });
+
+  return latestFinalResponseAt !== Number.NEGATIVE_INFINITY && latestFinalResponseAt >= latestPlanUpdatedAt;
+}
+
+function closePlanIfFinalResponseSeen(plan: SessionPlanPayload, events: SessionEventPayload[]) {
+  return shouldClosePlanFromEvents(plan, events) ? closePlanSteps(plan) : plan;
+}
+
 function hasIncompletePlanSteps(plan: SessionPlanPayload) {
   return getPlanSteps(plan).some((step) => step.status !== "completed" && step.status !== "cancelled");
 }
@@ -2123,6 +2534,11 @@ function buildToolSecondaryItem(
   const toolName = typeof eventData.tool === "string" ? eventData.tool : null;
   const semantic = resolveToolSemantic(toolName);
   const status = resolveSecondaryStatusMeta(state, eventData);
+  const displayOutput =
+    readNonEmptyText(output) ??
+    readNonEmptyText(eventData.output_preview) ??
+    readNonEmptyText(eventData.display_output) ??
+    null;
   const detailId = `secondary:${typeof eventData.tool_call_id === "string" ? eventData.tool_call_id : parentId}`;
   const command =
     toolName === "terminal" && typeof extractEventArguments(eventData)?.command === "string"
@@ -2135,7 +2551,7 @@ function buildToolSecondaryItem(
       toolName,
       state === "failed" ? "failed" : state === "completed" ? "completed" : "running",
       eventData,
-      output,
+      displayOutput,
       userPrompt
     );
 
@@ -2149,11 +2565,11 @@ function buildToolSecondaryItem(
     subtitle: buildToolSecondarySubtitle(toolName, eventData),
     statusLabel: status.label,
     statusTone: status.tone,
-    meta: buildToolSecondaryMeta(toolName, eventData, output),
+    meta: buildToolSecondaryMeta(toolName, eventData, displayOutput),
     command,
-    output,
+    output: displayOutput,
     argumentsPayload: extractEventArguments(eventData),
-    outputLineCount: countOutputLines(output),
+    outputLineCount: countOutputLines(displayOutput),
     detail: buildTraceDetail(
       detailId,
       "tool",
@@ -2163,15 +2579,22 @@ function buildToolSecondaryItem(
       summary,
       eventData,
       {
-        output,
+        output: displayOutput,
       }
     )
   };
 }
 
 function summarizeCommentaryContent(content: string | null | undefined, fallback: string) {
-  const normalized = (content ?? "").replace(/\s+/g, " ").trim();
-  return normalized || fallback;
+  const raw = content ?? "";
+  const normalized = raw.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return fallback;
+  }
+  if (looksStructuredTimelineCopy(raw, normalized)) {
+    return fallback;
+  }
+  return compactString(normalized, TIMELINE_PRIMARY_TEXT_MAX_CHARS);
 }
 
 function summarizeThinkingContent(content: string | null | undefined, state: TimelineNodeState) {
@@ -2274,6 +2697,32 @@ function extractApprovalNodePayload(event: SessionEventPayload, fallback: Approv
   };
 }
 
+function buildPendingApprovalFromEvent(event: SessionEventPayload): PendingApproval | null {
+  const eventData = event.data;
+  const approvalRequestId =
+    typeof eventData.approval_request_id === "string" && eventData.approval_request_id
+      ? eventData.approval_request_id
+      : null;
+  const tool = typeof eventData.tool === "string" && eventData.tool ? eventData.tool : null;
+  const argumentsPayload =
+    eventData.arguments && typeof eventData.arguments === "object" && !Array.isArray(eventData.arguments)
+      ? (eventData.arguments as Record<string, unknown>)
+      : null;
+  if (!approvalRequestId || !tool || !argumentsPayload) {
+    return null;
+  }
+  const timeoutSeconds = typeof eventData.timeout_seconds === "number" ? eventData.timeout_seconds : 0;
+  return {
+    approval_request_id: approvalRequestId,
+    turn_id: typeof eventData.turn_id === "string" ? eventData.turn_id : null,
+    tool,
+    arguments: argumentsPayload,
+    reason: typeof eventData.reason === "string" && eventData.reason ? eventData.reason : "requires_approval",
+    timeout_seconds: timeoutSeconds,
+    remaining_seconds: timeoutSeconds,
+  };
+}
+
 function buildApprovalNode(
   event: SessionEventPayload,
   state: Extract<TimelineNodeState, "pending" | "approved" | "rejected" | "failed">,
@@ -2335,38 +2784,46 @@ function buildProgressGroupNode(groupId: string, event: SessionEventPayload, pri
 
 function buildSkillSecondaryItem(parentId: string, event: SessionEventPayload): TimelineSecondaryItem {
   const eventData = buildEventDataWithRequest(event);
-  const skillName = typeof eventData.event === "string" ? eventData.event : "Skill";
-  const message = typeof eventData.message === "string" && eventData.message ? eventData.message : "这个分析步骤已完成";
+  const explicitSkillName =
+    typeof eventData.skill_name === "string" && eventData.skill_name.trim() ? eventData.skill_name.trim() : null;
+  const isSkillUsage = event.event === "skill_used" || Boolean(explicitSkillName);
+  const itemName = explicitSkillName ?? (typeof eventData.event === "string" ? eventData.event : "Skill");
+  const message =
+    (typeof eventData.summary === "string" && eventData.summary) ||
+    (typeof eventData.message === "string" && eventData.message) ||
+    (isSkillUsage ? "这个 Skill 步骤已完成" : "这个分析步骤已完成");
   const contextOutput = typeof eventData.context === "undefined" ? null : stringifyForPanel(eventData.context);
   const contextTool =
     eventData.context && typeof eventData.context === "object" && "tool" in eventData.context && typeof eventData.context.tool === "string"
       ? eventData.context.tool
       : null;
-  const detailId = `secondary:skill:${parentId}:${event.ts}:${skillName}`;
+  const pluginName = typeof eventData.plugin_name === "string" && eventData.plugin_name.trim() ? eventData.plugin_name.trim() : null;
+  const description = typeof eventData.description === "string" && eventData.description.trim() ? eventData.description.trim() : null;
+  const detailId = `secondary:skill:${parentId}:${event.ts}:${itemName}`;
 
   return {
     id: detailId,
     parentId,
     state: "completed",
-    label: skillName,
+    label: isSkillUsage ? `${itemName} Skill` : itemName,
     toolName: null,
     cardType: "generic",
-    subtitle: message,
+    subtitle: description ?? message,
     statusLabel: "已完成",
     statusTone: "green",
-    meta: contextTool ? ["Skill", contextTool] : ["Skill"],
-    output: contextOutput,
-    outputLineCount: countOutputLines(contextOutput),
+    meta: [isSkillUsage ? (pluginName ? `插件 ${pluginName}` : "Skill") : "Hook", ...(contextTool ? [contextTool] : [])],
+    output: contextOutput ?? description,
+    outputLineCount: countOutputLines(contextOutput ?? description),
     detail: buildTraceDetail(
       detailId,
       "skill",
       formatEventTime(event.ts),
-      skillName,
-      "Skill 详情",
+      isSkillUsage ? `${itemName} Skill` : itemName,
+      isSkillUsage ? "Skill 详情" : "Hook 详情",
       message,
       eventData,
       {
-        output: contextOutput,
+        output: contextOutput ?? description,
       }
     )
   };
@@ -2495,9 +2952,15 @@ function resolveProgressNodePrimaryText(
     return node.primaryText;
   }
   if (eventName === "commentary_delta" || eventName === "commentary_complete") {
-    return node.secondaryItems.length > 0 ? node.primaryText : normalized;
+    if (node.secondaryItems.length > 0 && !isWeakProgressPrimaryText(node.primaryText)) {
+      return node.primaryText;
+    }
+    return normalized;
   }
-  return node.primaryText || normalized;
+  if (!node.primaryText || isWeakProgressPrimaryText(node.primaryText)) {
+    return normalized;
+  }
+  return node.primaryText;
 }
 
 function applyTurnIdToNode(node: TimelineNode, turnId: string) {
@@ -2758,6 +3221,23 @@ function buildTimelineNodes(
       return;
     }
 
+    if (event.event === "skill_used") {
+      const groupId = resolveGroupId(eventData, toolCallId);
+      if (!groupId) {
+        return;
+      }
+      const skillName = resolveSkillNameFromEventData(eventData) ?? "Skill";
+      const primaryText =
+        typeof eventData.summary === "string" && eventData.summary
+          ? eventData.summary
+          : `使用 ${skillName} Skill，先读取它的工作说明`;
+      const node = ensureProgressNode(groupId, event, primaryText);
+      const item = buildSkillSecondaryItem(node.id, event);
+      upsertProgressSecondaryItem(node, item);
+      refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
+      return;
+    }
+
     if (event.event === "attachment_received" || event.event === "attachment_processed") {
       const attachmentCount = typeof eventData.count === "number" ? eventData.count : 0;
       const groupId = `attachment:${event.request_id ?? "current"}`;
@@ -2771,6 +3251,36 @@ function buildTimelineNodes(
       const item = buildAttachmentSecondaryItem(node.id, event);
       upsertProgressSecondaryItem(node, item);
       refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
+      return;
+    }
+
+    if (event.event === "tool_call_arguments_delta") {
+      if (!toolCallId) {
+        return;
+      }
+      const groupId = resolveGroupId(eventData, toolCallId);
+      if (!groupId) {
+        return;
+      }
+      const primaryText =
+        resolveProgressNodePrimaryText(
+          progressNodeByGroupId.get(groupId) ?? null,
+          event.event,
+          typeof eventData.summary_text === "string" && eventData.summary_text
+            ? eventData.summary_text
+            : resolveProgressPrimaryText(
+                "tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null,
+                "running",
+                eventData,
+                null,
+                userPrompt
+              )
+        );
+      const node = ensureProgressNode(groupId, event, primaryText);
+      const item = buildToolSecondaryItem(node.id, event, "running", null, userPrompt);
+      upsertProgressSecondaryItem(node, item);
+      refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
+      toolCallToGroupId.set(toolCallId, groupId);
       return;
     }
 
@@ -3104,10 +3614,30 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
       return;
     }
 
+    const assistantAttachments = parseMessageAttachments(message.metadata.attachments);
+    const assistantContent = message.content;
+    if (!assistantContent.trim() && assistantAttachments.length === 0) {
+      const emptyResponseMessage = "主模型返回了空白内容，当前没有可展示结果。请重试本轮请求。";
+      targetTurn.answer = {
+        detailId: `assistant:${message.id}`,
+        content: emptyResponseMessage,
+        attachments: [],
+        createdAt: message.created_at,
+        phase: "failed",
+        source: "session",
+        assistantMessageId: message.id,
+        finishReason: typeof message.metadata.finish_reason === "string" ? message.metadata.finish_reason : "empty_response",
+        errorMessage: emptyResponseMessage,
+      };
+      targetTurn.requestId = targetTurn.requestId ?? readRequestId(message.metadata);
+      targetTurn.status = "failed";
+      return;
+    }
+
     targetTurn.answer = {
       detailId: `assistant:${message.id}`,
-      content: message.content,
-      attachments: parseMessageAttachments(message.metadata.attachments),
+      content: assistantContent,
+      attachments: assistantAttachments,
       createdAt: message.created_at,
       phase: "persisted",
       source: "session",
@@ -3166,6 +3696,9 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
 
   turns.forEach((turn) => {
     const turnEvents = eventsByTurn.get(turn.id) ?? [];
+    if (turn.answer) {
+      turn.answer.attachments = mergeChatAttachments(turn.answer.attachments, buildOutputAttachmentsFromEvents(turnEvents));
+    }
     if (turn.status === "failed" && (!turn.answer || isRawToolCallMarkupText(turn.answer.content))) {
       const failedAnswer = synthesizeFailedTurnAnswer(turn.id, turnEvents);
       if (failedAnswer) {
@@ -3219,8 +3752,9 @@ function buildLiveTurn(liveTurn: LiveTurnState, sessionEvents: SessionEventPaylo
     (liveTurn.answer.phase === "waiting" || liveTurn.answer.phase === "streaming") &&
     !hasRunningThinking &&
     !hasAnswerStart;
+  const syntheticThinkingCopy = timeline.length > 0 ? "模型正在准备下一步" : null;
   const nextTimeline = shouldShowThinking
-    ? [...timeline, applyTurnIdToNode(buildThinkingNode(thinkingTs, null, "running", "当前思路"), turnId)]
+    ? [...timeline, applyTurnIdToNode(buildThinkingNode(thinkingTs, syntheticThinkingCopy, "running", timeline.length > 0 ? "等待模型输出" : "当前思路"), turnId)]
     : timeline;
 
   return {
@@ -3451,7 +3985,10 @@ function App() {
   const [configNotice, setConfigNotice] = useState<string | null>(null);
   const [pluginBusyName, setPluginBusyName] = useState<string | null>(null);
   const [leftWidth, setLeftWidth] = useState(() => readStoredNumber("newman-left-rail-width", 220, LEFT_MIN, LEFT_MAX));
-  const [dragging, setDragging] = useState<null | "left">(null);
+  const [htmlPreviewWidth, setHtmlPreviewWidth] = useState(() =>
+    readStoredNumber("newman-html-preview-width", HTML_PREVIEW_DEFAULT, HTML_PREVIEW_MIN, HTML_PREVIEW_MAX)
+  );
+  const [dragging, setDragging] = useState<null | "left" | "html-preview">(null);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [expandedTimelineIds, setExpandedTimelineIds] = useState<Record<string, boolean>>({});
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false);
@@ -3465,7 +4002,10 @@ function App() {
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [turnApprovalMode, setTurnApprovalMode] = useState<TurnApprovalMode>("manual");
   const [htmlPreview, setHtmlPreview] = useState<HtmlPreviewState | null>(null);
+  const [htmlPreviewView, setHtmlPreviewView] = useState<HtmlPreviewView>("preview");
   const conversationPaneRef = useRef<HTMLElement | null>(null);
+  const chatStageRef = useRef<HTMLDivElement | null>(null);
+  const htmlPreviewPanelRef = useRef<HTMLElement | null>(null);
   const composerFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillUploadFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillUploadFolderInputRef = useRef<HTMLInputElement | null>(null);
@@ -3652,6 +4192,49 @@ function App() {
     }
   };
 
+  const applyHtmlPreviewStreamEvent = (payload: SessionEventPayload) => {
+    if (payload.event === "tool_call_output_delta") {
+      if (payload.data.stream !== "file_content" || !isHtmlWriteFileEventData(payload.data)) {
+        return;
+      }
+      const delta = typeof payload.data.delta === "string" ? payload.data.delta : "";
+      if (!delta) {
+        return;
+      }
+      const path = getEventPathValue(payload.data);
+      const fallbackTitle = formatCompactPath(path) ?? "HTML 实时预览";
+      setHtmlPreview((currentPreview) => {
+        const sameStream = currentPreview?.source === "write_file" && currentPreview.path === path;
+        const content = sameStream ? `${currentPreview.content}${delta}` : delta;
+        return {
+          source: "write_file",
+          path,
+          streaming: true,
+          content,
+          title: buildHtmlPreviewTitleFromMarkup(content, fallbackTitle),
+        };
+      });
+      return;
+    }
+
+    if (payload.event === "tool_call_finished" && isHtmlWriteFileEventData(payload.data)) {
+      const path = getEventPathValue(payload.data);
+      setHtmlPreview((currentPreview) => {
+        if (!currentPreview || currentPreview.source !== "write_file") {
+          return currentPreview;
+        }
+        if (currentPreview.path && path && currentPreview.path !== path) {
+          return currentPreview;
+        }
+        return {
+          ...currentPreview,
+          streaming: false,
+          title: buildHtmlPreviewTitleFromMarkup(currentPreview.content, currentPreview.title),
+        };
+      });
+    }
+  };
+
   const waitForLiveAnswerDrain = async (targetLocalId: string) => {
     if (liveAnswerQueueRef.current.length === 0) {
       maybeFinalizeLiveAnswer(targetLocalId);
@@ -3691,13 +4274,19 @@ function App() {
   }, [leftWidth]);
 
   useEffect(() => {
+    window.localStorage.setItem("newman-html-preview-width", `${htmlPreviewWidth}`);
+  }, [htmlPreviewWidth]);
+
+  useEffect(() => {
     if (activePage !== "chat") {
       setHtmlPreview(null);
+      setHtmlPreviewView("preview");
     }
   }, [activePage]);
 
   useEffect(() => {
     setHtmlPreview(null);
+    setHtmlPreviewView("preview");
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -3708,6 +4297,7 @@ function App() {
     function handleKeyDown(event: globalThis.KeyboardEvent) {
       if (event.key === "Escape") {
         setHtmlPreview(null);
+        setHtmlPreviewView("preview");
       }
     }
 
@@ -3767,7 +4357,17 @@ function App() {
     if (!dragging) return;
 
     const onPointerMove = (event: PointerEvent) => {
-      setLeftWidth(clamp(event.clientX, LEFT_MIN, LEFT_MAX));
+      if (dragging === "left") {
+        setLeftWidth(clamp(event.clientX, LEFT_MIN, LEFT_MAX));
+        return;
+      }
+
+      const stageRect = chatStageRef.current?.getBoundingClientRect();
+      const panelRight = htmlPreviewPanelRef.current?.getBoundingClientRect().right ?? stageRect?.right ?? window.innerWidth;
+      const maxWidth = stageRect
+        ? Math.min(HTML_PREVIEW_MAX, Math.max(HTML_PREVIEW_MIN, stageRect.width - HTML_PREVIEW_MAIN_MIN))
+        : HTML_PREVIEW_MAX;
+      setHtmlPreviewWidth(clamp(panelRight - event.clientX, HTML_PREVIEW_MIN, maxWidth));
     };
 
     const onPointerUp = () => setDragging(null);
@@ -3850,11 +4450,12 @@ function App() {
         return false;
       }
 
+      const dedupedEvents = dedupeSessionEvents(nextEvents);
       setActiveSessionDetail(detail.session);
-      setActivePlan(detail.plan ?? null);
+      setActivePlan(closePlanIfFinalResponseSeen(detail.plan ?? null, dedupedEvents));
       setActiveCollaborationMode(detail.collaboration_mode ?? null);
       setActiveContextUsage(detail.context_usage ?? null);
-      setSessionEvents(dedupeSessionEvents(nextEvents));
+      setSessionEvents(dedupedEvents);
       setChatSessions((currentSessions) =>
         currentSessions.map((session) =>
           session.id === sessionId
@@ -4051,7 +4652,7 @@ function App() {
     void loadPendingApproval();
     const timer = window.setInterval(() => {
       void loadPendingApproval();
-    }, 2500);
+    }, 10000);
 
     return () => {
       cancelled = true;
@@ -4409,12 +5010,51 @@ function App() {
   }, [activePage, apiBase]);
 
   const isMobile = viewportWidth <= 820;
+  const isHtmlPreviewFloating = viewportWidth <= 980;
+  const maxHtmlPreviewWidth = useMemo(() => {
+    const mainStageWidth = viewportWidth - (isMobile ? 0 : leftWidth + HANDLE_WIDTH) - 12;
+    return clamp(mainStageWidth - HTML_PREVIEW_MAIN_MIN, HTML_PREVIEW_MIN, HTML_PREVIEW_MAX);
+  }, [isMobile, leftWidth, viewportWidth]);
+  const effectiveHtmlPreviewWidth = Math.min(htmlPreviewWidth, maxHtmlPreviewWidth);
+  const htmlPreviewPanelStyle = {
+    "--html-preview-width": `${effectiveHtmlPreviewWidth}px`
+  } as CSSProperties;
   const normalizedHtmlPreviewContent = useMemo(() => {
     if (!htmlPreview) {
       return "";
     }
 
-    const markup = htmlPreview.content.trim();
+    if (htmlPreview.initialView === "code") {
+      const escapedCode = escapeCodeHtml(htmlPreview.content.trimEnd());
+      return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        margin: 0;
+        background: #fffaf3;
+        color: #2d2722;
+        font: 13px/1.65 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      pre {
+        box-sizing: border-box;
+        min-height: 100vh;
+        margin: 0;
+        padding: 18px 20px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+    </style>
+  </head>
+  <body>
+    <pre>${escapedCode || " "}</pre>
+  </body>
+</html>`;
+    }
+
+    const markup = patchHtmlPreviewMarkupForSandbox(htmlPreview.content.trim());
     if (!markup) {
       return "";
     }
@@ -4432,8 +5072,18 @@ function App() {
   <body>
 ${markup}
   </body>
-</html>`;
+    </html>`;
   }, [htmlPreview]);
+  const htmlPreviewCode = htmlPreview?.content ?? "";
+  const htmlPreviewCodeHighlight = useMemo(
+    () => highlightCode(htmlPreviewCode, htmlPreview?.language ?? "html"),
+    [htmlPreviewCode, htmlPreview?.language]
+  );
+  const htmlPreviewBadge = htmlPreview?.initialView === "code" ? "CODE" : "HTML";
+  const openHtmlPreview = (payload: HtmlPreviewPayload) => {
+    setHtmlPreview(payload);
+    setHtmlPreviewView(payload.initialView ?? "preview");
+  };
   const liveTurnLocalId = liveTurn?.localId ?? null;
   const liveTurnRequestId = liveTurn?.requestId ?? null;
   const liveTurnServerTurnId = liveTurn?.serverTurnId ?? null;
@@ -4692,7 +5342,12 @@ ${markup}
 
           const payload = JSON.parse(dataLines.join("\n")) as SessionEventPayload;
           onEvent(payload);
-          if (payload.event === "assistant_delta" || payload.event === "final_response") {
+          if (
+            payload.event === "assistant_delta" ||
+            payload.event === "final_response" ||
+            payload.event === "tool_call_arguments_delta" ||
+            payload.event === "tool_call_output_delta"
+          ) {
             pendingBrowserYieldEvents += 1;
             if (pendingBrowserYieldEvents >= LIVE_STREAM_BROWSER_YIELD_EVERY_EVENTS) {
               pendingBrowserYieldEvents = 0;
@@ -4769,11 +5424,22 @@ ${markup}
 
   const handleComposerFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []);
-    if (files.some((file) => file.type !== "image/png" && file.type !== "image/jpeg")) {
-      setChatError("当前仅支持 PNG / JPEG 图片附件");
-    }
     appendComposerAttachments(files);
     event.target.value = "";
+  };
+
+  const handleComposerPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    if (sendingMessage || stoppingMessage || planModeUpdating) {
+      return;
+    }
+
+    const imageFiles = getClipboardImageFiles(event.clipboardData).map((file, index) => normalizeClipboardAttachmentFile(file, index));
+    if (imageFiles.length === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    appendComposerAttachments(imageFiles);
   };
 
   const appendSkillUploadFiles = (files: File[]) => {
@@ -5045,6 +5711,7 @@ ${markup}
         if (payload.event === "assistant_delta" || payload.event === "final_response") {
           enqueueLiveAnswerEvent(liveTurnLocalId, payload);
         }
+        applyHtmlPreviewStreamEvent(payload);
         if (payload.event === "error") {
           resetLiveAnswerStreaming();
         }
@@ -5077,6 +5744,27 @@ ${markup}
               : null;
           setActivePlan(planPayload);
         }
+        if (payload.event === "final_response") {
+          setActivePlan((currentPlan) => closePlanSteps(currentPlan));
+        }
+        if (payload.event === "tool_approval_request") {
+          const approval = buildPendingApprovalFromEvent(payload);
+          if (approval) {
+            setPendingApproval(approval);
+            setApprovalError(null);
+          }
+        }
+        if (payload.event === "tool_approval_resolved") {
+          const approvalRequestId =
+            typeof payload.data.approval_request_id === "string" && payload.data.approval_request_id
+              ? payload.data.approval_request_id
+              : null;
+          if (approvalRequestId) {
+            setPendingApproval((current) =>
+              current?.approval_request_id === approvalRequestId ? null : current
+            );
+          }
+        }
         setLiveTurn((currentTurn) => {
           if (!currentTurn || currentTurn.localId !== liveTurnLocalId) {
             return currentTurn;
@@ -5101,6 +5789,7 @@ ${markup}
             payload.event === "thinking_complete" ||
             payload.event === "commentary_delta" ||
             payload.event === "commentary_complete" ||
+            payload.event === "tool_call_arguments_delta" ||
             payload.event === "tool_call_output_delta"
           ) {
             return {
@@ -5720,6 +6409,7 @@ ${markup}
                 value={composerValue}
                 onChange={(event) => setComposerValue(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
+                onPaste={handleComposerPaste}
                 onFocus={() => setComposerFocused(true)}
                 onBlur={() => setComposerFocused(false)}
                 aria-label="message composer"
@@ -6186,7 +6876,11 @@ ${markup}
               </div>
             </section>
           ) : (
-            <div className={`chat-stage ${htmlPreview ? "with-html-preview" : ""}`}>
+            <div
+              ref={chatStageRef}
+              className={`chat-stage ${htmlPreview ? "with-html-preview" : ""}`}
+              style={htmlPreviewPanelStyle}
+            >
               <div className="chat-stage-main">
                 <section
                   ref={conversationPaneRef}
@@ -6413,7 +7107,9 @@ ${markup}
                                             <div className="timeline-secondary-region-inner">
                                               <div className="timeline-secondary-list">
                                                 {node.secondaryItems.map((item) => {
-                                                  const resultText = buildTimelineSecondaryResultText(item);
+                                                  const resultText = buildTimelineSecondaryResultText(item, {
+                                                    isTurnRunning: turn.isLive && turn.status === "running",
+                                                  });
                                                   const resultCodePreview = buildTimelineCodePreview(
                                                     item.toolName,
                                                     resultText,
@@ -6502,7 +7198,7 @@ ${markup}
                                       content={answerCopy}
                                       attachments={turn.answer?.attachments ?? []}
                                       className="trace-copy"
-                                      onOpenHtmlPreview={setHtmlPreview}
+                                      onOpenHtmlPreview={openHtmlPreview}
                                       deferCodeBlocksUntilComplete={turn.isLive && turn.status === "running"}
                                     />
                                   </div>
@@ -6519,43 +7215,87 @@ ${markup}
                 <footer className="composer-bar composer-bar-floating">{renderChatComposer("footer")}</footer>
               </div>
 
-              <aside className={`html-preview-panel ${htmlPreview ? "open" : ""}`} aria-label="HTML 预览面板">
+              <aside
+                ref={htmlPreviewPanelRef}
+                className={`html-preview-panel ${htmlPreview ? "open" : ""}`}
+                aria-label="HTML 预览面板"
+              >
+                {htmlPreview && !isHtmlPreviewFloating ? (
+                  <div
+                    className="html-preview-resize-handle"
+                    onPointerDown={(event) => {
+                      event.preventDefault();
+                      setDragging("html-preview");
+                    }}
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label="调整 HTML 预览宽度"
+                  />
+                ) : null}
                 <div className="html-preview-panel-inner">
-                  <div className="html-preview-panel-head">
-                    <div className="html-preview-panel-copy">
-                      <span className="html-preview-panel-kicker">
-                        <EyePanelIcon className="html-preview-panel-kicker-icon" />
-                        实时预览
+                  <div className="html-preview-frame-topbar">
+                    <div className="html-preview-frame-topbar-main">
+                      <span className="html-preview-frame-badge">{htmlPreviewBadge}</span>
+                      <span className="html-preview-frame-title">
+                        {htmlPreview?.streaming ? "生成中 · " : ""}
+                        {htmlPreview?.title ?? "HTML 实时预览"}
                       </span>
-                      <h3>{htmlPreview?.title ?? "HTML 实时预览"}</h3>
-                      <p>渲染当前代码块中的 HTML 内容。</p>
                     </div>
-                    <button
-                      type="button"
-                      className="html-preview-panel-close"
-                      onClick={() => setHtmlPreview(null)}
-                      aria-label="关闭 HTML 预览"
-                    >
-                      <ClosePanelIcon className="html-preview-panel-close-icon" />
-                    </button>
+                    <div className="html-preview-frame-actions">
+                      <div className="html-preview-view-toggle" role="group" aria-label="HTML 查看模式">
+                        <button
+                          type="button"
+                          className={htmlPreviewView === "preview" ? "active" : ""}
+                          onClick={() => setHtmlPreviewView("preview")}
+                          aria-pressed={htmlPreviewView === "preview"}
+                          title="预览模式"
+                        >
+                          <EyePanelIcon className="html-preview-view-toggle-icon" />
+                          <span>预览</span>
+                        </button>
+                        <button
+                          type="button"
+                          className={htmlPreviewView === "code" ? "active" : ""}
+                          onClick={() => setHtmlPreviewView("code")}
+                          aria-pressed={htmlPreviewView === "code"}
+                          title="代码模式"
+                        >
+                          <CodePanelIcon className="html-preview-view-toggle-icon" />
+                          <span>代码</span>
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        className="html-preview-panel-close"
+                        onClick={() => {
+                          setHtmlPreview(null);
+                          setHtmlPreviewView("preview");
+                        }}
+                        aria-label="关闭 HTML 预览"
+                      >
+                        <ClosePanelIcon className="html-preview-panel-close-icon" />
+                      </button>
+                    </div>
                   </div>
-
-                  <div className="html-preview-frame-shell">
-                    <div className="html-preview-frame-topbar">
-                      <span className="html-preview-frame-badge">HTML</span>
-                      <span className="html-preview-frame-title">{htmlPreview?.title ?? "HTML 实时预览"}</span>
-                    </div>
-                    <div className="html-preview-frame-stage">
-                      {htmlPreview ? (
-                        <iframe
-                          className="html-preview-iframe"
-                          title={htmlPreview.title}
-                          srcDoc={normalizedHtmlPreviewContent}
-                          sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
-                          referrerPolicy="no-referrer"
+                  <div className={`html-preview-frame-stage ${htmlPreviewView === "code" ? "code-mode" : "preview-mode"}`}>
+                    {htmlPreview && htmlPreviewView === "preview" ? (
+                      <iframe
+                        key={`${htmlPreview.path ?? htmlPreview.title}:${htmlPreview.streaming ? "streaming" : "complete"}`}
+                        className="html-preview-iframe"
+                        title={htmlPreview.title}
+                        srcDoc={normalizedHtmlPreviewContent}
+                        sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
+                        referrerPolicy="no-referrer"
+                      />
+                    ) : null}
+                    {htmlPreview && htmlPreviewView === "code" ? (
+                      <pre className="chat-code-block-pre html-preview-code">
+                        <code
+                          className={htmlPreviewCodeHighlight.language ? `language-${htmlPreviewCodeHighlight.language}` : undefined}
+                          dangerouslySetInnerHTML={{ __html: htmlPreviewCodeHighlight.html || "&nbsp;" }}
                         />
-                      ) : null}
-                    </div>
+                      </pre>
+                    ) : null}
                   </div>
                 </div>
               </aside>

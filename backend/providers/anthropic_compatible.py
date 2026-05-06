@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from backend.config.schema import ModelConfig
-from backend.providers.base import BaseProvider, ProviderChunk, ProviderError, ProviderResponse, TokenUsage, ToolCall
+from backend.providers.base import BaseProvider, ProviderChunk, ProviderError, ProviderResponse, TokenUsage, ToolCall, ToolCallDelta
 from backend.providers.token_estimator import estimate_message_tokens
 
 
@@ -97,6 +97,14 @@ class AnthropicCompatibleProvider(BaseProvider):
                                     if isinstance(block.get("input"), dict)
                                     else str(block.get("input", "")),
                                 }
+                                yield ProviderChunk(
+                                    type="tool_call_delta",
+                                    tool_call_delta=ToolCallDelta(
+                                        index=index,
+                                        id=tool_buffers[index]["id"] or None,
+                                        name=tool_buffers[index]["name"] or None,
+                                    ),
+                                )
                         elif event == "content_block_delta":
                             index = int(data.get("index", 0))
                             delta = data.get("delta") or {}
@@ -107,7 +115,18 @@ class AnthropicCompatibleProvider(BaseProvider):
                                     yield ProviderChunk(type="text", delta=text)
                             elif delta.get("type") == "input_json_delta":
                                 current = tool_buffers.setdefault(index, {"id": "", "name": "", "input": ""})
-                                current["input"] += str(delta.get("partial_json", ""))
+                                arguments_delta = str(delta.get("partial_json", ""))
+                                current["input"] += arguments_delta
+                                if arguments_delta:
+                                    yield ProviderChunk(
+                                        type="tool_call_delta",
+                                        tool_call_delta=ToolCallDelta(
+                                            index=index,
+                                            id=current["id"] or None,
+                                            name=current["name"] or None,
+                                            arguments_delta=arguments_delta,
+                                        ),
+                                    )
                         elif event == "message_delta":
                             delta = data.get("delta") or {}
                             if delta.get("stop_reason"):

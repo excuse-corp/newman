@@ -73,6 +73,30 @@ class WorkspacePermissionRouteTests(unittest.TestCase):
             self.assertEqual(response.content, b"\x89PNG\r\n\x1a\nmock")
             self.assertIn("inline", response.headers.get("content-disposition", ""))
 
+    def test_workspace_file_content_supports_download_disposition_for_unicode_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            target = workspace / "AI教育三年行动规划架构图.html"
+            target.write_text("<!doctype html><html></html>", encoding="utf-8")
+            settings = SimpleNamespace(
+                paths=SimpleNamespace(workspace=workspace, memory_dir=root / "memory"),
+                permissions=SimpleNamespace(
+                    readable_paths=[],
+                    writable_paths=[],
+                    protected_paths=[],
+                ),
+            )
+            client = TestClient(_build_app(settings))
+
+            response = client.get("/api/workspace/file-content", params={"path": str(target), "download": "true"})
+
+            self.assertEqual(response.status_code, 200)
+            disposition = response.headers.get("content-disposition", "")
+            self.assertIn("attachment", disposition)
+            self.assertIn("filename*=UTF-8''AI", disposition)
+
     def test_workspace_files_rejects_protected_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

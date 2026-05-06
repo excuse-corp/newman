@@ -24,7 +24,7 @@ from backend.memory.compressor import (
 from backend.memory.memory_extract import MemoryExtractor
 from backend.memory.stable_context import StableContextLoader
 from backend.plugin_runtime.service import PluginService
-from backend.providers.base import ProviderError, ProviderResponse, TokenUsage
+from backend.providers.base import ProviderError, ProviderResponse, TokenUsage, ToolCallDelta
 from backend.providers.multimodal import MultimodalAnalyzer
 from backend.providers.factory import build_provider
 from backend.rag.service import KnowledgeBaseService
@@ -62,7 +62,7 @@ from backend.tools.provider_exposure import (
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import ToolRouter, analyze_terminal_command
 from backend.tools.result import ToolExecutionResult
-from backend.tools.workspace_fs import build_path_access_policy
+from backend.tools.workspace_fs import build_path_access_policy, resolve_requested_path
 from backend.sandbox.native_sandbox import NativeSandbox
 from backend.sandbox.resource_limits import ResourceLimits
 from backend.usage.recorder import ModelRequestContext, record_model_usage
@@ -87,6 +87,10 @@ HTML_IMAGE_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 HTML_IMAGE_ATTR_RE = re.compile(r"\b(src|alt)=(['\"])(.*?)\2", re.IGNORECASE)
 DIRECT_IMAGE_SOURCE_PREFIXES = ("http://", "https://", "data:image/", "blob:")
 IMAGE_ATTACHMENT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"})
+TOOL_PREAMBLE_COMMENTARY_MAX_CHARS = 80
+TOOL_ARGUMENT_PROGRESS_EMIT_BYTES = 2_048
+TOOL_EVENT_OUTPUT_PREVIEW_MAX_CHARS = 8_000
+STRUCTURED_TOOL_PREAMBLE_RE = re.compile(r"(^|\n)\s*(?:#{1,6}\s+|\d+[.、]\s+|[-*]\s+)")
 ATTACHMENT_FIRST_REPLY_BLOCKED_TOOLS = frozenset(
     {
         "read_file",
@@ -105,6 +109,38 @@ def _build_tool_message_output(result: ToolExecutionResult) -> str:
 
     outputs = [part for part in [result.stdout.strip(), result.stderr.strip()] if part]
     return "\n".join(outputs)
+
+
+def _compact_tool_event_output_preview(value: str) -> str:
+    normalized = value.strip()
+    if len(normalized) <= TOOL_EVENT_OUTPUT_PREVIEW_MAX_CHARS:
+        return normalized
+    return (
+        normalized[:TOOL_EVENT_OUTPUT_PREVIEW_MAX_CHARS].rstrip()
+        + "\n\n... 输出较长，已截断预览。"
+    )
+
+
+def _build_tool_event_output_preview(result: ToolExecutionResult) -> str:
+    for candidate in (result.frontend_message, result.summary):
+        if candidate and candidate.strip():
+            return _compact_tool_event_output_preview(candidate)
+    return _compact_tool_event_output_preview(_build_tool_message_output(result))
+
+
+def _format_compact_bytes(value: int) -> str:
+    if value < 1024:
+        return f"{value} B"
+    if value < 1024 * 1024:
+        return f"{value / 1024:.1f} KB"
+    return f"{value / (1024 * 1024):.1f} MB"
+
+
+def _build_tool_argument_progress_summary(tool_name: str | None, argument_bytes: int) -> str:
+    tool_label = tool_name or "工具"
+    if argument_bytes > 0:
+        return f"正在准备 {tool_label} 调用参数（{_format_compact_bytes(argument_bytes)}）"
+    return f"正在准备 {tool_label} 调用参数"
 
 
 def _normalize_markdown_image_destination(raw_destination: str) -> str | None:
@@ -407,7 +443,10 @@ class NewmanRuntime:
         for _ in range(self.settings.runtime.max_tool_depth):
             group_id = task.next_action_group_id()
             self.skill_registry.sync_snapshot()
-            await self._maybe_checkpoint(task, turn_emit)
+            checkpoint_ok = await self._maybe_checkpoint(task, turn_emit)
+            if checkpoint_ok is False:
+                await self._finalize_context_irreducible(task, turn_emit, request_id=request_id)
+                return
             assembled = self._assemble_task_messages(task)
             provider_tools = self._provider_tools_for_turn(task)
 
@@ -445,7 +484,7 @@ class NewmanRuntime:
                 tool_call.arguments = self._prepare_tool_arguments(task, tool_call.name, tool_call.arguments)
 
             if not response.tool_calls:
-                final_content = response.content or response.commentary
+                final_content = response.content.strip() or response.commentary.strip()
                 assistant_message = self._build_assistant_message(
                     task,
                     final_content,
@@ -497,6 +536,16 @@ class NewmanRuntime:
 
             for tool_call in response.tool_calls:
                 task.tool_depth += 1
+                skill_usage_payload = self._skill_usage_payload_for_tool_call(tool_call.name, tool_call.arguments)
+                if skill_usage_payload is not None:
+                    await turn_emit(
+                        "skill_used",
+                        {
+                            "group_id": group_id,
+                            "tool_call_id": tool_call.id,
+                            **skill_usage_payload,
+                        },
+                    )
                 await turn_emit(
                     "tool_call_started",
                     {
@@ -553,24 +602,35 @@ class NewmanRuntime:
                     )
                 )
                 self.session_store.save(task.session)
+                finished_payload = {
+                    "group_id": group_id,
+                    "tool_call_id": tool_call.id,
+                    "tool": result.tool,
+                    "success": result.success,
+                    "category": result.category,
+                    "error_code": result.error_code,
+                    "severity": result.severity,
+                    "risk_level": result.risk_level,
+                    "recovery_class": result.recovery_class,
+                    "frontend_message": result.frontend_message,
+                    "recommended_next_step": result.recommended_next_step,
+                    "summary": result.summary,
+                    "duration_ms": result.duration_ms,
+                    "attempt_count": result.attempt_count,
+                }
+                output_preview = _build_tool_event_output_preview(result)
+                if output_preview:
+                    finished_payload["output_preview"] = output_preview
+                changed_path = result.metadata.get("path")
+                if isinstance(changed_path, str) and changed_path:
+                    finished_payload["path"] = changed_path
+                for metadata_key in ("bytes", "content_type", "created"):
+                    metadata_value = result.metadata.get(metadata_key)
+                    if metadata_value is not None:
+                        finished_payload[metadata_key] = metadata_value
                 await turn_emit(
                     "tool_call_finished",
-                    {
-                        "group_id": group_id,
-                        "tool_call_id": tool_call.id,
-                        "tool": result.tool,
-                        "success": result.success,
-                        "category": result.category,
-                        "error_code": result.error_code,
-                        "severity": result.severity,
-                        "risk_level": result.risk_level,
-                        "recovery_class": result.recovery_class,
-                        "frontend_message": result.frontend_message,
-                        "recommended_next_step": result.recommended_next_step,
-                        "summary": result.summary,
-                        "duration_ms": result.duration_ms,
-                        "attempt_count": result.attempt_count,
-                    },
+                    finished_payload,
                 )
                 if plan_payload := result.metadata.get("plan"):
                     await turn_emit(
@@ -609,7 +669,6 @@ class NewmanRuntime:
                     group_id=group_id,
                 )
                 if result.success and result.tool in {"write_file", "edit_file"}:
-                    changed_path = result.metadata.get("path")
                     if isinstance(changed_path, str) and changed_path:
                         if self._should_reload_ecosystem_for_path(changed_path):
                             self.reload_ecosystem()
@@ -660,6 +719,50 @@ class NewmanRuntime:
             for match in analysis.path_matches
         )
 
+    def _skill_usage_payload_for_tool_call(self, tool_name: str, arguments: dict[str, object]) -> dict[str, object] | None:
+        if tool_name not in {"read_file", "read_file_range"}:
+            return None
+        raw_path = arguments.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return None
+
+        try:
+            requested_path = resolve_requested_path(build_path_access_policy(self.settings), raw_path)
+        except Exception:
+            requested_path = Path(raw_path).expanduser()
+
+        try:
+            resolved_requested_path = requested_path.resolve()
+        except OSError:
+            resolved_requested_path = requested_path
+
+        try:
+            skills = self.skill_registry.list_skills()
+        except Exception:
+            return None
+
+        for skill in skills:
+            try:
+                skill_path = Path(skill.path).resolve()
+            except OSError:
+                continue
+            if skill_path != resolved_requested_path:
+                continue
+            skill_name = str(skill.name)
+            payload: dict[str, object] = {
+                "skill_name": skill_name,
+                "path": str(skill_path),
+                "summary": f"使用 {skill_name} Skill，先读取它的工作说明",
+            }
+            description = getattr(skill, "description", "")
+            if isinstance(description, str) and description.strip():
+                payload["description"] = description.strip()
+            plugin_name = getattr(skill, "plugin_name", None)
+            if isinstance(plugin_name, str) and plugin_name.strip():
+                payload["plugin_name"] = plugin_name.strip()
+            return payload
+        return None
+
     async def _stream_provider_response(
         self,
         assembled: list[dict[str, object]],
@@ -684,6 +787,10 @@ class NewmanRuntime:
         commentary_complete_pending = False
         answer_visible = False
         answer_started_emitted = False
+        defer_answer_visibility = bool(tools) and emit_answer_started_event
+        deferred_answer_deltas: list[str] = []
+        tool_signal_seen = False
+        tool_argument_progress: dict[str, dict[str, object]] = {}
 
         async def flush_commentary(*, force: bool = False, delta: str | None = None) -> None:
             nonlocal commentary_visible, commentary_complete_pending
@@ -723,12 +830,36 @@ class NewmanRuntime:
                 )
                 commentary_complete_pending = False
 
-        async def consume_parse_event(event) -> None:
+        async def emit_answer_delta(delta: str) -> None:
             nonlocal commentary_complete_pending, answer_started_emitted, answer_visible
-            if event.kind == "answer" and event.text:
-                content_parts.append(event.text)
-                if not "".join(content_parts).strip():
-                    return
+            if emit_answer_started_event and not answer_started_emitted:
+                answer_started_emitted = True
+                await emit(
+                    "answer_started",
+                    {
+                        "group_id": group_id,
+                        "model": self.settings.provider.model,
+                    },
+                )
+            answer_visible = True
+            await emit(
+                "assistant_delta",
+                {
+                    "content": "".join(content_parts),
+                    "delta": delta,
+                    "model": self.settings.provider.model,
+                },
+            )
+
+        async def flush_deferred_answer() -> None:
+            nonlocal answer_started_emitted, answer_visible
+            if not deferred_answer_deltas or tool_calls or answer_visible or not "".join(content_parts).strip():
+                return
+            visible_content_parts: list[str] = []
+            for delta in deferred_answer_deltas:
+                visible_content_parts.append(delta)
+                if not "".join(visible_content_parts).strip():
+                    continue
                 if emit_answer_started_event and not answer_started_emitted:
                     answer_started_emitted = True
                     await emit(
@@ -742,11 +873,105 @@ class NewmanRuntime:
                 await emit(
                     "assistant_delta",
                     {
-                        "content": "".join(content_parts),
-                        "delta": event.text,
+                        "content": "".join(visible_content_parts),
+                        "delta": delta,
                         "model": self.settings.provider.model,
                     },
                 )
+
+        async def prepare_for_tool_signal() -> None:
+            nonlocal answer_visible, answer_started_emitted, commentary_complete_pending, tool_signal_seen
+            if tool_signal_seen:
+                return
+            tool_signal_seen = True
+            leaked_answer = self._recover_tool_preamble_commentary("".join(content_parts))
+            if answer_visible:
+                content_parts.clear()
+                deferred_answer_deltas.clear()
+                answer_visible = False
+                answer_started_emitted = False
+                await emit(
+                    "assistant_delta",
+                    {
+                        "content": "",
+                        "delta": "",
+                        "model": self.settings.provider.model,
+                        "reset": True,
+                    },
+                )
+            elif leaked_answer:
+                content_parts.clear()
+                deferred_answer_deltas.clear()
+            elif content_parts:
+                content_parts.clear()
+                deferred_answer_deltas.clear()
+            if leaked_answer and not commentary_parts:
+                commentary_parts.append(leaked_answer)
+                commentary_complete_pending = True
+            await flush_commentary(force=True)
+
+        async def emit_tool_argument_progress(delta: ToolCallDelta) -> None:
+            if not group_id:
+                return
+            pending_key = f"pending:{delta.index}"
+            key = delta.id or pending_key
+            if delta.id and pending_key in tool_argument_progress and key not in tool_argument_progress:
+                tool_argument_progress[key] = tool_argument_progress.pop(pending_key)
+            progress = tool_argument_progress.setdefault(
+                key,
+                {
+                    "id": delta.id or pending_key,
+                    "name": delta.name,
+                    "argument_bytes": 0,
+                    "last_emit_bytes": -TOOL_ARGUMENT_PROGRESS_EMIT_BYTES,
+                    "emitted": False,
+                },
+            )
+            previous_name = progress.get("name") if isinstance(progress.get("name"), str) else None
+            if delta.id:
+                progress["id"] = delta.id
+            if delta.name:
+                progress["name"] = delta.name
+            if delta.arguments_delta:
+                progress["argument_bytes"] = int(progress.get("argument_bytes", 0)) + len(delta.arguments_delta.encode("utf-8"))
+
+            tool_name = progress.get("name") if isinstance(progress.get("name"), str) else None
+            argument_bytes = int(progress.get("argument_bytes", 0))
+            last_emit_bytes = int(progress.get("last_emit_bytes", -TOOL_ARGUMENT_PROGRESS_EMIT_BYTES))
+            should_emit = (
+                progress.get("emitted") is not True
+                or argument_bytes - last_emit_bytes >= TOOL_ARGUMENT_PROGRESS_EMIT_BYTES
+                or (delta.name is not None and delta.name != previous_name)
+            )
+            if not should_emit:
+                return
+
+            progress["emitted"] = True
+            progress["last_emit_bytes"] = argument_bytes
+            summary = _build_tool_argument_progress_summary(tool_name, argument_bytes)
+            await emit(
+                "tool_call_arguments_delta",
+                {
+                    "group_id": group_id,
+                    "tool_call_id": progress["id"],
+                    "tool": tool_name or "tool",
+                    "arguments_bytes": argument_bytes,
+                    "summary": summary,
+                    "summary_text": summary,
+                    "model": self.settings.provider.model,
+                },
+            )
+
+        async def consume_parse_event(event) -> None:
+            nonlocal commentary_complete_pending
+            if event.kind == "answer" and event.text:
+                content_parts.append(event.text)
+                if defer_answer_visibility and not answer_visible:
+                    deferred_answer_deltas.append(event.text)
+                    return
+                if not "".join(content_parts).strip():
+                    return
+                await emit_answer_delta(event.text)
                 return
             if event.kind == "thinking" and event.text:
                 thinking_parts.append(event.text)
@@ -780,26 +1005,11 @@ class NewmanRuntime:
             if chunk.type == "text" and chunk.delta:
                 for event in parser.feed(chunk.delta):
                     await consume_parse_event(event)
+            elif chunk.type == "tool_call_delta" and chunk.tool_call_delta:
+                await prepare_for_tool_signal()
+                await emit_tool_argument_progress(chunk.tool_call_delta)
             elif chunk.type == "tool_call" and chunk.tool_call:
-                leaked_answer = self._sanitize_commentary_brief("".join(content_parts))
-                if answer_visible:
-                    content_parts.clear()
-                    answer_visible = False
-                    answer_started_emitted = False
-                    await emit(
-                        "assistant_delta",
-                        {
-                            "content": "",
-                            "delta": "",
-                            "model": self.settings.provider.model,
-                            "reset": True,
-                        },
-                    )
-                elif leaked_answer:
-                    content_parts.clear()
-                if leaked_answer and not commentary_parts:
-                    commentary_parts.append(leaked_answer)
-                    commentary_complete_pending = True
+                await prepare_for_tool_signal()
                 tool_calls.append(chunk.tool_call)
                 await flush_commentary(force=True)
             elif chunk.type == "usage" and chunk.usage:
@@ -810,6 +1020,7 @@ class NewmanRuntime:
                     usage = chunk.usage
         for event in parser.flush():
             await consume_parse_event(event)
+        await flush_deferred_answer()
         await flush_commentary(force=bool(tool_calls))
         response = ProviderResponse(
             content="".join(content_parts),
@@ -902,16 +1113,17 @@ class NewmanRuntime:
     def _raise_for_empty_provider_response(self, response: ProviderResponse) -> None:
         if response.tool_calls:
             return
-        if response.content.strip() or response.commentary.strip():
+        if response.content.strip():
             return
         raise ProviderError(
             self.settings.provider.type,
             "empty_response",
-            "主模型本次返回空响应，流式响应可能被提前结束或被上游/网关截断",
+            "主模型本次没有返回可展示的最终回答或工具调用，流式响应可能被提前结束或被上游/网关截断",
             True,
             details={
                 "finish_reason": response.finish_reason,
                 "model": response.model or self.settings.provider.model,
+                "commentary_present": bool(response.commentary.strip()),
             },
         )
 
@@ -1075,7 +1287,10 @@ class NewmanRuntime:
             )
         )
         self.session_store.save(task.session)
-        await self._maybe_checkpoint(task, emit)
+        checkpoint_ok = await self._maybe_checkpoint(task, emit)
+        if checkpoint_ok is False:
+            await self._finalize_context_irreducible(task, emit, request_id=request_id)
+            return
 
         assembled = self._assemble_task_messages(task)
         try:
@@ -1180,7 +1395,10 @@ class NewmanRuntime:
             )
         )
         self.session_store.save(task.session)
-        await self._maybe_checkpoint(task, emit)
+        checkpoint_ok = await self._maybe_checkpoint(task, emit)
+        if checkpoint_ok is False:
+            await self._finalize_context_irreducible(task, emit, request_id=request_id)
+            return
 
         assembled = self._assemble_task_messages(task)
 
@@ -1298,6 +1516,59 @@ class NewmanRuntime:
         lines.append("如果你愿意，我可以先不依赖这个工具，直接基于现有上下文继续回答。")
         return "\n".join(lines)
 
+    async def _finalize_context_irreducible(
+        self,
+        task: SessionTask,
+        emit: EventEmitter,
+        *,
+        request_id: str | None = None,
+    ) -> None:
+        final_content = self._build_context_irreducible_message(task)
+        assistant_message = self._build_assistant_message(
+            task,
+            final_content,
+            request_id=request_id,
+            finish_reason="context_irreducible",
+        )
+        task.session.messages.append(assistant_message)
+        self.session_store.save(task.session)
+        await self._emit_final_response_message(
+            emit,
+            task,
+            assistant_message,
+            finish_reason="context_irreducible",
+        )
+        await emit(
+            "error",
+            {
+                "code": "NEWMAN-CONTEXT-001",
+                "message": "上下文已无法安全压缩",
+                "summary": task.session.metadata.get("last_compaction_failure_reason") or "context_irreducible",
+                "category": "context_irreducible",
+                "severity": "warning",
+                "risk_level": "medium",
+                "recovery_class": "user_action_required",
+                "retryable": False,
+                "recommended_next_step": "Start a new session, split the task, or switch to a model with a larger context window.",
+            },
+        )
+        await self._emit_hooks(
+            "SessionEnd",
+            emit,
+            session_id=task.session.session_id,
+            finish_reason="context_irreducible",
+        )
+
+    def _build_context_irreducible_message(self, task: SessionTask) -> str:
+        reason = task.session.metadata.get("last_compaction_failure_reason")
+        reason_text = f"\n原因：{reason}" if isinstance(reason, str) and reason.strip() else ""
+        return (
+            "当前会话上下文已经超过可安全继续的范围，自动压缩后仍无法腾出足够空间。"
+            "我已停止继续调用模型，避免丢失正在进行的工具链或生成不可靠结果。"
+            f"{reason_text}\n\n"
+            "建议：开启新会话继续、拆分任务，或切换到更大上下文窗口的模型。"
+        )
+
     def _build_provider_failure_message(
         self,
         result: ToolExecutionResult,
@@ -1380,6 +1651,19 @@ class NewmanRuntime:
     def _sanitize_commentary_brief(self, text: str) -> str:
         return " ".join(text.replace("\n", " ").split()).strip()
 
+    def _recover_tool_preamble_commentary(self, text: str) -> str:
+        raw = text.strip()
+        if not raw:
+            return ""
+        normalized = self._sanitize_commentary_brief(raw)
+        if not normalized:
+            return ""
+        if "\n" in raw or STRUCTURED_TOOL_PREAMBLE_RE.search(raw):
+            return ""
+        if len(normalized) > TOOL_PREAMBLE_COMMENTARY_MAX_CHARS:
+            return ""
+        return normalized
+
     def _current_turn_user_content(self, session, turn_id: str) -> str:
         current_turn_message = self._current_turn_user_message(session, turn_id)
         if current_turn_message is not None:
@@ -1419,6 +1703,57 @@ class NewmanRuntime:
 
     def _should_block_file_browsing_tools_for_attachment_turn(self, task: SessionTask) -> bool:
         return task.tool_depth == 0 and self._turn_has_parsed_attachment_context(task.session, task.turn_id or "")
+
+    def _should_allow_skill_read_for_attachment_turn(self, task: SessionTask) -> bool:
+        if not self._should_block_file_browsing_tools_for_attachment_turn(task):
+            return False
+        user_content = self._current_turn_user_content(task.session, task.turn_id)
+        terms = self._skill_relevance_terms(user_content)
+        if not terms:
+            return False
+        skill_registry = getattr(self, "skill_registry", None)
+        list_skills = getattr(skill_registry, "list_skills", None)
+        if not callable(list_skills):
+            return False
+        try:
+            skills = list_skills()
+        except Exception:
+            return False
+        for skill in skills:
+            fields = [
+                str(getattr(skill, "name", "") or ""),
+                str(getattr(skill, "description", "") or ""),
+                str(getattr(skill, "when_to_use", "") or ""),
+                str(getattr(skill, "summary", "") or ""),
+            ]
+            skill_path = getattr(skill, "path", "")
+            if isinstance(skill_path, str) and skill_path:
+                try:
+                    path = Path(skill_path)
+                    if path.is_file():
+                        fields.append(path.read_text(encoding="utf-8", errors="replace")[:20_000])
+                except OSError:
+                    pass
+            haystack = "\n".join(fields).casefold()
+            if any(term in haystack for term in terms):
+                return True
+        return False
+
+    def _skill_relevance_terms(self, user_content: str | None) -> set[str]:
+        normalized = (user_content or "").casefold().strip()
+        if not normalized:
+            return set()
+
+        terms = {
+            match.group(0)
+            for match in re.finditer(r"[a-z0-9][a-z0-9_-]{2,}", normalized)
+        }
+        for match in re.finditer(r"[\u4e00-\u9fff]{3,}", normalized):
+            phrase = match.group(0)
+            for width in range(3, min(6, len(phrase)) + 1):
+                for index in range(0, len(phrase) - width + 1):
+                    terms.add(phrase[index : index + width].casefold())
+        return terms
 
     def _assemble_task_messages(
         self,
@@ -1483,10 +1818,13 @@ class NewmanRuntime:
                 filtered_tools.append(tool.to_provider_schema())
                 existing_names.add(tool_name)
         if self._should_block_file_browsing_tools_for_attachment_turn(task):
+            blocked_tools = set(ATTACHMENT_FIRST_REPLY_BLOCKED_TOOLS)
+            if self._should_allow_skill_read_for_attachment_turn(task):
+                blocked_tools.discard("read_file")
             filtered_tools = [
                 schema
                 for schema in filtered_tools
-                if str(schema.get("function", {}).get("name", "")) not in ATTACHMENT_FIRST_REPLY_BLOCKED_TOOLS
+                if str(schema.get("function", {}).get("name", "")) not in blocked_tools
             ]
         return filtered_tools
 
@@ -1706,7 +2044,7 @@ class NewmanRuntime:
                 payload["group_id"] = group_id
             await emit("hook_triggered", payload)
 
-    async def _maybe_checkpoint(self, task: SessionTask, emit: EventEmitter) -> None:
+    async def _maybe_checkpoint(self, task: SessionTask, emit: EventEmitter) -> bool:
         assembled = self._assemble_task_messages(task)
         latest_record = self._latest_context_record(task.session.session_id)
         context_usage = build_context_usage_snapshot(
@@ -1722,11 +2060,14 @@ class NewmanRuntime:
         auto_compact_limit = context_usage.auto_compact_limit
         if projected_next_prompt_tokens < auto_compact_limit:
             self._reset_compaction_state(task)
-            return
+            return True
+
+        if self._context_irreducible(task):
+            return False
 
         if self._compaction_fail_streak(task) >= self.settings.runtime.context_compaction_max_failures:
             self._mark_compaction_failure(task, irreducible=True, reason="max_failures_reached")
-            return
+            return False
 
         critical = context_usage.projected_pressure >= self.settings.runtime.context_critical_threshold
         preserve_recent = self.settings.runtime.context_compaction_preserve_recent
@@ -1745,7 +2086,7 @@ class NewmanRuntime:
             )
             if microcompact_usage.projected_next_prompt_tokens < microcompact_usage.auto_compact_limit:
                 self._reset_compaction_state(task)
-                return
+                return True
 
         original_count = len(task.session.messages)
         checkpoint = self.checkpoints.get(task.session.session_id)
@@ -1762,7 +2103,7 @@ class NewmanRuntime:
         )
         if not summary_result:
             self._mark_compaction_failure(task, irreducible=True, reason="nothing_to_compress")
-            return
+            return False
         _, preserved_messages = split_session_messages(task.session, preserve_recent=preserve_recent)
         task.session.messages = preserved_messages
         task.session.metadata["checkpoint_active"] = True
@@ -1803,6 +2144,7 @@ class NewmanRuntime:
                 "compression_level": checkpoint.metadata.get("compression_level", "normal"),
             },
         )
+        return not self._context_irreducible(task)
 
     def _latest_context_record(self, session_id: str):
         if self.usage_store is None:
@@ -1815,6 +2157,9 @@ class NewmanRuntime:
     def _compaction_fail_streak(self, task: SessionTask) -> int:
         raw_value = task.session.metadata.get("compaction_fail_streak")
         return raw_value if isinstance(raw_value, int) and raw_value >= 0 else 0
+
+    def _context_irreducible(self, task: SessionTask) -> bool:
+        return task.session.metadata.get("context_irreducible") is True
 
     def _reset_compaction_state(self, task: SessionTask) -> None:
         task.session.metadata["compaction_fail_streak"] = 0
@@ -1888,7 +2233,73 @@ class NewmanRuntime:
         except ValueError:
             return None
 
-    def _build_assistant_attachments(self, content: str) -> list[dict[str, object]]:
+    def _build_file_attachment(
+        self,
+        path: Path,
+        *,
+        summary: str = "",
+        seen_paths: set[str],
+        source: str = "assistant_output",
+    ) -> dict[str, object] | None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return None
+        if not resolved.exists() or not resolved.is_file():
+            return None
+
+        path_key = str(resolved)
+        if path_key in seen_paths:
+            return None
+        seen_paths.add(path_key)
+
+        content_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+        suffix = resolved.suffix.lower()
+        if content_type.startswith("image/") or suffix in IMAGE_ATTACHMENT_SUFFIXES:
+            kind = "image"
+        elif suffix in {".html", ".htm"} or content_type == "text/html":
+            kind = "html"
+            content_type = "text/html"
+        else:
+            kind = "document"
+
+        return {
+            "attachment_id": uuid4().hex,
+            "source": source,
+            "kind": kind,
+            "filename": resolved.name,
+            "extension": suffix,
+            "content_type": content_type,
+            "size_bytes": resolved.stat().st_size,
+            "path": str(resolved),
+            "workspace_relative_path": self._workspace_relative_path(resolved),
+            "summary": summary.strip(),
+            "analysis_status": "completed",
+        }
+
+    def _build_turn_output_file_attachments(self, task: SessionTask, seen_paths: set[str]) -> list[dict[str, object]]:
+        attachments: list[dict[str, object]] = []
+        for message in task.session.messages:
+            if message.role != "tool":
+                continue
+            metadata = message.metadata
+            if metadata.get("turn_id") != task.turn_id or metadata.get("success") is not True:
+                continue
+            if metadata.get("tool") not in {"write_file", "edit_file"}:
+                continue
+            raw_path = metadata.get("path")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            attachment = self._build_file_attachment(
+                Path(raw_path),
+                summary=str(metadata.get("summary") or "生成文件"),
+                seen_paths=seen_paths,
+            )
+            if attachment is not None:
+                attachments.append(attachment)
+        return attachments
+
+    def _build_assistant_attachments(self, task: SessionTask, content: str) -> list[dict[str, object]]:
         attachments: list[dict[str, object]] = []
         seen_paths: set[str] = set()
 
@@ -1897,27 +2308,15 @@ class NewmanRuntime:
             if path is None:
                 continue
 
-            path_key = str(path)
-            if path_key in seen_paths:
-                continue
-            seen_paths.add(path_key)
-
-            summary = (alt_text or "").strip()
-            attachments.append(
-                {
-                    "attachment_id": uuid4().hex,
-                    "source": "assistant_output",
-                    "kind": "image",
-                    "filename": path.name,
-                    "extension": path.suffix.lower(),
-                    "content_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
-                    "size_bytes": path.stat().st_size,
-                    "path": str(path),
-                    "workspace_relative_path": self._workspace_relative_path(path),
-                    "summary": summary,
-                    "analysis_status": "completed",
-                }
+            attachment = self._build_file_attachment(
+                path,
+                summary=alt_text or "",
+                seen_paths=seen_paths,
             )
+            if attachment is not None:
+                attachments.append(attachment)
+
+        attachments.extend(self._build_turn_output_file_attachments(task, seen_paths))
         return attachments
 
     def _build_assistant_message(
@@ -1928,7 +2327,7 @@ class NewmanRuntime:
         request_id: str | None,
         finish_reason: str,
     ) -> SessionMessage:
-        attachments = self._build_assistant_attachments(content)
+        attachments = self._build_assistant_attachments(task, content)
         extra: dict[str, object] = {"finish_reason": finish_reason}
         if attachments:
             extra["attachments"] = attachments
@@ -1987,9 +2386,14 @@ class NewmanRuntime:
             "risk_level": result.risk_level,
             "recovery_class": result.recovery_class,
             "frontend_message": result.frontend_message,
+            "summary": result.summary,
             "recommended_next_step": result.recommended_next_step,
             "content_persisted": persisted_output == model_output,
         }
+        for metadata_key in ("path", "bytes", "content_type", "created", "replacements"):
+            metadata_value = result.metadata.get(metadata_key)
+            if metadata_value is not None:
+                metadata[metadata_key] = metadata_value
         if persisted_output != model_output:
             task.transient_tool_messages[tool_call_id] = SessionMessage(
                 id=uuid4().hex,

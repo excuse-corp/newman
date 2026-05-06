@@ -138,6 +138,7 @@ class ToolOrchestrator:
                 async def emit_tool_output(stream: str, delta: str) -> None:
                     if not tool_call_id:
                         return
+                    raw_path = arguments.get("path") if isinstance(arguments, dict) else None
                     await emit(
                         "tool_call_output_delta",
                         {
@@ -146,6 +147,8 @@ class ToolOrchestrator:
                             "tool": tool.meta.name,
                             "stream": stream,
                             "delta": delta,
+                            "arguments": arguments,
+                            **({"path": raw_path} if isinstance(raw_path, str) and raw_path else {}),
                         },
                     )
 

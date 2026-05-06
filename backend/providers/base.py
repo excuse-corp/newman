@@ -13,6 +13,14 @@ class ToolCall:
 
 
 @dataclass
+class ToolCallDelta:
+    index: int
+    id: str | None = None
+    name: str | None = None
+    arguments_delta: str = ""
+
+
+@dataclass
 class TokenUsage:
     input_tokens: int = 0
     output_tokens: int = 0
@@ -24,6 +32,7 @@ class ProviderChunk:
     type: str
     delta: str = ""
     tool_call: ToolCall | None = None
+    tool_call_delta: ToolCallDelta | None = None
     finish_reason: str | None = None
     usage: TokenUsage | None = None
 

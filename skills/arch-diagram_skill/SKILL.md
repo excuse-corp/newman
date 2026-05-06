@@ -154,9 +154,6 @@ Produce a single self-contained `.html` file and save it to `/mnt/user-data/outp
   <button class="btn btn-dl"   onclick="saveHTML()">⬇ 下载 HTML</button>
   <button class="btn btn-png"  id="pngBtn" onclick="exportPNG()">📷 导出 PNG</button>
 </div>
-<div id="tip" style="max-width:1200px;margin:0 auto 14px;padding:9px 14px;background:#fffbeb;border:1.5px solid #fcd34d;border-radius:8px;font-size:12.5px;color:#92400e;display:none">
-  💡 在 claude.ai 预览中无法直接导出 PNG。请点击「下载 HTML」，在浏览器本地打开后再点「导出 PNG」即可。
-</div>
 
 <div id="diagram">
   <!-- YOUR GENERATED LAYERS HERE -->
@@ -166,22 +163,8 @@ Produce a single self-contained `.html` file and save it to `/mnt/user-data/outp
 <script>
 const _origHTML = document.getElementById('diagram').innerHTML;
 
-function isSandboxed() {
-  try { return window.self !== window.top; } catch(e) { return true; }
-}
-
-window.addEventListener('load', () => {
-  if (isSandboxed()) {
-    document.getElementById('tip').style.display = 'block';
-  }
-});
-
 function saveHTML() {
-  const tip = document.getElementById('tip');
-  const prev = tip.style.display;
-  tip.style.display = 'none';
   const html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
-  tip.style.display = prev;
   const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -193,10 +176,6 @@ function saveHTML() {
 }
 
 async function exportPNG() {
-  if (isSandboxed()) {
-    alert('在 claude.ai 预览中无法导出 PNG。\n请先点击「下载 HTML」，在浏览器本地打开后再导出。');
-    return;
-  }
   if (typeof html2canvas === 'undefined') {
     alert('导出库加载失败，请检查网络后刷新重试。');
     return;

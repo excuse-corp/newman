@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import { highlightCode } from "./codeHighlight";
+import { highlightCode, inferLanguageFromPath } from "./codeHighlight";
 
 export type ChatAttachment = {
   id: string;
@@ -24,6 +24,11 @@ export type ChatAttachment = {
 export type HtmlPreviewPayload = {
   content: string;
   title: string;
+  source?: "code_block" | "write_file";
+  path?: string | null;
+  streaming?: boolean;
+  initialView?: "preview" | "code";
+  language?: string | null;
 };
 
 type MessageContentProps = {
@@ -146,13 +151,16 @@ function renderUserText(content: string) {
   });
 }
 
-function buildWorkspaceFileUrl(apiBase: string, path: string) {
+function buildWorkspaceFileUrl(apiBase: string, path: string, options?: { download?: boolean }) {
   const url = new URL(`${apiBase}/api/workspace/file-content`);
   url.searchParams.set("path", path);
+  if (options?.download) {
+    url.searchParams.set("download", "true");
+  }
   return url.toString();
 }
 
-function buildAttachmentUrl(apiBase: string, attachment: ChatAttachment) {
+function buildAttachmentUrl(apiBase: string, attachment: ChatAttachment, options?: { download?: boolean }) {
   if (attachment.previewUrl) {
     return attachment.previewUrl;
   }
@@ -164,6 +172,9 @@ function buildAttachmentUrl(apiBase: string, attachment: ChatAttachment) {
     `${apiBase}${useAttachmentContentRoute ? "/api/workspace/attachment-content" : "/api/workspace/file-content"}`,
   );
   url.searchParams.set("path", attachment.path);
+  if (options?.download) {
+    url.searchParams.set("download", "true");
+  }
   return url.toString();
 }
 
@@ -258,14 +269,6 @@ function buildMarkdownImageUrl(apiBase: string, source: string, attachment: Chat
   return buildWorkspaceFileUrl(apiBase, normalizedSource);
 }
 
-function getAttachmentExtension(attachment: ChatAttachment) {
-  if (attachment.extension) {
-    return attachment.extension.replace(/^\./, "").toUpperCase();
-  }
-  const suffix = attachment.filename.split(".").pop()?.trim().toLowerCase() ?? "";
-  return suffix ? suffix.toUpperCase() : "FILE";
-}
-
 function isImageAttachment(attachment: ChatAttachment) {
   const contentType = attachment.contentType.toLowerCase();
   if (contentType.startsWith("image/")) {
@@ -275,21 +278,72 @@ function isImageAttachment(attachment: ChatAttachment) {
   return extension === ".png" || extension === ".jpg" || extension === ".jpeg" || extension === ".webp";
 }
 
+function isHtmlAttachment(attachment: ChatAttachment) {
+  const extension = (attachment.extension ?? `.${attachment.filename.split(".").pop() ?? ""}`).toLowerCase();
+  return attachment.kind === "html" || attachment.contentType.toLowerCase() === "text/html" || extension === ".html" || extension === ".htm";
+}
+
+function inferAttachmentPreviewLanguage(attachment: ChatAttachment) {
+  return (
+    inferLanguageFromPath(attachment.path) ??
+    inferLanguageFromPath(attachment.workspaceRelativePath) ??
+    inferLanguageFromPath(attachment.filename)
+  );
+}
+
 function AttachmentFileCard({
+  apiBase,
   attachment,
   href,
+  onOpenHtmlPreview,
   tone = "user",
 }: {
+  apiBase: string;
   attachment: ChatAttachment;
   href: string | null;
+  onOpenHtmlPreview?: (payload: HtmlPreviewPayload) => void;
   tone?: "assistant" | "user";
 }) {
-  const cardTitle = attachment.summary || attachment.analysisError || attachment.filename;
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const cardTitle = attachment.filename;
+  const isHtml = isHtmlAttachment(attachment);
+  const previewLanguage = isHtml ? "html" : inferAttachmentPreviewLanguage(attachment);
+  const canPreviewAttachment = Boolean(href && onOpenHtmlPreview && previewLanguage);
+  const downloadHref = attachment.path ? buildAttachmentUrl(apiBase, attachment, { download: true }) : href;
+
+  const previewAttachment = async () => {
+    if (!href || !onOpenHtmlPreview || previewLoading) {
+      return;
+    }
+    setPreviewLoading(true);
+    setPreviewError(null);
+    try {
+      const response = await fetch(href);
+      if (!response.ok) {
+        throw new Error(`预览加载失败：${response.status}`);
+      }
+      const html = await response.text();
+      onOpenHtmlPreview({
+        content: html,
+        title: attachment.filename,
+        source: "write_file",
+        path: attachment.path,
+        streaming: false,
+        initialView: isHtml ? "preview" : "code",
+        language: previewLanguage,
+      });
+    } catch (error) {
+      setPreviewError(error instanceof Error ? error.message : "预览加载失败");
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
   const content = (
-    <>
-      <span className="chat-attachment-file-badge">{getAttachmentExtension(attachment)}</span>
+    <div className="chat-attachment-file-main">
       <strong className="chat-attachment-file-name">{attachment.filename}</strong>
-    </>
+    </div>
   );
 
   if (!href) {
@@ -301,16 +355,27 @@ function AttachmentFileCard({
   }
 
   return (
-    <a
-      className={joinClassNames("chat-attachment-file", tone === "assistant" && "assistant")}
-      href={href}
-      target="_blank"
-      rel="noreferrer"
-      title={cardTitle}
-      aria-label={`打开附件 ${attachment.filename}`}
-    >
+    <div className={joinClassNames("chat-attachment-file", "actionable", tone === "assistant" && "assistant")} title={cardTitle}>
       {content}
-    </a>
+      <div className="chat-attachment-file-actions">
+        {canPreviewAttachment ? (
+          <button
+            type="button"
+            className="chat-attachment-file-action"
+            onClick={() => void previewAttachment()}
+            disabled={previewLoading}
+          >
+            {previewLoading ? "预览中" : "预览"}
+          </button>
+        ) : null}
+        {downloadHref ? (
+          <a className="chat-attachment-file-action ghost" href={downloadHref} download={attachment.filename}>
+            下载
+          </a>
+        ) : null}
+      </div>
+      {previewError ? <span className="chat-attachment-file-error">{previewError}</span> : null}
+    </div>
   );
 }
 
@@ -319,6 +384,7 @@ function AttachmentGallery({
   attachments,
   failedAttachmentIds,
   onPreview,
+  onOpenHtmlPreview,
   onAttachmentError,
   tone = "user",
   ariaLabel,
@@ -327,6 +393,7 @@ function AttachmentGallery({
   attachments: ChatAttachment[];
   failedAttachmentIds: string[];
   onPreview: (attachment: ChatAttachment, src: string) => void;
+  onOpenHtmlPreview?: (payload: HtmlPreviewPayload) => void;
   onAttachmentError: (attachmentId: string) => void;
   tone?: "assistant" | "user";
   ariaLabel: string;
@@ -336,7 +403,16 @@ function AttachmentGallery({
       {attachments.map((attachment) => {
         const src = buildAttachmentUrl(apiBase, attachment);
         if (!isImageAttachment(attachment)) {
-          return <AttachmentFileCard key={attachment.id} attachment={attachment} href={src} tone={tone} />;
+          return (
+            <AttachmentFileCard
+              key={attachment.id}
+              apiBase={apiBase}
+              attachment={attachment}
+              href={src}
+              onOpenHtmlPreview={onOpenHtmlPreview}
+              tone={tone}
+            />
+          );
         }
         if (!src) {
           return (
@@ -617,6 +693,8 @@ function MarkdownCodeBlock({
                 onOpenHtmlPreview?.({
                   content: codeText,
                   title: buildHtmlPreviewTitle(codeText),
+                  source: "code_block",
+                  streaming: false,
                 })
               }
             >
@@ -740,6 +818,7 @@ export default function MessageContent({
               attachments={attachments}
               failedAttachmentIds={failedAttachmentIds}
               onPreview={(attachment, src) => setPreview({ attachment, src })}
+              onOpenHtmlPreview={onOpenHtmlPreview}
               onAttachmentError={(attachmentId) =>
                 setFailedAttachmentIds((current) => (current.includes(attachmentId) ? current : [...current, attachmentId]))
               }
@@ -790,6 +869,7 @@ export default function MessageContent({
             attachments={assistantLooseAttachments}
             failedAttachmentIds={failedAttachmentIds}
             onPreview={(attachment, src) => setPreview({ attachment, src })}
+            onOpenHtmlPreview={onOpenHtmlPreview}
             onAttachmentError={(attachmentId) =>
               setFailedAttachmentIds((current) => (current.includes(attachmentId) ? current : [...current, attachmentId]))
             }
