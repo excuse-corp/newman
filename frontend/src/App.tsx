@@ -272,7 +272,7 @@ type LiveAnswerQueueItem =
     };
 
 const LIVE_ANSWER_MAX_CHARS_PER_FRAME = 28;
-const LIVE_STREAM_BROWSER_YIELD_EVERY_EVENTS = 8;
+const LIVE_STREAM_BROWSER_YIELD_EVERY_EVENTS = 4;
 
 type PendingFinalAnswer = {
   localId: string;
@@ -998,6 +998,12 @@ const TOOL_SEMANTIC_MAP: Record<
   list_files: { label: "list_files", cardType: "file", runningText: "我先整理一下文件列表", completedText: "文件列表我已经拿到了" },
   search_files: { label: "search_files", cardType: "search", runningText: "我先检索一下相关文件", completedText: "相关文件我已经找到了" },
   grep: { label: "grep", cardType: "search", runningText: "我先搜索一下文件内容", completedText: "匹配内容我已经找到了" },
+  google_search: {
+    label: "google_search",
+    cardType: "search",
+    runningText: "我先搜索相关网页资料",
+    completedText: "网页搜索结果我已经拿到了"
+  },
   fetch_url: { label: "fetch_url", cardType: "network", runningText: "我先看一下网页资料", completedText: "网页资料我已经取回来了" },
   terminal: { label: "terminal", cardType: "terminal", runningText: "我先运行一条命令确认情况", completedText: "命令我已经执行完了" },
   write_file: { label: "write_file", cardType: "file", runningText: "我先创建对应文件", completedText: "文件我已经创建好了" },
@@ -1607,6 +1613,43 @@ function formatCompactPath(path: string | null | undefined) {
   return `${extractName(parent)}/${fileName}`;
 }
 
+const HASH_PATH_SEGMENT_RE = /^[0-9a-f]{16,}$/i;
+const COMPACT_HASH_PATH_RE = /(?:…\/)?(?:[0-9a-f]{16,}\/)+[0-9a-f]{16,}(?:\.[A-Za-z0-9]+)?/gi;
+
+function isHashPathSegment(value: string) {
+  const stem = value.replace(/\.[^.]+$/, "");
+  return HASH_PATH_SEGMENT_RE.test(stem);
+}
+
+function formatToolPathTarget(path: string | null | undefined) {
+  if (!path) {
+    return null;
+  }
+  const normalized = path.trim().replace(/\\/g, "/");
+  if (!normalized) {
+    return null;
+  }
+  if (`/${normalized}`.includes("/parser_outputs/chat/")) {
+    return "匹配到的解析文档";
+  }
+  if (`/${normalized}`.includes("/user_uploads/chat/")) {
+    return "上传附件";
+  }
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length >= 2 && isHashPathSegment(parts[parts.length - 1]) && parts.slice(0, -1).some(isHashPathSegment)) {
+    return "内部生成文档";
+  }
+  return formatCompactPath(path);
+}
+
+function sanitizeActionBriefForDisplay(value: string) {
+  return value
+    .replace(/(?:…\/)?(?:parser_outputs|user_uploads)\/chat\/[^\s，。；,;]+/gi, "匹配到的解析文档")
+    .replace(COMPACT_HASH_PATH_RE, "匹配到的解析文档")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function getEventPathValue(eventData: Record<string, unknown>) {
   const argumentsPayload = extractEventArguments(eventData);
   const rawPath =
@@ -1728,7 +1771,12 @@ function looksStructuredTimelineCopy(raw: string, normalized: string) {
 function isWeakProgressPrimaryText(value: string | null | undefined) {
   const raw = value ?? "";
   const normalized = raw.replace(/\s+/g, " ").trim();
-  if (!normalized || normalized === "我先继续处理这一步") {
+  if (
+    !normalized ||
+    normalized === "我先继续处理这一步" ||
+    normalized === "我先获取完成任务需要的信息" ||
+    /^正在准备 .+ 调用参数(?:（[^）]+）)?$/.test(normalized)
+  ) {
     return true;
   }
   return looksStructuredTimelineCopy(raw, normalized);
@@ -1759,12 +1807,14 @@ function resolveToolTarget(toolName: string | null | undefined, eventData: Recor
     (typeof eventData.path === "string" ? eventData.path : null) ??
     (argumentsPayload && typeof argumentsPayload.path === "string" ? argumentsPayload.path : null);
   if (rawPath) {
-    return formatCompactPath(rawPath);
+    return formatToolPathTarget(rawPath);
   }
 
   const rawQuery =
     (typeof eventData.query === "string" ? eventData.query : null) ??
-    (argumentsPayload && typeof argumentsPayload.query === "string" ? argumentsPayload.query : null);
+    (typeof eventData.q === "string" ? eventData.q : null) ??
+    (argumentsPayload && typeof argumentsPayload.query === "string" ? argumentsPayload.query : null) ??
+    (argumentsPayload && typeof argumentsPayload.q === "string" ? argumentsPayload.q : null);
   if (rawQuery) {
     return `「${compactString(rawQuery, 36)}」相关资料`;
   }
@@ -1821,9 +1871,14 @@ function resolveProgressPrimaryText(
   _userPrompt?: string | null
 ) {
   const semantic = resolveToolSemantic(toolName);
+  const actionBrief = typeof eventData.action_brief === "string" ? eventData.action_brief.trim() : "";
   const summaryText = typeof eventData.summary_text === "string" ? eventData.summary_text : null;
   const target = resolveToolTarget(toolName, eventData);
   const skillName = resolveSkillNameFromEventData(eventData);
+
+  if (actionBrief) {
+    return compactString(sanitizeActionBriefForDisplay(actionBrief), TIMELINE_PRIMARY_TEXT_MAX_CHARS);
+  }
 
   if (summaryText) {
     return summaryText;
@@ -1847,6 +1902,9 @@ function resolveProgressPrimaryText(
     }
     if (toolName === "search_files" || toolName === "grep") {
       return target ? `我先检索 ${target}，定位相关内容` : semantic.runningText;
+    }
+    if (toolName === "google_search") {
+      return target ? `我先搜索 ${target}，确认可引用的信息来源` : semantic.runningText;
     }
     if (toolName === "list_dir" || toolName === "list_files") {
       return target ? `我先查看 ${target} 的结构` : semantic.runningText;
@@ -1890,6 +1948,9 @@ function resolveProgressPrimaryText(
   }
   if (toolName === "list_dir" || toolName === "list_files") {
     return target ? `已确认 ${target} 的结构` : semantic.completedText;
+  }
+  if (toolName === "google_search") {
+    return target ? `已拿到 ${target} 的搜索结果` : semantic.completedText;
   }
   if (toolName === "update_plan") {
     return "执行步骤我已经整理好了";
@@ -2162,6 +2223,78 @@ function dedupeSessionEvents(events: SessionEventPayload[]) {
     deduped.push(event);
   });
   return deduped.sort((left, right) => left.ts - right.ts);
+}
+
+function readLiveEventText(event: SessionEventPayload, key: string) {
+  const value = event.data[key];
+  return typeof value === "string" ? value : "";
+}
+
+function hasLiveEventText(event: SessionEventPayload, key: string) {
+  return Boolean(readLiveEventText(event, key));
+}
+
+function sameLiveEventScope(left: SessionEventPayload, right: SessionEventPayload, keys: string[]) {
+  if (left.event !== right.event || left.request_id !== right.request_id) {
+    return false;
+  }
+  return keys.every((key) => readLiveEventText(left, key) === readLiveEventText(right, key));
+}
+
+function mergeLiveSessionEvent(previous: SessionEventPayload, next: SessionEventPayload) {
+  if (
+    next.event === "tool_call_output_delta" &&
+    hasLiveEventText(next, "tool_call_id") &&
+    sameLiveEventScope(previous, next, ["turn_id", "group_id", "tool_call_id", "stream"])
+  ) {
+    return {
+      ...next,
+      data: {
+        ...previous.data,
+        ...next.data,
+        delta: `${readLiveEventText(previous, "delta")}${readLiveEventText(next, "delta")}`,
+      },
+    };
+  }
+
+  if (
+    next.event === "tool_call_arguments_delta" &&
+    hasLiveEventText(next, "tool_call_id") &&
+    sameLiveEventScope(previous, next, ["turn_id", "group_id", "tool_call_id"])
+  ) {
+    return next;
+  }
+
+  if (
+    (next.event === "thinking_delta" || next.event === "commentary_delta") &&
+    (hasLiveEventText(next, "turn_id") || hasLiveEventText(next, "group_id")) &&
+    sameLiveEventScope(previous, next, ["turn_id", "group_id"])
+  ) {
+    return {
+      ...next,
+      data: {
+        ...previous.data,
+        ...next.data,
+        delta: `${readLiveEventText(previous, "delta")}${readLiveEventText(next, "delta")}`,
+      },
+    };
+  }
+
+  return null;
+}
+
+function coalesceLiveSessionEvents(events: SessionEventPayload[]) {
+  const coalesced: SessionEventPayload[] = [];
+  events.forEach((event) => {
+    const previous = coalesced[coalesced.length - 1];
+    const merged = previous ? mergeLiveSessionEvent(previous, event) : null;
+    if (merged) {
+      coalesced[coalesced.length - 1] = merged;
+      return;
+    }
+    coalesced.push(event);
+  });
+  return coalesced;
 }
 
 function mapSessionSummary(record: SessionSummaryRecord): ChatSession {
@@ -2944,7 +3077,7 @@ function resolveProgressNodePrimaryText(
   eventName: SessionEventPayload["event"],
   proposedText: string
 ) {
-  const normalized = proposedText.trim();
+  const normalized = sanitizeActionBriefForDisplay(proposedText).trim();
   if (!node) {
     return normalized;
   }
@@ -3039,8 +3172,10 @@ function buildTimelineNodes(
     const rawCommentary =
       typeof message.metadata.commentary === "string" && message.metadata.commentary
         ? message.metadata.commentary
-        : message.content;
-    const commentary = summarizeCommentaryContent(rawCommentary, "");
+        : typeof message.metadata.action_brief === "string" && message.metadata.action_brief
+          ? message.metadata.action_brief
+          : message.content;
+    const commentary = summarizeCommentaryContent(sanitizeActionBriefForDisplay(rawCommentary), "");
     if (commentary) {
       commentaryByGroupId.set(groupId, commentary);
     }
@@ -3227,10 +3362,17 @@ function buildTimelineNodes(
         return;
       }
       const skillName = resolveSkillNameFromEventData(eventData) ?? "Skill";
-      const primaryText =
-        typeof eventData.summary === "string" && eventData.summary
-          ? eventData.summary
-          : `使用 ${skillName} Skill，先读取它的工作说明`;
+      const proposedText =
+        typeof eventData.action_brief === "string" && eventData.action_brief
+          ? eventData.action_brief
+          : typeof eventData.summary === "string" && eventData.summary
+            ? eventData.summary
+            : `使用 ${skillName} Skill，先读取它的工作说明`;
+      const primaryText = resolveProgressNodePrimaryText(
+        progressNodeByGroupId.get(groupId) ?? null,
+        event.event,
+        proposedText
+      );
       const node = ensureProgressNode(groupId, event, primaryText);
       const item = buildSkillSecondaryItem(node.id, event);
       upsertProgressSecondaryItem(node, item);
@@ -3266,15 +3408,17 @@ function buildTimelineNodes(
         resolveProgressNodePrimaryText(
           progressNodeByGroupId.get(groupId) ?? null,
           event.event,
-          typeof eventData.summary_text === "string" && eventData.summary_text
-            ? eventData.summary_text
-            : resolveProgressPrimaryText(
-                "tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null,
-                "running",
-                eventData,
-                null,
-                userPrompt
-              )
+          typeof eventData.action_brief === "string" && eventData.action_brief
+            ? eventData.action_brief
+            : typeof eventData.summary_text === "string" && eventData.summary_text
+              ? eventData.summary_text
+              : resolveProgressPrimaryText(
+                  "tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null,
+                  "running",
+                  eventData,
+                  null,
+                  userPrompt
+                )
         );
       const node = ensureProgressNode(groupId, event, primaryText);
       const item = buildToolSecondaryItem(node.id, event, "running", null, userPrompt);
@@ -4015,6 +4159,8 @@ function App() {
   const shouldAutoScrollRef = useRef(true);
   const attachmentPreviewUrlsRef = useRef<string[]>([]);
   const liveAttachmentUrlsRef = useRef<string[]>([]);
+  const liveSessionEventQueueRef = useRef<SessionEventPayload[]>([]);
+  const liveSessionEventFlushFrameRef = useRef<number | null>(null);
   const liveAnswerQueueRef = useRef<LiveAnswerQueueItem[]>([]);
   const liveAnswerFlushFrameRef = useRef<number | null>(null);
   const pendingFinalAnswerRef = useRef<PendingFinalAnswer | null>(null);
@@ -4047,6 +4193,38 @@ function App() {
     liveAnswerQueueRef.current = [];
     pendingFinalAnswerRef.current = null;
     resolveLiveAnswerDrain();
+  };
+
+  const flushLiveSessionEventQueue = () => {
+    liveSessionEventFlushFrameRef.current = null;
+    const queuedEvents = liveSessionEventQueueRef.current;
+    if (queuedEvents.length === 0) {
+      return;
+    }
+    liveSessionEventQueueRef.current = [];
+    setLiveSessionEvents((currentEvents) => coalesceLiveSessionEvents([...currentEvents, ...queuedEvents]));
+  };
+
+  const scheduleLiveSessionEventFlush = () => {
+    if (liveSessionEventFlushFrameRef.current !== null) {
+      return;
+    }
+    liveSessionEventFlushFrameRef.current = window.requestAnimationFrame(() => {
+      flushLiveSessionEventQueue();
+    });
+  };
+
+  const enqueueLiveSessionEvent = (payload: SessionEventPayload) => {
+    liveSessionEventQueueRef.current.push(payload);
+    scheduleLiveSessionEventFlush();
+  };
+
+  const resetLiveSessionEventQueue = () => {
+    if (liveSessionEventFlushFrameRef.current !== null) {
+      window.cancelAnimationFrame(liveSessionEventFlushFrameRef.current);
+      liveSessionEventFlushFrameRef.current = null;
+    }
+    liveSessionEventQueueRef.current = [];
   };
 
   const maybeFinalizeLiveAnswer = (targetLocalId: string) => {
@@ -4319,6 +4497,7 @@ function App() {
       activeMessageControllerRef.current?.abort();
       activeMessageControllerRef.current = null;
       resetLiveAnswerStreaming();
+      resetLiveSessionEventQueue();
     };
   }, []);
 
@@ -4604,6 +4783,7 @@ function App() {
   useEffect(() => {
     if (!activeSessionId) {
       resetLiveAnswerStreaming();
+      resetLiveSessionEventQueue();
       setActiveSessionDetail(null);
       setActivePlan(null);
       setActiveCollaborationMode(null);
@@ -4617,6 +4797,7 @@ function App() {
 
     const controller = new AbortController();
     resetLiveAnswerStreaming();
+    resetLiveSessionEventQueue();
     setActiveSessionDetail(null);
     setActivePlan(null);
     setActiveCollaborationMode(null);
@@ -5546,6 +5727,7 @@ ${markup}
       });
       activeMessageControllerRef.current = null;
       controller.abort();
+      resetLiveSessionEventQueue();
       setLiveSessionEvents([]);
       setLiveTurn((currentTurn) =>
         currentTurn
@@ -5565,6 +5747,7 @@ ${markup}
       await loadChatSessions(undefined, sessionId);
       await loadChatWorkspace(sessionId, undefined, { silent: true });
       setLiveTurn(null);
+      resetLiveSessionEventQueue();
       setLiveSessionEvents([]);
       setChatNotice(data.message || (data.interrupted ? "当前任务已停止" : "当前没有可停止的任务"));
     } catch (error) {
@@ -5655,6 +5838,7 @@ ${markup}
       );
       setComposerValue("");
       setComposerAttachments([]);
+      resetLiveSessionEventQueue();
       setLiveSessionEvents([]);
       switchPage("chat");
 
@@ -5708,6 +5892,9 @@ ${markup}
         }
 
         const payloadTurnId = readTurnId(payload.data);
+        if (shouldPersistLiveSessionEvent(payload)) {
+          enqueueLiveSessionEvent(payload);
+        }
         if (payload.event === "assistant_delta" || payload.event === "final_response") {
           enqueueLiveAnswerEvent(liveTurnLocalId, payload);
         }
@@ -5724,9 +5911,6 @@ ${markup}
             const contextBudgetWarning = warnings.find((item) => item.includes("上下文预算"));
             setChatNotice(contextBudgetWarning ?? warnings[0]);
           }
-        }
-        if (shouldPersistLiveSessionEvent(payload)) {
-          setLiveSessionEvents((currentEvents) => [...currentEvents, payload]);
         }
         if (payload.event === "collaboration_mode_changed") {
           const modePayload =
@@ -5834,12 +6018,14 @@ ${markup}
           return nextTurn;
         });
       });
+      flushLiveSessionEventQueue();
       await waitForLiveAnswerDrain(liveTurnLocalId);
       finishStreamingState();
 
       await loadChatSessions(undefined, sessionId);
       const refreshed = await loadChatWorkspace(sessionId, undefined, { silent: true });
       if (refreshed && activeSessionIdRef.current === sessionId) {
+        resetLiveSessionEventQueue();
         setLiveSessionEvents([]);
         setLiveTurn((currentTurn) => (currentTurn && currentTurn.localId === liveTurnLocalId ? null : currentTurn));
       }
@@ -5847,11 +6033,13 @@ ${markup}
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) {
         resetLiveAnswerStreaming();
+        resetLiveSessionEventQueue();
         return;
       }
       const message = error instanceof Error ? error.message : "发送消息失败";
       setChatError(message);
       resetLiveAnswerStreaming();
+      resetLiveSessionEventQueue();
       setLiveTurn((currentTurn) =>
         currentTurn
           ? {

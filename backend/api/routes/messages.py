@@ -76,6 +76,7 @@ async def send_message(session_id: str, request: Request):
             with audit_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
             await queue.put(format_sse_payload(payload))
+            await asyncio.sleep(0)
 
         async def run_worker() -> None:
             nonlocal stream_failed
@@ -210,7 +211,8 @@ async def send_message(session_id: str, request: Request):
         event_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )

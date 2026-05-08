@@ -104,6 +104,31 @@ class _DummyMultiChunkProvider:
         return 0
 
 
+class _DummyLongToolBackedAnswerProvider:
+    def __init__(self, observed_events: list[tuple[str, dict[str, object]]]) -> None:
+        self.observed_events = observed_events
+        self.stream_released_before_done = False
+
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        yield ProviderChunk(
+            type="text",
+            delta=(
+                "这是一段较长的最终回答，用来确认工具回合后的正式回复不会一直等到 provider 结束后才展示，"
+                "而是在足够确定这是回答正文时就开始向前端释放流式片段，让用户能持续看到内容增长，"
+                "并且后续增量仍然保持顺序。"
+            ),
+        )
+        self.stream_released_before_done = any(event == "assistant_delta" for event, _ in self.observed_events)
+        yield ProviderChunk(type="text", delta="后续内容继续正常追加。")
+        yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
 class _DummyMarkdownImageProvider:
     def __init__(self, content: str) -> None:
         self.content = content
@@ -241,6 +266,51 @@ class _DummyThinkingFallbackProvider:
         yield ProviderChunk(
             type="tool_call",
             tool_call=ToolCall(id="tool-1", name="read_file_range", arguments={"path": "/tmp/demo.txt", "offset": 1, "limit": 5}),
+        )
+        yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
+class _DummyBareGoogleSearchProvider:
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        yield ProviderChunk(
+            type="tool_call",
+            tool_call=ToolCall(
+                id="tool-1",
+                name="google_search",
+                arguments={"q": "L20 显卡 MiniCPM-V 2.5 部署案例"},
+            ),
+        )
+        yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
+class _DummyBareParsedArtifactReadProvider:
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        yield ProviderChunk(
+            type="tool_call",
+            tool_call=ToolCall(
+                id="tool-1",
+                name="read_file_range",
+                arguments={
+                    "path": (
+                        "parser_outputs/chat/5cfc42933c8849e5ab63d0e1e63e67a5/"
+                        "2908843bc7b842d3ab6b38c2f2994a5b/e9d8371588054dd88ca3539257500e60.md"
+                    ),
+                    "offset": 1,
+                    "limit": 80,
+                },
+            ),
         )
         yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
 
@@ -897,6 +967,114 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(runtime.provider.chat_calls[0]["tools"], [])
 
+    async def test_missing_commentary_without_thinking_uses_tool_argument_brief(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.provider = _DummyBareGoogleSearchProvider()
+        runtime.usage_store = None
+        runtime.settings = SimpleNamespace(
+            provider=SimpleNamespace(
+                model="dummy-model",
+                type="mock",
+                context_window=None,
+                effective_context_window=None,
+            )
+        )
+
+        session = SessionRecord(
+            session_id="session-1",
+            title="Google Search Brief Test",
+            messages=[
+                SessionMessage(
+                    id="user-1",
+                    role="user",
+                    content="L20显卡有成功部署 mimov2.5 的案例吗",
+                    metadata={"turn_id": "turn-1"},
+                )
+            ],
+        )
+        task = SessionTask(session=session, permission_context=PermissionContext(), turn_id="turn-1")
+
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def emit(event: str, data: dict[str, object]) -> None:
+            events.append((event, data))
+
+        response = await runtime._stream_provider_response(
+            [{"role": "system", "content": "test"}],
+            [{"name": "google_search"}],
+            emit,
+            session_id="session-1",
+            turn_id="turn-1",
+            request_kind="session_turn",
+            counts_toward_context_window=True,
+            group_id="turn-1:group:1",
+        )
+        response = await runtime._ensure_tool_response_commentary(
+            task,
+            response,
+            emit,
+            group_id="turn-1:group:1",
+        )
+
+        self.assertEqual(
+            response.commentary,
+            "我先搜索「L20 显卡 MiniCPM-V 2.5 部署案例」相关资料，确认可引用的信息来源。",
+        )
+        self.assertEqual([event for event, _ in events], ["commentary_delta", "commentary_complete"])
+        self.assertEqual(events[0][1]["content"], response.commentary)
+
+    async def test_internal_parsed_artifact_path_uses_readable_brief_target(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.provider = _DummyBareParsedArtifactReadProvider()
+        runtime.usage_store = None
+        runtime.settings = SimpleNamespace(
+            provider=SimpleNamespace(
+                model="dummy-model",
+                type="mock",
+                context_window=None,
+                effective_context_window=None,
+            )
+        )
+
+        session = SessionRecord(
+            session_id="session-1",
+            title="Parsed Artifact Brief Test",
+            messages=[
+                SessionMessage(
+                    id="user-1",
+                    role="user",
+                    content="8卡L20可以部署mimo v2.5吗？",
+                    metadata={"turn_id": "turn-1"},
+                )
+            ],
+        )
+        task = SessionTask(session=session, permission_context=PermissionContext(), turn_id="turn-1", tool_depth=1)
+
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def emit(event: str, data: dict[str, object]) -> None:
+            events.append((event, data))
+
+        response = await runtime._stream_provider_response(
+            [{"role": "system", "content": "test"}],
+            [{"name": "read_file_range"}],
+            emit,
+            session_id="session-1",
+            turn_id="turn-1",
+            request_kind="session_turn",
+            counts_toward_context_window=True,
+            group_id="turn-1:group:2",
+        )
+        response = await runtime._ensure_tool_response_commentary(
+            task,
+            response,
+            emit,
+            group_id="turn-1:group:2",
+        )
+
+        self.assertEqual(response.commentary, "我继续读取 匹配到的解析文档，确认里面的相关信息。")
+        self.assertNotIn("5cfc42933c8849e5ab63d0e1e63e67a5", response.commentary)
+
     async def test_tool_preamble_answer_is_reclaimed_into_commentary(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.provider = _DummyLeakyToolPreambleProvider()
@@ -931,11 +1109,9 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(response.tool_calls), 1)
         self.assertEqual(
             [event for event, _ in events],
-            ["assistant_delta", "assistant_delta", "commentary_delta", "commentary_complete"],
+            ["commentary_delta", "commentary_complete"],
         )
-        self.assertEqual(events[1][1]["content"], "")
-        self.assertEqual(events[1][1]["reset"], True)
-        self.assertEqual(events[2][1]["content"], "再读取 README 了解产品整体介绍")
+        self.assertEqual(events[0][1]["content"], "再读取 README 了解产品整体介绍")
 
     async def test_structured_tool_preamble_is_not_reclaimed_into_commentary(self) -> None:
         runtime = object.__new__(NewmanRuntime)
@@ -1120,6 +1296,40 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[2][1]["delta"], "第二段结论。")
         self.assertEqual(events[2][1]["content"], response.content)
 
+    async def test_tool_backed_long_final_answer_releases_before_provider_done(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        events: list[tuple[str, dict[str, object]]] = []
+        provider = _DummyLongToolBackedAnswerProvider(events)
+        runtime.provider = provider
+        runtime.usage_store = None
+        runtime.settings = SimpleNamespace(
+            provider=SimpleNamespace(
+                model="dummy-model",
+                type="mock",
+                context_window=None,
+                effective_context_window=None,
+            )
+        )
+
+        async def emit(event: str, data: dict[str, object]) -> None:
+            events.append((event, data))
+
+        response = await runtime._stream_provider_response(
+            [{"role": "system", "content": "test"}],
+            [{"name": "read_file"}],
+            emit,
+            session_id="session-1",
+            turn_id="turn-1",
+            request_kind="session_turn",
+            counts_toward_context_window=True,
+            group_id="turn-1:group:stream",
+            emit_answer_started_event=True,
+        )
+
+        self.assertTrue(provider.stream_released_before_done)
+        self.assertEqual(response.content, events[-1][1]["content"])
+        self.assertEqual([event for event, _ in events[:2]], ["answer_started", "assistant_delta"])
+
     async def test_emit_hooks_carries_group_id_for_skill_timeline(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.hook_manager = _DummyHookManagerWithMessage()
@@ -1235,6 +1445,7 @@ class ToolResultPersistenceTests(unittest.TestCase):
             result,
             tool_call_id="call-1",
             group_id="turn-1:group:1",
+            action_brief="我先读取 README.md，确认里面的相关信息。",
             request_id="req-1",
         )
 
@@ -1265,6 +1476,7 @@ class ToolResultPersistenceTests(unittest.TestCase):
             result,
             tool_call_id="call-2",
             group_id="turn-1:group:1",
+            action_brief="我先在项目里检索 Newman，定位相关代码。",
             request_id=None,
         )
 
@@ -1293,6 +1505,7 @@ class ToolResultPersistenceTests(unittest.TestCase):
             result,
             tool_call_id="call-3",
             group_id="turn-1:group:3",
+            action_brief="我先运行命令，确认当前状态。",
             request_id=None,
         )
 

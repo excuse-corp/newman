@@ -24,7 +24,7 @@ from backend.memory.compressor import (
 from backend.memory.memory_extract import MemoryExtractor
 from backend.memory.stable_context import StableContextLoader
 from backend.plugin_runtime.service import PluginService
-from backend.providers.base import ProviderError, ProviderResponse, TokenUsage, ToolCallDelta
+from backend.providers.base import ProviderError, ProviderResponse, TokenUsage, ToolCall, ToolCallDelta
 from backend.providers.multimodal import MultimodalAnalyzer
 from backend.providers.factory import build_provider
 from backend.rag.service import KnowledgeBaseService
@@ -88,9 +88,14 @@ HTML_IMAGE_ATTR_RE = re.compile(r"\b(src|alt)=(['\"])(.*?)\2", re.IGNORECASE)
 DIRECT_IMAGE_SOURCE_PREFIXES = ("http://", "https://", "data:image/", "blob:")
 IMAGE_ATTACHMENT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"})
 TOOL_PREAMBLE_COMMENTARY_MAX_CHARS = 80
+ACTION_BRIEF_MAX_CHARS = 140
+ACTION_BRIEF_VALUE_MAX_CHARS = 64
+ANSWER_DEFER_RELEASE_CHARS = 96
+STRUCTURED_ANSWER_DEFER_RELEASE_CHARS = 360
 TOOL_ARGUMENT_PROGRESS_EMIT_BYTES = 2_048
 TOOL_EVENT_OUTPUT_PREVIEW_MAX_CHARS = 8_000
 STRUCTURED_TOOL_PREAMBLE_RE = re.compile(r"(^|\n)\s*(?:#{1,6}\s+|\d+[.、]\s+|[-*]\s+)")
+HASH_PATH_SEGMENT_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
 ATTACHMENT_FIRST_REPLY_BLOCKED_TOOLS = frozenset(
     {
         "read_file",
@@ -141,6 +146,209 @@ def _build_tool_argument_progress_summary(tool_name: str | None, argument_bytes:
     if argument_bytes > 0:
         return f"正在准备 {tool_label} 调用参数（{_format_compact_bytes(argument_bytes)}）"
     return f"正在准备 {tool_label} 调用参数"
+
+
+def _compact_action_brief(text: str, max_chars: int = ACTION_BRIEF_MAX_CHARS) -> str:
+    normalized = " ".join(text.replace("\n", " ").split()).strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[: max_chars - 1]}…"
+
+
+def _compact_action_value(value: object, max_chars: int = ACTION_BRIEF_VALUE_MAX_CHARS) -> str:
+    normalized = " ".join(str(value).replace("\n", " ").split()).strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[: max_chars - 1]}…"
+
+
+def _read_action_argument(arguments: dict[str, object], *keys: str) -> str | None:
+    for key in keys:
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _format_action_path(raw_path: str | None) -> str | None:
+    if not raw_path:
+        return None
+    normalized = raw_path.strip()
+    if not normalized:
+        return None
+    if len(normalized) <= ACTION_BRIEF_VALUE_MAX_CHARS:
+        return normalized
+    path = Path(normalized)
+    parts = [part for part in path.parts if part not in {path.anchor, "/"}]
+    if len(parts) >= 3:
+        return f"…/{'/'.join(parts[-3:])}"
+    if len(parts) >= 1:
+        return f"…/{'/'.join(parts)}"
+    return _compact_action_value(normalized)
+
+
+def _is_hash_path_segment(value: str) -> bool:
+    stem = Path(value).stem
+    return bool(HASH_PATH_SEGMENT_RE.match(stem))
+
+
+def _format_internal_action_path(raw_path: str | None) -> str | None:
+    if not raw_path:
+        return None
+    normalized = raw_path.strip().replace("\\", "/")
+    if not normalized:
+        return None
+    if "/parser_outputs/chat/" in f"/{normalized}":
+        return "匹配到的解析文档"
+    if "/user_uploads/chat/" in f"/{normalized}":
+        return "上传附件"
+
+    parts = [part for part in normalized.split("/") if part and part != "."]
+    if len(parts) >= 2 and _is_hash_path_segment(parts[-1]) and any(_is_hash_path_segment(part) for part in parts[:-1]):
+        return "内部生成文档"
+    return None
+
+
+def _attachment_label_for_action_path(task: SessionTask, raw_path: str | None) -> str | None:
+    if not raw_path:
+        return None
+    target = raw_path.strip()
+    if not target:
+        return None
+    current_turn = task.session.messages[-1] if task.session.messages else None
+    for message in reversed(task.session.messages):
+        if message.role != "user":
+            continue
+        if task.turn_id and message.metadata.get("turn_id") != task.turn_id:
+            continue
+        current_turn = message
+        break
+    attachments = current_turn.metadata.get("attachments") if current_turn is not None else None
+    if not isinstance(attachments, list):
+        return None
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        filename = item.get("filename")
+        if not isinstance(filename, str) or not filename.strip():
+            continue
+        candidates = (
+            item.get("path"),
+            item.get("workspace_relative_path"),
+            item.get("parsed_markdown_path"),
+            item.get("parsed_markdown_relative_path"),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip() == target:
+                if candidate == item.get("parsed_markdown_path") or candidate == item.get("parsed_markdown_relative_path"):
+                    return f"上传附件「{_compact_action_value(filename, 36)}」的解析结果"
+                return f"上传附件「{_compact_action_value(filename, 36)}」"
+    return None
+
+
+def _format_action_path_for_task(raw_path: str | None, task: SessionTask) -> str | None:
+    return _attachment_label_for_action_path(task, raw_path) or _format_internal_action_path(raw_path) or _format_action_path(raw_path)
+
+
+def _format_action_url(raw_url: str | None) -> str | None:
+    if not raw_url:
+        return None
+    normalized = raw_url.strip()
+    if not normalized:
+        return None
+    parsed = urlparse(normalized)
+    if parsed.netloc:
+        path = parsed.path.rstrip("/")
+        suffix = ""
+        if path and path != "/":
+            suffix = _compact_action_value(path, 32)
+        return f"{parsed.netloc}{suffix}"
+    return _compact_action_value(normalized)
+
+
+def _brief_prefix_for_task(task: SessionTask) -> str:
+    return "我继续" if task.tool_depth > 0 else "我先"
+
+
+def _build_single_tool_action_brief(tool_call: ToolCall, prefix: str, task: SessionTask) -> str:
+    tool_name = tool_call.name
+    arguments = tool_call.arguments
+
+    if tool_name == "google_search":
+        query = _read_action_argument(arguments, "q", "query")
+        if query:
+            return f"{prefix}搜索「{_compact_action_value(query)}」相关资料，确认可引用的信息来源。"
+        return f"{prefix}搜索相关网页资料，确认可引用的信息来源。"
+
+    if tool_name in {"search_files", "grep"}:
+        query = _read_action_argument(arguments, "query", "pattern")
+        path = _format_action_path_for_task(_read_action_argument(arguments, "path"), task)
+        if query and path and path != ".":
+            return f"{prefix}在 {path} 中检索「{_compact_action_value(query)}」，定位相关代码。"
+        if query:
+            return f"{prefix}在项目里检索「{_compact_action_value(query)}」，定位相关代码。"
+        return f"{prefix}检索项目内容，定位相关线索。"
+
+    if tool_name in {"read_file", "read_file_range"}:
+        path = _format_action_path_for_task(_read_action_argument(arguments, "path"), task)
+        if path:
+            return f"{prefix}读取 {path}，确认里面的相关信息。"
+        return f"{prefix}读取相关文件，确认里面的可用信息。"
+
+    if tool_name in {"list_dir", "list_files"}:
+        path = _format_action_path_for_task(_read_action_argument(arguments, "path"), task) or "当前目录"
+        return f"{prefix}查看 {path} 的结构，确认下一步该读哪些内容。"
+
+    if tool_name == "fetch_url":
+        target = _format_action_url(_read_action_argument(arguments, "url"))
+        if target:
+            return f"{prefix}打开 {target} 的网页资料，确认其中可用信息。"
+        return f"{prefix}打开网页资料，确认其中可用信息。"
+
+    if tool_name == "terminal":
+        command = _read_action_argument(arguments, "command")
+        if command:
+            return f"{prefix}运行命令「{_compact_action_value(command)}」，确认当前状态。"
+        return f"{prefix}运行命令，确认当前状态。"
+
+    if tool_name == "write_file":
+        path = _format_action_path_for_task(_read_action_argument(arguments, "path"), task)
+        if path:
+            return f"{prefix}生成 {path}，把当前结果落到文件里。"
+        return f"{prefix}生成对应文件，把当前结果落下来。"
+
+    if tool_name == "edit_file":
+        path = _format_action_path_for_task(_read_action_argument(arguments, "path"), task)
+        if path:
+            return f"{prefix}修改 {path}，把实现调整到目标状态。"
+        return f"{prefix}修改对应文件，把实现调整到目标状态。"
+
+    if tool_name == "update_plan":
+        return f"{prefix}把已知信息拆成执行步骤，便于按阶段推进。"
+
+    if tool_name in {"enter_plan_mode", "update_plan_draft", "exit_plan_mode"}:
+        return f"{prefix}更新当前协作流程，确保后续步骤可追踪。"
+
+    return f"{prefix}调用 {tool_name}，获取完成这一步需要的信息。"
+
+
+def _build_multi_tool_action_brief(tool_calls: list[ToolCall], prefix: str) -> str:
+    tool_names = [tool_call.name for tool_call in tool_calls]
+    unique_tool_names = list(dict.fromkeys(tool_names))
+    if unique_tool_names == ["google_search"]:
+        queries = [
+            query
+            for tool_call in tool_calls
+            if (query := _read_action_argument(tool_call.arguments, "q", "query")) is not None
+        ]
+        if len(queries) >= 2:
+            return f"{prefix}用多个关键词搜索公开资料，交叉确认可引用的信息来源。"
+        return f"{prefix}并行搜索公开资料，确认可引用的信息来源。"
+    if len(unique_tool_names) <= 2:
+        labels = " 和 ".join(unique_tool_names)
+    else:
+        labels = f"{unique_tool_names[0]} 等 {len(unique_tool_names)} 个工具"
+    return f"{prefix}并行调用 {labels}，收集完成判断需要的信息。"
 
 
 def _normalize_markdown_image_destination(raw_destination: str) -> str | None:
@@ -509,6 +717,7 @@ class NewmanRuntime:
                 )
                 return
 
+            action_brief = response.commentary.strip()
             assistant_tool_message = SessionMessage(
                 id=uuid4().hex,
                 role="assistant",
@@ -519,6 +728,7 @@ class NewmanRuntime:
                     extra={
                         "group_id": group_id,
                         "commentary": response.commentary,
+                        "action_brief": action_brief,
                         "phase": "commentary" if response.commentary else "tool_call",
                         "tool_calls": [
                             {
@@ -543,6 +753,7 @@ class NewmanRuntime:
                         {
                             "group_id": group_id,
                             "tool_call_id": tool_call.id,
+                            "action_brief": action_brief,
                             **skill_usage_payload,
                         },
                     )
@@ -553,6 +764,7 @@ class NewmanRuntime:
                         "tool_call_id": tool_call.id,
                         "tool": tool_call.name,
                         "arguments": tool_call.arguments,
+                        "action_brief": action_brief,
                     },
                 )
                 disallow_reason = self._tool_disallow_reason_for_task(task, tool_call.name)
@@ -598,6 +810,7 @@ class NewmanRuntime:
                         result,
                         tool_call_id=tool_call.id,
                         group_id=group_id,
+                        action_brief=action_brief,
                         request_id=request_id,
                     )
                 )
@@ -617,6 +830,7 @@ class NewmanRuntime:
                     "summary": result.summary,
                     "duration_ms": result.duration_ms,
                     "attempt_count": result.attempt_count,
+                    "action_brief": action_brief,
                 }
                 output_preview = _build_tool_event_output_preview(result)
                 if output_preview:
@@ -787,7 +1001,7 @@ class NewmanRuntime:
         commentary_complete_pending = False
         answer_visible = False
         answer_started_emitted = False
-        defer_answer_visibility = bool(tools) and emit_answer_started_event
+        defer_answer_visibility = bool(tools)
         deferred_answer_deltas: list[str] = []
         tool_signal_seen = False
         tool_argument_progress: dict[str, dict[str, object]] = {}
@@ -851,9 +1065,20 @@ class NewmanRuntime:
                 },
             )
 
-        async def flush_deferred_answer() -> None:
+        def deferred_answer_release_ready() -> bool:
+            raw = "".join(deferred_answer_deltas).strip()
+            if not raw:
+                return False
+            normalized = self._sanitize_commentary_brief(raw)
+            if "\n" in raw and STRUCTURED_TOOL_PREAMBLE_RE.search(raw):
+                return len(normalized) >= STRUCTURED_ANSWER_DEFER_RELEASE_CHARS
+            return len(normalized) >= ANSWER_DEFER_RELEASE_CHARS
+
+        async def flush_deferred_answer(*, force: bool = False) -> None:
             nonlocal answer_started_emitted, answer_visible
             if not deferred_answer_deltas or tool_calls or answer_visible or not "".join(content_parts).strip():
+                return
+            if not force and not deferred_answer_release_ready():
                 return
             visible_content_parts: list[str] = []
             for delta in deferred_answer_deltas:
@@ -878,6 +1103,7 @@ class NewmanRuntime:
                         "model": self.settings.provider.model,
                     },
                 )
+            deferred_answer_deltas.clear()
 
         async def prepare_for_tool_signal() -> None:
             nonlocal answer_visible, answer_started_emitted, commentary_complete_pending, tool_signal_seen
@@ -968,6 +1194,7 @@ class NewmanRuntime:
                 content_parts.append(event.text)
                 if defer_answer_visibility and not answer_visible:
                     deferred_answer_deltas.append(event.text)
+                    await flush_deferred_answer()
                     return
                 if not "".join(content_parts).strip():
                     return
@@ -1020,7 +1247,7 @@ class NewmanRuntime:
                     usage = chunk.usage
         for event in parser.flush():
             await consume_parse_event(event)
-        await flush_deferred_answer()
+        await flush_deferred_answer(force=True)
         await flush_commentary(force=bool(tool_calls))
         response = ProviderResponse(
             content="".join(content_parts),
@@ -1140,6 +1367,8 @@ class NewmanRuntime:
 
         commentary = await self._generate_commentary_from_thinking(task, response)
         if not commentary:
+            commentary = self._build_action_brief_from_tool_calls(task, response)
+        if not commentary:
             return response
 
         response.commentary = commentary
@@ -1161,6 +1390,18 @@ class NewmanRuntime:
             },
         )
         return response
+
+    def _build_action_brief_from_tool_calls(
+        self,
+        task: SessionTask,
+        response: ProviderResponse,
+    ) -> str:
+        if not response.tool_calls:
+            return ""
+        prefix = _brief_prefix_for_task(task)
+        if len(response.tool_calls) == 1:
+            return _compact_action_brief(_build_single_tool_action_brief(response.tool_calls[0], prefix, task))
+        return _compact_action_brief(_build_multi_tool_action_brief(response.tool_calls, prefix))
 
     async def _generate_commentary_from_thinking(
         self,
@@ -2369,6 +2610,7 @@ class NewmanRuntime:
         *,
         tool_call_id: str,
         group_id: str,
+        action_brief: str,
         request_id: str | None,
     ) -> SessionMessage:
         model_output = _build_tool_message_output(result) or result.summary
@@ -2379,6 +2621,7 @@ class NewmanRuntime:
             "group_id": group_id,
             "tool_call_id": tool_call_id,
             "tool": result.tool,
+            "action_brief": action_brief,
             "category": result.category,
             "success": result.success,
             "error_code": result.error_code,
