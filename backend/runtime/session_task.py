@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from backend.sessions.models import SessionMessage, SessionRecord
 from backend.tools.permission_context import PermissionContext
+from backend.runtime.turn_completion import TurnProgressState
 
 
 @dataclass
@@ -14,6 +15,7 @@ class SessionTask:
     tool_depth: int = 0
     action_group_index: int = 0
     transient_tool_messages: dict[str, SessionMessage] = field(default_factory=dict)
+    progress: TurnProgressState = field(default_factory=TurnProgressState)
 
     def next_action_group_id(self) -> str:
         self.action_group_index += 1

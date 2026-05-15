@@ -167,8 +167,14 @@ sandbox:
   enabled: true
   mode: "workspace-write"
 
+permissions:
+  writable_paths:
+    - "skills"
+    - "plugins"
+    - "backend/tools"
+
 paths:
-  workspace: "."
+  workspace: "backend_data/runtime_workspace"
 ```
 
 如果你希望把更多稳定配置固化到项目里，也可以继续写在 `newman.yaml`，例如：
@@ -238,6 +244,14 @@ sandbox:
   mode: "workspace-write"
   network_access: false
   writable_roots: []
+
+permissions:
+  # paths.workspace 是主要操作空间，默认可读写；这里列出额外可写的维护目录。
+  writable_paths:
+    - "backend_data/memory"
+    - "skills"
+    - "plugins"
+    - "backend/tools"
 ```
 
 ## 启动

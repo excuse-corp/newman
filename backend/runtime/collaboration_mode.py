@@ -12,14 +12,14 @@ PLAN_COLLABORATION_MODE: CollaborationModeName = "plan"
 
 PLAN_MODE_BLOCKED_TOOLS = frozenset({"enter_plan_mode", "update_plan_draft", "exit_plan_mode"})
 
-DEFAULT_MODE_BLOCKED_TOOLS = frozenset({"update_plan_draft", "exit_plan_mode"})
+DEFAULT_MODE_BLOCKED_TOOLS = frozenset({"update_plan", "update_plan_draft", "exit_plan_mode"})
 
 COLLABORATION_MODE_DEFAULT_PROMPT = """## Collaboration Mode
 当前处于 Default mode。
 
 - 简单任务直接回答或直接实施。
-- 普通的多步任务，可以直接使用 `update_plan` 维护实施中的 checklist，但不是每轮都必须使用。
 - 只有在任务复杂、需要拆解成可持续跟踪的待办清单时，才调用 `enter_plan_mode`。
+- `update_plan` 只能在 Plan mode 使用；Default mode 下不要调用 `update_plan`。
 - 不要为了简单任务进入 Plan mode。
 """
 

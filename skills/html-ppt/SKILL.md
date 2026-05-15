@@ -10,17 +10,43 @@ when_to_use: Use when the user asks for work related to html-ppt.
 
 Five-phase workflow: **Outline → Color → Slide Plan → HTML Preview → PPTX + Per-Slide QA**
 
+Important workflow gate rule:
+- When a phase requires user confirmation, selection, or revision, call `request_user_input` and stop the turn.
+- Do not use a normal final answer to ask for approval.
+- Do not mark a phase complete until the user has explicitly approved or selected the required option.
+- If the user replies "继续" while a gate is pending, treat it as approval of the current gate only, then move to the next gate and call `request_user_input` again if that next phase requires user input.
+
 ---
 
 ## Phase 1: Outline
 
-Generate a numbered outline from the user's content. Ask to confirm before proceeding.
+Generate a numbered outline from the user's content.
+
+Then call `request_user_input`:
+- `kind`: `confirm`
+- `skill_name`: `html-ppt`
+- `phase`: `outline`
+- `content`: the full outline
+- `prompt`: ask whether the outline is approved or needs revision
+- `options`: approve / revise
+
+Stop after this tool call. Do not proceed to color selection in the same turn.
 
 ---
 
 ## Phase 2: Color Selection
 
-Read `references/design-system.md` for the 5 built-in palettes. Present all options to the user — **never auto-select**. Wait for confirmation. If user describes a custom direction, build a palette using the 6-key theme structure.
+Read `references/design-system.md` for the 5 built-in palettes. Present all options to the user — **never auto-select**. If user describes a custom direction, build a palette using the 6-key theme structure.
+
+Then call `request_user_input`:
+- `kind`: `choice`
+- `skill_name`: `html-ppt`
+- `phase`: `color_selection`
+- `content`: the palette options
+- `prompt`: ask the user to choose one palette or describe a custom direction
+- `options`: one option per built-in palette, plus a custom option if useful
+
+Stop after this tool call. Do not choose a palette yourself.
 
 ---
 
@@ -46,7 +72,17 @@ Read `references/templates.md` and `references/templates-advanced.md`.
 **Theme keys** (mandatory, never invent alternatives):
 `primary · secondary · accent · text_dark · text_body · bg_light · fontHeading · fontBody`
 
-Present the plan per slide (page / template / content mapping). Confirm with user before proceeding.
+Present the plan per slide (page / template / content mapping).
+
+Then call `request_user_input`:
+- `kind`: `confirm`
+- `skill_name`: `html-ppt`
+- `phase`: `slide_plan`
+- `content`: the slide-by-slide template plan
+- `prompt`: ask whether the layout/template plan is approved or needs revision
+- `options`: approve / revise
+
+Stop after this tool call. Do not generate HTML until the user approves the slide plan.
 
 ---
 
@@ -54,7 +90,11 @@ Present the plan per slide (page / template / content mapping). Confirm with use
 
 Generate a single `.jsx` artifact: slides as scrollable 16:9 cards (`max-width: 960px`, `overflow: hidden`), page badges on content slides, no animations.
 
-After rendering, self-check: empty zones → fix or switch template; overflow → reduce content; imbalanced columns → redistribute. Show to user, iterate on feedback.
+Write the preview artifact only to a path allowed by the current workspace, such as the current working directory or an existing workspace output directory discovered with `list_dir`. Do not target `/root/newman/output/` unless that path is confirmed writable in this run.
+
+If `write_file` fails, do not answer as if generation has started or completed. Fix the path and retry the write in the same turn when possible. If no writable path is available, return a clear blocked response that says the HTML artifact was not generated.
+
+After rendering, self-check: empty zones → fix or switch template; overflow → reduce content; imbalanced columns → redistribute. Show to user, iterate on feedback. This phase may end with an `artifact_ready` response only after the HTML file is successfully written and previewable.
 
 ---
 

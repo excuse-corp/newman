@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from json import JSONDecodeError
 from typing import Any
 
@@ -10,6 +11,18 @@ import httpx
 from backend.config.schema import ModelConfig
 from backend.providers.base import BaseProvider, ProviderChunk, ProviderError, ProviderResponse, TokenUsage, ToolCall, ToolCallDelta
 from backend.providers.token_estimator import estimate_message_tokens
+
+
+OPENAI_COMPATIBLE_MODEL_PROFILES: dict[str, dict[str, Any]] = {
+    "mimo-v2.5": {
+        "reasoning": {
+            "field": "reasoning_content",
+            "replay_required": True,
+        }
+    }
+}
+DEFAULT_REASONING_CONTENT_FIELD = "reasoning_content"
+INTERNAL_MESSAGE_KEYS = {"provider_state"}
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -50,6 +63,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 usage=usage,
                 model=body.get("model", self.config.model),
                 finish_reason=choice.get("finish_reason", "stop"),
+                provider_state=_extract_response_provider_state(self.config, message),
             )
         except (KeyError, IndexError, TypeError, ValueError, JSONDecodeError) as exc:
             raise ProviderError("openai_compatible", "response_parse_error", f"OpenAI-compatible response malformed: {exc}") from exc
@@ -65,6 +79,7 @@ class OpenAICompatibleProvider(BaseProvider):
 
         payload = _build_payload(self.config, messages, tools, stream=True, **kwargs)
         partial_tool_calls: dict[int, dict[str, str]] = {}
+        provider_state: dict[str, Any] = {}
 
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout) as client:
@@ -83,6 +98,7 @@ class OpenAICompatibleProvider(BaseProvider):
                         choice = (data.get("choices") or [{}])[0]
                         delta = choice.get("delta") or {}
                         usage = _parse_usage(data.get("usage", {})) if isinstance(data.get("usage"), dict) else None
+                        _accumulate_response_provider_state(self.config, delta, provider_state)
                         if content := delta.get("content"):
                             yield ProviderChunk(type="text", delta=str(content), finish_reason=choice.get("finish_reason"))
                         for tool_call in delta.get("tool_calls", []) or []:
@@ -123,6 +139,8 @@ class OpenAICompatibleProvider(BaseProvider):
         except httpx.HTTPError as exc:
             raise ProviderError("openai_compatible", "network_error", f"OpenAI-compatible streaming failed: {exc}", True) from exc
 
+        if provider_state:
+            yield ProviderChunk(type="provider_state", provider_state=provider_state)
         for index in sorted(partial_tool_calls):
             item = partial_tool_calls[index]
             try:
@@ -140,7 +158,7 @@ class OpenAICompatibleProvider(BaseProvider):
         yield ProviderChunk(type="done", finish_reason="stop")
 
     def estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
-        return estimate_message_tokens(messages, model=self.config.model)
+        return estimate_message_tokens(_prepare_messages_for_payload(self.config, messages), model=self.config.model)
 
 
 def _build_payload(
@@ -153,7 +171,7 @@ def _build_payload(
 ) -> dict[str, Any]:
     payload = {
         "model": config.model,
-        "messages": messages,
+        "messages": _prepare_messages_for_payload(config, messages),
         "max_tokens": kwargs.get("max_tokens", config.max_tokens),
         "temperature": kwargs.get("temperature", config.temperature),
         "stream": stream,
@@ -163,6 +181,80 @@ def _build_payload(
     if tools:
         payload["tools"] = tools
     return payload
+
+
+def _prepare_messages_for_payload(config: ModelConfig, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    replay_field = _reasoning_replay_field(config)
+    prepared: list[dict[str, Any]] = []
+    for message in messages:
+        next_message = {key: value for key, value in message.items() if key not in INTERNAL_MESSAGE_KEYS}
+        if replay_field and _message_has_tool_calls(message):
+            provider_state = message.get("provider_state")
+            value = ""
+            if isinstance(provider_state, dict):
+                raw_value = provider_state.get(replay_field)
+                if raw_value is not None:
+                    value = str(raw_value)
+            next_message[replay_field] = value
+        prepared.append(next_message)
+    return prepared
+
+
+def _message_has_tool_calls(message: dict[str, Any]) -> bool:
+    return message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list) and bool(message.get("tool_calls"))
+
+
+def _model_capabilities(config: ModelConfig) -> dict[str, Any]:
+    profile = OPENAI_COMPATIBLE_MODEL_PROFILES.get(config.model, {})
+    capabilities = _deep_merge_dicts(profile, config.capabilities if isinstance(config.capabilities, dict) else {})
+    return capabilities
+
+
+def _deep_merge_dicts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    result = deepcopy(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_dicts(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _reasoning_replay_field(config: ModelConfig) -> str | None:
+    reasoning = _model_capabilities(config).get("reasoning")
+    if not isinstance(reasoning, dict) or not bool(reasoning.get("replay_required")):
+        return None
+    field = reasoning.get("replay_field") or reasoning.get("field") or DEFAULT_REASONING_CONTENT_FIELD
+    return str(field).strip() or None
+
+
+def _reasoning_response_fields(config: ModelConfig) -> set[str]:
+    fields = {DEFAULT_REASONING_CONTENT_FIELD}
+    reasoning = _model_capabilities(config).get("reasoning")
+    if isinstance(reasoning, dict):
+        for key in ("response_field", "replay_field", "field"):
+            raw_value = reasoning.get(key)
+            if isinstance(raw_value, str) and raw_value.strip():
+                fields.add(raw_value.strip())
+    return fields
+
+
+def _extract_response_provider_state(config: ModelConfig, message: dict[str, Any]) -> dict[str, Any]:
+    state: dict[str, Any] = {}
+    _accumulate_response_provider_state(config, message, state)
+    return state
+
+
+def _accumulate_response_provider_state(config: ModelConfig, delta: dict[str, Any], state: dict[str, Any]) -> None:
+    for field in _reasoning_response_fields(config):
+        if field not in delta:
+            continue
+        value = delta.get(field)
+        existing = state.get(field)
+        if isinstance(existing, str):
+            state[field] = existing + str(value or "")
+        else:
+            state[field] = str(value or "")
 
 
 def _parse_usage(usage_raw: dict[str, Any]) -> TokenUsage:

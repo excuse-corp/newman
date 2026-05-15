@@ -13,6 +13,20 @@ Use these guidelines when creating or revising a skill.
 - Tell the agent which tools to prefer.
 - Tell the agent what not to do.
 
+## Model user-input checkpoints explicitly
+
+- If the workflow needs user approval, revision, option selection, or missing information before continuing, instruct the agent to call `request_user_input` and stop the turn.
+- Do not phrase a normal final answer as "please confirm and I will continue"; the runtime may treat that as the final answer for the turn.
+- Use `kind: "confirm"` for approval gates, `kind: "choice"` for explicit options, and `kind: "free_text"` for open-ended input.
+- Include stable metadata such as `skill_name`, `phase`, and `workflow_id` when the skill has multiple phases.
+- Treat a pending-gate "continue" response as approval of the current gate only; later template, color, review, or generation gates still need their own `request_user_input` call.
+
+## Keep planning mode explicit
+
+- `update_plan` is only available in Plan mode.
+- Do not add generic instructions that tell agents to call `update_plan` from Default mode.
+- If a skill needs a visible checklist, say that the agent or user must enter Plan mode before using `update_plan`.
+
 ## Good frontmatter
 
 - `name` should be the stable skill id.

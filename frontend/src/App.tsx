@@ -24,6 +24,8 @@ type MemoryKey = "memory" | "user";
 type TurnApprovalMode = "manual" | "auto_allow";
 type CollaborationModeName = "default" | "plan";
 type PlanStepStatus = "pending" | "in_progress" | "completed" | "blocked" | "cancelled";
+type TurnOutcome = "answered" | "awaiting_user" | "artifact_ready" | "task_completed" | "blocked" | "failed";
+type AwaitingUserInputKind = "confirm" | "choice" | "free_text";
 type UiTheme = "classic" | "coral";
 type StatusTagTone = "blue" | "green" | "orange";
 
@@ -53,6 +55,30 @@ type PendingApproval = {
   reason: string;
   timeout_seconds: number;
   remaining_seconds: number;
+};
+
+type AwaitingUserInputOption = {
+  label: string;
+  value: string;
+  description?: string | null;
+};
+
+type AwaitingUserInputPayload = {
+  requestId: string;
+  kind: AwaitingUserInputKind;
+  prompt: string;
+  content?: string | null;
+  options: AwaitingUserInputOption[];
+  workflowId?: string | null;
+  skillName?: string | null;
+  phase?: string | null;
+  status?: string | null;
+  createdAt?: string | null;
+};
+
+type AwaitingUserInputSelection = {
+  value: string;
+  label: string;
 };
 
 type ApprovalRequestLike = Pick<PendingApproval, "tool" | "arguments" | "reason">;
@@ -113,6 +139,8 @@ type SessionDetailResponse = {
     markdown: string;
     approved_at: string;
   } | null;
+  workflow_state?: Record<string, unknown> | null;
+  awaiting_user_input?: Record<string, unknown> | null;
   context_usage?: {
     effective_context_window: number;
     auto_compact_limit: number;
@@ -199,6 +227,7 @@ type TimelineSecondaryItem = {
   command?: string | null;
   output?: string | null;
   argumentsPayload?: Record<string, unknown> | null;
+  awaitingUserInput?: AwaitingUserInputPayload | null;
   outputLineCount: number;
   detail: TraceEntry;
 };
@@ -235,6 +264,8 @@ type TurnAnswer = {
   source: "live" | "session";
   assistantMessageId?: string | null;
   finishReason?: string | null;
+  turnOutcome?: TurnOutcome | null;
+  awaitingUserInput?: AwaitingUserInputPayload | null;
   errorMessage?: string | null;
 };
 
@@ -279,6 +310,8 @@ type PendingFinalAnswer = {
   content: string;
   attachments: ChatAttachment[];
   finishReason: string | null;
+  turnOutcome: TurnOutcome | null;
+  awaitingUserInput: AwaitingUserInputPayload | null;
   assistantMessageId: string | null;
   createdAt: string | null;
 };
@@ -291,7 +324,9 @@ type ComposerAttachment = ChatAttachment & {
 type HtmlPreviewState = HtmlPreviewPayload & {
   source?: "code_block" | "write_file";
   path?: string | null;
+  toolCallId?: string | null;
   streaming?: boolean;
+  saveStatus?: "saving" | "saved" | "failed";
 };
 
 type SkillSummary = {
@@ -1008,6 +1043,12 @@ const TOOL_SEMANTIC_MAP: Record<
   terminal: { label: "terminal", cardType: "terminal", runningText: "我先运行一条命令确认情况", completedText: "命令我已经执行完了" },
   write_file: { label: "write_file", cardType: "file", runningText: "我先创建对应文件", completedText: "文件我已经创建好了" },
   edit_file: { label: "edit_file", cardType: "file", runningText: "我先修改对应文件", completedText: "文件我已经改好了" },
+  request_user_input: {
+    label: "等待用户输入",
+    cardType: "generic",
+    runningText: "我需要你确认后再继续",
+    completedText: "正在等待你的确认"
+  },
   update_plan: { label: "update_plan", cardType: "plan", runningText: "我先整理一下执行步骤", completedText: "执行步骤我已经更新了" },
   enter_plan_mode: {
     label: "enter_plan_mode",
@@ -1567,6 +1608,7 @@ function resolveTimelineNodeIcon(node: TimelineNode): TimelineMarkerIconName {
   const latestItem = [...node.secondaryItems].reverse().find((item) => item.toolName || item.cardType);
   const toolName = latestItem?.toolName ?? null;
 
+  if (toolName === "request_user_input") return "approval";
   if (toolName === "list_dir" || toolName === "list_files") return "folder";
   if (toolName === "read_file" || toolName === "read_file_range") return "file";
   if (toolName === "write_file") return "file_plus";
@@ -1927,6 +1969,9 @@ function resolveProgressPrimaryText(
     if (toolName === "terminal") {
       return "我先运行命令确认当前状态";
     }
+    if (toolName === "request_user_input") {
+      return "我需要你确认后再继续";
+    }
     return semantic.runningText;
   }
 
@@ -1957,12 +2002,18 @@ function resolveProgressPrimaryText(
   }
   if (toolName === "write_file") {
     if (isHtmlWriteFileEventData(eventData)) {
+      if (eventData.success === false) {
+        return target ? `HTML 写入失败：${target}` : "HTML 写入失败";
+      }
       return target ? `HTML 文件已经生成：${target}` : "HTML 文件已经生成";
     }
     return target ? `文件已经创建：${target}` : semantic.completedText;
   }
   if (toolName === "edit_file") {
     return target ? `文件已经修改：${target}` : semantic.completedText;
+  }
+  if (toolName === "request_user_input") {
+    return "正在等待你的确认";
   }
 
   return semantic.completedText;
@@ -1996,6 +2047,10 @@ function buildToolSecondarySubtitle(toolName: string | null | undefined, eventDa
   if (toolName === "terminal") {
     return typeof args?.command === "string" && args.command.trim() ? args.command.trim() : "执行命令";
   }
+  if (toolName === "request_user_input") {
+    const awaiting = parseAwaitingUserInputFromToolArguments(args);
+    return awaiting ? getAwaitingInputTitle(awaiting) : "等待用户确认";
+  }
   const target = resolveToolTarget(toolName, eventData);
   if (target) {
     return target;
@@ -2010,6 +2065,10 @@ function buildToolSecondarySubtitle(toolName: string | null | undefined, eventDa
 }
 
 function buildTimelineToolSummary(node: TimelineNode) {
+  if (node.secondaryItems.some((item) => item.toolName === "request_user_input")) {
+    return "确认后继续";
+  }
+
   const labels = Array.from(
     new Set(
       node.secondaryItems
@@ -2606,26 +2665,36 @@ function closePlanSteps(plan: SessionPlanPayload): SessionPlanPayload {
   };
 }
 
+function eventMarksTaskCompleted(event: SessionEventPayload) {
+  if (event.event === "turn_completed") {
+    return readTurnOutcome(event.data) === "task_completed";
+  }
+  if (event.event === "final_response") {
+    return readTurnOutcome(event.data) === "task_completed";
+  }
+  return false;
+}
+
 function shouldClosePlanFromEvents(plan: SessionPlanPayload, events: SessionEventPayload[]) {
   if (!hasIncompletePlanSteps(plan)) {
     return false;
   }
 
   let latestPlanUpdatedAt = Number.NEGATIVE_INFINITY;
-  let latestFinalResponseAt = Number.NEGATIVE_INFINITY;
+  let latestTaskCompletedAt = Number.NEGATIVE_INFINITY;
   events.forEach((event) => {
     if (event.event === "plan_updated") {
       latestPlanUpdatedAt = Math.max(latestPlanUpdatedAt, event.ts);
     }
-    if (event.event === "final_response") {
-      latestFinalResponseAt = Math.max(latestFinalResponseAt, event.ts);
+    if (eventMarksTaskCompleted(event)) {
+      latestTaskCompletedAt = Math.max(latestTaskCompletedAt, event.ts);
     }
   });
 
-  return latestFinalResponseAt !== Number.NEGATIVE_INFINITY && latestFinalResponseAt >= latestPlanUpdatedAt;
+  return latestTaskCompletedAt !== Number.NEGATIVE_INFINITY && latestTaskCompletedAt >= latestPlanUpdatedAt;
 }
 
-function closePlanIfFinalResponseSeen(plan: SessionPlanPayload, events: SessionEventPayload[]) {
+function closePlanIfTaskCompletedSeen(plan: SessionPlanPayload, events: SessionEventPayload[]) {
   return shouldClosePlanFromEvents(plan, events) ? closePlanSteps(plan) : plan;
 }
 
@@ -2668,14 +2737,17 @@ function buildToolSecondaryItem(
   const semantic = resolveToolSemantic(toolName);
   const status = resolveSecondaryStatusMeta(state, eventData);
   const displayOutput =
-    readNonEmptyText(output) ??
-    readNonEmptyText(eventData.output_preview) ??
-    readNonEmptyText(eventData.display_output) ??
-    null;
+    toolName === "request_user_input"
+      ? null
+      : readNonEmptyText(output) ??
+        readNonEmptyText(eventData.output_preview) ??
+        readNonEmptyText(eventData.display_output) ??
+        null;
   const detailId = `secondary:${typeof eventData.tool_call_id === "string" ? eventData.tool_call_id : parentId}`;
+  const argumentsPayload = extractEventArguments(eventData);
   const command =
-    toolName === "terminal" && typeof extractEventArguments(eventData)?.command === "string"
-      ? (extractEventArguments(eventData)?.command as string)
+    toolName === "terminal" && typeof argumentsPayload?.command === "string"
+      ? (argumentsPayload.command as string)
       : null;
   const summary =
     (typeof eventData.frontend_message === "string" && eventData.frontend_message) ||
@@ -2701,7 +2773,8 @@ function buildToolSecondaryItem(
     meta: buildToolSecondaryMeta(toolName, eventData, displayOutput),
     command,
     output: displayOutput,
-    argumentsPayload: extractEventArguments(eventData),
+    argumentsPayload,
+    awaitingUserInput: toolName === "request_user_input" ? parseAwaitingUserInputFromToolArguments(argumentsPayload) : null,
     outputLineCount: countOutputLines(displayOutput),
     detail: buildTraceDetail(
       detailId,
@@ -3033,6 +3106,8 @@ function upsertProgressSecondaryItem(node: TimelineNode, item: TimelineSecondary
   node.secondaryItems[existingIndex] = {
     ...item,
     command: item.command ?? existingItem.command ?? null,
+    argumentsPayload: item.argumentsPayload ?? existingItem.argumentsPayload ?? null,
+    awaitingUserInput: item.awaitingUserInput ?? existingItem.awaitingUserInput ?? null,
     detail: {
       ...item.detail,
       output: item.detail.output ?? existingItem.detail.output ?? null,
@@ -3561,6 +3636,114 @@ function readRequestId(value: Record<string, unknown>) {
   return typeof requestId === "string" && requestId ? requestId : null;
 }
 
+function readOptionalString(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function readTurnOutcome(value: Record<string, unknown>) {
+  const outcome = value.turn_outcome;
+  return outcome === "answered" ||
+    outcome === "awaiting_user" ||
+    outcome === "artifact_ready" ||
+    outcome === "task_completed" ||
+    outcome === "blocked" ||
+    outcome === "failed"
+    ? outcome
+    : null;
+}
+
+function parseAwaitingUserInputPayload(value: unknown): AwaitingUserInputPayload | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const requestId = readOptionalString(value.request_id);
+  const prompt = readOptionalString(value.prompt);
+  const kind = value.kind;
+  if (!requestId || !prompt || (kind !== "confirm" && kind !== "choice" && kind !== "free_text")) {
+    return null;
+  }
+
+  const options = Array.isArray(value.options)
+    ? value.options
+        .map((item): AwaitingUserInputOption | null => {
+          if (!isRecord(item)) {
+            return null;
+          }
+          const label = readOptionalString(item.label);
+          const optionValue = readOptionalString(item.value);
+          if (!label || !optionValue) {
+            return null;
+          }
+          return {
+            label,
+            value: optionValue,
+            description: readOptionalString(item.description)
+          };
+        })
+        .filter((item): item is AwaitingUserInputOption => item !== null)
+    : [];
+
+  return {
+    requestId,
+    kind,
+    prompt,
+    content: readOptionalString(value.content),
+    options,
+    workflowId: readOptionalString(value.workflow_id),
+    skillName: readOptionalString(value.skill_name),
+    phase: readOptionalString(value.phase),
+    status: readOptionalString(value.status),
+    createdAt: readOptionalString(value.created_at)
+  };
+}
+
+function readAwaitingUserInput(value: Record<string, unknown>) {
+  return parseAwaitingUserInputPayload(value.awaiting_user_input);
+}
+
+function parseAwaitingUserInputFromToolArguments(value: unknown): AwaitingUserInputPayload | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const kind = value.kind;
+  const prompt = readOptionalString(value.prompt);
+  if (!prompt || (kind !== "confirm" && kind !== "choice" && kind !== "free_text")) {
+    return null;
+  }
+  const options = Array.isArray(value.options)
+    ? value.options
+        .map((item): AwaitingUserInputOption | null => {
+          if (!isRecord(item)) {
+            return null;
+          }
+          const label = readOptionalString(item.label);
+          const optionValue = readOptionalString(item.value);
+          if (!label || !optionValue) {
+            return null;
+          }
+          return {
+            label,
+            value: optionValue,
+            description: readOptionalString(item.description)
+          };
+        })
+        .filter((item): item is AwaitingUserInputOption => item !== null)
+    : [];
+  return {
+    requestId: readOptionalString(value.request_id) ?? `tool:${readOptionalString(value.workflow_id) ?? prompt}`,
+    kind,
+    prompt,
+    content: readOptionalString(value.content),
+    options,
+    workflowId: readOptionalString(value.workflow_id),
+    skillName: readOptionalString(value.skill_name),
+    phase: readOptionalString(value.phase),
+    status: readOptionalString(value.status) ?? "pending",
+    createdAt: readOptionalString(value.created_at)
+  };
+}
+
 function readApprovalMode(value: Record<string, unknown>) {
   const approvalMode = value.approval_mode;
   if (approvalMode === "auto_allow" || approvalMode === "auto_approve_level2") {
@@ -3643,6 +3826,7 @@ function synthesizeFailedTurnAnswer(turnId: string, events: SessionEventPayload[
       source: "session",
       assistantMessageId: null,
       finishReason: event.event,
+      turnOutcome: "failed",
       errorMessage: content
     };
   }
@@ -3771,6 +3955,8 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
         source: "session",
         assistantMessageId: message.id,
         finishReason: typeof message.metadata.finish_reason === "string" ? message.metadata.finish_reason : "empty_response",
+        turnOutcome: readTurnOutcome(message.metadata) ?? "failed",
+        awaitingUserInput: readAwaitingUserInput(message.metadata),
         errorMessage: emptyResponseMessage,
       };
       targetTurn.requestId = targetTurn.requestId ?? readRequestId(message.metadata);
@@ -3786,7 +3972,9 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
       phase: "persisted",
       source: "session",
       assistantMessageId: message.id,
-      finishReason: typeof message.metadata.finish_reason === "string" ? message.metadata.finish_reason : null
+      finishReason: typeof message.metadata.finish_reason === "string" ? message.metadata.finish_reason : null,
+      turnOutcome: readTurnOutcome(message.metadata),
+      awaitingUserInput: readAwaitingUserInput(message.metadata)
     };
     targetTurn.requestId = targetTurn.requestId ?? readRequestId(message.metadata);
     if (targetTurn.status === "running") {
@@ -3831,6 +4019,10 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
       if (recoveryClass === "fatal" || recoveryClass === "blocked") {
         turn.status = "failed";
       }
+      return;
+    }
+    if (event.event === "tool_call_finished" && event.data.tool === "write_file" && event.data.success === false && isHtmlWriteFileEventData(event.data)) {
+      turn.status = "failed";
       return;
     }
     if (turn.status === "running" && turn.answer) {
@@ -3950,6 +4142,26 @@ function hasSystemMetaNode(turn: ChatTurn) {
   return turn.timeline.some((node) => node.kind === "system_meta");
 }
 
+function hasAwaitingInputTimelineCard(turn: ChatTurn, awaiting: AwaitingUserInputPayload | null | undefined) {
+  if (!awaiting) {
+    return false;
+  }
+  return turn.timeline.some((node) =>
+    node.secondaryItems.some(
+      (item) =>
+        item.toolName === "request_user_input" &&
+        item.awaitingUserInput &&
+        (item.awaitingUserInput.requestId === awaiting.requestId ||
+          (Boolean(item.awaitingUserInput.workflowId && awaiting.workflowId) &&
+            item.awaitingUserInput.workflowId === awaiting.workflowId &&
+            item.awaitingUserInput.phase === awaiting.phase) ||
+          (item.awaitingUserInput.skillName === awaiting.skillName &&
+            item.awaitingUserInput.phase === awaiting.phase &&
+            item.awaitingUserInput.prompt === awaiting.prompt))
+    )
+  );
+}
+
 function resolveAnswerCopy(answer: TurnAnswer | null, status: TurnStatus) {
   if (answer && (answer.content.trim() || answer.attachments.length > 0)) {
     return answer.content;
@@ -3972,6 +4184,16 @@ function resolveAnswerCopy(answer: TurnAnswer | null, status: TurnStatus) {
   return "正在准备回答...";
 }
 
+function turnHasFailedHtmlWrite(turn: ChatTurn) {
+  return turn.timeline.some((node) =>
+    node.secondaryItems.some((item) => item.toolName === "write_file" && item.state === "failed" && item.argumentsPayload && isHtmlWriteFileEventData({
+      tool: "write_file",
+      success: false,
+      arguments: item.argumentsPayload
+    }))
+  );
+}
+
 function shouldRenderAnswerBubble(turn: ChatTurn) {
   if (!turn.answer) {
     return false;
@@ -3980,6 +4202,10 @@ function shouldRenderAnswerBubble(turn: ChatTurn) {
   const hasAttachments = turn.answer.attachments.length > 0;
 
   if (turn.status === "failed" && !turn.answer.content.trim() && hasSystemMetaNode(turn)) {
+    return false;
+  }
+
+  if (turnHasFailedHtmlWrite(turn) && turn.answer.turnOutcome === "answered") {
     return false;
   }
 
@@ -4006,6 +4232,38 @@ function shouldRenderAssistantMessageMeta(turn: ChatTurn) {
     return true;
   }
   return turn.status === "completed" || turn.status === "failed";
+}
+
+function getAwaitingInputTitle(request: AwaitingUserInputPayload) {
+  if (request.kind === "choice") {
+    return "等待选择";
+  }
+  if (request.kind === "free_text") {
+    return "等待补充";
+  }
+  return "等待确认";
+}
+
+function getAwaitingInputMetaItems(request: AwaitingUserInputPayload) {
+  return [request.skillName, request.phase].filter((item): item is string => Boolean(item));
+}
+
+function shouldDraftAwaitingOption(request: AwaitingUserInputPayload, option: AwaitingUserInputOption, index: number) {
+  if (request.kind !== "confirm") {
+    return false;
+  }
+  const normalized = `${option.label} ${option.value}`.toLowerCase();
+  return index > 0 || /revise|change|edit|modify|修改|调整|补充|修订|重写|不通过/.test(normalized);
+}
+
+function buildAwaitingOptionReply(request: AwaitingUserInputPayload, option: AwaitingUserInputOption) {
+  if (request.kind === "confirm" && option.value === "approved") {
+    return option.label;
+  }
+  if (option.value && option.value !== option.label) {
+    return `我选择：${option.label}（${option.value}）`;
+  }
+  return option.label;
 }
 
 function normalizeSessionEventPayload(payload: unknown): SessionEventPayload | null {
@@ -4055,6 +4313,8 @@ function App() {
   const [activePlan, setActivePlan] = useState<SessionPlanPayload>(null);
   const [activeCollaborationMode, setActiveCollaborationMode] = useState<SessionDetailResponse["collaboration_mode"]>(null);
   const [activeContextUsage, setActiveContextUsage] = useState<SessionDetailResponse["context_usage"]>(null);
+  const [activeAwaitingUserInput, setActiveAwaitingUserInput] = useState<AwaitingUserInputPayload | null>(null);
+  const [awaitingInputSelections, setAwaitingInputSelections] = useState<Record<string, AwaitingUserInputSelection>>({});
   const [sessionEvents, setSessionEvents] = useState<SessionEventPayload[]>([]);
   const [liveSessionEvents, setLiveSessionEvents] = useState<SessionEventPayload[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
@@ -4166,6 +4426,7 @@ function App() {
   const pendingFinalAnswerRef = useRef<PendingFinalAnswer | null>(null);
   const liveAnswerDrainPromiseRef = useRef<Promise<void> | null>(null);
   const liveAnswerDrainResolverRef = useRef<(() => void) | null>(null);
+  const awaitingInputSelectionsRef = useRef<Record<string, AwaitingUserInputSelection>>({});
 
   const resolveLiveAnswerDrain = () => {
     const resolver = liveAnswerDrainResolverRef.current;
@@ -4194,6 +4455,10 @@ function App() {
     pendingFinalAnswerRef.current = null;
     resolveLiveAnswerDrain();
   };
+
+  useEffect(() => {
+    awaitingInputSelectionsRef.current = awaitingInputSelections;
+  }, [awaitingInputSelections]);
 
   const flushLiveSessionEventQueue = () => {
     liveSessionEventFlushFrameRef.current = null;
@@ -4249,6 +4514,8 @@ function App() {
           content: pendingFinal.content || currentTurn.answer.content,
           attachments: pendingFinal.attachments.length > 0 ? pendingFinal.attachments : currentTurn.answer.attachments,
           finishReason: pendingFinal.finishReason ?? currentTurn.answer.finishReason,
+          turnOutcome: pendingFinal.turnOutcome ?? currentTurn.answer.turnOutcome,
+          awaitingUserInput: pendingFinal.awaitingUserInput ?? currentTurn.answer.awaitingUserInput,
           assistantMessageId: pendingFinal.assistantMessageId ?? currentTurn.answer.assistantMessageId,
           createdAt: pendingFinal.createdAt ?? currentTurn.answer.createdAt
         }
@@ -4359,6 +4626,8 @@ function App() {
         content: typeof payload.data.content === "string" ? payload.data.content : "",
         attachments: parseMessageAttachments(payload.data.attachments),
         finishReason: typeof payload.data.finish_reason === "string" ? payload.data.finish_reason : null,
+        turnOutcome: readTurnOutcome(payload.data),
+        awaitingUserInput: readAwaitingUserInput(payload.data),
         assistantMessageId: typeof payload.data.message_id === "string" ? payload.data.message_id : null,
         createdAt: typeof payload.data.created_at === "string" ? payload.data.created_at : null
       };
@@ -4371,6 +4640,26 @@ function App() {
   };
 
   const applyHtmlPreviewStreamEvent = (payload: SessionEventPayload) => {
+    if (payload.event === "tool_call_started" && isHtmlWriteFileEventData(payload.data)) {
+      const path = getEventPathValue(payload.data);
+      const toolCallId = typeof payload.data.tool_call_id === "string" ? payload.data.tool_call_id : null;
+      const argumentsPayload = extractEventArguments(payload.data);
+      const content = argumentsPayload && typeof argumentsPayload.content === "string" ? argumentsPayload.content : "";
+      if (content) {
+        const fallbackTitle = formatCompactPath(path) ?? "HTML 实时预览";
+        setHtmlPreview({
+          source: "write_file",
+          path,
+          toolCallId,
+          streaming: true,
+          saveStatus: "saving",
+          content,
+          title: buildHtmlPreviewTitleFromMarkup(content, fallbackTitle),
+        });
+      }
+      return;
+    }
+
     if (payload.event === "tool_call_output_delta") {
       if (payload.data.stream !== "file_content" || !isHtmlWriteFileEventData(payload.data)) {
         return;
@@ -4380,14 +4669,19 @@ function App() {
         return;
       }
       const path = getEventPathValue(payload.data);
+      const toolCallId = typeof payload.data.tool_call_id === "string" ? payload.data.tool_call_id : null;
       const fallbackTitle = formatCompactPath(path) ?? "HTML 实时预览";
       setHtmlPreview((currentPreview) => {
-        const sameStream = currentPreview?.source === "write_file" && currentPreview.path === path;
+        const sameStream =
+          currentPreview?.source === "write_file" &&
+          ((toolCallId && currentPreview.toolCallId === toolCallId) || currentPreview.path === path);
         const content = sameStream ? `${currentPreview.content}${delta}` : delta;
         return {
           source: "write_file",
           path,
+          toolCallId,
           streaming: true,
+          saveStatus: "saving",
           content,
           title: buildHtmlPreviewTitleFromMarkup(content, fallbackTitle),
         };
@@ -4395,19 +4689,39 @@ function App() {
       return;
     }
 
-    if (payload.event === "tool_call_finished" && isHtmlWriteFileEventData(payload.data)) {
+    if (payload.event === "tool_call_finished" && payload.data.tool === "write_file") {
       const path = getEventPathValue(payload.data);
+      const toolCallId = typeof payload.data.tool_call_id === "string" ? payload.data.tool_call_id : null;
+      const argumentsPayload = extractEventArguments(payload.data);
+      const fallbackContent = argumentsPayload && typeof argumentsPayload.content === "string" ? argumentsPayload.content : "";
+      const success = payload.data.success !== false;
       setHtmlPreview((currentPreview) => {
-        if (!currentPreview || currentPreview.source !== "write_file") {
+        const eventLooksHtml = isHtmlWriteFileEventData(payload.data);
+        const matchesCurrentPreview =
+          currentPreview?.source === "write_file" &&
+          ((toolCallId && currentPreview.toolCallId === toolCallId) || (path && currentPreview.path === path));
+        if (!eventLooksHtml && !matchesCurrentPreview) {
           return currentPreview;
         }
-        if (currentPreview.path && path && currentPreview.path !== path) {
+        if (currentPreview?.toolCallId && toolCallId && currentPreview.toolCallId !== toolCallId) {
           return currentPreview;
         }
+        if (currentPreview?.path && path && currentPreview.path !== path) {
+          return currentPreview;
+        }
+        const content = currentPreview?.content || fallbackContent;
+        if (!content) {
+          return currentPreview;
+        }
+        const title = buildHtmlPreviewTitleFromMarkup(content, currentPreview?.title ?? formatCompactPath(path) ?? "HTML 实时预览");
         return {
-          ...currentPreview,
+          source: "write_file",
+          path: currentPreview?.path ?? path,
+          toolCallId: currentPreview?.toolCallId ?? toolCallId,
+          content,
           streaming: false,
-          title: buildHtmlPreviewTitleFromMarkup(currentPreview.content, currentPreview.title),
+          saveStatus: success ? "saved" : "failed",
+          title,
         };
       });
     }
@@ -4465,6 +4779,8 @@ function App() {
   useEffect(() => {
     setHtmlPreview(null);
     setHtmlPreviewView("preview");
+    setActiveAwaitingUserInput(null);
+    setAwaitingInputSelections({});
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -4631,9 +4947,18 @@ function App() {
 
       const dedupedEvents = dedupeSessionEvents(nextEvents);
       setActiveSessionDetail(detail.session);
-      setActivePlan(closePlanIfFinalResponseSeen(detail.plan ?? null, dedupedEvents));
+      setActivePlan(closePlanIfTaskCompletedSeen(detail.plan ?? null, dedupedEvents));
       setActiveCollaborationMode(detail.collaboration_mode ?? null);
       setActiveContextUsage(detail.context_usage ?? null);
+      const nextAwaiting = parseAwaitingUserInputPayload(detail.awaiting_user_input);
+      setActiveAwaitingUserInput(nextAwaiting);
+      setAwaitingInputSelections((currentSelections) => {
+        if (!nextAwaiting) {
+          return {};
+        }
+        const nextSelection = currentSelections[nextAwaiting.requestId];
+        return nextSelection ? { [nextAwaiting.requestId]: nextSelection } : {};
+      });
       setSessionEvents(dedupedEvents);
       setChatSessions((currentSessions) =>
         currentSessions.map((session) =>
@@ -5260,7 +5585,7 @@ ${markup}
     () => highlightCode(htmlPreviewCode, htmlPreview?.language ?? "html"),
     [htmlPreviewCode, htmlPreview?.language]
   );
-  const htmlPreviewBadge = htmlPreview?.initialView === "code" ? "CODE" : "HTML";
+  const htmlPreviewBadge = htmlPreview?.saveStatus === "failed" ? "HTML 未保存" : htmlPreview?.initialView === "code" ? "CODE" : "HTML";
   const openHtmlPreview = (payload: HtmlPreviewPayload) => {
     setHtmlPreview(payload);
     setHtmlPreviewView(payload.initialView ?? "preview");
@@ -5312,7 +5637,7 @@ ${markup}
   const composerDisplayMode = pendingComposerMode ?? currentCollaborationMode;
   const activePlanSteps = getPlanSteps(activePlan);
   const activePlanProgress = getPlanProgress(activePlan);
-  const showComposerPlanTray = composerDisplayMode === "plan" && activePlanSteps.length > 0;
+  const showComposerPlanTray = activePlanSteps.length > 0 && hasIncompletePlanSteps(activePlan);
   const slashCommandQuery = extractComposerSlashQuery(composerValue);
   const availableSlashCommands =
     composerDisplayMode === "plan"
@@ -5758,9 +6083,13 @@ ${markup}
     }
   };
 
-  const submitComposer = async () => {
-    const trimmed = composerValue.trim();
-    if ((!trimmed && composerAttachments.length === 0) || sendingMessage) return;
+  const submitComposer = async (submission?: { content?: string; attachments?: ComposerAttachment[]; clearComposer?: boolean }) => {
+    const submittedContent = submission?.content ?? composerValue;
+    const submittedAttachments = submission?.attachments ?? composerAttachments;
+    const shouldClearComposer = submission?.clearComposer ?? !submission;
+    const trimmed = submittedContent.trim();
+    if ((!trimmed && submittedAttachments.length === 0) || sendingMessage) return;
+    const awaitedRequestAtSubmit = activeAwaitingUserInput?.requestId ?? null;
     const desiredCollaborationMode = pendingComposerMode ?? currentCollaborationMode;
 
     setChatError(null);
@@ -5795,7 +6124,7 @@ ${markup}
       scrollConversationToBottom();
       const createdAt = new Date().toISOString();
       const liveTurnLocalId = `live-turn-${Date.now()}`;
-      const attachmentSnapshot = composerAttachments.map(({ file: _file, ...attachment }) => attachment);
+      const attachmentSnapshot = submittedAttachments.map(({ file: _file, ...attachment }) => attachment);
       resetLiveAnswerStreaming();
       setLiveTurn({
         sessionId,
@@ -5819,6 +6148,8 @@ ${markup}
           source: "live",
           assistantMessageId: null,
           finishReason: null,
+          turnOutcome: null,
+          awaitingUserInput: null,
           errorMessage: null
         },
         status: "running"
@@ -5836,20 +6167,22 @@ ${markup}
             : session
         )
       );
-      setComposerValue("");
-      setComposerAttachments([]);
+      if (shouldClearComposer) {
+        setComposerValue("");
+        setComposerAttachments([]);
+      }
       resetLiveSessionEventQueue();
       setLiveSessionEvents([]);
       switchPage("chat");
 
       const response =
-        composerAttachments.length > 0
+        submittedAttachments.length > 0
           ? await (() => {
               const body = new FormData();
               if (trimmed) {
                 body.append("content", trimmed);
               }
-              composerAttachments.forEach((attachment) => {
+              submittedAttachments.forEach((attachment) => {
                 body.append("attachments", attachment.file, attachment.filename);
               });
               body.append("approval_mode", turnApprovalMode);
@@ -5928,7 +6261,18 @@ ${markup}
               : null;
           setActivePlan(planPayload);
         }
-        if (payload.event === "final_response") {
+        if (payload.event === "user_input_requested" || payload.event === "final_response") {
+          const awaiting = readAwaitingUserInput(payload.data);
+          if (awaiting) {
+            setActiveAwaitingUserInput(awaiting);
+          } else if (payload.event === "final_response" && readTurnOutcome(payload.data) !== "awaiting_user") {
+            setActiveAwaitingUserInput(null);
+          }
+        }
+        if (payload.event === "turn_completed" && readTurnOutcome(payload.data) !== "awaiting_user") {
+          setActiveAwaitingUserInput(null);
+        }
+        if (eventMarksTaskCompleted(payload)) {
           setActivePlan((currentPlan) => closePlanSteps(currentPlan));
         }
         if (payload.event === "tool_approval_request") {
@@ -6024,6 +6368,22 @@ ${markup}
 
       await loadChatSessions(undefined, sessionId);
       const refreshed = await loadChatWorkspace(sessionId, undefined, { silent: true });
+      if (awaitedRequestAtSubmit) {
+        setAwaitingInputSelections((currentSelections) => {
+          const currentSelection = currentSelections[awaitedRequestAtSubmit];
+          if (!currentSelection) {
+            return currentSelections;
+          }
+          const stillAwaitingSameRequest = activeAwaitingUserInput?.requestId === awaitedRequestAtSubmit;
+          const shouldKeepSelection =
+            stillAwaitingSameRequest && awaitingInputSelectionsRef.current[awaitedRequestAtSubmit] === currentSelection;
+          if (shouldKeepSelection) {
+            return currentSelections;
+          }
+          const { [awaitedRequestAtSubmit]: _removed, ...remainingSelections } = currentSelections;
+          return remainingSelections;
+        });
+      }
       if (refreshed && activeSessionIdRef.current === sessionId) {
         resetLiveSessionEventQueue();
         setLiveSessionEvents([]);
@@ -6084,6 +6444,147 @@ ${markup}
     }
   };
 
+  const focusComposerWithAwaitingDraft = (draft = "") => {
+    setComposerValue((currentValue) => (currentValue.trim() ? currentValue : draft));
+    requestAnimationFrame(() => {
+      const textarea = composerTextareaRef.current;
+      if (!textarea) {
+        return;
+      }
+      textarea.focus();
+      const cursorPosition = textarea.value.length;
+      textarea.setSelectionRange(cursorPosition, cursorPosition);
+    });
+  };
+
+  const markAwaitingInputSubmitted = (request: AwaitingUserInputPayload, selection: AwaitingUserInputSelection) => {
+    setAwaitingInputSelections((current) => ({
+      ...current,
+      [request.requestId]: selection,
+    }));
+  };
+
+  const submitAwaitingOption = async (
+    request: AwaitingUserInputPayload,
+    option: AwaitingUserInputOption,
+    index: number
+  ) => {
+    if (shouldDraftAwaitingOption(request, option, index)) {
+      markAwaitingInputSubmitted(request, { value: option.value, label: option.label });
+      focusComposerWithAwaitingDraft(`${option.label}：`);
+      return;
+    }
+    markAwaitingInputSubmitted(request, { value: option.value, label: option.label });
+    await submitComposer({
+      content: buildAwaitingOptionReply(request, option),
+      attachments: [],
+      clearComposer: true
+    });
+  };
+
+  const renderAwaitingUserInputCard = (request: AwaitingUserInputPayload, turn: ChatTurn, options?: { compact?: boolean }) => {
+    const isSameActiveRequest = Boolean(
+      activeAwaitingUserInput &&
+        (activeAwaitingUserInput.requestId === request.requestId ||
+          (Boolean(activeAwaitingUserInput.workflowId && request.workflowId) &&
+            activeAwaitingUserInput.workflowId === request.workflowId &&
+            activeAwaitingUserInput.phase === request.phase) ||
+          (activeAwaitingUserInput.skillName === request.skillName &&
+            activeAwaitingUserInput.phase === request.phase &&
+            activeAwaitingUserInput.prompt === request.prompt))
+    );
+    const belongsToLiveTurn = Boolean(turn.isLive && turn.answer?.awaitingUserInput?.requestId === request.requestId);
+    const isActiveRequest = isSameActiveRequest || belongsToLiveTurn;
+    const submittedSelection = awaitingInputSelections[request.requestId] ?? null;
+    const isSubmittedRequest = Boolean(submittedSelection);
+    const requestStateClass = isSubmittedRequest ? "submitted" : isActiveRequest ? "active" : "resolved";
+    const isActionDisabled = isSubmittedRequest || !isActiveRequest || sendingMessage || stoppingMessage || planModeUpdating;
+    const statusLabel = isSubmittedRequest ? "已选择" : isActiveRequest ? (sendingMessage ? "正在发送" : "等待回复") : "已处理";
+    const metaItems = getAwaitingInputMetaItems(request);
+    const title = getAwaitingInputTitle(request);
+    const requestOptions = request.options;
+
+    return (
+      <article className={`awaiting-input-card kind-${request.kind} ${options?.compact ? "compact" : ""} ${
+        requestStateClass
+      }`}>
+        <header className="awaiting-input-card-head">
+          <span className="awaiting-input-card-icon" aria-hidden="true">
+            <TimelineMarkerIcon name="approval" className="awaiting-input-card-icon-svg" />
+          </span>
+          <div className="awaiting-input-card-head-copy">
+            <div className="awaiting-input-card-title-row">
+              <h3>{title}</h3>
+              <span className={`awaiting-input-status ${requestStateClass}`}>{statusLabel}</span>
+            </div>
+            {metaItems.length > 0 ? (
+              <div className="awaiting-input-meta" aria-label="工作流信息">
+                {metaItems.map((item) => (
+                  <span key={item}>{item}</span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        </header>
+
+        {request.content ? (
+          <div className="awaiting-input-content">
+            <MessageContent
+              apiBase={apiBase}
+              variant="assistant"
+              content={request.content}
+              attachments={[]}
+              className="awaiting-input-content-copy"
+              onOpenHtmlPreview={openHtmlPreview}
+              deferCodeBlocksUntilComplete={turn.isLive && turn.status === "running"}
+            />
+          </div>
+        ) : null}
+
+        <p className="awaiting-input-prompt">{request.prompt}</p>
+
+        {requestOptions.length > 0 ? (
+          <div className="awaiting-input-actions" role="group" aria-label={request.prompt}>
+            {requestOptions.map((option, index) => {
+              const draftsReply = shouldDraftAwaitingOption(request, option, index);
+              const isSelectedOption = submittedSelection?.value === option.value;
+              return (
+                <button
+                  key={`${option.value}:${index}`}
+                  type="button"
+                  className={`awaiting-input-option ${index === 0 && !draftsReply ? "primary" : "secondary"} ${
+                    isSelectedOption ? "selected" : ""
+                  }`}
+                  onClick={() => void submitAwaitingOption(request, option, index)}
+                  disabled={isActionDisabled}
+                  aria-pressed={isSelectedOption}
+                >
+                  <span className="awaiting-input-option-label">{option.label}</span>
+                  {option.description ? <span className="awaiting-input-option-description">{option.description}</span> : null}
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="awaiting-input-actions" role="group" aria-label={request.prompt}>
+            <button
+              type="button"
+              className={`awaiting-input-option primary ${submittedSelection ? "selected" : ""}`}
+              onClick={() => {
+                markAwaitingInputSubmitted(request, { value: "free_text", label: "填写回复" });
+                focusComposerWithAwaitingDraft();
+              }}
+              disabled={isActionDisabled}
+              aria-pressed={Boolean(submittedSelection)}
+            >
+              <span className="awaiting-input-option-label">填写回复</span>
+            </button>
+          </div>
+        )}
+      </article>
+    );
+  };
+
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Escape" && showComposerSlashMenu) {
       event.preventDefault();
@@ -6124,6 +6625,9 @@ ${markup}
     const manual = expandedTimelineIds[node.id];
     if (typeof manual === "boolean") {
       return manual;
+    }
+    if (node.secondaryItems.some((item) => item.toolName === "request_user_input")) {
+      return true;
     }
     return false;
   };
@@ -7092,8 +7596,10 @@ ${markup}
 
                       {displayTurns.map((turn) => {
                         const answerCopy = resolveAnswerCopy(turn.answer, turn.status);
-                        const showAnswerBubble = shouldRenderAnswerBubble(turn);
                         const showAssistantMessageMeta = shouldRenderAssistantMessageMeta(turn);
+                        const awaitingInput = turn.answer?.awaitingUserInput ?? null;
+                        const showAwaitingInputInAnswer = Boolean(awaitingInput && !hasAwaitingInputTimelineCard(turn, awaitingInput));
+                        const showAnswerBubble = shouldRenderAnswerBubble(turn) && (!awaitingInput || showAwaitingInputInAnswer);
                         const assistantCopyValue =
                           turn.answer?.content.trim() ? turn.answer.content : turn.answer?.phase === "failed" ? answerCopy : null;
                         const visibleThinkingNode = turn.timeline.find(
@@ -7306,31 +7812,39 @@ ${markup}
                                                   return (
                                                     <article
                                                       key={item.id}
-                                                      className={`timeline-secondary-card ${item.cardType}`}
+                                                      className={`timeline-secondary-card ${item.cardType} ${
+                                                        item.awaitingUserInput ? "awaiting-input-secondary-card" : ""
+                                                      }`}
                                                     >
-                                                      <div className="timeline-secondary-head">
-                                                        <div className="timeline-secondary-head-main">
-                                                          <div className="timeline-secondary-label-row">
-                                                            <span className="timeline-secondary-label">{item.label}</span>
-                                                            <span className="timeline-secondary-time-inline">{item.detail.time}</span>
+                                                      {item.awaitingUserInput ? (
+                                                        renderAwaitingUserInputCard(item.awaitingUserInput, turn, { compact: true })
+                                                      ) : (
+                                                        <>
+                                                          <div className="timeline-secondary-head">
+                                                            <div className="timeline-secondary-head-main">
+                                                              <div className="timeline-secondary-label-row">
+                                                                <span className="timeline-secondary-label">{item.label}</span>
+                                                                <span className="timeline-secondary-time-inline">{item.detail.time}</span>
+                                                              </div>
+                                                            </div>
                                                           </div>
-                                                        </div>
-                                                      </div>
-                                                      <div className="timeline-secondary-result-wrap timeline-code-block">
-                                                        {item.cardType === "terminal" && item.command ? (
-                                                          <pre className="timeline-terminal-command">{`$ ${item.command}`}</pre>
-                                                        ) : null}
-                                                        <pre
-                                                          className={`timeline-secondary-result timeline-code-block-pre ${
-                                                            item.cardType === "terminal" ? "terminal" : ""
-                                                          }`}
-                                                        >
-                                                          <code
-                                                            className={resultCodePreview.language ? `language-${resultCodePreview.language}` : undefined}
-                                                            dangerouslySetInnerHTML={{ __html: resultCodePreview.html }}
-                                                          />
-                                                        </pre>
-                                                      </div>
+                                                          <div className="timeline-secondary-result-wrap timeline-code-block">
+                                                            {item.cardType === "terminal" && item.command ? (
+                                                              <pre className="timeline-terminal-command">{`$ ${item.command}`}</pre>
+                                                            ) : null}
+                                                            <pre
+                                                              className={`timeline-secondary-result timeline-code-block-pre ${
+                                                                item.cardType === "terminal" ? "terminal" : ""
+                                                              }`}
+                                                            >
+                                                              <code
+                                                                className={resultCodePreview.language ? `language-${resultCodePreview.language}` : undefined}
+                                                                dangerouslySetInnerHTML={{ __html: resultCodePreview.html }}
+                                                              />
+                                                            </pre>
+                                                          </div>
+                                                        </>
+                                                      )}
                                                     </article>
                                                   );
                                                 })}
@@ -7380,15 +7894,19 @@ ${markup}
                                   showMeta={showAssistantMessageMeta && Boolean(turn.answer)}
                                 >
                                   <div className="trace-bubble wide final answer-bubble">
-                                    <MessageContent
-                                      apiBase={apiBase}
-                                      variant="assistant"
-                                      content={answerCopy}
-                                      attachments={turn.answer?.attachments ?? []}
-                                      className="trace-copy"
-                                      onOpenHtmlPreview={openHtmlPreview}
-                                      deferCodeBlocksUntilComplete={turn.isLive && turn.status === "running"}
-                                    />
+                                    {awaitingInput ? (
+                                      renderAwaitingUserInputCard(awaitingInput, turn)
+                                    ) : (
+                                      <MessageContent
+                                        apiBase={apiBase}
+                                        variant="assistant"
+                                        content={answerCopy}
+                                        attachments={turn.answer?.attachments ?? []}
+                                        className="trace-copy"
+                                        onOpenHtmlPreview={openHtmlPreview}
+                                        deferCodeBlocksUntilComplete={turn.isLive && turn.status === "running"}
+                                      />
+                                    )}
                                   </div>
                                 </MessageHoverShell>
                               </div>
@@ -7425,7 +7943,7 @@ ${markup}
                     <div className="html-preview-frame-topbar-main">
                       <span className="html-preview-frame-badge">{htmlPreviewBadge}</span>
                       <span className="html-preview-frame-title">
-                        {htmlPreview?.streaming ? "生成中 · " : ""}
+                        {htmlPreview?.streaming ? "生成中 · " : htmlPreview?.saveStatus === "failed" ? "写入失败 · " : ""}
                         {htmlPreview?.title ?? "HTML 实时预览"}
                       </span>
                     </div>

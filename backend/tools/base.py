@@ -50,11 +50,20 @@ class BaseTool(ABC):
         return await self.run(arguments, session_id)
 
     def to_provider_schema(self) -> dict[str, Any]:
+        description = self.meta.description
+        if self.meta.allowed_paths:
+            allowed_paths = "\n".join(f"- {path}" for path in self.meta.allowed_paths)
+            description = (
+                f"{description}\n\n"
+                "Path access for this tool:\n"
+                "Use only paths under these allowed roots:\n"
+                f"{allowed_paths}"
+            )
         return {
             "type": "function",
             "function": {
                 "name": self.meta.name,
-                "description": self.meta.description,
+                "description": description,
                 "parameters": self.meta.input_schema,
             },
         }

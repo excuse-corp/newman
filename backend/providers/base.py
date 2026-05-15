@@ -33,6 +33,7 @@ class ProviderChunk:
     delta: str = ""
     tool_call: ToolCall | None = None
     tool_call_delta: ToolCallDelta | None = None
+    provider_state: dict[str, Any] | None = None
     finish_reason: str | None = None
     usage: TokenUsage | None = None
 
@@ -43,9 +44,11 @@ class ProviderResponse:
     thinking: str = ""
     commentary: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    invalid_tool_calls: list[ToolCall] = field(default_factory=list)
     usage: TokenUsage = field(default_factory=TokenUsage)
     model: str = ""
     finish_reason: str = "stop"
+    provider_state: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

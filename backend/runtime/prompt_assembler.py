@@ -5,6 +5,7 @@ import json
 from backend.memory.stable_context import StableContextLoader
 from backend.runtime.collaboration_mode import build_collaboration_mode_prompt
 from backend.runtime.message_rendering import build_user_message_for_provider
+from backend.runtime.workflow_state import build_workflow_state_prompt
 from backend.sessions.models import CheckpointRecord, SessionMessage, SessionRecord
 
 
@@ -12,7 +13,8 @@ COMMENTARY_SYSTEM_GUARDRAIL = (
     "CRITICAL TOOL/SKILL RULE:\n"
     "If you will call any tool or use any skill in this turn, you must output exactly one short "
     "<commentary>...</commentary> message immediately before the first tool or skill action.\n"
-    "Do not skip it. Use the user's language. Do not put final-answer content inside <commentary>."
+    "Do not skip it. Use the user's language. Do not put final-answer content inside <commentary>.\n"
+    "`commentary` is not a function/tool name. Never call a tool named commentary, thinking, or think."
 )
 
 
@@ -27,12 +29,16 @@ class PromptAssembler:
         checkpoint: CheckpointRecord | None,
         *,
         tool_message_overrides: dict[str, SessionMessage] | None = None,
+        include_provider_state: bool = False,
     ) -> list[dict]:
         stable_context = self.stable_context_loader.build(tools_overview)
         system_sections = [
             f"{COMMENTARY_SYSTEM_GUARDRAIL}\n\n{stable_context}",
             build_collaboration_mode_prompt(session),
         ]
+        workflow_state_prompt = build_workflow_state_prompt(session)
+        if workflow_state_prompt:
+            system_sections.append(workflow_state_prompt)
         overrides = tool_message_overrides or {}
         failed_tool_call_ids = {
             str(item.metadata.get("tool_call_id"))
@@ -77,6 +83,10 @@ class PromptAssembler:
                     message: dict[str, object] = {"role": item.role, "content": item.content}
                     if provider_tool_calls:
                         message["tool_calls"] = provider_tool_calls
+                    if include_provider_state:
+                        provider_state = item.metadata.get("provider_state")
+                        if isinstance(provider_state, dict) and provider_state:
+                            message["provider_state"] = provider_state
                     messages.append(message)
                     continue
 

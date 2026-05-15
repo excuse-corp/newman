@@ -76,6 +76,43 @@ class PromptAssemblerTests(unittest.TestCase):
             self.assertEqual(tool_message["role"], "tool")
             self.assertEqual(tool_message["tool_call_id"], "call_1")
 
+    def test_can_include_provider_state_for_tool_call_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp)
+            (memory_dir / "Newman.md").write_text("# Newman\n", encoding="utf-8")
+            (memory_dir / "USER.md").write_text("# USER\n", encoding="utf-8")
+            (memory_dir / "SKILLS_SNAPSHOT.md").write_text("# Skills\n", encoding="utf-8")
+            assembler = PromptAssembler(StableContextLoader(memory_dir))
+
+            session = SessionRecord(
+                session_id="session-1",
+                title="Provider State Test",
+                messages=[
+                    SessionMessage(id="u1", role="user", content="读 README"),
+                    SessionMessage(
+                        id="a1",
+                        role="assistant",
+                        content="我先读取 README。",
+                        metadata={
+                            "provider_state": {"reasoning_content": "需要先读取文件"},
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "name": "read_file",
+                                    "arguments": {"path": "README.md"},
+                                }
+                            ],
+                        },
+                    ),
+                ],
+            )
+
+            without_state = assembler.assemble(session, "tools", None)
+            with_state = assembler.assemble(session, "tools", None, include_provider_state=True)
+
+            self.assertNotIn("provider_state", without_state[-1])
+            self.assertEqual(with_state[-1]["provider_state"], {"reasoning_content": "需要先读取文件"})
+
     def test_prefers_transient_tool_override_for_current_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_dir = Path(tmp)

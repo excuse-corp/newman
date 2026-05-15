@@ -20,6 +20,7 @@ class ModelConfig(BaseModel):
     model: str = "newman-dev"
     endpoint: str | None = None
     api_key: str | None = None
+    capabilities: dict[str, Any] = Field(default_factory=dict)
     context_window: int | None = None
     embedding_dimension: int | None = None
     timeout: int = 60

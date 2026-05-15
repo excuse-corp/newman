@@ -19,7 +19,7 @@ Produce a reusable skill directory with a high-quality `SKILL.md`, plus any ligh
 3. Use the local template files in this skill before writing anything from scratch.
 4. Keep `SKILL.md` short and procedural. Put bulky details in `references/`.
 5. If a skill ships Python code with third-party packages, prefer a skill-local environment and wrapper script over relying on global packages.
-6. If the task spans multiple files, create or update a plan with `update_plan`.
+6. If the task genuinely needs a tracked checklist, enter or rely on Plan mode before using `update_plan`. Do not tell a skill to call `update_plan` from Default mode.
 
 ## Required skill structure
 
@@ -54,7 +54,19 @@ skills/
 - Prefer `read_file` to inspect existing skills and templates.
 - Prefer `write_file` for new files and `edit_file` for targeted updates.
 - Use `search_files` to find similar skills or repeated conventions.
+- Use `request_user_input` for workflow checkpoints that require user confirmation, choice, or free-text input before continuing.
+- Use `update_plan` only while Plan mode is active. If a tracked checklist is necessary, the agent or user must enter Plan mode first.
 - Use `terminal` only when file tools are insufficient.
+
+## Workflow gates
+
+- When a skill has phases that must pause for user approval, revision, option selection, or missing information, write the workflow so the agent calls `request_user_input` and then stops the turn.
+- Do not use a normal final answer as a checkpoint that expects the user to approve and continue. A normal final answer should mean the current turn is answered, blocked, completed, or has an artifact ready.
+- For confirmation gates, include the content being approved and use `kind: "confirm"`.
+- For template, color, variant, or mode selection, use `kind: "choice"` and provide explicit options.
+- For open-ended requirements, use `kind: "free_text"`.
+- Include stable metadata such as `skill_name`, `phase`, and a `workflow_id` when a multi-step skill needs to resume cleanly.
+- If the user says "continue" while a gate is pending, treat that as approval of the current gate only. Do not skip later gates; ask for the next required choice with another `request_user_input` call.
 
 ## Python dependency isolation
 

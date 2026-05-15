@@ -16,6 +16,8 @@ EVENT_TYPES = [
     "plan_updated",
     "collaboration_mode_changed",
     "plan_draft_updated",
+    "workflow_state_changed",
+    "user_input_requested",
     "tool_approval_request",
     "tool_approval_resolved",
     "tool_error_feedback",
@@ -25,6 +27,7 @@ EVENT_TYPES = [
     "checkpoint_created",
     "turn_interrupted",
     "final_response",
+    "turn_completed",
     "stream_completed",
     "error",
 ]

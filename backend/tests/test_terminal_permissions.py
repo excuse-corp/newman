@@ -72,6 +72,22 @@ class TerminalPermissionTests(unittest.TestCase):
             self.assertEqual(len(reasons), 1)
             self.assertTrue(reasons[0].startswith("terminal_write_readonly_path:"))
 
+    def test_terminal_static_checks_allow_writes_to_runtime_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+
+            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace)}})
+            router = ToolRouter(ToolRegistry(), settings)
+
+            reasons = router.static_checks(
+                _FakeTerminalTool(),
+                {"command": "touch ./notes.txt"},
+            )
+
+            self.assertEqual(reasons, [])
+
     def test_terminal_static_checks_deny_writes_outside_allowed_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

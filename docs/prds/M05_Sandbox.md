@@ -28,8 +28,8 @@
   - `read-only`
   - `workspace-write`
   - `danger-full-access`
-- 工作区路径作为默认可写根
-- 额外 `writable_roots` 配置
+- runtime workspace 路径作为默认可读写根
+- 通过 `permissions.writable_paths` / `sandbox.writable_roots` 显式声明可写根
 - 网络默认关闭（`network_access: false`）
 - 执行超时与输出截断
 - 健康检查中暴露沙箱状态
@@ -49,7 +49,7 @@
 ### 本阶段交付
 
 - Linux 下 `terminal` 实际通过 `bwrap` 启动
-- `workspace-write` 模式允许写入 `workspace` 与配置声明的 `writable_roots`
+- `workspace-write` 模式允许写入 runtime workspace 与配置声明的额外可写根
 - `read-only` 模式只允许只读访问
 - `danger-full-access` 模式保留为显式关闭沙箱的兼容模式
 
@@ -88,7 +88,7 @@ sandbox/
 | 模式 | 含义 |
 |------|------|
 | `read-only` | 允许读取工作区，禁止写入 |
-| `workspace-write` | 允许写入 `workspace` 与额外 `writable_roots` |
+| `workspace-write` | 允许写入 runtime workspace、`permissions.writable_paths` 与额外 `sandbox.writable_roots` |
 | `danger-full-access` | 不启用原生沙箱，直接在宿主机执行 |
 
 说明：
@@ -122,7 +122,7 @@ LinuxBwrapSandbox 构造 bwrap 参数
 
 - `workspace` 是默认工作目录，不等于安全边界
 - 真正的安全边界由原生沙箱决定
-- `workspace-write` 模式下，`workspace` 只是默认可写根之一
+- `workspace-write` 模式下，`workspace` 是 Newman 的默认工作目录与默认可写操作空间
 
 ### 6.4 非 Linux 平台策略
 
@@ -148,7 +148,7 @@ sandbox:
 说明：
 
 - `backend` 当前只支持 `linux_bwrap`
-- `writable_roots` 为附加可写目录，默认只写 `workspace`
+- `writable_roots` 为 terminal 沙箱附加可写目录；工具层额外写入白名单来自 `permissions.writable_paths`
 - `timeout` 与 `output_limit_bytes` 为所有执行模式共用限制
 
 ---
@@ -156,7 +156,7 @@ sandbox:
 ## 八、验收标准
 
 1. Linux 下 `terminal` 在 `read-only` 模式不能写工作区文件
-2. Linux 下 `terminal` 在 `workspace-write` 模式可写 `workspace`
+2. Linux 下 `terminal` 在 `workspace-write` 模式可写 runtime workspace 与显式配置的额外可写根
 3. Linux 下 `terminal` 在 `danger-full-access` 模式不经过 `bwrap`
 4. 当 `network_access=false` 时，沙箱命令无法直接访问外网
 5. 未安装 `bwrap` 时返回结构化错误，而不是静默回退

@@ -22,6 +22,7 @@ from backend.runtime.collaboration_mode import (
     get_collaboration_mode,
     get_plan_draft,
 )
+from backend.runtime.workflow_state import AWAITING_USER_INPUT_METADATA_KEY, WORKFLOW_STATE_METADATA_KEY
 from backend.sessions.models import SessionMessage, SessionSummary
 
 
@@ -113,6 +114,8 @@ async def get_session(session_id: str, request: Request):
         "collaboration_mode": get_collaboration_mode(session).model_dump(mode="json"),
         "plan_draft": plan_draft.model_dump(mode="json") if plan_draft else None,
         "approved_plan": approved_plan.model_dump(mode="json") if approved_plan else None,
+        "workflow_state": session.metadata.get(WORKFLOW_STATE_METADATA_KEY),
+        "awaiting_user_input": session.metadata.get(AWAITING_USER_INPUT_METADATA_KEY),
         "checkpoint": checkpoint,
         "context_usage": _build_context_usage(runtime, session, checkpoint),
     }

@@ -16,6 +16,27 @@ class _FakeTool(BaseTool):
 
 
 class ToolRegistryExposureTests(unittest.TestCase):
+    def test_provider_schema_includes_allowed_paths_in_description(self) -> None:
+        tool = _FakeTool(
+            ToolMeta(
+                name="write_file",
+                description="Create a file",
+                input_schema={"type": "object"},
+                risk_level="high",
+                approval_behavior="confirmable",
+                timeout_seconds=1,
+                allowed_paths=["/workspace", "/workspace/skills"],
+            )
+        )
+
+        schema = tool.to_provider_schema()
+
+        description = schema["function"]["description"]
+        self.assertIn("Create a file", description)
+        self.assertIn("Path access for this tool", description)
+        self.assertIn("- /workspace", description)
+        self.assertIn("- /workspace/skills", description)
+
     def test_describe_omits_alias_tools(self) -> None:
         registry = ToolRegistry()
         registry.register(

@@ -51,6 +51,7 @@ from backend.runtime.session_task import SessionTask
 from backend.sessions.models import SessionMessage, SessionRecord
 from backend.sessions.session_store import SessionStore
 from backend.tools.impl.read_file import ReadFileTool
+from backend.tools.impl.request_user_input import RequestUserInputTool
 from backend.tools.impl.write_file import WriteFileTool
 from backend.tools.permission_context import PermissionContext
 from backend.tools.registry import ToolRegistry
@@ -63,7 +64,7 @@ class _DummyApproval:
 
 
 class _DummyPromptAssembler:
-    def assemble(self, session, tools_overview, checkpoint, tool_message_overrides=None):
+    def assemble(self, session, tools_overview, checkpoint, tool_message_overrides=None, **kwargs):
         return [{"role": "system", "content": "test"}]
 
 
@@ -104,7 +105,7 @@ class _DummyMultiChunkProvider:
         return 0
 
 
-class _DummyLongToolBackedAnswerProvider:
+class _DummyLongDeferredAnswerProvider:
     def __init__(self, observed_events: list[tuple[str, dict[str, object]]]) -> None:
         self.observed_events = observed_events
         self.stream_released_before_done = False
@@ -248,6 +249,31 @@ class _DummyCommentaryProvider:
         return 0
 
 
+class _DummyProviderStateToolProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        if self.calls > 1:
+            yield ProviderChunk(type="text", delta="完成")
+            yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+            return
+        yield ProviderChunk(type="provider_state", provider_state={"reasoning_content": "需要先读取文件"})
+        yield ProviderChunk(type="text", delta="<commentary>我先读取 README</commentary>")
+        yield ProviderChunk(
+            type="tool_call",
+            tool_call=ToolCall(id="tool-1", name="read_file", arguments={"path": "README.md"}),
+        )
+        yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
 class _DummyThinkingFallbackProvider:
     def __init__(self) -> None:
         self.chat_calls: list[dict[str, object]] = []
@@ -367,6 +393,96 @@ class _DummyToolCallDeltaProvider:
         return 0
 
 
+class _DummyRequestUserInputProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        if self.calls > 1:
+            raise AssertionError("run loop should stop after request_user_input")
+        yield ProviderChunk(
+            type="tool_call",
+            tool_call=ToolCall(
+                id="tool-1",
+                name="request_user_input",
+                arguments={
+                    "kind": "confirm",
+                    "skill_name": "html-ppt",
+                    "phase": "outline",
+                    "content": "【PPT 大纲】\n1. 封面",
+                    "prompt": "这个大纲可以继续吗？",
+                },
+            ),
+        )
+        yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
+class _DummyCompletionGateProvider:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        self.calls.append({"messages": messages, "tools": tools})
+        if len(self.calls) == 1:
+            yield ProviderChunk(
+                type="tool_call",
+                tool_call=ToolCall(
+                    id="tool-1",
+                    name="terminal",
+                    arguments={"command": "find /root/newman -name '*.log'"},
+                ),
+            )
+            yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+            return
+        if len(self.calls) == 2:
+            yield ProviderChunk(type="text", delta="我来试试在允许的路径范围内找找日志相关信息。")
+            yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+            return
+        yield ProviderChunk(type="text", delta="系统运行日志在 `backend_data/run/logs/backend.log` 和 `backend_data/run/logs/frontend.log`。会话审计日志在 `backend_data/audit/{session_id}.log`，默认受保护，不能直接读取。")
+        yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
+class _DummyInvalidCommentaryToolProvider:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        self.calls.append({"messages": messages, "tools": tools})
+        if len(self.calls) == 1:
+            yield ProviderChunk(
+                type="tool_call_delta",
+                tool_call_delta=ToolCallDelta(index=0, id="tool-1", name="commentary", arguments_delta="{}"),
+            )
+            yield ProviderChunk(type="text", delta="<commentary>我先调用 commentary，获取完成这一步需要的信息。</commentary>")
+            yield ProviderChunk(type="tool_call", tool_call=ToolCall(id="tool-1", name="commentary", arguments={}))
+            yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+            return
+        yield ProviderChunk(
+            type="text",
+            delta="系统运行日志在 `backend_data/run/logs/backend.log` 和 `backend_data/run/logs/frontend.log`。",
+        )
+        yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
 class _DummyStructuredLeakyToolPreambleProvider:
     async def chat(self, messages, tools=None, **kwargs):
         raise AssertionError("chat should not be called in this test")
@@ -455,6 +571,243 @@ class PostUserMessageHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved.messages[0].content, "更新后的用户消息")
             self.assertEqual(runtime.provider.calls[0]["messages"][0]["content"], "更新后的用户消息")
             self.assertTrue(any(event == "final_response" for event, _ in events))
+
+
+class WorkflowAwaitingUserRunLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_user_input_finishes_turn_as_awaiting_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_store = SessionStore(Path(tmp))
+            session = session_store.create(title="ppt")
+            provider = _DummyRequestUserInputProvider()
+            request_tool = RequestUserInputTool()
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.provider = provider
+            runtime.usage_store = None
+            runtime.session_store = session_store
+            runtime.hook_manager = _DummyHookManager()
+            runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
+            runtime.reload_ecosystem = lambda: None
+            runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
+            runtime._tools_overview = lambda: "tools"
+            runtime._assemble_task_messages = lambda task: [{"role": "user", "content": task.session.messages[-1].content}]
+            runtime._provider_tools_for_turn = lambda task: [request_tool.to_provider_schema()]
+            runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
+            runtime.feedback_writer = SimpleNamespace(build=lambda result: "")
+            runtime.settings = SimpleNamespace(
+                provider=SimpleNamespace(
+                    model="dummy-model",
+                    type="mock",
+                    context_window=None,
+                    effective_context_window=None,
+                ),
+                approval=_DummyApproval(),
+                runtime=SimpleNamespace(max_tool_depth=30),
+            )
+            runtime.router = SimpleNamespace(
+                route=lambda tool_name, arguments: request_tool,
+                static_checks=lambda tool, arguments: [],
+            )
+
+            async def execute_tool(tool, arguments, session_id, emit, **kwargs):
+                return await tool.run(arguments, session_id)
+
+            runtime.orchestrator = SimpleNamespace(execute=execute_tool)
+
+            async def fake_maybe_checkpoint(task, emit):
+                return True
+
+            runtime._maybe_checkpoint = fake_maybe_checkpoint
+
+            events: list[tuple[str, dict[str, object]]] = []
+
+            async def emit(event: str, data: dict[str, object]) -> None:
+                events.append((event, data))
+
+            await runtime.handle_message(session.session_id, "做一份3页ppt", emit, turn_id="turn-1")
+
+            saved = session_store.get(session.session_id)
+            self.assertEqual(provider.calls, 1)
+            self.assertEqual(saved.messages[-1].role, "assistant")
+            self.assertEqual(saved.messages[-1].metadata["turn_outcome"], "awaiting_user")
+            self.assertIn("awaiting_user_input", saved.metadata)
+            self.assertTrue(any(event == "user_input_requested" for event, _ in events))
+            final_payload = next(data for event, data in events if event == "final_response")
+            self.assertEqual(final_payload["finish_reason"], "awaiting_user")
+            self.assertEqual(final_payload["turn_outcome"], "awaiting_user")
+            completed_payload = next(data for event, data in events if event == "turn_completed")
+            self.assertEqual(completed_payload["turn_outcome"], "awaiting_user")
+
+
+class TurnCompletionGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pseudo_commentary_tool_call_retries_without_stream_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="logs")
+            provider = _DummyInvalidCommentaryToolProvider()
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.provider = provider
+            runtime.usage_store = None
+            runtime.session_store = session_store
+            runtime.hook_manager = _DummyHookManager()
+            runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
+            runtime.reload_ecosystem = lambda: None
+            runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
+            runtime._tools_overview = lambda: "tools"
+            runtime._assemble_task_messages = lambda task: [
+                {"role": message.role, "content": message.content}
+                for message in task.session.messages
+            ]
+            runtime._provider_tools_for_turn = lambda task: [{"type": "function", "function": {"name": "terminal"}}]
+            runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
+            runtime.feedback_writer = SimpleNamespace(build=lambda result: "")
+            runtime.settings = SimpleNamespace(
+                provider=SimpleNamespace(
+                    model="dummy-model",
+                    type="openai_compatible",
+                    context_window=None,
+                    effective_context_window=None,
+                ),
+                approval=_DummyApproval(),
+                runtime=SimpleNamespace(max_tool_depth=30),
+                paths=SimpleNamespace(workspace=root / "workspace"),
+            )
+            runtime.router = SimpleNamespace(
+                route=lambda tool_name, arguments: (_ for _ in ()).throw(AssertionError("invalid tool must not route")),
+                static_checks=lambda tool, arguments: [],
+            )
+            runtime.orchestrator = SimpleNamespace(
+                execute=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("invalid tool must not execute"))
+            )
+
+            async def fake_maybe_checkpoint(task, emit):
+                return True
+
+            runtime._maybe_checkpoint = fake_maybe_checkpoint
+
+            events: list[tuple[str, dict[str, object]]] = []
+
+            async def emit(event: str, data: dict[str, object]) -> None:
+                events.append((event, data))
+
+            await runtime.handle_message(
+                session.session_id,
+                "系统日志在哪里",
+                emit,
+                turn_id="turn-1",
+                request_id="req-1",
+            )
+
+            saved = session_store.get(session.session_id)
+            self.assertEqual(len(provider.calls), 2)
+            self.assertEqual(provider.calls[1]["tools"], [])
+            self.assertIn("backend_data/run/logs/backend.log", saved.messages[-1].content)
+            self.assertEqual(saved.messages[-1].metadata["turn_outcome"], "answered")
+            self.assertTrue(
+                any(
+                    message.role == "system"
+                    and message.metadata.get("type") == "invalid_tool_call_feedback"
+                    for message in saved.messages
+                )
+            )
+            self.assertFalse(any(event == "tool_call_started" for event, _ in events))
+            self.assertFalse(any(event == "tool_call_arguments_delta" for event, _ in events))
+            final_response_payload = next(data for event, data in events if event == "final_response")
+            self.assertIn("backend_data/run/logs/frontend.log", final_response_payload["content"])
+
+    async def test_incomplete_action_after_recoverable_tool_failure_forces_finalization_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="logs")
+            provider = _DummyCompletionGateProvider()
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.provider = provider
+            runtime.usage_store = None
+            runtime.session_store = session_store
+            runtime.hook_manager = _DummyHookManager()
+            runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
+            runtime.reload_ecosystem = lambda: None
+            runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
+            runtime._tools_overview = lambda: "tools"
+            runtime._assemble_task_messages = lambda task: [
+                {"role": message.role, "content": message.content}
+                for message in task.session.messages
+            ]
+            runtime._provider_tools_for_turn = lambda task: [{"type": "function", "function": {"name": "terminal"}}]
+            runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
+            runtime.feedback_writer = SimpleNamespace(build=lambda result: f"tool failed: {result.summary}")
+            runtime.settings = SimpleNamespace(
+                provider=SimpleNamespace(
+                    model="dummy-model",
+                    type="mock",
+                    context_window=None,
+                    effective_context_window=None,
+                ),
+                approval=_DummyApproval(),
+                runtime=SimpleNamespace(max_tool_depth=30),
+                paths=SimpleNamespace(workspace=root / "workspace"),
+            )
+            runtime.router = SimpleNamespace(
+                route=lambda tool_name, arguments: SimpleNamespace(meta=SimpleNamespace(name=tool_name)),
+                static_checks=lambda tool, arguments: [],
+            )
+
+            async def execute_tool(tool, arguments, session_id, emit, **kwargs):
+                return ToolExecutionResult(
+                    success=False,
+                    tool="terminal",
+                    action="approval",
+                    category="permission_error",
+                    summary="目标路径不在当前权限范围内",
+                )
+
+            runtime.orchestrator = SimpleNamespace(execute=execute_tool)
+
+            async def fake_maybe_checkpoint(task, emit):
+                return True
+
+            runtime._maybe_checkpoint = fake_maybe_checkpoint
+
+            events: list[tuple[str, dict[str, object]]] = []
+
+            async def emit(event: str, data: dict[str, object]) -> None:
+                events.append((event, data))
+
+            await runtime.handle_message(
+                session.session_id,
+                "你知道系统的日志在哪吗",
+                emit,
+                turn_id="turn-1",
+                request_id="req-1",
+            )
+
+            saved = session_store.get(session.session_id)
+            assistant_messages = [message for message in saved.messages if message.role == "assistant"]
+            self.assertEqual(len(provider.calls), 3)
+            self.assertEqual(provider.calls[2]["tools"], [])
+            self.assertTrue(
+                any(
+                    message.role == "system"
+                    and message.metadata.get("type") == "completion_gate_feedback"
+                    for message in saved.messages
+                )
+            )
+            self.assertFalse(
+                any(message.content == "我来试试在允许的路径范围内找找日志相关信息。" for message in assistant_messages)
+            )
+            self.assertIn("backend_data/run/logs/backend.log", saved.messages[-1].content)
+            self.assertEqual(saved.messages[-1].metadata["turn_outcome"], "answered")
+            self.assertTrue(
+                any(event == "assistant_delta" and data.get("reset") is True for event, data in events)
+            )
+            final_response_payload = next(data for event, data in events if event == "final_response")
+            self.assertIn("backend_data/run/logs/frontend.log", final_response_payload["content"])
+            completed_payload = next(data for event, data in events if event == "turn_completed")
+            self.assertEqual(completed_payload["turn_outcome"], "answered")
 
 
 class ProviderFailureHandlingTests(unittest.IsolatedAsyncioTestCase):
@@ -910,6 +1263,105 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[2][1]["group_id"], "turn-1:group:1")
         self.assertEqual(events[2][1]["content"], "我先定位相关文件")
 
+    async def test_stream_response_preserves_provider_state_without_emitting_it(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.provider = _DummyProviderStateToolProvider()
+        runtime.usage_store = None
+        runtime.settings = SimpleNamespace(
+            provider=SimpleNamespace(
+                model="dummy-model",
+                type="openai_compatible",
+                context_window=None,
+                effective_context_window=None,
+            )
+        )
+
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def emit(event: str, data: dict[str, object]) -> None:
+            events.append((event, data))
+
+        response = await runtime._stream_provider_response(
+            [{"role": "system", "content": "test"}],
+            [{"name": "read_file"}],
+            emit,
+            session_id="session-1",
+            turn_id="turn-1",
+            request_kind="session_turn",
+            counts_toward_context_window=True,
+            group_id="turn-1:group:1",
+        )
+
+        self.assertEqual(response.provider_state, {"reasoning_content": "需要先读取文件"})
+        self.assertEqual([event for event, _ in events], ["commentary_delta", "commentary_complete"])
+
+    async def test_tool_call_assistant_message_persists_provider_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_store = SessionStore(Path(tmp))
+            session = session_store.create(title="provider-state")
+            provider = _DummyProviderStateToolProvider()
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.provider = provider
+            runtime.usage_store = None
+            runtime.session_store = session_store
+            runtime.hook_manager = _DummyHookManager()
+            runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
+            runtime.reload_ecosystem = lambda: None
+            runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
+            runtime._tools_overview = lambda: "tools"
+            runtime._assemble_task_messages = lambda task: [{"role": "user", "content": task.session.messages[-1].content}]
+            runtime._provider_tools_for_turn = lambda task: [{"type": "function", "function": {"name": "read_file"}}]
+            runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
+            runtime.feedback_writer = SimpleNamespace(build=lambda result: "")
+            runtime.settings = SimpleNamespace(
+                provider=SimpleNamespace(
+                    model="dummy-model",
+                    type="openai_compatible",
+                    context_window=None,
+                    effective_context_window=None,
+                ),
+                approval=_DummyApproval(),
+                runtime=SimpleNamespace(max_tool_depth=30),
+            )
+            runtime.router = SimpleNamespace(
+                route=lambda tool_name, arguments: SimpleNamespace(meta=SimpleNamespace(name=tool_name)),
+                static_checks=lambda tool, arguments: [],
+            )
+
+            async def execute_tool(tool, arguments, session_id, emit, **kwargs):
+                return ToolExecutionResult(
+                    True,
+                    "read_file",
+                    "read",
+                    summary="已读取 README.md",
+                    stdout='{"dataBase64":"UkVBRE1F"}',
+                )
+
+            runtime.orchestrator = SimpleNamespace(execute=execute_tool)
+
+            async def fake_maybe_checkpoint(task, emit):
+                return True
+
+            runtime._maybe_checkpoint = fake_maybe_checkpoint
+
+            events: list[tuple[str, dict[str, object]]] = []
+
+            async def emit(event: str, data: dict[str, object]) -> None:
+                events.append((event, data))
+
+            await runtime.handle_message(session.session_id, "读 README", emit, turn_id="turn-1")
+
+            saved = session_store.get(session.session_id)
+            assistant_tool_message = next(
+                message
+                for message in saved.messages
+                if message.role == "assistant" and isinstance(message.metadata.get("tool_calls"), list)
+            )
+            self.assertEqual(assistant_tool_message.metadata["provider_state"], {"reasoning_content": "需要先读取文件"})
+            self.assertNotIn("需要先读取文件", assistant_tool_message.content)
+            self.assertEqual(saved.messages[-1].content, "完成")
+
     async def test_missing_commentary_uses_thinking_fallback_brief(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.provider = _DummyThinkingFallbackProvider()
@@ -1296,10 +1748,43 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[2][1]["delta"], "第二段结论。")
         self.assertEqual(events[2][1]["content"], response.content)
 
-    async def test_tool_backed_long_final_answer_releases_before_provider_done(self) -> None:
+    async def test_long_deferred_answer_can_release_before_provider_done_without_answer_start_node(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         events: list[tuple[str, dict[str, object]]] = []
-        provider = _DummyLongToolBackedAnswerProvider(events)
+        provider = _DummyLongDeferredAnswerProvider(events)
+        runtime.provider = provider
+        runtime.usage_store = None
+        runtime.settings = SimpleNamespace(
+            provider=SimpleNamespace(
+                model="dummy-model",
+                type="mock",
+                context_window=None,
+                effective_context_window=None,
+            )
+        )
+
+        async def emit(event: str, data: dict[str, object]) -> None:
+            events.append((event, data))
+
+        response = await runtime._stream_provider_response(
+            [{"role": "system", "content": "test"}],
+            [{"name": "read_file"}],
+            emit,
+            session_id="session-1",
+            turn_id="turn-1",
+            request_kind="session_turn",
+            counts_toward_context_window=True,
+            group_id="turn-1:group:stream",
+        )
+
+        self.assertTrue(provider.stream_released_before_done)
+        self.assertEqual(response.content, events[-1][1]["content"])
+        self.assertEqual(events[0][0], "assistant_delta")
+
+    async def test_tool_backed_final_answer_waits_until_provider_done_before_answer_start_node(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        events: list[tuple[str, dict[str, object]]] = []
+        provider = _DummyLongDeferredAnswerProvider(events)
         runtime.provider = provider
         runtime.usage_store = None
         runtime.settings = SimpleNamespace(
@@ -1326,7 +1811,7 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
             emit_answer_started_event=True,
         )
 
-        self.assertTrue(provider.stream_released_before_done)
+        self.assertFalse(provider.stream_released_before_done)
         self.assertEqual(response.content, events[-1][1]["content"])
         self.assertEqual([event for event, _ in events[:2]], ["answer_started", "assistant_delta"])
 
@@ -1536,6 +2021,38 @@ class ToolResultPersistenceTests(unittest.TestCase):
 
 
 class CollaborationModeRuntimeTests(unittest.TestCase):
+    def test_tools_overview_includes_workspace_access_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            readable = root / "docs"
+            writable = root / "skills"
+            protected = root / ".env"
+            readable.mkdir()
+            writable.mkdir()
+            protected.write_text("secret", encoding="utf-8")
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.registry = SimpleNamespace(describe=lambda: "- write_file: Create a file")
+            runtime.mcp_registry = SimpleNamespace(describe_resources=lambda: "")
+            runtime.settings = SimpleNamespace(
+                paths=SimpleNamespace(workspace=root),
+                permissions=SimpleNamespace(
+                    readable_paths=[readable],
+                    writable_paths=[writable],
+                    protected_paths=[protected],
+                ),
+            )
+
+            overview = runtime._tools_overview()
+
+            self.assertIn("## Workspace Access", overview)
+            self.assertIn(f"Runtime workspace (primary operation space): {root.resolve()}", overview)
+            self.assertIn(f"Primary output directory for user deliverables: {root.resolve() / 'outputs'}", overview)
+            self.assertIn(f"- {writable.resolve()}", overview)
+            self.assertIn(f"- {readable.resolve()}", overview)
+            self.assertIn(f"- {protected.resolve()}", overview)
+            self.assertIn("When creating user-facing files", overview)
+
     def test_current_turn_user_content_prefers_multimodal_normalized_input(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         session = SessionRecord(
@@ -1688,6 +2205,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             tools_for_provider=lambda permission_context, active_groups=None: [
                 {"type": "function", "function": {"name": "read_file"}},
                 {"type": "function", "function": {"name": "enter_plan_mode"}},
+                {"type": "function", "function": {"name": "update_plan"}},
                 {"type": "function", "function": {"name": "update_plan_draft"}},
                 {"type": "function", "function": {"name": "exit_plan_mode"}},
             ]
@@ -1758,7 +2276,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(
             [tool["function"]["name"] for tool in tools],
-            ["enter_plan_mode", "update_plan"],
+            ["enter_plan_mode"],
         )
 
     def test_provider_tools_keep_skill_read_and_write_for_attachment_generation_task(self) -> None:
@@ -1823,7 +2341,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
 
             self.assertEqual(
                 [tool["function"]["name"] for tool in tools],
-                ["read_file", "enter_plan_mode", "update_plan", "write_file"],
+                ["read_file", "enter_plan_mode", "write_file"],
             )
 
     def test_provider_tools_keep_file_browsing_tools_after_attachment_turn_has_already_used_tools(self) -> None:
@@ -1926,7 +2444,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             runtime.registry = ToolRegistry()
             runtime.registry.register(WriteFileTool(Path(tmp)))
             runtime.prompt_assembler = SimpleNamespace(
-                assemble=lambda session, tools_overview, checkpoint, tool_message_overrides=None: [
+                assemble=lambda session, tools_overview, checkpoint, tool_message_overrides=None, **kwargs: [
                     {"role": "system", "content": "test"},
                     {
                         "role": "assistant",
@@ -1962,11 +2480,47 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             self.assertIn("content", arguments)
             self.assertEqual(arguments["content"], "")
 
+    def test_assemble_task_messages_drops_unknown_history_tool_calls(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.registry = ToolRegistry()
+        runtime.prompt_assembler = SimpleNamespace(
+            assemble=lambda session, tools_overview, checkpoint, tool_message_overrides=None, **kwargs: [
+                {"role": "system", "content": "test"},
+                {
+                    "role": "assistant",
+                    "content": "我先调用 commentary，获取完成这一步需要的信息。",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "commentary", "arguments": "{}"},
+                        }
+                    ],
+                    "provider_state": {"reasoning_content": "内部状态"},
+                },
+            ]
+        )
+        runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
+        runtime._tools_overview = lambda: "tools"
+        runtime.settings = SimpleNamespace(provider=SimpleNamespace(type="openai_compatible"))
+
+        task = SessionTask(
+            session=SessionRecord(session_id="session-1", title="repair", messages=[]),
+            permission_context=PermissionContext(),
+            turn_id="turn-1",
+        )
+
+        assembled = runtime._assemble_task_messages(task)
+
+        self.assertNotIn("tool_calls", assembled[1])
+        self.assertNotIn("provider_state", assembled[1])
+        self.assertEqual(assembled[1]["content"], "我先调用 commentary，获取完成这一步需要的信息。")
+
     def test_assemble_task_messages_downgrades_midstream_system_messages_for_openai_provider(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.registry = ToolRegistry()
         runtime.prompt_assembler = SimpleNamespace(
-            assemble=lambda session, tools_overview, checkpoint, tool_message_overrides=None: [
+            assemble=lambda session, tools_overview, checkpoint, tool_message_overrides=None, **kwargs: [
                 {"role": "system", "content": "top-level system"},
                 {"role": "user", "content": "写一个 html 页面"},
                 {"role": "system", "content": "tool failure feedback"},
@@ -2040,6 +2594,17 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
         self.assertTrue(runtime._is_tool_allowed_for_task(task, "update_plan"))
         self.assertFalse(runtime._is_tool_allowed_for_task(task, "update_plan_draft"))
         self.assertFalse(runtime._is_tool_allowed_for_task(task, "enter_plan_mode"))
+
+    def test_default_mode_blocks_update_plan_until_plan_mode_entered(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        task = SessionTask(
+            session=SessionRecord(session_id="session-1", title="default", messages=[]),
+            permission_context=PermissionContext(),
+            turn_id="turn-1",
+        )
+
+        self.assertFalse(runtime._is_tool_allowed_for_task(task, "update_plan"))
+        self.assertTrue(runtime._is_tool_allowed_for_task(task, "enter_plan_mode"))
 
     def test_plan_mode_allows_execution_tools_after_checklist_exists(self) -> None:
         runtime = object.__new__(NewmanRuntime)

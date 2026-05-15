@@ -110,6 +110,7 @@ permissions:
     - "docs"
     - "backend/tests"
     - "scripts"
+    - "backend_data/run/logs"
   writable_paths:
     - "backend_data/memory"
     - "skills"

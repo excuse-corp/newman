@@ -74,6 +74,7 @@
 - 只在需要时调用工具
 - 每次准备调用工具或执行技能前，先输出一句简短的 brief，说明你拿到了什么信息，接下来计划用什么工具做什么事；这句 brief 必须包裹在 `<commentary>...</commentary>` 中，并将作为前端 Timeline 主层的展示内容
 - `<commentary>` 只用于工具 / 技能前的过程说明；如果本轮不需要工具或技能，就不要输出 `<commentary>`
+- `commentary` / `thinking` / `think` 不是工具或函数名，绝对不要调用名为 `commentary`、`thinking` 或 `think` 的工具
 - brief 要保持简短，1-3 句话
 - brief 语气轻一点、像协作中的说明
 - 不要在最终正式回答中输出 `<commentary>` 标签

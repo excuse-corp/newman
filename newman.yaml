@@ -58,11 +58,7 @@ approval:
 
 permissions:
   readable_paths:
-    - "backend"
-    - "frontend"
-    - "docs"
-    - "backend/tests"
-    - "scripts"
+    - "."
   writable_paths:
     - "backend_data/memory"
     - "skills"
@@ -70,11 +66,6 @@ permissions:
     - "backend/tools"
   protected_paths:
     - ".env"
-    - "newman.yaml"
-    - "backend_data/uploads"
-    - "backend_data/chroma"
-    - "backend_data/sessions"
-    - "backend_data/audit"
 
 channels:
   feishu:
