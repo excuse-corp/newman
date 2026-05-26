@@ -90,6 +90,7 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertIn("project deployment config generated during initialization", project_config_text)
             self.assertIn("server:", project_config_text)
             self.assertIn("runtime:", project_config_text)
+            self.assertIn("provider_retry_attempts:", project_config_text)
             self.assertIn("rag:", project_config_text)
             self.assertIn("sandbox:", project_config_text)
             self.assertIn("permissions:", project_config_text)
@@ -177,10 +178,12 @@ class ConfigLoaderTests(unittest.TestCase):
                     temperature: 0.0
                 runtime:
                   max_tool_depth: 20
-                  context_compress_threshold: 0.8
+                  context_compress_threshold: 0.85
                   context_critical_threshold: 0.92
                   tool_retry_attempts: 3
                   tool_retry_backoff_seconds: 1.0
+                  provider_retry_attempts: 3
+                  provider_retry_backoff_seconds: 1.0
                 rag:
                   postgres_dsn: "postgresql://postgres@127.0.0.1:65437/newman"
                   chroma_collection: "knowledge_chunks"

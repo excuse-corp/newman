@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -35,9 +36,17 @@ class CompressionSummaryResult:
 
 
 @dataclass(frozen=True)
+class MessageSegment:
+    start: int
+    end: int
+    key: str
+
+
+@dataclass(frozen=True)
 class ContextCompactionBudget:
     effective_context_window: int
     auto_compact_limit: int
+    soft_compact_limit: int
     reply_reserve_tokens: int
     compact_reserve_tokens: int
     safety_buffer_tokens: int
@@ -47,13 +56,16 @@ class ContextCompactionBudget:
 class ContextUsageSnapshot:
     effective_context_window: int
     auto_compact_limit: int
+    soft_compact_limit: int
     projected_next_prompt_tokens: int
     projected_pressure: float
+    budget_pressure: float
     projection_source: str
     confirmed_prompt_tokens: int | None = None
     confirmed_pressure: float | None = None
     confirmed_request_kind: str | None = None
     confirmed_recorded_at: str | None = None
+    projected_over_soft_limit: bool = False
     projected_over_limit: bool = False
     compaction_stage: str | None = None
     compaction_fail_streak: int = 0
@@ -64,13 +76,16 @@ class ContextUsageSnapshot:
         return {
             "effective_context_window": self.effective_context_window,
             "auto_compact_limit": self.auto_compact_limit,
+            "soft_compact_limit": self.soft_compact_limit,
             "confirmed_prompt_tokens": self.confirmed_prompt_tokens,
             "confirmed_pressure": self.confirmed_pressure,
             "confirmed_request_kind": self.confirmed_request_kind,
             "confirmed_recorded_at": self.confirmed_recorded_at,
             "projected_next_prompt_tokens": self.projected_next_prompt_tokens,
             "projected_pressure": self.projected_pressure,
+            "budget_pressure": self.budget_pressure,
             "projection_source": self.projection_source,
+            "projected_over_soft_limit": self.projected_over_soft_limit,
             "projected_over_limit": self.projected_over_limit,
             "compaction_stage": self.compaction_stage,
             "compaction_fail_streak": self.compaction_fail_streak,
@@ -83,44 +98,66 @@ def split_session_messages(
     session: SessionRecord,
     preserve_recent: int = 4,
 ) -> tuple[list[SessionMessage], list[SessionMessage]]:
-    messages = list(session.messages)
+    return _split_message_list(list(session.messages), preserve_recent=preserve_recent)
+
+
+def split_session_messages_for_checkpoint(
+    session: SessionRecord,
+    preserve_recent: int = 4,
+    checkpoint: CheckpointRecord | None = None,
+) -> tuple[list[SessionMessage], list[SessionMessage]]:
+    archived_count = checkpoint_archived_message_count(session, checkpoint)
+    return _split_message_list(list(session.messages)[archived_count:], preserve_recent=preserve_recent)
+
+
+def model_visible_session_messages(
+    session: SessionRecord,
+    checkpoint: CheckpointRecord | None = None,
+) -> list[SessionMessage]:
+    return list(session.messages)[checkpoint_archived_message_count(session, checkpoint) :]
+
+
+def checkpoint_archived_message_count(session: SessionRecord, checkpoint: CheckpointRecord | None) -> int:
+    if not checkpoint or session.metadata.get("checkpoint_active") is not True:
+        return 0
+    if checkpoint.metadata.get("transcript_retained") is not True:
+        return 0
+    if len(checkpoint.turn_range) >= 2 and isinstance(checkpoint.turn_range[1], int):
+        return min(max(checkpoint.turn_range[1], 0), len(session.messages))
+    raw_count = checkpoint.metadata.get("compressed_message_count")
+    if isinstance(raw_count, int):
+        return min(max(raw_count, 0), len(session.messages))
+    return 0
+
+
+def _split_message_list(
+    messages: list[SessionMessage],
+    preserve_recent: int = 4,
+) -> tuple[list[SessionMessage], list[SessionMessage]]:
     if preserve_recent <= 0:
         return messages, []
-    if len(messages) <= preserve_recent:
+    segments = _build_message_segments(messages)
+    if len(segments) <= preserve_recent:
         return [], messages
 
-    preserve_start = max(len(messages) - preserve_recent, 0)
-    preserved_messages = messages[preserve_start:]
-    preserve_turn_ids = {
-        turn_id
-        for turn_id in (_message_turn_id(message) for message in preserved_messages)
-        if turn_id
-    }
-    preserve_group_ids = {
-        group_id
-        for group_id in (_message_group_id(message) for message in preserved_messages)
-        if group_id
-    }
-
-    while preserve_start > 0:
-        candidate = messages[preserve_start - 1]
-        candidate_turn_id = _message_turn_id(candidate)
-        candidate_group_id = _message_group_id(candidate)
-        if candidate_turn_id and candidate_turn_id in preserve_turn_ids:
-            preserve_start -= 1
-            continue
-        if candidate_group_id and candidate_group_id in preserve_group_ids:
-            preserve_start -= 1
-            if candidate_turn_id:
-                preserve_turn_ids.add(candidate_turn_id)
-            continue
-        break
+    preserve_segment_start = max(len(segments) - preserve_recent, 0)
+    preserve_start = segments[preserve_segment_start].start
 
     return messages[:preserve_start], messages[preserve_start:]
 
 
-def microcompact_session(session: SessionRecord, preserve_recent: int = 4) -> int:
-    messages_to_compact, _ = split_session_messages(session, preserve_recent=preserve_recent)
+def microcompact_session(
+    session: SessionRecord,
+    preserve_recent: int = 4,
+    *,
+    checkpoint: CheckpointRecord | None = None,
+    artifact_dir: Path | None = None,
+) -> int:
+    messages_to_compact, _ = split_session_messages_for_checkpoint(
+        session,
+        preserve_recent=preserve_recent,
+        checkpoint=checkpoint,
+    )
     compactable_ids = {message.id for message in messages_to_compact}
     compacted_count = 0
     for message in session.messages:
@@ -129,6 +166,10 @@ def microcompact_session(session: SessionRecord, preserve_recent: int = 4) -> in
         replacement = _build_microcompact_tool_content(message)
         if not replacement or replacement == message.content:
             continue
+        artifact_ref = _write_microcompact_artifact(message, artifact_dir)
+        if artifact_ref:
+            replacement = _build_microcompact_tool_content(message, artifact_ref=artifact_ref) or replacement
+            message.metadata["microcompact_artifact_ref"] = artifact_ref
         message.metadata["microcompact_applied"] = True
         message.metadata["microcompact_strategy"] = "tool_output_digest"
         message.metadata["microcompact_original_length"] = len(message.content)
@@ -148,7 +189,11 @@ async def summarize_messages(
     turn_id: str | None = None,
     request_kind: str = "context_compaction",
 ) -> CompressionSummaryResult | None:
-    head, preserved_recent_messages = split_session_messages(session, preserve_recent=preserve_recent)
+    head, preserved_recent_messages = split_session_messages_for_checkpoint(
+        session,
+        preserve_recent=preserve_recent,
+        checkpoint=checkpoint,
+    )
     if not head:
         return None
 
@@ -230,14 +275,25 @@ def build_checkpoint_metadata(
     preserve_recent: int,
     compression_level: str,
     original_message_count: int,
+    archived_message_count: int | None = None,
+    microcompact_count: int = 0,
 ) -> dict[str, object]:
     metadata: dict[str, object] = {
         "preserve_recent": preserve_recent,
+        "preserve_unit": "segment",
         "compression_level": compression_level,
         "original_message_count": original_message_count,
-        "compressed_message_count": result.source_message_count,
+        "compressed_message_count": archived_message_count if archived_message_count is not None else result.source_message_count,
+        "newly_compressed_message_count": result.source_message_count,
+        "transcript_retained": True,
         "summary_strategy": result.strategy,
+        "compact_boundary": {
+            "type": "checkpoint_archived_prefix",
+            "message_count": archived_message_count if archived_message_count is not None else result.source_message_count,
+        },
     }
+    if microcompact_count:
+        metadata["microcompact_count"] = microcompact_count
     if result.model:
         metadata["summary_model"] = result.model
     if result.usage:
@@ -273,9 +329,12 @@ def build_context_compaction_budget(model_config: ModelConfig, runtime_config: R
         effective_context_window - reply_reserve_tokens - compact_reserve_tokens - safety_buffer_tokens,
         1,
     )
+    soft_threshold = min(max(float(runtime_config.context_compress_threshold), 0.0), 1.0)
+    soft_compact_limit = max(int(auto_compact_limit * soft_threshold), 1)
     return ContextCompactionBudget(
         effective_context_window=effective_context_window,
         auto_compact_limit=auto_compact_limit,
+        soft_compact_limit=soft_compact_limit,
         reply_reserve_tokens=reply_reserve_tokens,
         compact_reserve_tokens=compact_reserve_tokens,
         safety_buffer_tokens=safety_buffer_tokens,
@@ -304,15 +363,16 @@ def build_context_usage_snapshot(
         confirmed_prompt_tokens = latest_record.input_tokens
         confirmed_request_kind = latest_record.request_kind
         confirmed_recorded_at = latest_record.created_at
-        incremental_projection = confirmed_prompt_tokens + _estimate_incremental_context_tokens(
-            provider,
-            session,
-            checkpoint,
-            latest_record,
-        )
-        if incremental_projection >= assembled_estimate:
-            projected_next_prompt_tokens = incremental_projection
-            projection_source = "confirmed_plus_delta"
+        if not _context_rewrite_invalidates_confirmed_context(session, checkpoint, latest_record):
+            incremental_projection = confirmed_prompt_tokens + _estimate_incremental_context_tokens(
+                provider,
+                session,
+                checkpoint,
+                latest_record,
+            )
+            if incremental_projection >= assembled_estimate:
+                projected_next_prompt_tokens = incremental_projection
+                projection_source = "confirmed_plus_delta"
 
     confirmed_pressure = (
         confirmed_prompt_tokens / budget.effective_context_window
@@ -322,6 +382,11 @@ def build_context_usage_snapshot(
     projected_pressure = (
         projected_next_prompt_tokens / budget.effective_context_window
         if budget.effective_context_window
+        else 0.0
+    )
+    budget_pressure = (
+        projected_next_prompt_tokens / budget.auto_compact_limit
+        if budget.auto_compact_limit
         else 0.0
     )
     raw_fail_streak = session.metadata.get("compaction_fail_streak")
@@ -338,13 +403,16 @@ def build_context_usage_snapshot(
     return ContextUsageSnapshot(
         effective_context_window=budget.effective_context_window,
         auto_compact_limit=budget.auto_compact_limit,
+        soft_compact_limit=budget.soft_compact_limit,
         confirmed_prompt_tokens=confirmed_prompt_tokens,
         confirmed_pressure=confirmed_pressure,
         confirmed_request_kind=confirmed_request_kind,
         confirmed_recorded_at=confirmed_recorded_at,
         projected_next_prompt_tokens=projected_next_prompt_tokens,
         projected_pressure=projected_pressure,
+        budget_pressure=budget_pressure,
         projection_source=projection_source,
+        projected_over_soft_limit=projected_next_prompt_tokens >= budget.soft_compact_limit,
         projected_over_limit=projected_next_prompt_tokens >= budget.auto_compact_limit,
         compaction_stage=compaction_stage,
         compaction_fail_streak=compaction_fail_streak,
@@ -364,7 +432,6 @@ def _build_compaction_payload(
             "session_id": session.session_id,
             "title": session.title,
             "message_count": len(session.messages),
-            "metadata": session.metadata,
         },
         "existing_checkpoint_summary": checkpoint.summary if checkpoint and checkpoint.summary.strip() else "",
         "messages_to_compact": [_serialize_message(message) for message in messages_to_compact],
@@ -373,13 +440,96 @@ def _build_compaction_payload(
 
 
 def _serialize_message(message: SessionMessage) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "id": message.id,
         "role": message.role,
         "content": message.content,
         "created_at": message.created_at,
-        "metadata": message.metadata,
     }
+    metadata = _compaction_metadata_for_message(message)
+    if metadata:
+        payload["metadata"] = metadata
+    return payload
+
+
+def _compaction_metadata_for_message(message: SessionMessage) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    message_type = message.metadata.get("type")
+    if isinstance(message_type, str) and message_type:
+        metadata["type"] = message_type
+
+    attachments = _compaction_attachment_descriptors(message.metadata.get("attachments"))
+    if attachments:
+        metadata["attachments"] = attachments
+
+    if message.role == "assistant":
+        tool_call_names = _compaction_tool_call_names(message.metadata.get("tool_calls"))
+        if tool_call_names:
+            metadata["tool_calls"] = tool_call_names
+        finish_reason = message.metadata.get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason:
+            metadata["finish_reason"] = finish_reason
+        turn_outcome = message.metadata.get("turn_outcome")
+        if isinstance(turn_outcome, str) and turn_outcome:
+            metadata["turn_outcome"] = turn_outcome
+        return metadata
+
+    if message.role == "tool":
+        for key in (
+            "tool",
+            "success",
+            "summary",
+            "frontend_message",
+            "recommended_next_step",
+            "error_code",
+            "recovery_class",
+            "path",
+            "microcompact_artifact_ref",
+            "microcompact_strategy",
+        ):
+            value = message.metadata.get(key)
+            if isinstance(value, bool):
+                metadata[key] = value
+                continue
+            if isinstance(value, str) and value:
+                metadata[key] = value
+        for key in ("microcompact_original_length",):
+            value = message.metadata.get(key)
+            if isinstance(value, int):
+                metadata[key] = value
+        return metadata
+
+    return metadata
+
+
+def _compaction_tool_call_names(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def _compaction_attachment_descriptors(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    descriptors: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        descriptor: dict[str, str] = {}
+        for key in ("name", "content_type", "kind"):
+            field = item.get(key)
+            if isinstance(field, str) and field:
+                descriptor[key] = field
+        if descriptor:
+            descriptors.append(descriptor)
+    return descriptors
 
 
 def _estimate_incremental_context_tokens(
@@ -412,6 +562,89 @@ def _estimate_incremental_context_tokens(
     return provider.estimate_tokens(delta_messages)
 
 
+def _context_rewrite_invalidates_confirmed_context(
+    session: SessionRecord,
+    checkpoint: CheckpointRecord | None,
+    latest_record: ModelUsageRecord,
+) -> bool:
+    if checkpoint_archived_message_count(session, checkpoint) <= 0:
+        checkpoint_invalidates = False
+    else:
+        checkpoint_created_at = _parse_timestamp(checkpoint.created_at if checkpoint else None)
+        latest_recorded_at = _parse_timestamp(latest_record.created_at)
+        checkpoint_invalidates = bool(
+            checkpoint_created_at is not None
+            and latest_recorded_at is not None
+            and checkpoint_created_at > latest_recorded_at
+        )
+    if checkpoint_invalidates:
+        return True
+
+    latest_recorded_at = _parse_timestamp(latest_record.created_at)
+    microcompact_at = _parse_timestamp(str(session.metadata.get("last_microcompact_at") or ""))
+    return bool(microcompact_at is not None and latest_recorded_at is not None and microcompact_at > latest_recorded_at)
+
+
+def _build_message_segments(messages: list[SessionMessage]) -> list[MessageSegment]:
+    segments: list[MessageSegment] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        group_id = _message_group_id(message)
+        if group_id:
+            end = index + 1
+            while end < len(messages) and _message_group_id(messages[end]) == group_id:
+                end += 1
+            segments.append(MessageSegment(start=index, end=end, key=f"group:{group_id}"))
+            index = end
+            continue
+
+        tool_call_ids = _assistant_tool_call_ids(message)
+        if message.role == "assistant" and tool_call_ids:
+            remaining = set(tool_call_ids)
+            end = index + 1
+            while end < len(messages):
+                candidate_tool_call_id = _message_tool_call_id(messages[end])
+                if messages[end].role != "tool" or candidate_tool_call_id not in remaining:
+                    break
+                remaining.discard(candidate_tool_call_id)
+                end += 1
+                if not remaining:
+                    break
+            segments.append(MessageSegment(start=index, end=end, key=f"tool_calls:{','.join(tool_call_ids)}"))
+            index = end
+            continue
+
+        tool_call_id = _message_tool_call_id(message)
+        if message.role == "tool" and tool_call_id:
+            segments.append(MessageSegment(start=index, end=index + 1, key=f"tool:{tool_call_id}"))
+            index += 1
+            continue
+
+        segments.append(MessageSegment(start=index, end=index + 1, key=f"message:{message.id}"))
+        index += 1
+    return segments
+
+
+def _assistant_tool_call_ids(message: SessionMessage) -> list[str]:
+    tool_calls = message.metadata.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return []
+    ids: list[str] = []
+    for raw_tool_call in tool_calls:
+        if not isinstance(raw_tool_call, dict):
+            continue
+        tool_call_id = raw_tool_call.get("id")
+        if isinstance(tool_call_id, str) and tool_call_id.strip():
+            ids.append(tool_call_id)
+    return ids
+
+
+def _message_tool_call_id(message: SessionMessage) -> str | None:
+    tool_call_id = message.metadata.get("tool_call_id")
+    return tool_call_id if isinstance(tool_call_id, str) and tool_call_id else None
+
+
 def _normalize_summary_text(content: str) -> str:
     cleaned = content.strip()
     if cleaned.startswith("```") and cleaned.endswith("```"):
@@ -419,11 +652,6 @@ def _normalize_summary_text(content: str) -> str:
         if len(lines) >= 3:
             cleaned = "\n".join(lines[1:-1]).strip()
     return cleaned
-
-
-def _message_turn_id(message: SessionMessage) -> str | None:
-    turn_id = message.metadata.get("turn_id")
-    return turn_id if isinstance(turn_id, str) and turn_id else None
 
 
 def _message_group_id(message: SessionMessage) -> str | None:
@@ -471,7 +699,7 @@ def _provider_message_from_session_message(message: SessionMessage) -> dict[str,
     return {"role": message.role, "content": message.content}
 
 
-def _build_microcompact_tool_content(message: SessionMessage) -> str | None:
+def _build_microcompact_tool_content(message: SessionMessage, *, artifact_ref: str | None = None) -> str | None:
     if message.metadata.get("microcompact_applied"):
         return None
 
@@ -492,6 +720,8 @@ def _build_microcompact_tool_content(message: SessionMessage) -> str | None:
     preview = _truncate_text(normalized_content, MICROCOMPACT_TOOL_PREVIEW_CHARS)
 
     parts = [f"[Microcompact tool output] {tool_name} {status}."]
+    if artifact_ref:
+        parts.append(f"Original output archived at: {artifact_ref}.")
     if frontend_message:
         parts.append(frontend_message.strip())
     elif preview:
@@ -501,6 +731,19 @@ def _build_microcompact_tool_content(message: SessionMessage) -> str | None:
     elif preview and frontend_message:
         parts.append(f"Preview: {preview}")
     return " ".join(part for part in parts if part).strip()
+
+
+def _write_microcompact_artifact(message: SessionMessage, artifact_dir: Path | None) -> str | None:
+    if artifact_dir is None or not message.content:
+        return None
+    digest = sha256(message.content.encode("utf-8", errors="replace")).hexdigest()[:24]
+    safe_message_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in message.id)[:80]
+    filename = f"{safe_message_id or 'message'}_{digest}.txt"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / filename
+    if not artifact_path.exists():
+        artifact_path.write_text(message.content, encoding="utf-8")
+    return str(artifact_path)
 
 
 def _parse_timestamp(value: str | None) -> datetime | None:

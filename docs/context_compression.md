@@ -24,10 +24,11 @@ Newman 将“上下文占用”拆成两套指标：
 
 因此：
 
-- UI 主圆环使用 `confirmed_prompt_tokens`
+- UI 主圆环使用 `projected_next_prompt_tokens / auto_compact_limit`
 - 自动压缩触发使用 `projected_next_prompt_tokens`
+- `confirmed_prompt_tokens` 作为 tooltip 中的已确认参考值
 
-这两套指标分别面向“回看已确认事实”和“前瞻下一次风险”，不混用。
+这两套指标分别面向“回看已确认事实”和“前瞻下一次风险”，UI 主状态以前瞻风险为准。
 
 ---
 
@@ -77,30 +78,30 @@ effective_context_window = configured_context_window * 95%
 
 ## 3. UI 展示口径
 
-聊天页上下文圆环展示 `confirmed_prompt_tokens`。
+聊天页上下文圆环展示预算使用率：
 
 也就是说，圆环回答的是：
 
 ```text
-上一条真实主模型请求的输入，占有效上下文窗口的多少
+下一次主模型请求预计 prompt，占可用 prompt 预算的多少
 ```
 
 推荐展示字段：
 
-- `confirmed_prompt_tokens`
-- `confirmed_pressure`
-- `effective_context_window`
+- `projected_next_prompt_tokens`
+- `auto_compact_limit`
+- `budget_pressure`
+- `projected_over_soft_limit`
+- `projected_over_limit`
 
 推荐行为：
 
-- 主圆环显示 `confirmed_pressure`
-- Tooltip 或调试面板可额外显示 `projected_next_prompt_tokens`
-- 当尚无真实 usage 记录时，圆环显示空态 `--`
+- 主圆环显示 `budget_pressure = projected_next_prompt_tokens / auto_compact_limit`
+- Tooltip 补充显示 `confirmed_prompt_tokens / effective_context_window`
+- `projected_over_soft_limit` 进入接近压缩状态
+- `projected_over_limit` 进入即将压缩状态
 
-这样 UI 的语义始终稳定：
-
-- 有记录时，展示已确认值
-- 无记录时，不拿估算值冒充已确认值
+这样 UI 与自动压缩触发条件保持一致。
 
 ---
 
@@ -119,8 +120,8 @@ effective_context_window = configured_context_window * 95%
 
 1. 组装下一次主模型请求的 prompt
 2. 计算 `projected_next_prompt_tokens`
-3. 与 `auto_compact_limit` 比较
-4. 如超限，执行压缩
+3. 与 `soft_compact_limit`、`auto_compact_limit` 比较
+4. 如超过软阈值，先执行 tool output microcompact；仍超线再执行 checkpoint 压缩；如超过硬阈值，则必须压缩到可继续
 5. 压缩后重新组装并复检
 6. 通过后再发主模型请求
 
@@ -130,7 +131,7 @@ effective_context_window = configured_context_window * 95%
 
 ## 5. 自动压缩采用预算制
 
-自动压缩不直接使用单一百分比阈值，而是使用预算制上限：
+自动压缩使用预算制上限：
 
 ```text
 auto_compact_limit =
@@ -140,11 +141,29 @@ auto_compact_limit =
   - safety_buffer_tokens
 ```
 
+`auto_compact_limit` 也可称为 `usable_prompt_budget`。
+
+软压缩线：
+
+```text
+soft_compact_limit = auto_compact_limit * runtime.context_compress_threshold
+```
+
+默认 `runtime.context_compress_threshold = 0.85`。
+
 触发条件为：
 
 ```text
-if projected_next_prompt_tokens >= auto_compact_limit:
-    trigger compact
+if projected_next_prompt_tokens < soft_compact_limit:
+    no compact
+
+if projected_next_prompt_tokens >= soft_compact_limit:
+    tool output microcompact
+    if still >= soft_compact_limit:
+        checkpoint compact
+
+if checkpoint compact cannot reduce enough and projected_next_prompt_tokens >= auto_compact_limit:
+    context_irreducible
 ```
 
 ### 5.1 预算项含义
@@ -199,7 +218,13 @@ safety_buffer_tokens = 4096
 auto_compact_limit = 190000 - 4096 - 2048 - 4096 = 179760
 ```
 
-这时，只有当下一次主请求预计达到 `179760` token 以上时，才触发自动压缩。
+默认软压缩线为：
+
+```text
+soft_compact_limit = 179760 * 0.85 = 152796
+```
+
+这时，下一次主请求预计达到 `152796` token 以上会尝试 checkpoint 压缩；达到 `179760` token 以上则属于必须压缩的硬线。
 
 ---
 
@@ -260,40 +285,61 @@ projected_next_prompt_tokens = estimate_tokens(assembled_prompt)
 
 ---
 
-## 7. 压缩采用分级策略
+## 7. 压缩采用最小分级策略
 
-Newman 的自动压缩分为三层：
+Newman 的自动压缩保留三层，按成本从低到高执行：
 
-1. `microcompact`
+1. `tool output microcompact`
 2. `checkpoint compact`
 3. `irreducible`
 
-每一层执行后都重新计算 `projected_next_prompt_tokens`，只有仍然超限时才进入下一层。
+每一层执行后都重新计算 `projected_next_prompt_tokens`。达到 `soft_compact_limit` 后先压缩旧工具输出；如果仍然超线，再执行 `checkpoint compact`。达到 `auto_compact_limit` 后，压缩失败会阻断后续主模型请求。
 
-### 7.1 `microcompact`
+### 7.1 `tool output microcompact`
 
-`microcompact` 优先处理历史中体积大、但保真要求低的内容。
+达到软阈值后，先尝试压缩旧工具输出。
 
-首要目标是老的工具输出，尤其是：
+压缩对象只包括可归档前缀里的 `tool` 消息，不处理最近保留的 segment，也不处理已归档到 checkpoint 边界之前的历史。
 
-- 大段终端 stdout
-- 大段检索结果
-- 大段中间分析文本
+原始工具输出会被替换成短摘要，例如：
 
-`microcompact` 的目标不是生成全局摘要，而是把“旧的胖消息”压成短摘要或引用。
+```text
+[Microcompact tool output] terminal success.
+Original output archived at: backend_data/sessions/tool_outputs/{session_id}/...
+Preview: ...
+```
 
-它遵循两个原则：
-
-- 不动最近完整 turn / group
-- 不改变当前工作所依赖的最新消息链
+如果运行时提供了 artifact 目录，原始输出会先落盘，路径写入 `message.metadata.microcompact_artifact_ref`。这样模型上下文变短，但调试和审计仍可追溯原始工具输出。
 
 ### 7.2 `checkpoint compact`
 
-如果 `microcompact` 后仍超限，则执行 `checkpoint compact`。
+执行 `tool output microcompact` 后，如果下一次 prompt 仍然达到软阈值，就执行 `checkpoint compact`。
 
-它会把较早的历史压缩成 `checkpoint.summary`，并保留最近仍需原样工作的消息尾部。
+它会把较早的历史压缩成 `checkpoint.summary`，并记录 prompt 应跳过的历史前缀边界。
+
+重要语义：
+
+- `session.messages` 是 UI 和审计用的完整聊天 transcript，压缩后不删除历史消息
+- prompt 组装时使用 `checkpoint.summary + 未归档的新消息`
+- 前端聊天记录保持原样，只在当前 turn 的 timeline 中显示“上下文已压缩”这类小型系统提示
+
+边界语义：
+
+- checkpoint 文件里的 `turn_range[1]` 记录已归档前缀的消息数
+- prompt 组装只读取这个边界之后的消息
+- 边界之前的消息仍保留在 `session.messages` 里，供 UI、审计和恢复查看
 
 `checkpoint compact` 生成的是 handoff summary，而不是简单拼接日志。
+
+摘要目标是“保留后续仍然需要的持续有效上下文”，不是复述内部执行过程。因此默认会排除：
+
+- 逐步工具调用流水
+- 文件读写和 memory 维护记录
+- workflow / request / turn / group 等内部 ID
+- 已完成分支的过程叙述
+- 仅用于压测或填充上下文的噪声材料
+
+如果某个工具结果构成持续约束、会影响下一步，或属于用户后续会直接依赖的可见结果，才应进入 `checkpoint.summary`。
 
 ### 7.3 `irreducible`
 
@@ -313,23 +359,25 @@ Newman 的自动压缩分为三层：
 
 ---
 
-## 8. 保留策略按 turn / group，而不是按消息条数
+## 8. 保留策略按 segment，而不是按完整 turn
 
-压缩保留单位不是“最近 N 条消息”，而是“最近完整工作单元”。
+压缩保留单位不是完整 `turn_id`。`turn_id` 是 UI 聚合概念，不适合作为压缩原子；同一个长 turn 里，较早且已经闭合的工作片段可以被归档。
 
-至少保留以下内容：
+当前实现里的 segment 规则：
 
-- 最近完整 `turn_id`
-- 最近完整 `group_id`
-- 最近一次 assistant tool-calls 与其对应的全部 tool 结果
+- 有 `group_id` 的连续消息归为一个 segment
+- 没有 `group_id` 的 assistant tool-calls，会和紧随其后的对应 tool results 归为一个 segment
+- 普通 user / assistant / system 消息各自作为独立 segment
+
+`runtime.context_compaction_preserve_recent` 表示保留最近多少个 segment，默认是 `4`。
 
 不能出现以下切法：
 
 - 保留了 tool result，但丢了发起它的 assistant tool-calls
 - 保留了 assistant tool-calls，但只保留了部分 tool 结果
-- 把同一轮工作链切成前后两半
+- 把同一个 `group_id` 的工具调用链切成前后两半
 
-这样做的目标是保证压缩后仍然保留最小可继续执行单元。
+这样做的目标是保证压缩后仍然保留最小可继续执行单元，同时避免“所有尾部消息都属于同一个 `turn_id`，导致没有任何可压缩内容”的 `nothing_to_compress` 问题。
 
 ---
 
@@ -413,10 +461,12 @@ POST /api/sessions/{session_id}/compress
 
 流程为：
 
-1. 计算当前可归档前缀和应保留尾部
-2. 执行 `checkpoint compact`
-3. 压缩后复检
-4. 返回新的 checkpoint 和裁剪后的 session
+1. 计算当前可归档前缀和应保留 segment 尾部
+2. 先执行旧工具输出 microcompact
+3. 执行 `checkpoint compact`
+4. 记录新的 checkpoint 和归档边界
+5. 压缩后复检
+6. 返回新的 checkpoint 和完整 session transcript
 
 手动压缩的主要用途是：
 
@@ -453,12 +503,16 @@ POST /api/sessions/{session_id}/restore-checkpoint
 {
   "effective_context_window": 190000,
   "auto_compact_limit": 179760,
+  "soft_compact_limit": 152796,
   "confirmed_prompt_tokens": 8200,
   "confirmed_pressure": 0.0431,
   "confirmed_request_kind": "session_turn",
   "confirmed_recorded_at": "2026-04-16T09:30:00Z",
   "projected_next_prompt_tokens": 12140,
   "projected_pressure": 0.0639,
+  "budget_pressure": 0.0675,
+  "projected_over_soft_limit": false,
+  "projected_over_limit": false,
   "projection_source": "confirmed_plus_delta"
 }
 ```
@@ -517,10 +571,11 @@ projected_next_prompt_tokens = 9100
 
 Newman 的上下文压缩方案可以概括为：
 
-- UI 展示上一条真实主请求的 `confirmed_prompt_tokens`
+- UI 圆环展示 `projected_next_prompt_tokens / auto_compact_limit`
 - 自动压缩依据下一条主请求的 `projected_next_prompt_tokens`
-- 压缩阈值使用预算制 `auto_compact_limit`
+- 压缩阈值使用预算制 `soft_compact_limit` 和 `auto_compact_limit`
 - 压缩检查发生在每一次主模型请求前
-- 压缩保留单位是最近完整 `turn / group`，而不是固定条数消息
-- 压缩流程按 `microcompact -> checkpoint compact -> irreducible` 分级执行
+- 压缩保留单位是最近完整 segment，而不是完整 `turn_id`
+- 压缩不删除 `session.messages`，只改变 prompt 组装所使用的历史范围
+- 压缩流程按 `tool output microcompact -> checkpoint compact -> irreducible` 分级执行
 - 每次压缩后都必须复检，并通过失败熔断避免无效反复压缩

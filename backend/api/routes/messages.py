@@ -31,6 +31,7 @@ class ActiveSessionRun:
     user_content: str = ""
     approval_mode: str = "manual"
     interrupted: bool = False
+    detached: bool = False
 
 
 @router.post("/{session_id}/messages")
@@ -66,8 +67,6 @@ async def send_message(session_id: str, request: Request):
         active_run: ActiveSessionRun | None = None
 
         async def emit(event: str, data: dict):
-            if stream_closed:
-                return
             current_run = active_runs.get(session_id)
             if current_run is not None and current_run.interrupted and event != "stream_completed":
                 return
@@ -75,18 +74,23 @@ async def send_message(session_id: str, request: Request):
             audit_path.parent.mkdir(parents=True, exist_ok=True)
             with audit_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            await queue.put(format_sse_payload(payload))
-            await asyncio.sleep(0)
+            target_queue = queue
+            if current_run is not None:
+                target_queue = current_run.event_queue
+            if target_queue is not None:
+                await target_queue.put(format_sse_payload(payload))
+                await asyncio.sleep(0)
 
         async def run_worker() -> None:
             nonlocal stream_failed
             try:
                 saved_attachments = await attachment_service.save_uploads(session_id, provisional_turn_id, uploads) if uploads else []
+                serialized_attachments = attachment_service.serialize(saved_attachments)
                 metadata = {
-                    "attachments": attachment_service.serialize(saved_attachments),
+                    "attachments": serialized_attachments,
                     "approval_mode": approval_mode,
                     "original_content": content,
-                    "input_modalities": _infer_input_modalities(content, attachment_service.serialize(saved_attachments)),
+                    "input_modalities": _infer_input_modalities(content, serialized_attachments),
                 }
 
                 post_user_message = None
@@ -101,47 +105,17 @@ async def send_message(session_id: str, request: Request):
                                 "turn_id": task.turn_id,
                             },
                         )
-                        attachment_analysis, multimodal_parse, multimodal_failure = await attachment_service.analyze_attachments(
-                            content,
-                            saved_attachments,
-                            session_id=session_id,
-                            turn_id=task.turn_id,
-                        )
-                        _apply_attachment_parse_to_user_message(
-                            user_message,
-                            content,
-                            attachment_service.serialize(saved_attachments),
-                            attachment_analysis,
-                            multimodal_parse,
-                        )
                         _maybe_refresh_session_title(task.session, user_message)
-                        failed_attachments = [item for item in saved_attachments if item.analysis_status == "failed"]
-                        if failed_attachments:
-                            warning_metadata = {
-                                "type": "attachment_analysis_warning",
-                                "turn_id": task.turn_id,
-                                **({"request_id": request_id} if request_id else {}),
-                            }
-                            if multimodal_failure:
-                                warning_metadata.update(multimodal_failure)
-                            task.session.messages.append(
-                                SessionMessage(
-                                    id=uuid4().hex,
-                                    role="system",
-                                    content=attachment_service.build_failure_warning(saved_attachments),
-                                    metadata=warning_metadata,
-                                )
-                            )
                         runtime.session_store.save(task.session)
                         await emit_turn(
                             "attachment_processed",
                             {
                                 "count": len(saved_attachments),
                                 "files": attachment_service.build_event_files(saved_attachments),
-                                "ok": not failed_attachments,
+                                "ok": True,
+                                "status": "registered",
                                 "turn_id": task.turn_id,
-                                "warnings": attachment_analysis.get("warnings", []),
-                                **(multimodal_failure or {}),
+                                "warnings": [],
                             },
                         )
 
@@ -171,10 +145,11 @@ async def send_message(session_id: str, request: Request):
                 )
             finally:
                 current_run = active_runs.get(session_id)
-                if current_run is not None:
+                if current_run is not None and current_run.worker is worker:
                     current_run.turn_id = current_run.turn_id or _resolve_turn_id(runtime, session_id, request_id)
-                if not stream_closed:
-                    await emit("stream_completed", {"session_id": session_id, "ok": not stream_failed})
+                await emit("stream_completed", {"session_id": session_id, "ok": not stream_failed})
+                if current_run is not None and current_run.worker is worker:
+                    _clear_active_session_run(active_runs, session_id, current_run)
 
         worker = asyncio.create_task(run_worker())
         active_run = ActiveSessionRun(
@@ -191,7 +166,9 @@ async def send_message(session_id: str, request: Request):
             while True:
                 if await request.is_disconnected():
                     stream_closed = True
-                    worker.cancel()
+                    if active_run is not None:
+                        active_run.detached = True
+                        active_run.event_queue = None
                     break
                 if worker.done() and queue.empty():
                     break
@@ -201,11 +178,14 @@ async def send_message(session_id: str, request: Request):
                     continue
         finally:
             stream_closed = True
-            if not worker.done():
-                worker.cancel()
-            with suppress(asyncio.CancelledError):
-                await worker
-            _clear_active_session_run(active_runs, session_id, active_run)
+            detached = active_run.detached if active_run is not None else False
+            if not detached or worker.done():
+                if not worker.done():
+                    worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker
+                if active_run is not None:
+                    _clear_active_session_run(active_runs, session_id, active_run)
 
     return StreamingResponse(
         event_stream(),
@@ -284,24 +264,6 @@ async def _parse_request_payload(request: Request) -> tuple[str, list[UploadFile
     return content, uploads, approval_mode
 
 
-def _apply_attachment_parse_to_user_message(
-    user_message: SessionMessage,
-    original_content: str,
-    attachments: list[dict[str, object]],
-    attachment_analysis: dict[str, object],
-    multimodal_parse: dict[str, object] | None = None,
-) -> None:
-    user_message.content = original_content
-    user_message.metadata["original_content"] = original_content
-    user_message.metadata["input_modalities"] = _infer_input_modalities(original_content, attachments)
-    user_message.metadata["attachments"] = attachments
-    user_message.metadata["attachment_analysis"] = attachment_analysis
-    if multimodal_parse is not None:
-        user_message.metadata["multimodal_parse"] = multimodal_parse
-    else:
-        user_message.metadata.pop("multimodal_parse", None)
-
-
 def _maybe_refresh_session_title(session, user_message: SessionMessage) -> None:
     if session.title != "未命名会话":
         return
@@ -375,7 +337,7 @@ def _persist_turn_interrupted(
     user_content: str,
     approval_mode: str,
 ) -> dict[str, object]:
-    message = "当前任务已停止"
+    message = "上一次回合被用户中断，当前任务已停止。"
     session = runtime.session_store.get(session_id)
     if turn_id and not any(item.role == "user" and item.metadata.get("turn_id") == turn_id for item in session.messages):
         session.messages.append(

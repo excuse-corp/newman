@@ -4,11 +4,12 @@ import json
 import mimetypes
 import re
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from starlette.datastructures import UploadFile
 
-from backend.attachments.models import ParsedAttachment, SavedAttachment
+from backend.attachments.models import ParsedAttachment, SavedAttachment, utc_now
 from backend.attachments.parser import parse_attachment
 from backend.providers.base import ProviderError
 
@@ -38,7 +39,8 @@ class AttachmentService:
         originals_dir.mkdir(parents=True, exist_ok=True)
 
         saved: list[SavedAttachment] = []
-        for upload in uploads:
+        kind_counts: dict[str, int] = {}
+        for order_index, upload in enumerate(uploads, start=1):
             filename = _normalize_filename(upload.filename)
             suffix = Path(filename).suffix.lower()
             if suffix not in ALLOWED_ATTACHMENT_SUFFIXES:
@@ -56,16 +58,20 @@ class AttachmentService:
             target = originals_dir / f"{attachment_id}{suffix}"
             target.write_bytes(data)
             content_type = upload.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            kind = _infer_attachment_kind(suffix)
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
             saved.append(
                 SavedAttachment(
                     attachment_id=attachment_id,
-                    kind=_infer_attachment_kind(suffix),
+                    kind=kind,
                     filename=filename,
                     extension=suffix,
                     content_type=content_type,
                     size_bytes=len(data),
                     path=target,
                     workspace_relative_path=self._relative_path(target),
+                    order_index=order_index,
+                    kind_index=kind_counts[kind],
                 )
             )
         self._write_manifest(session_id, turn_id, saved)
@@ -79,23 +85,93 @@ class AttachmentService:
         session_id: str,
         turn_id: str,
     ) -> tuple[dict[str, object], dict[str, object] | None, dict[str, str] | None]:
+        _attachments, attachment_analysis, multimodal_parse, multimodal_failure = await self.parse_selected_attachments(
+            content,
+            attachments,
+            session_id=session_id,
+            turn_id=turn_id,
+            target_ids={item.attachment_id for item in attachments},
+        )
+        return attachment_analysis, multimodal_parse, multimodal_failure
+
+    def serialize(self, attachments: list[SavedAttachment]) -> list[dict[str, object]]:
+        return [item.to_metadata() for item in attachments]
+
+    def restore(self, metadata: dict[str, Any]) -> SavedAttachment:
+        attachment_id = str(metadata.get("attachment_id") or "").strip()
+        if not attachment_id:
+            raise ValueError("附件元数据缺少 attachment_id")
+        path = Path(str(metadata.get("path") or "")).expanduser()
+        filename = str(metadata.get("filename") or "").strip() or path.name or "attachment"
+        extension = str(metadata.get("extension") or path.suffix or "").strip().lower()
+        kind = str(metadata.get("kind") or _infer_attachment_kind(extension)).strip() or "text"
+        content_type = str(metadata.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream")
+        uploaded_at = str(metadata.get("uploaded_at") or "").strip()
+        order_index = _coerce_non_negative_int(metadata.get("order_index"))
+        kind_index = _coerce_non_negative_int(metadata.get("kind_index"))
+        attachment = SavedAttachment(
+            attachment_id=attachment_id,
+            kind=kind,
+            filename=filename,
+            extension=extension,
+            content_type=content_type,
+            size_bytes=_coerce_non_negative_int(metadata.get("size_bytes")),
+            path=path,
+            workspace_relative_path=str(metadata.get("workspace_relative_path") or "").strip(),
+            uploaded_at=uploaded_at or metadata_timestamp_fallback(),
+            order_index=order_index,
+            kind_index=kind_index,
+            source=str(metadata.get("source") or "user_upload").strip() or "user_upload",
+            summary=str(metadata.get("summary") or "").strip(),
+            analysis_status=str(metadata.get("analysis_status") or "saved").strip() or "saved",
+            warnings=_normalize_string_list(metadata.get("warnings")),
+            analysis_error=_normalize_optional_string(metadata.get("analysis_error")),
+        )
+        parsed_markdown_path = _normalize_optional_string(metadata.get("parsed_markdown_path"))
+        if parsed_markdown_path:
+            attachment.parsed_markdown_path = Path(parsed_markdown_path).expanduser()
+        parsed_markdown_relative_path = _normalize_optional_string(metadata.get("parsed_markdown_relative_path"))
+        if parsed_markdown_relative_path:
+            attachment.parsed_markdown_relative_path = parsed_markdown_relative_path
+        return attachment
+
+    def restore_many(self, metadata_items: list[dict[str, Any]]) -> list[SavedAttachment]:
+        return [self.restore(item) for item in metadata_items]
+
+    async def parse_selected_attachments(
+        self,
+        content: str,
+        attachments: list[SavedAttachment],
+        *,
+        session_id: str,
+        turn_id: str,
+        target_ids: set[str],
+    ) -> tuple[list[SavedAttachment], dict[str, object], dict[str, object] | None, dict[str, str] | None]:
         outputs_dir = self._turn_dirs(session_id, turn_id)[1]
         outputs_dir.mkdir(parents=True, exist_ok=True)
 
-        image_attachments = [item for item in attachments if item.extension in IMAGE_SUFFIXES]
+        selected = [item for item in attachments if item.attachment_id in target_ids]
+        if not selected:
+            raise ValueError("未找到可解析的附件")
+
         multimodal_parse: dict[str, object] | None = None
         multimodal_failure: dict[str, str] | None = None
-        if image_attachments:
+        image_targets = [
+            item
+            for item in selected
+            if item.extension in IMAGE_SUFFIXES and item.analysis_status != "parsed"
+        ]
+        if image_targets:
             multimodal_parse, multimodal_failure = await self._parse_images(
                 content,
-                image_attachments,
+                image_targets,
                 outputs_dir,
                 session_id=session_id,
                 turn_id=turn_id,
             )
 
-        for attachment in attachments:
-            if attachment.extension in IMAGE_SUFFIXES:
+        for attachment in selected:
+            if attachment.extension in IMAGE_SUFFIXES or attachment.analysis_status == "parsed":
                 continue
             try:
                 parsed = parse_attachment(attachment.path)
@@ -107,11 +183,16 @@ class AttachmentService:
             self._apply_parsed_attachment(attachment, parsed, outputs_dir)
 
         self._write_manifest(session_id, turn_id, attachments)
-        attachment_analysis = self._build_attachment_analysis(content, attachments, multimodal_parse)
-        return attachment_analysis, multimodal_parse, multimodal_failure
+        attachment_analysis = self.build_attachment_analysis(content, attachments, multimodal_parse)
+        return attachments, attachment_analysis, multimodal_parse, multimodal_failure
 
-    def serialize(self, attachments: list[SavedAttachment]) -> list[dict[str, object]]:
-        return [item.to_metadata() for item in attachments]
+    def build_attachment_analysis(
+        self,
+        content: str,
+        attachments: list[SavedAttachment],
+        multimodal_parse: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return self._build_attachment_analysis(content, attachments, multimodal_parse)
 
     def build_event_files(self, attachments: list[SavedAttachment]) -> list[dict[str, object]]:
         files: list[dict[str, object]] = []
@@ -122,6 +203,9 @@ class AttachmentService:
                 "kind": item.kind,
                 "extension": item.extension,
                 "size_bytes": item.size_bytes,
+                "uploaded_at": item.uploaded_at,
+                "order_index": item.order_index,
+                "kind_index": item.kind_index,
                 "summary": item.summary,
                 "analysis_status": item.analysis_status,
             }
@@ -210,11 +294,18 @@ class AttachmentService:
     ) -> dict[str, object]:
         completed = [item for item in attachments if item.analysis_status == "parsed"]
         failed = [item for item in attachments if item.analysis_status == "failed"]
+        pending = [item for item in attachments if item.analysis_status not in {"parsed", "failed"}]
         status = "completed"
-        if completed and failed:
+        if pending and completed:
             status = "partial"
-        elif not completed:
+        elif pending and failed:
+            status = "partial"
+        elif completed and failed:
+            status = "partial"
+        elif failed:
             status = "failed"
+        elif pending:
+            status = "pending"
         normalized = content.strip()
         if not normalized:
             normalized = "请阅读已上传附件并基于附件内容回答用户请求。"
@@ -227,6 +318,9 @@ class AttachmentService:
                 "attachment_id": item.attachment_id,
                 "filename": item.filename,
                 "kind": item.kind,
+                "uploaded_at": item.uploaded_at,
+                "order_index": item.order_index,
+                "kind_index": item.kind_index,
                 "status": item.analysis_status,
                 "summary": item.summary,
                 "markdown_path": str(item.parsed_markdown_path) if item.parsed_markdown_path is not None else None,
@@ -297,6 +391,38 @@ def _normalize_filename(value: str | None) -> str:
     basename = Path(raw).name
     cleaned = re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff ]+", "_", basename).strip(" .")
     return cleaned or "attachment"
+
+
+def metadata_timestamp_fallback() -> str:
+    return utc_now()
+
+
+def _coerce_non_negative_int(value: object) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return normalized if normalized >= 0 else 0
+
+
+def _normalize_optional_string(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _normalize_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        normalized = item.strip()
+        if normalized:
+            items.append(normalized)
+    return items
 
 
 def _infer_attachment_kind(suffix: str) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from backend.runtime.workflow_state import (
@@ -22,7 +23,9 @@ class RequestUserInputTool(BaseTool):
             description=(
                 "Pause the current turn and request structured input from the user. Use this for workflow gates such "
                 "as confirmation, option selection, or free-form revisions. Do not use a normal final answer when the "
-                "next step must wait for the user."
+                "next step must wait for the user. When the user can choose from known alternatives, use kind='choice' "
+                "and pass concise options with label/value/description instead of embedding a numbered list only in "
+                "the prompt. Use kind='free_text' only when the user must type custom information."
             ),
             input_schema={
                 "type": "object",
@@ -86,6 +89,8 @@ class RequestUserInputTool(BaseTool):
         content = str(arguments.get("content") or "").strip()
         options = _normalize_options(arguments.get("options"))
 
+        if not options:
+            options = _extract_enumerated_options(prompt)
         if kind in {"confirm", "choice"} and not options:
             options = _default_options_for_kind(kind)
         if kind == "choice" and len(options) < 2:
@@ -157,6 +162,41 @@ def _normalize_options(value: object) -> list[dict[str, object]]:
     return options
 
 
+def _extract_enumerated_options(prompt: str) -> list[dict[str, object]]:
+    matches = list(re.finditer(r"(?:^|[\s\n:：，,；;])([1-9]\d*)[.．、)]\s*", prompt))
+    if len(matches) < 2:
+        return []
+
+    options: list[dict[str, object]] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(prompt)
+        raw_text = re.sub(r"\s+", " ", prompt[start:end]).strip()
+        if not raw_text:
+            continue
+        label, description = _split_enumerated_option_text(raw_text)
+        if not label:
+            continue
+        option: dict[str, object] = {
+            "label": label,
+            "value": f"option_{match.group(1) or index + 1}",
+        }
+        if description:
+            option["description"] = description
+        options.append(option)
+    return options if len(options) >= 2 else []
+
+
+def _split_enumerated_option_text(text: str) -> tuple[str, str | None]:
+    match = re.search(r"[?？。.!！]\s*(?=(如果|如需|请|需要|可提供|补充))", text)
+    if match is None:
+        return text.strip(), None
+    boundary = match.end()
+    label = text[:boundary].strip()
+    description = text[boundary:].strip()
+    return label, description or None
+
+
 def _default_options_for_kind(kind: str) -> list[dict[str, object]]:
     if kind == "confirm":
         return [
@@ -197,4 +237,3 @@ def _render_user_input_request(awaiting: dict[str, object]) -> str:
 
 def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
     return [RequestUserInputTool()]
-

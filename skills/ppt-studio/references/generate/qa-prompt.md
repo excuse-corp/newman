@@ -1,6 +1,12 @@
 # QA Sub-Agent Prompt
 
-This file contains the prompt used to invoke the per-slide visual QA sub-agent in Phase 5.
+## When QA Runs
+
+**Phase 4b** — after `render.py --rasterize` produces `qa/slide-N.jpg` from the HTML preview.
+
+QA runs on the HTML-rasterized images, **not** on the final PPTX. Because the HTML preview and PPTX share the same `layout()` logic, passing QA at Phase 4 means the PPTX will also pass. There is no separate QA loop in Phase 5.
+
+---
 
 ## Scoring Model
 
@@ -83,19 +89,50 @@ PRIORITY_FIX: [Dx] element → change → estimated weighted score gain
 ONE_LINE_VERDICT: [one sentence: main weakness + what fixing it would achieve]
 
 Tags: [CRITICAL] [CONTENT] [DENSITY] [DESIGN] [COLOR] [POLISH]
+```
 
-Example:
-D1_TYPOGRAPHY: 7/10
-D2_COLOR: 4/10
-D3_LAYOUT: 6/10
-D4_EXPRESSION: 6/10
-D5_POLISH: 5/10
-WEIGHTED_SCORE: 5.6
-APPROVED: false
-TOP_3_ISSUES:
-1. [D2][CRITICAL][COLOR] all cards — fill '1A4FAA' same family as bg '0052CC', fails squint test → change fills to 'FFFFFF', body text to '333333' → D2+4, D5+1
-2. [D5][DESIGN] subtitle — '3B7DD8' on '0052CC' near-invisible → change to 'CCE0FF' → D5+2, D2+1
-3. [D3][DENSITY] right column bottom 35% empty → reduce card height 4.2→3.0 → D3+2
-PRIORITY_FIX: [D2] card fills → 'FFFFFF' + body text '333333' → +1.4 weighted
-ONE_LINE_VERDICT: Cards dissolve into the background — fixing card contrast alone transforms this from unreadable to professional.
+---
+
+## QA Loop Logic
+
+```
+FOR each qa/slide-N.jpg:
+  iteration = 0
+  WHILE iteration < 3:
+    send image + prompt → parse verdict
+    IF APPROVED OR (WEIGHTED_SCORE ≥ 6.0 AND no dimension ≤ 3): BREAK
+    apply PRIORITY_FIX first
+    apply [CRITICAL] and [CONTENT] fixes from TOP_3_ISSUES
+    apply [DESIGN][POLISH] only if iteration < 2
+    update plan.json → re-run render.py --rasterize for this slide only → re-check
+    iteration += 1
+  IF still failing after 3 iterations: log ⚠️ ONE_LINE_VERDICT and continue
+```
+
+After all slides pass (or are flagged), re-run `render.py --preview` to regenerate the final preview.html with all fixes applied. Then present to user for Phase 4c gate.
+
+---
+
+## Fix Translation
+
+All QA fixes go into `plan.json` or `render.py` — never hand-patch the HTML.
+
+| QA issue | Fix location |
+|---|---|
+| Wrong color on an element | `theme.*` in plan.json |
+| Too much / too little content | slide content fields in plan.json |
+| Card layout density | switch template or reduce card count in plan.json |
+| Decorative element position or size | `layout()` function in render.py |
+| Font size or weight | `layout()` function in render.py |
+
+---
+
+## Output Summary
+
+After all slides:
+```
+✅ Passed: [slide numbers]
+🔄 Fixed: [slide N: N iterations, what changed]
+⚠️ Flagged: [slide N: ONE_LINE_VERDICT]
+DECK-WIDE PATTERNS: [issues on 3+ slides → fix in shared layout code]
 ```

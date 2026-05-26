@@ -1,10 +1,10 @@
 ---
-name: skill-creator
-description: Create or update Newman skills in the workspace using the current skill conventions.
-when_to_use: Use when the user wants to create, revise, package, or standardize a skill.
+name: skill-manager
+description: Create, update, or delete Newman skills in the workspace using the current skill conventions.
+when_to_use: Use when the user wants to create, revise, package, standardize, or delete a skill.
 ---
 
-# Skill Creator
+# Skill Manager
 
 Use this skill when the task is to create a new skill or improve an existing one.
 
@@ -16,10 +16,11 @@ Produce a reusable skill directory with a high-quality `SKILL.md`, plus any ligh
 
 1. Inspect existing skills first with `list_dir`, `search_files`, and `read_file`.
 2. Confirm the target skill name, purpose, trigger scenario, and runtime assumptions from the user's request.
-3. Use the local template files in this skill before writing anything from scratch.
-4. Keep `SKILL.md` short and procedural. Put bulky details in `references/`.
-5. If a skill ships Python code with third-party packages, prefer a skill-local environment and wrapper script over relying on global packages.
-6. If the task genuinely needs a tracked checklist, enter or rely on Plan mode before using `update_plan`. Do not tell a skill to call `update_plan` from Default mode.
+3. If the user wants to delete a skill, confirm the target skill name and delete its entire directory.
+4. Use the local template files in this skill before writing anything from scratch.
+5. Keep `SKILL.md` short and procedural. Put bulky details in `references/`.
+6. If a skill ships Python code with third-party packages, prefer a skill-local environment and wrapper script over relying on global packages.
+7. If the task genuinely needs a tracked checklist, enter or rely on Plan mode before using `update_plan`. Do not tell a skill to call `update_plan` from Default mode.
 
 ## Required skill structure
 
@@ -56,6 +57,7 @@ skills/
 - Use `search_files` to find similar skills or repeated conventions.
 - Use `request_user_input` for workflow checkpoints that require user confirmation, choice, or free-text input before continuing.
 - Use `update_plan` only while Plan mode is active. If a tracked checklist is necessary, the agent or user must enter Plan mode first.
+- Use `terminal` to delete entire skill directories when the user wants to remove a skill. Always confirm with the user before deletion.
 - Use `terminal` only when file tools are insufficient.
 
 ## Workflow gates

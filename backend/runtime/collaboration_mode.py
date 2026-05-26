@@ -10,9 +10,9 @@ CollaborationModeName = Literal["default", "plan"]
 DEFAULT_COLLABORATION_MODE: CollaborationModeName = "default"
 PLAN_COLLABORATION_MODE: CollaborationModeName = "plan"
 
-PLAN_MODE_BLOCKED_TOOLS = frozenset({"enter_plan_mode", "update_plan_draft", "exit_plan_mode"})
+PLAN_MODE_BLOCKED_TOOLS = frozenset({"enter_plan_mode"})
 
-DEFAULT_MODE_BLOCKED_TOOLS = frozenset({"update_plan", "update_plan_draft", "exit_plan_mode"})
+DEFAULT_MODE_BLOCKED_TOOLS = frozenset({"update_plan"})
 
 COLLABORATION_MODE_DEFAULT_PROMPT = """## Collaboration Mode
 当前处于 Default mode。
@@ -33,7 +33,6 @@ COLLABORATION_MODE_PLAN_PROMPT = """## Collaboration Mode
 - 完成一步后，立刻调用 `update_plan` 将该项标记为 `completed`，并把下一项推进为 `in_progress`。
 - 如果暂时无法继续，调用 `update_plan` 将当前步骤标记为 `blocked`，并在 `explanation` 中写清阻塞原因。
 - 如果目标变化，可以重排或改写未完成步骤；除非用户明确取消，否则保留已完成项。
-- 不要调用 `update_plan_draft` 或 `exit_plan_mode`；旧草案流不再是这个模式的主链路。
 """
 
 

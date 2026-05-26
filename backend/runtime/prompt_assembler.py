@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from backend.memory.compressor import model_visible_session_messages
 from backend.memory.stable_context import StableContextLoader
 from backend.runtime.collaboration_mode import build_collaboration_mode_prompt
 from backend.runtime.message_rendering import build_user_message_for_provider
@@ -15,6 +16,17 @@ COMMENTARY_SYSTEM_GUARDRAIL = (
     "<commentary>...</commentary> message immediately before the first tool or skill action.\n"
     "Do not skip it. Use the user's language. Do not put final-answer content inside <commentary>.\n"
     "`commentary` is not a function/tool name. Never call a tool named commentary, thinking, or think."
+)
+
+USER_INPUT_SYSTEM_GUARDRAIL = (
+    "CRITICAL USER-INPUT RULE:\n"
+    "If you need the user to provide missing information, choose from options, confirm a decision, "
+    "approve content, or revise requirements before you can continue the task, call the "
+    "`request_user_input` tool. Do not present that question as a normal final answer. "
+    "When the user can choose among known alternatives, pass them as structured options instead of "
+    "only embedding a numbered list in the prompt. "
+    "A final answer is only for completed work or an answer that does not need the user to reply "
+    "before the workflow can continue."
 )
 
 
@@ -33,16 +45,17 @@ class PromptAssembler:
     ) -> list[dict]:
         stable_context = self.stable_context_loader.build(tools_overview)
         system_sections = [
-            f"{COMMENTARY_SYSTEM_GUARDRAIL}\n\n{stable_context}",
+            f"{COMMENTARY_SYSTEM_GUARDRAIL}\n\n{USER_INPUT_SYSTEM_GUARDRAIL}\n\n{stable_context}",
             build_collaboration_mode_prompt(session),
         ]
         workflow_state_prompt = build_workflow_state_prompt(session)
         if workflow_state_prompt:
             system_sections.append(workflow_state_prompt)
         overrides = tool_message_overrides or {}
+        prompt_messages = model_visible_session_messages(session, checkpoint)
         failed_tool_call_ids = {
             str(item.metadata.get("tool_call_id"))
-            for item in session.messages
+            for item in prompt_messages
             if item.role == "tool"
             and item.metadata.get("success") is False
             and isinstance(item.metadata.get("tool_call_id"), str)
@@ -55,7 +68,7 @@ class PromptAssembler:
         if checkpoint and not has_restored_checkpoint:
             system_sections.append(f"## Checkpoint Summary\n{checkpoint.summary}")
         messages = [{"role": "system", "content": "\n\n".join(system_sections)}]
-        for item in session.messages:
+        for item in prompt_messages:
             if item.role == "assistant":
                 tool_calls = item.metadata.get("tool_calls")
                 if isinstance(tool_calls, list) and tool_calls:

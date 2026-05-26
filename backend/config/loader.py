@@ -29,10 +29,12 @@ server:
 
 runtime:
   max_tool_depth: 30
-  context_compress_threshold: 0.8
+  context_compress_threshold: 0.85
   context_critical_threshold: 0.92
   tool_retry_attempts: 3
   tool_retry_backoff_seconds: 1.0
+  provider_retry_attempts: 3
+  provider_retry_backoff_seconds: 1.0
 
 rag:
   chroma_collection: "knowledge_chunks"

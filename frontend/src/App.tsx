@@ -76,10 +76,23 @@ type AwaitingUserInputPayload = {
   createdAt?: string | null;
 };
 
+type AwaitingUserInputReplyMetadata = {
+  requestId?: string | null;
+  workflowId?: string | null;
+  kind?: string | null;
+  skillName?: string | null;
+  phase?: string | null;
+};
+
 type AwaitingUserInputSelection = {
   value: string;
   label: string;
 };
+
+const DEFAULT_CONFIRM_AWAITING_OPTIONS: AwaitingUserInputOption[] = [
+  { label: "确认，继续", value: "approved" },
+  { label: "需要修改", value: "revise" },
+];
 
 type ApprovalRequestLike = Pick<PendingApproval, "tool" | "arguments" | "reason">;
 type ApprovalNodePayload = ApprovalRequestLike & {
@@ -144,13 +157,16 @@ type SessionDetailResponse = {
   context_usage?: {
     effective_context_window: number;
     auto_compact_limit: number;
+    soft_compact_limit: number;
     confirmed_prompt_tokens: number | null;
     confirmed_pressure: number | null;
     confirmed_request_kind: string | null;
     confirmed_recorded_at: string | null;
     projected_next_prompt_tokens: number;
     projected_pressure: number | null;
+    budget_pressure: number | null;
     projection_source: string;
+    projected_over_soft_limit: boolean;
     projected_over_limit: boolean;
     compaction_stage: string | null;
     compaction_fail_streak: number;
@@ -253,6 +269,7 @@ type TurnMessage = {
   createdAt: string;
   persisted: boolean;
   approvalMode?: TurnApprovalMode | null;
+  respondsToAwaitingUserInput?: AwaitingUserInputReplyMetadata | null;
 };
 
 type TurnAnswer = {
@@ -591,6 +608,7 @@ const HTML_PREVIEW_MIN = 360;
 const HTML_PREVIEW_MAX = 920;
 const HTML_PREVIEW_DEFAULT = 760;
 const HTML_PREVIEW_MAIN_MIN = 360;
+const TURN_APPROVAL_MODE_STORAGE_KEY = "newman-turn-approval-mode";
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -618,6 +636,10 @@ function isWorkspacePage(value: string | null): value is WorkspacePage {
 
 function isUiTheme(value: string | null): value is UiTheme {
   return value === "classic" || value === "coral";
+}
+
+function isTurnApprovalMode(value: string | null): value is TurnApprovalMode {
+  return value === "manual" || value === "auto_allow";
 }
 
 function formatCompactionStage(stage: string | null | undefined) {
@@ -695,6 +717,19 @@ function formatBytes(size: number) {
     return `${(size / 1024).toFixed(1)} KB`;
   }
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatTokenCount(value: number | null | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "--";
+  }
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}m`;
+  }
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
+  }
+  return `${Math.max(0, Math.round(value))}`;
 }
 
 function makeAttachmentId(seed: string, index: number) {
@@ -847,31 +882,40 @@ function inferAttachmentKind(filename: string, extension: string | null | undefi
   return "document";
 }
 
-function buildOutputAttachmentsFromEvents(events: SessionEventPayload[]) {
+function isSessionOutputPath(
+  path: string | null | undefined,
+  workspaceRelativePath: string | null | undefined,
+  sessionId: string
+) {
+  const expectedRelativePrefix = `outputs/chat/${sessionId}/`;
+  const relative = (workspaceRelativePath || "").replace(/\\/g, "/").trim();
+  if (relative) {
+    return relative === expectedRelativePrefix.slice(0, -1) || relative.startsWith(expectedRelativePrefix);
+  }
+  const normalizedPath = (path || "").replace(/\\/g, "/");
+  return normalizedPath.includes(`/${expectedRelativePrefix}`);
+}
+
+function buildOutputAttachmentsFromEvents(events: SessionEventPayload[], sessionId: string, _turnId: string) {
   const attachments: ChatAttachment[] = [];
   const seen = new Set<string>();
-  events.forEach((event, index) => {
-    if (event.event !== "tool_call_finished") {
-      return;
-    }
-    const tool = typeof event.data.tool === "string" ? event.data.tool : "";
-    if (tool !== "write_file" && tool !== "edit_file") {
-      return;
-    }
-    if (event.data.success !== true) {
-      return;
-    }
-    const path = getEventPathValue(event.data);
+  const pushAttachment = (
+    path: string,
+    index: number,
+    data: {
+      bytes?: number | null;
+      contentType?: string | null;
+      summary?: string | null;
+      workspaceRelativePath?: string | null;
+    },
+  ) => {
     if (!path || seen.has(path)) {
       return;
     }
     seen.add(path);
     const filename = extractName(path) || `output-${index + 1}`;
     const extension = getAttachmentExtension(filename, null);
-    const contentType =
-      typeof event.data.content_type === "string" && event.data.content_type
-        ? event.data.content_type
-        : inferAttachmentContentType(filename, extension);
+    const contentType = data.contentType && data.contentType.trim() ? data.contentType : inferAttachmentContentType(filename, extension);
     attachments.push({
       id: makeAttachmentId(path, index),
       filename,
@@ -881,11 +925,65 @@ function buildOutputAttachmentsFromEvents(events: SessionEventPayload[]) {
       extension,
       path,
       previewUrl: null,
-      summary: typeof event.data.summary === "string" ? event.data.summary : "生成文件",
-      sizeBytes: typeof event.data.bytes === "number" ? event.data.bytes : null,
-      workspaceRelativePath: null,
+      summary: data.summary ?? "生成文件",
+      sizeBytes: typeof data.bytes === "number" ? data.bytes : null,
+      workspaceRelativePath: data.workspaceRelativePath ?? null,
       analysisStatus: "completed",
       analysisError: null,
+    });
+  };
+
+  events.forEach((event, index) => {
+    if (event.event !== "tool_call_finished") {
+      return;
+    }
+    const tool = typeof event.data.tool === "string" ? event.data.tool : "";
+    const rawOutputFiles = Array.isArray(event.data.output_files) ? event.data.output_files : [];
+    let hasExplicitOutputFiles = false;
+    rawOutputFiles.forEach((rawItem, fileIndex) => {
+      if (!rawItem || typeof rawItem !== "object") {
+        return;
+      }
+      const path = typeof rawItem.path === "string" ? rawItem.path : "";
+      if (!path) {
+        return;
+      }
+      hasExplicitOutputFiles = true;
+      const workspaceRelativePath =
+        typeof rawItem.workspace_relative_path === "string" ? rawItem.workspace_relative_path : null;
+      if (!isSessionOutputPath(path, workspaceRelativePath, sessionId)) {
+        return;
+      }
+      pushAttachment(path, index * 100 + fileIndex, {
+        bytes: typeof rawItem.bytes === "number" ? rawItem.bytes : null,
+        contentType: typeof rawItem.content_type === "string" ? rawItem.content_type : null,
+        summary:
+          typeof rawItem.summary === "string"
+            ? rawItem.summary
+            : typeof event.data.summary === "string"
+              ? event.data.summary
+              : "生成文件",
+        workspaceRelativePath,
+      });
+    });
+    if (hasExplicitOutputFiles) {
+      return;
+    }
+    if (tool !== "write_file" && tool !== "edit_file") {
+      return;
+    }
+    if (event.data.success !== true) {
+      return;
+    }
+    const path = getEventPathValue(event.data);
+    if (!path || !isSessionOutputPath(path, null, sessionId)) {
+      return;
+    }
+    pushAttachment(path, index, {
+      bytes: typeof event.data.bytes === "number" ? event.data.bytes : null,
+      contentType: typeof event.data.content_type === "string" ? event.data.content_type : null,
+      summary: typeof event.data.summary === "string" ? event.data.summary : "生成文件",
+      workspaceRelativePath: null,
     });
   });
   return attachments;
@@ -1055,18 +1153,6 @@ const TOOL_SEMANTIC_MAP: Record<
     cardType: "plan",
     runningText: "我先切换到计划模式",
     completedText: "已经进入计划模式"
-  },
-  update_plan_draft: {
-    label: "update_plan_draft",
-    cardType: "plan",
-    runningText: "我先更新旧版方案草稿",
-    completedText: "旧版方案草稿我已经更新了"
-  },
-  exit_plan_mode: {
-    label: "exit_plan_mode",
-    cardType: "plan",
-    runningText: "我先退出计划模式",
-    completedText: "已经退出计划模式"
   },
   search_knowledge_base: {
     label: "search_knowledge_base",
@@ -1617,7 +1703,7 @@ function resolveTimelineNodeIcon(node: TimelineNode): TimelineMarkerIconName {
   if (toolName === "grep") return "code_search";
   if (toolName === "fetch_url") return "globe";
   if (toolName === "terminal") return "terminal";
-  if (toolName === "update_plan" || toolName === "enter_plan_mode" || toolName === "update_plan_draft" || toolName === "exit_plan_mode") return "plan";
+  if (toolName === "update_plan" || toolName === "enter_plan_mode") return "plan";
   if (toolName && toolName.startsWith("mcp__")) return "generic";
 
   if (latestItem?.cardType === "file") return "file";
@@ -2149,12 +2235,6 @@ function buildTimelineCodePreview(toolName: string | null | undefined, rawText: 
       content = fileContent;
       language = inferLanguageFromPath(path);
     }
-  } else if ((toolName === "exit_plan_mode" || toolName === "update_plan_draft") && isRecord(source)) {
-    const markdown = typeof source.markdown === "string" ? source.markdown.trim() : "";
-    if (markdown) {
-      content = markdown;
-      language = "markdown";
-    }
   } else if (toolName === "terminal") {
     language = "bash";
   }
@@ -2418,9 +2498,6 @@ function buildApprovalActionText(toolName: string, argumentsPayload: Record<stri
   if (toolName === "enter_plan_mode") {
     return "进入计划模式";
   }
-  if (toolName === "exit_plan_mode") {
-    return "退出计划模式";
-  }
   const target = resolveApprovalTargetLabel({
     tool: toolName,
     arguments: argumentsPayload,
@@ -2461,9 +2538,6 @@ function buildApprovalSupportCopy(request: ApprovalRequestLike) {
   if (request.tool === "enter_plan_mode") {
     return "确认后我会切换到计划模式，先拆出待办清单，再按步骤执行并持续更新进度。";
   }
-  if (request.tool === "exit_plan_mode") {
-    return "确认后我会退出计划模式。";
-  }
   if (normalizedReason && !isMachineApprovalReason(normalizedReason)) {
     return "确认后我会继续执行这一步；如果拒绝，本次调用会立即停止。";
   }
@@ -2476,9 +2550,6 @@ function buildApprovalSupportCopy(request: ApprovalRequestLike) {
 function buildApprovalPayloadLabel(request: ApprovalRequestLike) {
   if (request.tool === "enter_plan_mode") {
     return "切换说明";
-  }
-  if (request.tool === "exit_plan_mode") {
-    return "计划内容";
   }
   if (request.tool === "terminal") {
     const command = typeof request.arguments.command === "string" ? request.arguments.command.trim() : "";
@@ -2493,10 +2564,6 @@ function buildApprovalPayloadPreview(request: ApprovalRequestLike) {
   if (request.tool === "enter_plan_mode") {
     const reason = typeof request.arguments.reason === "string" ? request.arguments.reason.trim() : "";
     return reason || "准备进入计划模式";
-  }
-  if (request.tool === "exit_plan_mode") {
-    const markdown = typeof request.arguments.markdown === "string" ? request.arguments.markdown.trim() : "";
-    return markdown || stringifyForPanel(request.arguments);
   }
   if (request.tool === "terminal") {
     const command = typeof request.arguments.command === "string" ? request.arguments.command.trim() : "";
@@ -2662,17 +2729,39 @@ function closePlanSteps(plan: SessionPlanPayload): SessionPlanPayload {
     ...plan,
     steps,
     progress: buildPlanProgressFromRawSteps(steps),
+    current_step: null,
   };
 }
 
+function eventMarksTurnFinalized(event: SessionEventPayload) {
+  return event.event === "turn_completed" || event.event === "final_response";
+}
+
 function eventMarksTaskCompleted(event: SessionEventPayload) {
-  if (event.event === "turn_completed") {
-    return readTurnOutcome(event.data) === "task_completed";
+  return eventMarksTurnFinalized(event) && readTurnOutcome(event.data) === "task_completed";
+}
+
+function eventMarksSuccessfulTurnFinalized(event: SessionEventPayload) {
+  if (!eventMarksTurnFinalized(event)) {
+    return false;
   }
-  if (event.event === "final_response") {
-    return readTurnOutcome(event.data) === "task_completed";
+  const outcome = readTurnOutcome(event.data);
+  return outcome === "answered" || outcome === "artifact_ready" || outcome === "task_completed";
+}
+
+function canImplicitlyClosePlanAfterFinalAnswer(plan: SessionPlanPayload) {
+  const incompleteSteps = getPlanSteps(plan).filter((step) => step.status !== "completed" && step.status !== "cancelled");
+  return incompleteSteps.length === 1 && incompleteSteps[0].status === "in_progress";
+}
+
+function shouldClosePlanFromEvent(plan: SessionPlanPayload, event: SessionEventPayload) {
+  if (!hasIncompletePlanSteps(plan)) {
+    return false;
   }
-  return false;
+  if (eventMarksTaskCompleted(event)) {
+    return true;
+  }
+  return eventMarksSuccessfulTurnFinalized(event) && canImplicitlyClosePlanAfterFinalAnswer(plan);
 }
 
 function shouldClosePlanFromEvents(plan: SessionPlanPayload, events: SessionEventPayload[]) {
@@ -2682,6 +2771,7 @@ function shouldClosePlanFromEvents(plan: SessionPlanPayload, events: SessionEven
 
   let latestPlanUpdatedAt = Number.NEGATIVE_INFINITY;
   let latestTaskCompletedAt = Number.NEGATIVE_INFINITY;
+  let latestImplicitCompletionAt = Number.NEGATIVE_INFINITY;
   events.forEach((event) => {
     if (event.event === "plan_updated") {
       latestPlanUpdatedAt = Math.max(latestPlanUpdatedAt, event.ts);
@@ -2689,9 +2779,20 @@ function shouldClosePlanFromEvents(plan: SessionPlanPayload, events: SessionEven
     if (eventMarksTaskCompleted(event)) {
       latestTaskCompletedAt = Math.max(latestTaskCompletedAt, event.ts);
     }
+    if (eventMarksSuccessfulTurnFinalized(event)) {
+      latestImplicitCompletionAt = Math.max(latestImplicitCompletionAt, event.ts);
+    }
   });
 
-  return latestTaskCompletedAt !== Number.NEGATIVE_INFINITY && latestTaskCompletedAt >= latestPlanUpdatedAt;
+  if (latestTaskCompletedAt !== Number.NEGATIVE_INFINITY && latestTaskCompletedAt >= latestPlanUpdatedAt) {
+    return true;
+  }
+
+  return (
+    canImplicitlyClosePlanAfterFinalAnswer(plan) &&
+    latestImplicitCompletionAt !== Number.NEGATIVE_INFINITY &&
+    latestImplicitCompletionAt >= latestPlanUpdatedAt
+  );
 }
 
 function closePlanIfTaskCompletedSeen(plan: SessionPlanPayload, events: SessionEventPayload[]) {
@@ -2723,6 +2824,177 @@ function buildToolSecondaryMeta(
     meta.push(`${eventData.replacements} 处替换`);
   }
   return meta;
+}
+
+function formatDelaySeconds(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  if (value < 1) {
+    return `${Math.round(value * 1000)}ms`;
+  }
+  if (value < 10) {
+    return `${value.toFixed(value < 2 ? 1 : 0)}s`;
+  }
+  return `${Math.round(value)}s`;
+}
+
+function buildProviderSecondaryMeta(event: SessionEventPayload, eventData: Record<string, unknown>) {
+  const meta: string[] = [];
+  const provider = readNonEmptyText(eventData.provider);
+  if (provider) {
+    meta.push(provider);
+  }
+  const attemptCount =
+    typeof eventData.attempt_count === "number"
+      ? eventData.attempt_count
+      : typeof eventData.attempt === "number"
+        ? eventData.attempt
+        : null;
+  const maxAttempts = typeof eventData.max_attempts === "number" ? eventData.max_attempts : null;
+  if (attemptCount && maxAttempts) {
+    meta.push(`第 ${attemptCount}/${maxAttempts} 次`);
+  } else if (attemptCount) {
+    meta.push(`第 ${attemptCount} 次`);
+  }
+  const delayLabel = formatDelaySeconds(eventData.delay_seconds);
+  if (delayLabel && (event.event === "provider_retry_scheduled" || eventData.will_retry === true)) {
+    meta.push(`${delayLabel} 后重试`);
+  }
+  if (typeof eventData.status_code === "number") {
+    meta.push(`HTTP ${eventData.status_code}`);
+  }
+  return meta;
+}
+
+function buildProviderSecondarySummary(
+  event: SessionEventPayload,
+  eventData: Record<string, unknown>,
+  state: Extract<TimelineNodeState, "recovering" | "failed">
+) {
+  const message = readNonEmptyText(eventData.message) ?? readNonEmptyText(eventData.summary);
+  if (event.event === "provider_retry_scheduled") {
+    return "主模型连接波动，正在自动重试";
+  }
+  if (event.event === "provider_fallback_started") {
+    return "流式解析异常，正在切到同模型非流式兜底";
+  }
+  if (state === "recovering") {
+    if (eventData.will_transport_fallback === true) {
+      return "主模型响应异常，正在准备非流式兜底";
+    }
+    return "主模型连接波动，正在恢复";
+  }
+  return message ?? "主模型响应异常，当前无法继续";
+}
+
+function buildProviderSecondaryOutput(
+  event: SessionEventPayload,
+  eventData: Record<string, unknown>,
+  state: Extract<TimelineNodeState, "recovering" | "failed">
+) {
+  const lines: string[] = [];
+  const message = readNonEmptyText(eventData.message) ?? readNonEmptyText(eventData.summary);
+  if (message) {
+    lines.push(message);
+  }
+
+  if (event.event === "provider_retry_scheduled") {
+    const attempt = typeof eventData.attempt === "number" ? eventData.attempt : null;
+    const maxAttempts = typeof eventData.max_attempts === "number" ? eventData.max_attempts : null;
+    const delayLabel = formatDelaySeconds(eventData.delay_seconds);
+    lines.push(
+      attempt && maxAttempts
+        ? `准备进行第 ${attempt}/${maxAttempts} 次重试。`
+        : attempt
+          ? `准备进行第 ${attempt} 次重试。`
+          : "准备再次尝试连接主模型。"
+    );
+    if (delayLabel) {
+      lines.push(`等待 ${delayLabel} 后继续。`);
+    }
+    const reason = readNonEmptyText(eventData.reason);
+    if (reason) {
+      lines.push(`原因：${reason}`);
+    }
+  } else if (event.event === "provider_fallback_started") {
+    lines.push("流式解析失败，正在切换到同模型非流式响应继续。");
+    const category = readNonEmptyText(eventData.from_category);
+    if (category) {
+      lines.push(`触发原因：${category}`);
+    }
+  } else {
+    const attemptCount = typeof eventData.attempt_count === "number" ? eventData.attempt_count : null;
+    const maxAttempts = typeof eventData.max_attempts === "number" ? eventData.max_attempts : null;
+    if (attemptCount && maxAttempts) {
+      lines.push(`当前尝试 ${attemptCount}/${maxAttempts}。`);
+    }
+    if (eventData.will_retry === true) {
+      const delayLabel = formatDelaySeconds(eventData.delay_seconds);
+      lines.push(delayLabel ? `连接将于 ${delayLabel} 后自动重试。` : "正在安排自动重试。");
+    } else if (eventData.will_transport_fallback === true) {
+      lines.push("正在准备同模型非流式兜底。");
+    }
+    const retrySuppressedMessage = readNonEmptyText(eventData.retry_suppressed_message);
+    if (retrySuppressedMessage) {
+      lines.push(retrySuppressedMessage);
+    }
+    if (eventData.partial_response_visible === true) {
+      lines.push("已有部分输出对用户可见。");
+    }
+  }
+
+  if (typeof eventData.status_code === "number") {
+    lines.push(`状态码：HTTP ${eventData.status_code}`);
+  }
+  const errorCode = readNonEmptyText(eventData.code);
+  if (errorCode) {
+    lines.push(`错误码：${errorCode}`);
+  }
+
+  if (lines.length === 0) {
+    return state === "recovering" ? "正在恢复模型响应，请稍后查看结果。" : "主模型响应失败，当前没有更多可展示的细节。";
+  }
+  return lines.join("\n");
+}
+
+function buildProviderSecondaryItem(
+  parentId: string,
+  event: SessionEventPayload,
+  state: Extract<TimelineNodeState, "recovering" | "failed">
+): TimelineSecondaryItem {
+  const eventData = buildEventDataWithRequest(event);
+  const status = resolveSecondaryStatusMeta(state, eventData, "orange");
+  const detailId = `secondary:provider:${parentId}`;
+  const output = buildProviderSecondaryOutput(event, eventData, state);
+  const summary = buildProviderSecondarySummary(event, eventData, state);
+
+  return {
+    id: detailId,
+    parentId,
+    state,
+    label: "主模型响应",
+    toolName: null,
+    cardType: "network",
+    subtitle: summary,
+    statusLabel: status.label,
+    statusTone: status.tone,
+    meta: buildProviderSecondaryMeta(event, eventData),
+    output,
+    outputLineCount: countOutputLines(output),
+    detail: buildTraceDetail(
+      detailId,
+      "agent",
+      formatEventTime(event.ts),
+      "主模型响应",
+      "模型恢复",
+      summary,
+      eventData,
+      {
+        output,
+      }
+    )
+  };
 }
 
 function buildToolSecondaryItem(
@@ -3035,65 +3307,15 @@ function buildSkillSecondaryItem(parentId: string, event: SessionEventPayload): 
   };
 }
 
-function buildAttachmentSecondaryItem(parentId: string, event: SessionEventPayload): TimelineSecondaryItem {
-  const eventData = buildEventDataWithRequest(event);
-  const files =
-    Array.isArray(eventData.files) && eventData.files.every((item) => item && typeof item === "object")
-      ? (eventData.files as Array<Record<string, unknown>>)
-      : [];
-  const count = typeof eventData.count === "number" ? eventData.count : files.length;
-  const isProcessed = event.event === "attachment_processed";
-  const isFailed =
-    eventData.ok === false ||
-    files.some((item) => item.analysis_status === "failed" || (typeof item.analysis_error === "string" && item.analysis_error));
-  const status = isFailed
-    ? { label: "失败", tone: "orange" as StatusTagTone }
-    : isProcessed
-      ? { label: "已完成", tone: "green" as StatusTagTone }
-      : { label: "处理中", tone: "blue" as StatusTagTone };
-  const subtitle =
-    files
-      .map((item) => {
-        const filename = typeof item.filename === "string" ? item.filename : "附件";
-        const summary = typeof item.summary === "string" && item.summary ? item.summary : null;
-        const error = typeof item.analysis_error === "string" && item.analysis_error ? item.analysis_error : null;
-        return summary ? `${filename}: ${summary}` : error ? `${filename}: ${error}` : filename;
-      })
-      .join("\n") || `${count} 个附件`;
+function resolveAttachmentWarningText(eventData: Record<string, unknown>) {
   const warnings =
     Array.isArray(eventData.warnings) && eventData.warnings.every((item) => typeof item === "string")
       ? (eventData.warnings as string[])
       : [];
-  const output = warnings.length > 0 ? `${subtitle}\n${warnings.join("\n")}` : subtitle;
-  const detailId = `secondary:attachment:${parentId}`;
-  const summary = isFailed ? "附件解析失败，已跳过不可用附件" : isProcessed ? "附件解析已完成" : `已接收 ${count} 个附件`;
-
-  return {
-    id: detailId,
-    parentId,
-    state: isFailed ? "failed" : isProcessed ? "completed" : "running",
-    label: "附件解析",
-    toolName: null,
-    cardType: "attachment",
-    subtitle: summary,
-    statusLabel: status.label,
-    statusTone: status.tone,
-    meta: count > 0 ? [`${count} 个附件`] : ["附件"],
-    output,
-    outputLineCount: countOutputLines(output),
-    detail: buildTraceDetail(
-      detailId,
-      "result",
-      formatEventTime(event.ts),
-      "attachment",
-      "附件",
-      summary,
-      eventData,
-      {
-        output,
-      }
-    ),
-  };
+  if (warnings.length === 0) {
+    return null;
+  }
+  return warnings.find((item) => item.includes("上下文预算")) ?? warnings[0] ?? null;
 }
 
 function upsertProgressSecondaryItem(node: TimelineNode, item: TimelineSecondaryItem) {
@@ -3113,6 +3335,72 @@ function upsertProgressSecondaryItem(node: TimelineNode, item: TimelineSecondary
       output: item.detail.output ?? existingItem.detail.output ?? null,
     },
   };
+}
+
+function settleProviderRecoveryItem(
+  node: TimelineNode,
+  event: SessionEventPayload,
+  state: Extract<TimelineNodeState, "completed" | "failed">,
+  summary: string
+) {
+  const providerItemId = `secondary:provider:${node.id}`;
+  const existingIndex = node.secondaryItems.findIndex((item) => item.id === providerItemId);
+  if (existingIndex === -1) {
+    return;
+  }
+
+  const currentItem = node.secondaryItems[existingIndex];
+  if (currentItem.state !== "recovering" && currentItem.state !== "running") {
+    return;
+  }
+
+  const eventData = buildEventDataWithRequest(event);
+  const status = resolveSecondaryStatusMeta(state, eventData, state === "completed" ? "green" : "orange");
+  const output = [currentItem.output?.trim(), summary].filter(Boolean).join("\n");
+  node.secondaryItems[existingIndex] = {
+    ...currentItem,
+    state,
+    subtitle: summary,
+    statusLabel: status.label,
+    statusTone: status.tone,
+    output,
+    outputLineCount: countOutputLines(output),
+    detail: buildTraceDetail(
+      currentItem.id,
+      "agent",
+      formatEventTime(event.ts),
+      currentItem.label,
+      "模型恢复",
+      summary,
+      eventData,
+      {
+        output,
+      }
+    )
+  };
+  node.state = resolveProgressGroupState(node.secondaryItems);
+  node.time = formatEventTime(event.ts);
+  node.primaryText = summary;
+  node.detail = buildTraceDetail(
+    node.id,
+    "trace",
+    node.time,
+    summary,
+    "执行进展",
+    summary,
+    eventData
+  );
+}
+
+function settleAllProviderRecoveryItems(
+  nodes: Iterable<TimelineNode>,
+  event: SessionEventPayload,
+  state: Extract<TimelineNodeState, "completed" | "failed">,
+  summary: string
+) {
+  for (const node of nodes) {
+    settleProviderRecoveryItem(node, event, state, summary);
+  }
 }
 
 function resolveProgressGroupState(items: TimelineSecondaryItem[]): TimelineNodeState {
@@ -3357,9 +3645,18 @@ function buildTimelineNodes(
     }
 
     if (event.event === "answer_started") {
+      settleAllProviderRecoveryItems(progressNodeByGroupId.values(), event, "completed", "主模型连接已恢复，已继续生成回复。");
       const nextNode = buildAnswerStartNode(event);
       nodes.push(nextNode);
       answerStartNodeId = nextNode.id;
+      return;
+    }
+
+    if (event.event === "turn_completed") {
+      const outcome = readTurnOutcome(eventData);
+      const nextState = outcome === "failed" || outcome === "blocked" ? "failed" : "completed";
+      const summary = nextState === "completed" ? "主模型连接已恢复，本轮已完成。" : "主模型恢复未能完成，本轮已结束。";
+      settleAllProviderRecoveryItems(progressNodeByGroupId.values(), event, nextState, summary);
       return;
     }
 
@@ -3427,6 +3724,7 @@ function buildTimelineNodes(
       const existingNode = progressNodeByGroupId.get(groupId) ?? null;
       const primaryText = resolveProgressNodePrimaryText(existingNode, event.event, commentary);
       const node = ensureProgressNode(groupId, event, primaryText);
+      settleProviderRecoveryItem(node, event, "completed", "主模型连接已恢复，继续执行。");
       refreshProgressGroupNode(node, event, primaryText, commentary);
       return;
     }
@@ -3449,25 +3747,41 @@ function buildTimelineNodes(
         proposedText
       );
       const node = ensureProgressNode(groupId, event, primaryText);
+      settleProviderRecoveryItem(node, event, "completed", "主模型连接已恢复，继续执行。");
       const item = buildSkillSecondaryItem(node.id, event);
       upsertProgressSecondaryItem(node, item);
       refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
       return;
     }
 
-    if (event.event === "attachment_received" || event.event === "attachment_processed") {
-      const attachmentCount = typeof eventData.count === "number" ? eventData.count : 0;
-      const groupId = `attachment:${event.request_id ?? "current"}`;
-      const primaryText =
-        event.event === "attachment_processed"
-          ? eventData.ok === false
-            ? "附件解析失败，已跳过不可用附件"
-            : "附件解析已完成"
-          : `已接收 ${attachmentCount} 个附件`;
+    if (
+      event.event === "stream_error" ||
+      event.event === "provider_retry_scheduled" ||
+      event.event === "provider_fallback_started"
+    ) {
+      const groupId =
+        (typeof eventData.group_id === "string" && eventData.group_id) || `provider:${event.request_id ?? event.ts}`;
+      const nextState =
+        event.event === "stream_error" && eventData.will_retry !== true && eventData.will_transport_fallback !== true
+          ? "failed"
+          : "recovering";
+      const primaryText = resolveProgressNodePrimaryText(
+        progressNodeByGroupId.get(groupId) ?? null,
+        event.event,
+        buildProviderSecondarySummary(event, eventData, nextState)
+      );
       const node = ensureProgressNode(groupId, event, primaryText);
-      const item = buildAttachmentSecondaryItem(node.id, event);
+      const item = buildProviderSecondaryItem(node.id, event, nextState);
       upsertProgressSecondaryItem(node, item);
       refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
+      return;
+    }
+
+    if (event.event === "attachment_received" || event.event === "attachment_processed") {
+      const warningText = event.event === "attachment_processed" ? resolveAttachmentWarningText(eventData) : null;
+      if (warningText) {
+        nodes.push(buildSystemMetaNode(event, warningText));
+      }
       return;
     }
 
@@ -3479,26 +3793,13 @@ function buildTimelineNodes(
       if (!groupId) {
         return;
       }
-      const primaryText =
-        resolveProgressNodePrimaryText(
-          progressNodeByGroupId.get(groupId) ?? null,
-          event.event,
-          typeof eventData.action_brief === "string" && eventData.action_brief
-            ? eventData.action_brief
-            : typeof eventData.summary_text === "string" && eventData.summary_text
-              ? eventData.summary_text
-              : resolveProgressPrimaryText(
-                  "tool" in eventData && typeof eventData.tool === "string" ? eventData.tool : null,
-                  "running",
-                  eventData,
-                  null,
-                  userPrompt
-                )
-        );
-      const node = ensureProgressNode(groupId, event, primaryText);
-      const item = buildToolSecondaryItem(node.id, event, "running", null, userPrompt);
-      upsertProgressSecondaryItem(node, item);
-      refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
+      const node = progressNodeByGroupId.get(groupId) ?? null;
+      if (node) {
+        settleProviderRecoveryItem(node, event, "completed", "主模型连接已恢复，继续执行。");
+        const item = buildToolSecondaryItem(node.id, event, "running", null, userPrompt);
+        upsertProgressSecondaryItem(node, item);
+        refreshProgressGroupNode(node, event, node.primaryText, item.detail.summary);
+      }
       toolCallToGroupId.set(toolCallId, groupId);
       return;
     }
@@ -3527,8 +3828,9 @@ function buildTimelineNodes(
               toolOutput,
               userPrompt
             )
-        );
+      );
       const node = ensureProgressNode(groupId, event, primaryText);
+      settleProviderRecoveryItem(node, event, "completed", "主模型连接已恢复，继续执行。");
       const item = buildToolSecondaryItem(node.id, event, "running", toolOutput, userPrompt);
       upsertProgressSecondaryItem(node, item);
       refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
@@ -3554,8 +3856,9 @@ function buildTimelineNodes(
               toolOutput,
               userPrompt
             )
-        );
+      );
       const node = ensureProgressNode(groupId, event, primaryText);
+      settleProviderRecoveryItem(node, event, "completed", "主模型连接已恢复，继续执行。");
       const item = buildToolSecondaryItem(node.id, event, "running", toolOutput, userPrompt);
       upsertProgressSecondaryItem(node, item);
       refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
@@ -3584,8 +3887,9 @@ function buildTimelineNodes(
               toolOutput,
               userPrompt
             )
-        );
+      );
       const node = ensureProgressNode(groupId, event, primaryText);
+      settleProviderRecoveryItem(node, event, "completed", "主模型连接已恢复，继续执行。");
       const item = buildToolSecondaryItem(node.id, event, nextState, toolOutput, userPrompt);
       upsertProgressSecondaryItem(node, item);
       refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
@@ -3608,6 +3912,7 @@ function buildTimelineNodes(
             summarizeCommentaryContent(typeof eventData.message === "string" ? eventData.message : "", "我先继续处理这一步")
         );
       const node = ensureProgressNode(groupId, event, primaryText);
+      settleProviderRecoveryItem(node, event, "completed", "主模型连接已恢复，继续执行。");
       const item = buildSkillSecondaryItem(node.id, event);
       upsertProgressSecondaryItem(node, item);
       refreshProgressGroupNode(node, event, primaryText, item.detail.summary);
@@ -3636,8 +3941,97 @@ function readRequestId(value: Record<string, unknown>) {
   return typeof requestId === "string" && requestId ? requestId : null;
 }
 
+function readAwaitingUserInputReply(value: Record<string, unknown>): AwaitingUserInputReplyMetadata | null {
+  const raw = value.responds_to_awaiting_user_input;
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const requestId = readOptionalString(raw.request_id);
+  const workflowId = readOptionalString(raw.workflow_id);
+  if (!requestId && !workflowId) {
+    return null;
+  }
+  return {
+    requestId,
+    workflowId,
+    kind: readOptionalString(raw.kind),
+    skillName: readOptionalString(raw.skill_name),
+    phase: readOptionalString(raw.phase)
+  };
+}
+
+function awaitingReplyMatchesRequest(reply: AwaitingUserInputReplyMetadata | null | undefined, request: AwaitingUserInputPayload | null | undefined) {
+  if (!reply || !request) {
+    return false;
+  }
+  if (reply.requestId && reply.requestId === request.requestId) {
+    return true;
+  }
+  if (reply.workflowId && request.workflowId && reply.workflowId === request.workflowId) {
+    return true;
+  }
+  return false;
+}
+
 function readOptionalString(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function normalizeAwaitingInputOptions(
+  kind: AwaitingUserInputKind,
+  prompt: string,
+  rawOptions: AwaitingUserInputOption[]
+) {
+  if (rawOptions.length > 0) {
+    return rawOptions;
+  }
+  const inferred = extractEnumeratedAwaitingOptions(prompt);
+  if (inferred.length >= 2) {
+    return inferred;
+  }
+  return kind === "confirm" ? DEFAULT_CONFIRM_AWAITING_OPTIONS : [];
+}
+
+function extractEnumeratedAwaitingOptions(prompt: string): AwaitingUserInputOption[] {
+  const markerPattern = /(?:^|[\s\n:：，,；;])([1-9]\d*)[.．、)]\s*/g;
+  const markers = Array.from(prompt.matchAll(markerPattern));
+  if (markers.length < 2) {
+    return [];
+  }
+
+  return markers
+    .map((match, index): AwaitingUserInputOption | null => {
+      const matchIndex = match.index ?? 0;
+      const start = matchIndex + match[0].length;
+      const end = index + 1 < markers.length ? markers[index + 1].index ?? prompt.length : prompt.length;
+      const rawText = prompt.slice(start, end).replace(/\s+/g, " ").trim();
+      if (!rawText) {
+        return null;
+      }
+      const { label, description } = splitAwaitingOptionText(rawText);
+      if (!label) {
+        return null;
+      }
+      const number = match[1] || String(index + 1);
+      return {
+        label,
+        value: `option_${number}`,
+        description,
+      };
+    })
+    .filter((item): item is AwaitingUserInputOption => item !== null);
+}
+
+function splitAwaitingOptionText(text: string) {
+  const normalized = text.trim();
+  const followUpMatch = normalized.match(/[?？。.!！]\s*(?=(如果|如需|请|需要|可提供|补充))/);
+  if (!followUpMatch || followUpMatch.index === undefined) {
+    return { label: normalized, description: null };
+  }
+  const boundary = followUpMatch.index + followUpMatch[0].trimEnd().length;
+  const label = normalized.slice(0, boundary).trim();
+  const description = normalized.slice(boundary).trim();
+  return { label, description: description || null };
 }
 
 function readTurnOutcome(value: Record<string, unknown>) {
@@ -3664,7 +4058,7 @@ function parseAwaitingUserInputPayload(value: unknown): AwaitingUserInputPayload
     return null;
   }
 
-  const options = Array.isArray(value.options)
+  const rawOptions = Array.isArray(value.options)
     ? value.options
         .map((item): AwaitingUserInputOption | null => {
           if (!isRecord(item)) {
@@ -3683,6 +4077,7 @@ function parseAwaitingUserInputPayload(value: unknown): AwaitingUserInputPayload
         })
         .filter((item): item is AwaitingUserInputOption => item !== null)
     : [];
+  const options = normalizeAwaitingInputOptions(kind, prompt, rawOptions);
 
   return {
     requestId,
@@ -3711,7 +4106,7 @@ function parseAwaitingUserInputFromToolArguments(value: unknown): AwaitingUserIn
   if (!prompt || (kind !== "confirm" && kind !== "choice" && kind !== "free_text")) {
     return null;
   }
-  const options = Array.isArray(value.options)
+  const rawOptions = Array.isArray(value.options)
     ? value.options
         .map((item): AwaitingUserInputOption | null => {
           if (!isRecord(item)) {
@@ -3730,6 +4125,7 @@ function parseAwaitingUserInputFromToolArguments(value: unknown): AwaitingUserIn
         })
         .filter((item): item is AwaitingUserInputOption => item !== null)
     : [];
+  const options = normalizeAwaitingInputOptions(kind, prompt, rawOptions);
   return {
     requestId: readOptionalString(value.request_id) ?? `tool:${readOptionalString(value.workflow_id) ?? prompt}`,
     kind,
@@ -3842,6 +4238,9 @@ function resolveTurnIdForEvent(
   if (directTurnId && turnIds.has(directTurnId)) {
     return directTurnId;
   }
+  if (directTurnId) {
+    return null;
+  }
   if (turns.length === 0) {
     return null;
   }
@@ -3861,7 +4260,7 @@ function resolveTurnIdForEvent(
   return turns[turns.length - 1]?.id ?? null;
 }
 
-function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: SessionEventPayload[]) {
+function buildChatTurns(sessionId: string, messages: SessionMessageRecord[], sessionEvents: SessionEventPayload[]) {
   const turns: ChatTurn[] = [];
   const turnsById = new Map<string, ChatTurn>();
   const toolMessagesByTurn = new Map<string, SessionMessageRecord[]>();
@@ -3882,7 +4281,8 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
         attachments: parseMessageAttachments(message.metadata.attachments),
         createdAt: message.created_at,
         persisted: true,
-        approvalMode: readApprovalMode(message.metadata)
+        approvalMode: readApprovalMode(message.metadata),
+        respondsToAwaitingUserInput: readAwaitingUserInputReply(message.metadata)
       },
       answer: null,
       timeline: [],
@@ -3982,6 +4382,21 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
     }
   });
 
+  const awaitingParentByReplyTurnId = new Map<string, ChatTurn>();
+  turns.forEach((turn, turnIndex) => {
+    const reply = turn.userMessage.respondsToAwaitingUserInput;
+    if (!reply) {
+      return;
+    }
+    for (let index = turnIndex - 1; index >= 0; index -= 1) {
+      const candidate = turns[index];
+      if (awaitingReplyMatchesRequest(reply, candidate.answer?.awaitingUserInput)) {
+        awaitingParentByReplyTurnId.set(turn.id, candidate);
+        return;
+      }
+    }
+  });
+
   const turnIds = new Set(turns.map((turn) => turn.id));
   sessionEvents.forEach((event, index) => {
     const turnId = resolveTurnIdForEvent(event, turns, turnIds);
@@ -4032,19 +4447,44 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
 
   turns.forEach((turn) => {
     const turnEvents = eventsByTurn.get(turn.id) ?? [];
-    if (turn.answer) {
-      turn.answer.attachments = mergeChatAttachments(turn.answer.attachments, buildOutputAttachmentsFromEvents(turnEvents));
+    const eventAttachments = buildOutputAttachmentsFromEvents(turnEvents, sessionId, turn.id);
+    const parentAwaitingTurn = awaitingParentByReplyTurnId.get(turn.id) ?? null;
+    const interrupted = turnHasInterruptedEvent(turnEvents);
+    if (interrupted && turn.answer && isRawToolCallMarkupText(turn.answer.content)) {
+      turn.answer = {
+        ...turn.answer,
+        content: "",
+        errorMessage: null,
+      };
     }
-    if (turn.status === "failed" && (!turn.answer || isRawToolCallMarkupText(turn.answer.content))) {
+    if (turn.status === "failed" && interrupted && !turn.answer && eventAttachments.length > 0) {
+      turn.answer = {
+        detailId: `interrupted:${turn.id}`,
+        content: "",
+        attachments: [],
+        createdAt: new Date(turnEvents[turnEvents.length - 1]?.ts ?? Date.now()).toISOString(),
+        phase: "failed",
+        source: "session",
+        assistantMessageId: null,
+        finishReason: "turn_interrupted",
+        turnOutcome: "failed",
+        errorMessage: null,
+      };
+    }
+    if (turn.status === "failed" && !interrupted && (!turn.answer || isRawToolCallMarkupText(turn.answer.content))) {
       const failedAnswer = synthesizeFailedTurnAnswer(turn.id, turnEvents);
       if (failedAnswer) {
         turn.answer = failedAnswer;
       }
     }
+    if (turn.answer) {
+      const mergedCurrentAttachments = mergeChatAttachments(turn.answer.attachments, eventAttachments);
+      turn.answer.attachments = mergeChatAttachments(mergedCurrentAttachments, parentAwaitingTurn?.answer?.attachments ?? []);
+    }
     if (turn.status === "running" && turn.answer) {
       turn.status = "completed";
     }
-    turn.timeline = buildTimelineNodes(
+    const nextTimeline = buildTimelineNodes(
       turnEvents,
       toolMessagesByTurn.get(turn.id) ?? [],
       assistantToolMessagesByTurn.get(turn.id) ?? [],
@@ -4052,6 +4492,35 @@ function buildChatTurns(messages: SessionMessageRecord[], sessionEvents: Session
     ).map((node) =>
       applyTurnIdToNode(node, turn.id)
     );
+    if (
+      nextTimeline.length === 0 &&
+      turn.answer &&
+      turn.userMessage.respondsToAwaitingUserInput &&
+      !turn.answer.awaitingUserInput &&
+      turn.answer.turnOutcome !== "awaiting_user"
+    ) {
+      const resolvedAt = parseTimestamp(turn.answer.createdAt) ?? parseTimestamp(turn.userMessage.createdAt) ?? Date.now();
+      const outcome = turn.answer.turnOutcome ?? (turn.status === "failed" ? "failed" : "answered");
+      const summary = outcome === "failed" || outcome === "blocked" ? "确认回复处理失败，本轮已结束" : "已确认，当前任务已完成";
+      nextTimeline.push(
+        applyTurnIdToNode(
+          buildSystemMetaNode(
+            {
+              event: "awaiting_user_reply_resolved",
+              data: {
+                turn_id: turn.id,
+                turn_outcome: outcome
+              },
+              ts: resolvedAt,
+              ...(turn.requestId ? { request_id: turn.requestId } : {})
+            },
+            summary
+          ),
+          turn.id
+        )
+      );
+    }
+    turn.timeline = nextTimeline;
   });
 
   return turns;
@@ -4142,6 +4611,10 @@ function hasSystemMetaNode(turn: ChatTurn) {
   return turn.timeline.some((node) => node.kind === "system_meta");
 }
 
+function turnHasInterruptedEvent(events: SessionEventPayload[]) {
+  return events.some((event) => event.event === "turn_interrupted");
+}
+
 function hasAwaitingInputTimelineCard(turn: ChatTurn, awaiting: AwaitingUserInputPayload | null | undefined) {
   if (!awaiting) {
     return false;
@@ -4201,7 +4674,7 @@ function shouldRenderAnswerBubble(turn: ChatTurn) {
 
   const hasAttachments = turn.answer.attachments.length > 0;
 
-  if (turn.status === "failed" && !turn.answer.content.trim() && hasSystemMetaNode(turn)) {
+  if (turn.status === "failed" && !turn.answer.content.trim() && !hasAttachments && hasSystemMetaNode(turn)) {
     return false;
   }
 
@@ -4239,13 +4712,9 @@ function getAwaitingInputTitle(request: AwaitingUserInputPayload) {
     return "等待选择";
   }
   if (request.kind === "free_text") {
-    return "等待补充";
+    return request.options.length > 0 ? "等待选择或补充" : "等待补充";
   }
   return "等待确认";
-}
-
-function getAwaitingInputMetaItems(request: AwaitingUserInputPayload) {
-  return [request.skillName, request.phase].filter((item): item is string => Boolean(item));
 }
 
 function shouldDraftAwaitingOption(request: AwaitingUserInputPayload, option: AwaitingUserInputOption, index: number) {
@@ -4315,11 +4784,11 @@ function App() {
   const [activeContextUsage, setActiveContextUsage] = useState<SessionDetailResponse["context_usage"]>(null);
   const [activeAwaitingUserInput, setActiveAwaitingUserInput] = useState<AwaitingUserInputPayload | null>(null);
   const [awaitingInputSelections, setAwaitingInputSelections] = useState<Record<string, AwaitingUserInputSelection>>({});
+  const [awaitingInputDrafts, setAwaitingInputDrafts] = useState<Record<string, string>>({});
   const [sessionEvents, setSessionEvents] = useState<SessionEventPayload[]>([]);
   const [liveSessionEvents, setLiveSessionEvents] = useState<SessionEventPayload[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
-  const [chatNotice, setChatNotice] = useState<string | null>(null);
   const [sendingMessage, setSendingMessage] = useState(false);
   const [stoppingMessage, setStoppingMessage] = useState(false);
   const [liveTurn, setLiveTurn] = useState<LiveTurnState | null>(null);
@@ -4404,7 +4873,10 @@ function App() {
   const [composerValue, setComposerValue] = useState("");
   const [pendingComposerMode, setPendingComposerMode] = useState<CollaborationModeName | null>(null);
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
-  const [turnApprovalMode, setTurnApprovalMode] = useState<TurnApprovalMode>("manual");
+  const [turnApprovalMode, setTurnApprovalMode] = useState<TurnApprovalMode>(() => {
+    const stored = window.localStorage.getItem(TURN_APPROVAL_MODE_STORAGE_KEY);
+    return isTurnApprovalMode(stored) ? stored : "manual";
+  });
   const [htmlPreview, setHtmlPreview] = useState<HtmlPreviewState | null>(null);
   const [htmlPreviewView, setHtmlPreviewView] = useState<HtmlPreviewView>("preview");
   const conversationPaneRef = useRef<HTMLElement | null>(null);
@@ -4414,9 +4886,11 @@ function App() {
   const skillUploadFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillUploadFolderInputRef = useRef<HTMLInputElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const composerPlanTrayListRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
   const activeMessageControllerRef = useRef<AbortController | null>(null);
   const shouldAutoScrollRef = useRef(true);
+  const lastComposerPlanFocusRef = useRef<string | null>(null);
   const attachmentPreviewUrlsRef = useRef<string[]>([]);
   const liveAttachmentUrlsRef = useRef<string[]>([]);
   const liveSessionEventQueueRef = useRef<SessionEventPayload[]>([]);
@@ -4770,6 +5244,10 @@ function App() {
   }, [htmlPreviewWidth]);
 
   useEffect(() => {
+    window.localStorage.setItem(TURN_APPROVAL_MODE_STORAGE_KEY, turnApprovalMode);
+  }, [turnApprovalMode]);
+
+  useEffect(() => {
     if (activePage !== "chat") {
       setHtmlPreview(null);
       setHtmlPreviewView("preview");
@@ -5031,7 +5509,6 @@ function App() {
 
     setPlanModeUpdating(true);
     setChatError(null);
-    setChatNotice(null);
     if (!options?.preserveComposerOverride) {
       setPendingComposerMode(nextMode);
     }
@@ -5046,7 +5523,6 @@ function App() {
         }
         return false;
       }
-      setChatNotice(nextMode === "plan" ? "已切换到计划模式" : "已切回默认模式");
       return true;
     } catch (error) {
       if (!options?.preserveComposerOverride) {
@@ -5594,8 +6070,8 @@ ${markup}
   const liveTurnRequestId = liveTurn?.requestId ?? null;
   const liveTurnServerTurnId = liveTurn?.serverTurnId ?? null;
   const persistedTurns = useMemo(
-    () => buildChatTurns(activeSessionDetail?.messages ?? [], sessionEvents),
-    [activeSessionDetail?.messages, sessionEvents]
+    () => buildChatTurns(activeSessionDetail?.session_id ?? "", activeSessionDetail?.messages ?? [], sessionEvents),
+    [activeSessionDetail?.session_id, activeSessionDetail?.messages, sessionEvents]
   );
   const visiblePersistedTurns = useMemo(
     () => persistedTurns.filter((turn) => !turnMatchesLiveTurn(turn, liveTurn)),
@@ -5614,30 +6090,64 @@ ${markup}
     !chatLoading &&
     !sendingMessage &&
     displayTurns.length === 0;
-  const contextPressure = activeContextUsage?.confirmed_pressure ?? null;
+  const contextPressure =
+    activeContextUsage?.budget_pressure ??
+    (activeContextUsage && activeContextUsage.auto_compact_limit > 0
+      ? activeContextUsage.projected_next_prompt_tokens / activeContextUsage.auto_compact_limit
+      : null);
   const contextProgress = contextPressure === null ? null : Math.min(Math.max(contextPressure, 0), 1);
   const contextPercent = contextPressure === null ? null : Math.max(0, Math.round(contextPressure * 100));
   const contextRingProgress = contextProgress ?? 0;
   const compactionStageLabel = formatCompactionStage(activeContextUsage?.compaction_stage);
   const compactionFailureLabel = formatCompactionFailureReason(activeContextUsage?.last_compaction_failure_reason);
-  const contextMetaSecondary = activeContextUsage?.context_irreducible
+  const contextStatusLabel = activeContextUsage?.context_irreducible
     ? "当前上下文已不可再压缩"
-    : activeContextUsage?.projected_over_limit
-      ? "当前上下文已达到自动压缩判断线"
-      : compactionFailureLabel
-        ? compactionFailureLabel
-        : compactionStageLabel;
-  const contextMetaDetail =
+    : compactionFailureLabel
+      ? compactionFailureLabel
+      : activeContextUsage?.projected_over_limit
+        ? "超过硬线，必须压缩"
+        : activeContextUsage?.projected_over_soft_limit
+          ? "预计下一轮会压缩"
+          : compactionStageLabel ?? "正常";
+  const contextFailureDetail =
     activeContextUsage && activeContextUsage.compaction_fail_streak > 0
       ? `连续失败 ${activeContextUsage.compaction_fail_streak} 次`
       : null;
-  const hasContextMeta = Boolean(contextMetaSecondary || contextMetaDetail);
+  const contextPercentLabel = contextPercent === null ? "--" : contextPercent > 999 ? "999+" : `${contextPercent}%`;
+  const contextRingStateClass = activeContextUsage?.context_irreducible
+    ? "is-irreducible"
+    : activeContextUsage?.projected_over_limit
+      ? "is-over"
+      : activeContextUsage?.projected_over_soft_limit
+        ? "is-soft"
+        : "";
+  const contextRingTitle =
+    !activeContextUsage
+      ? "当前还没有上下文使用量数据"
+      : [
+          `Context 预算使用率 ${contextPercentLabel}`,
+          `预计下一轮：${formatTokenCount(activeContextUsage.projected_next_prompt_tokens)} / ${formatTokenCount(
+            activeContextUsage.auto_compact_limit
+          )} tokens`,
+          `已确认：${formatTokenCount(activeContextUsage.confirmed_prompt_tokens)} / ${formatTokenCount(
+            activeContextUsage.effective_context_window
+          )} tokens`,
+          `状态：${contextStatusLabel}`,
+          contextFailureDetail,
+        ]
+          .filter(Boolean)
+          .join("\n");
   const activeApprovalMode = approvalModeMeta[turnApprovalMode];
   const currentCollaborationMode = activeCollaborationMode?.mode ?? "default";
   const composerDisplayMode = pendingComposerMode ?? currentCollaborationMode;
   const activePlanSteps = getPlanSteps(activePlan);
   const activePlanProgress = getPlanProgress(activePlan);
-  const showComposerPlanTray = activePlanSteps.length > 0 && hasIncompletePlanSteps(activePlan);
+  const showComposerPlanTray = composerDisplayMode === "plan" && activePlanSteps.length > 0 && hasIncompletePlanSteps(activePlan);
+  const activeComposerPlanStep =
+    activePlanSteps.find((step) => step.status === "in_progress") ??
+    activePlanSteps.find((step) => step.status === "blocked") ??
+    activePlanSteps.find((step) => step.status !== "completed" && step.status !== "cancelled") ??
+    null;
   const slashCommandQuery = extractComposerSlashQuery(composerValue);
   const availableSlashCommands =
     composerDisplayMode === "plan"
@@ -5645,6 +6155,29 @@ ${markup}
       : buildComposerSlashCommands().filter((command) =>
           slashCommandQuery === null ? false : !slashCommandQuery || command.keyword.includes(slashCommandQuery)
         );
+
+  useLayoutEffect(() => {
+    if (!showComposerPlanTray) {
+      lastComposerPlanFocusRef.current = null;
+      return;
+    }
+    if (!activeComposerPlanStep) {
+      return;
+    }
+    const targetKey = `${activeComposerPlanStep.id}:${activeComposerPlanStep.status}`;
+    if (lastComposerPlanFocusRef.current === targetKey) {
+      return;
+    }
+
+    const list = composerPlanTrayListRef.current;
+    const target = list?.querySelector<HTMLElement>(`[data-plan-step-id="${activeComposerPlanStep.id}"]`);
+    if (!target) {
+      return;
+    }
+    target.scrollIntoView({ block: "nearest", inline: "nearest" });
+    lastComposerPlanFocusRef.current = targetKey;
+  }, [showComposerPlanTray, activeComposerPlanStep?.id, activeComposerPlanStep?.status]);
+
   const showComposerSlashMenu =
     composerFocused &&
     slashCommandQuery !== null &&
@@ -6044,7 +6577,6 @@ ${markup}
     setPendingApproval(null);
     setApprovalError(null);
     setChatError(null);
-    setChatNotice("正在停止当前任务...");
 
     try {
       const data = await fetchJson<InterruptTurnResponse>(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/interrupt`, {
@@ -6074,9 +6606,7 @@ ${markup}
       setLiveTurn(null);
       resetLiveSessionEventQueue();
       setLiveSessionEvents([]);
-      setChatNotice(data.message || (data.interrupted ? "当前任务已停止" : "当前没有可停止的任务"));
     } catch (error) {
-      setChatNotice(null);
       setChatError(error instanceof Error ? error.message : "停止当前任务失败");
     } finally {
       setStoppingMessage(false);
@@ -6093,7 +6623,6 @@ ${markup}
     const desiredCollaborationMode = pendingComposerMode ?? currentCollaborationMode;
 
     setChatError(null);
-    setChatNotice(null);
     setSendingMessage(true);
     const controller = new AbortController();
     activeMessageControllerRef.current = controller;
@@ -6235,16 +6764,6 @@ ${markup}
         if (payload.event === "error") {
           resetLiveAnswerStreaming();
         }
-        if (payload.event === "attachment_processed") {
-          const warnings =
-            Array.isArray(payload.data.warnings) && payload.data.warnings.every((item) => typeof item === "string")
-              ? (payload.data.warnings as string[])
-              : [];
-          if (warnings.length > 0) {
-            const contextBudgetWarning = warnings.find((item) => item.includes("上下文预算"));
-            setChatNotice(contextBudgetWarning ?? warnings[0]);
-          }
-        }
         if (payload.event === "collaboration_mode_changed") {
           const modePayload =
             "collaboration_mode" in payload.data && payload.data.collaboration_mode && typeof payload.data.collaboration_mode === "object"
@@ -6272,8 +6791,10 @@ ${markup}
         if (payload.event === "turn_completed" && readTurnOutcome(payload.data) !== "awaiting_user") {
           setActiveAwaitingUserInput(null);
         }
-        if (eventMarksTaskCompleted(payload)) {
-          setActivePlan((currentPlan) => closePlanSteps(currentPlan));
+        if (eventMarksTurnFinalized(payload)) {
+          setActivePlan((currentPlan) =>
+            shouldClosePlanFromEvent(currentPlan, payload) ? closePlanSteps(currentPlan) : currentPlan
+          );
         }
         if (payload.event === "tool_approval_request") {
           const approval = buildPendingApprovalFromEvent(payload);
@@ -6464,6 +6985,26 @@ ${markup}
     }));
   };
 
+  const updateAwaitingInputDraft = (request: AwaitingUserInputPayload, value: string) => {
+    setAwaitingInputDrafts((current) => ({
+      ...current,
+      [request.requestId]: value,
+    }));
+  };
+
+  const submitAwaitingFreeText = async (request: AwaitingUserInputPayload) => {
+    const content = (awaitingInputDrafts[request.requestId] ?? "").trim();
+    if (!content) {
+      return;
+    }
+    markAwaitingInputSubmitted(request, { value: "free_text", label: content });
+    await submitComposer({
+      content,
+      attachments: [],
+      clearComposer: true
+    });
+  };
+
   const submitAwaitingOption = async (
     request: AwaitingUserInputPayload,
     option: AwaitingUserInputOption,
@@ -6499,10 +7040,21 @@ ${markup}
     const isSubmittedRequest = Boolean(submittedSelection);
     const requestStateClass = isSubmittedRequest ? "submitted" : isActiveRequest ? "active" : "resolved";
     const isActionDisabled = isSubmittedRequest || !isActiveRequest || sendingMessage || stoppingMessage || planModeUpdating;
-    const statusLabel = isSubmittedRequest ? "已选择" : isActiveRequest ? (sendingMessage ? "正在发送" : "等待回复") : "已处理";
-    const metaItems = getAwaitingInputMetaItems(request);
+    const statusLabel = isSubmittedRequest
+      ? submittedSelection?.value === "free_text"
+        ? "已回复"
+        : "已选择"
+      : isActiveRequest
+        ? (sendingMessage ? "正在发送" : "等待回复")
+        : "已处理";
     const title = getAwaitingInputTitle(request);
     const requestOptions = request.options;
+    const freeTextDraft = awaitingInputDrafts[request.requestId] ?? "";
+    const showInlineReply = requestOptions.length === 0 || request.kind === "free_text";
+    const replyPlaceholder =
+      requestOptions.length > 0 ? "没有合适选项时，在这里补充具体说明" : "在这里输入你的回复";
+    const replyInputId = `awaiting-input-${request.requestId}-${options?.compact ? "compact" : "full"}`;
+    const manualReplyHint = showInlineReply ? "你也可以直接输入你所想的。" : "你也可以直接在底部输入你所想的。";
 
     return (
       <article className={`awaiting-input-card kind-${request.kind} ${options?.compact ? "compact" : ""} ${
@@ -6517,13 +7069,6 @@ ${markup}
               <h3>{title}</h3>
               <span className={`awaiting-input-status ${requestStateClass}`}>{statusLabel}</span>
             </div>
-            {metaItems.length > 0 ? (
-              <div className="awaiting-input-meta" aria-label="工作流信息">
-                {metaItems.map((item) => (
-                  <span key={item}>{item}</span>
-                ))}
-              </div>
-            ) : null}
           </div>
         </header>
 
@@ -6565,22 +7110,60 @@ ${markup}
               );
             })}
           </div>
-        ) : (
-          <div className="awaiting-input-actions" role="group" aria-label={request.prompt}>
+        ) : null}
+
+        <p className="awaiting-input-manual-hint">{manualReplyHint}</p>
+
+        {showInlineReply ? (
+          <div className={`awaiting-input-reply ${requestOptions.length > 0 ? "with-options" : ""}`}>
+            <label className="awaiting-input-reply-label" htmlFor={replyInputId}>
+              {requestOptions.length > 0 ? "或者输入具体回复" : "输入回复"}
+            </label>
+            <textarea
+              id={replyInputId}
+              className="awaiting-input-reply-textarea"
+              value={freeTextDraft}
+              onChange={(event) => updateAwaitingInputDraft(request, event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
+                  return;
+                }
+                event.preventDefault();
+                void submitAwaitingFreeText(request);
+              }}
+              placeholder={replyPlaceholder}
+              rows={3}
+              disabled={isActionDisabled}
+            />
+            <div className="awaiting-input-reply-footer">
+              <span className="awaiting-input-reply-hint">Enter 发送，Shift + Enter 换行</span>
+              <button
+                type="button"
+                className={`awaiting-input-reply-submit ${submittedSelection?.value === "free_text" ? "selected" : ""}`}
+                onClick={() => void submitAwaitingFreeText(request)}
+                disabled={isActionDisabled || !freeTextDraft.trim()}
+                aria-pressed={submittedSelection?.value === "free_text"}
+              >
+                发送回复
+              </button>
+            </div>
+          </div>
+        ) : requestOptions.length === 0 ? (
+          <div className="awaiting-input-reply-fallback">
             <button
               type="button"
-              className={`awaiting-input-option primary ${submittedSelection ? "selected" : ""}`}
+              className={`awaiting-input-reply-submit ${submittedSelection ? "selected" : ""}`}
               onClick={() => {
-                markAwaitingInputSubmitted(request, { value: "free_text", label: "填写回复" });
+                markAwaitingInputSubmitted(request, { value: "free_text", label: "下方回复" });
                 focusComposerWithAwaitingDraft();
               }}
               disabled={isActionDisabled}
               aria-pressed={Boolean(submittedSelection)}
             >
-              <span className="awaiting-input-option-label">填写回复</span>
+              在下方输入回复
             </button>
           </div>
-        )}
+        ) : null}
       </article>
     );
   };
@@ -6645,7 +7228,6 @@ ${markup}
 
   const createDraftSession = async () => {
     setSessionsError(null);
-    setChatNotice(null);
 
     try {
       const data = await fetchJson<CreateSessionResponse>(`${apiBase}/api/sessions`, {
@@ -7024,9 +7606,9 @@ ${markup}
           </div>
         </div>
 
-        <div className="composer-plan-tray-list" role="list" aria-label="当前执行清单">
+        <div ref={composerPlanTrayListRef} className="composer-plan-tray-list" role="list" aria-label="当前执行清单">
           {activePlanSteps.map((step) => (
-            <div key={step.id} className={`composer-plan-item status-${step.status}`} role="listitem">
+            <div key={step.id} className={`composer-plan-item status-${step.status}`} role="listitem" data-plan-step-id={step.id}>
               <span className="composer-plan-item-icon" aria-hidden="true">
                 <PlanChecklistStatusIcon status={step.status} className="composer-plan-item-icon-svg" />
               </span>
@@ -7234,33 +7816,13 @@ ${markup}
                   {showContextMeter ? (
                     <div className="context-meter">
                       <div
-                        className={`context-ring ${contextProgress === null ? "is-empty" : ""}`}
+                        className={`context-ring ${contextProgress === null ? "is-empty" : ""} ${contextRingStateClass}`}
                         style={{ ["--context-progress" as string]: String(contextRingProgress) }}
-                        aria-label={contextPercent === null ? "Context 使用率暂不可用" : `Context 使用率 ${contextPercent}%`}
-                        title={
-                          contextPercent === null
-                            ? "当前还没有已确认的上下文使用量数据"
-                            : `已确认 Context 使用率 ${contextPercent}% (${activeContextUsage?.confirmed_prompt_tokens ?? 0}/${activeContextUsage?.effective_context_window ?? 0} tokens)${
-                                contextMetaSecondary ? `\n${contextMetaSecondary}` : ""
-                              }${contextMetaDetail ? `\n${contextMetaDetail}` : ""}`
-                        }
+                        aria-label={contextPercent === null ? "Context 预算使用率暂不可用" : `Context 预算使用率 ${contextPercentLabel}`}
+                        title={contextRingTitle}
                       >
-                        <span>{contextPercent === null ? "--" : `${contextPercent}%`}</span>
+                        <span>{contextPercentLabel}</span>
                       </div>
-                      {hasContextMeta ? (
-                        <div className="context-meter-meta" aria-hidden="true">
-                          {contextMetaSecondary ? (
-                            <span
-                              className={`context-meter-secondary ${
-                                activeContextUsage?.context_irreducible || activeContextUsage?.projected_over_limit ? "warn" : ""
-                              }`}
-                            >
-                              {contextMetaSecondary}
-                            </span>
-                          ) : null}
-                          {contextMetaDetail ? <span className="context-meter-detail">{contextMetaDetail}</span> : null}
-                        </div>
-                      ) : null}
                     </div>
                   ) : null}
 
@@ -7823,7 +8385,12 @@ ${markup}
                                                           <div className="timeline-secondary-head">
                                                             <div className="timeline-secondary-head-main">
                                                               <div className="timeline-secondary-label-row">
-                                                                <span className="timeline-secondary-label">{item.label}</span>
+                                                                <div className="timeline-secondary-title-row">
+                                                                  <span className="timeline-secondary-label">{item.label}</span>
+                                                                  <span className={`timeline-secondary-status-tag tone-${item.statusTone}`}>
+                                                                    {item.statusLabel}
+                                                                  </span>
+                                                                </div>
                                                                 <span className="timeline-secondary-time-inline">{item.detail.time}</span>
                                                               </div>
                                                             </div>

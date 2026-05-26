@@ -27,8 +27,8 @@ class ReadFileTool(BaseTool):
         self.meta = ToolMeta(
             name="read_file",
             description=(
-                "Read a small workspace file and return the entire contents as base64 in dataBase64. "
-                "Use this only when you need the exact complete file bytes. "
+                "Read a small workspace file. UTF-8 text files are returned as plain text in content; "
+                "binary or non-UTF-8 files are returned as base64 in dataBase64. "
                 "If the file may be large or you only need part of a text file, use read_file_range instead."
             ),
             input_schema={
@@ -72,9 +72,24 @@ class ReadFileTool(BaseTool):
             )
 
         data = path.read_bytes()
-        payload = {
-            "dataBase64": base64.b64encode(data).decode("ascii"),
-        }
+        text = _decode_utf8_text(data)
+        if text is None:
+            payload = {
+                "path": str(path),
+                "encoding": "base64",
+                "binary": True,
+                "dataBase64": base64.b64encode(data).decode("ascii"),
+                "note": "Binary or non-UTF-8 file bytes; do not use terminal to decode this output.",
+            }
+            persisted_mode = "full_base64"
+        else:
+            payload = {
+                "path": str(path),
+                "encoding": "utf-8",
+                "binary": False,
+                "content": text,
+            }
+            persisted_mode = "full_text"
         metadata = {
             "path": str(path),
             "size_bytes": len(data),
@@ -86,7 +101,7 @@ class ReadFileTool(BaseTool):
             summary=f"已读取文件 {path.name}（{len(data)} 字节）",
             stdout=json.dumps(payload, ensure_ascii=False, indent=2),
             metadata=metadata,
-            persisted_output=_build_full_read_persisted_output(path, size_bytes=len(data)),
+            persisted_output=_build_full_read_persisted_output(path, size_bytes=len(data), mode=persisted_mode),
         )
 
 
@@ -223,14 +238,14 @@ def _coerce_positive_int(raw_value: Any, *, field_name: str) -> int:
     return value
 
 
-def _build_full_read_persisted_output(path: Path, *, size_bytes: int) -> str:
+def _build_full_read_persisted_output(path: Path, *, size_bytes: int, mode: str) -> str:
     return json.dumps(
         {
             "summary": f"Read complete file {path.name}; raw content omitted from persisted history",
             "path": str(path),
             "sizeBytes": size_bytes,
             "contentPersisted": False,
-            "mode": "full_base64",
+            "mode": mode,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -260,6 +275,15 @@ def _build_range_read_persisted_output(path: Path, chunk: dict[str, Any]) -> str
 def _looks_binary_file(path: Path) -> bool:
     with path.open("rb") as handle:
         return b"\x00" in handle.read(4096)
+
+
+def _decode_utf8_text(data: bytes) -> str | None:
+    if b"\x00" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _read_text_range(path: Path, *, offset: int, limit: int) -> dict[str, Any]:

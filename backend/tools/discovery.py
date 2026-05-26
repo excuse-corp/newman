@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING
 from backend.tools.base import BaseTool
 
 if TYPE_CHECKING:
+    from backend.sessions.session_store import SessionStore
     from backend.rag.service import KnowledgeBaseService
+    from backend.providers.multimodal import MultimodalAnalyzer
     from backend.sandbox.native_sandbox import NativeSandbox
     from backend.tools.workspace_fs import PathAccessPolicy
 
@@ -18,6 +20,8 @@ class BuiltinToolContext:
     path_policy: "PathAccessPolicy"
     sandbox: "NativeSandbox"
     knowledge_base: "KnowledgeBaseService"
+    session_store: "SessionStore | None" = None
+    multimodal_analyzer: "MultimodalAnalyzer | None" = None
 
 
 def load_builtin_tools(context: BuiltinToolContext) -> list[BaseTool]:

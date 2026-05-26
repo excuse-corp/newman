@@ -280,21 +280,21 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 
 这是最容易误解的一块。
 
-主模型看到的“历史聊天记录”不是一个整块 JSON，而是把 `session.messages` 当前保留下来的每一条消息，按顺序逐条映射成 chat message。
+主模型看到的“历史聊天记录”不是一个整块 JSON，而是 checkpoint 边界之后的 `session.messages`，按顺序逐条映射成 chat message。
 
 ### 5.1 它保留什么
 
-保留的是“当前 session 里仍然存在的消息”，包括但不限于：
+模型可见的是“当前 checkpoint 边界之后的消息”，包括但不限于：
 
 - `user`
 - `assistant`
 - `tool`
 - `system`
 
-如果 session 曾经被压缩过，那么较老历史已经不在 `session.messages` 里了，只剩：
+如果 session 曾经被压缩过，较老历史仍然保留在完整 transcript 里，但不会再进入主模型 prompt。模型只看到：
 
 - checkpoint summary
-- 最近保留的原始消息
+- 最近保留的原始 segment
 - 压缩后新增的消息
 
 ### 5.2 它不保留什么
@@ -520,8 +520,10 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 
 如果需要压缩，会发生两件事：
 
-1. 旧消息被裁剪，`session.messages` 只保留最近 4 条
-2. 生成或刷新 `checkpoint.summary`
+1. 旧工具输出先做 microcompact，模型上下文只保留摘要和 artifact 引用
+2. 已闭合的旧 segment 被吸收到 `checkpoint.summary`
+3. `session.messages` 仍作为 UI/audit transcript 保留完整历史
+4. prompt 组装只读取 checkpoint 边界之后的消息
 
 所以本轮第一次真正送给模型的 prompt，看到的已经是“压缩后的 session 视图”。
 

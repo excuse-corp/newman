@@ -52,8 +52,6 @@ def _resolve_recovery_class(result: ToolExecutionResult, default_recovery_class:
         return "fatal"
     if result.tool.startswith("provider:"):
         return "fatal"
-    if "执行异常" in result.summary:
-        return "fatal"
     return default_recovery_class
 
 
@@ -62,6 +60,11 @@ def _resolve_next_step(result: ToolExecutionResult, default_next_step: str) -> s
         return default_next_step
     if result.category == "runtime_exception" and result.exit_code not in (None, 0):
         return "Inspect the command output, correct the failing arguments or environment, then retry the smallest needed step."
+    if result.category == "runtime_exception":
+        return (
+            "Inspect the exception details, avoid repeating the same failing action, "
+            "and try a smaller alternative step or tool."
+        )
     if result.recovery_class == "fatal":
         return "Stop this round, summarize the blocker clearly, and wait for user intervention or a configuration fix."
     return default_next_step

@@ -5,7 +5,9 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import textwrap
+import time
 import types
 import unittest
 from pathlib import Path
@@ -50,12 +52,13 @@ sys.modules.setdefault("chromadb", fake_chromadb)
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.datastructures import UploadFile
 
 from backend.api.middleware.error_handler import install_error_handlers
 from backend.api.routes.approvals import router as approvals_router
 from backend.api.routes.config import router as config_router
 from backend.api.routes.knowledge import router as knowledge_router
-from backend.api.routes.messages import ActiveSessionRun, router as messages_router
+from backend.api.routes.messages import ActiveSessionRun, router as messages_router, send_message
 from backend.api.routes.plugins import router as plugins_router
 from backend.api.routes.sessions import router as sessions_router
 from backend.api.routes.skills import router as skills_router
@@ -71,6 +74,8 @@ from backend.sessions.session_store import SessionStore
 from backend.skill_runtime.registry import SkillRegistry
 from backend.tools.approval import ApprovalManager, ApprovalRequest
 from backend.tools.base import BaseTool, ToolMeta
+from backend.tools.discovery import BuiltinToolContext
+from backend.tools.impl.parse_attachment import ParseAttachmentTool
 from backend.tools.impl.read_file import ReadFileTool
 from backend.tools.result import ToolExecutionResult
 from backend.tools.workspace_fs import PathAccessPolicy
@@ -154,6 +159,54 @@ class _DummyMessageRuntime:
             {
                 "session_id": session_id,
                 "content": "ok",
+                "finish_reason": "stop",
+            },
+        )
+
+
+class _BackgroundMessageRuntime(_DummyMessageRuntime):
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+        self.completed = False
+        self.cancelled = False
+
+    async def handle_message(
+        self,
+        session_id: str,
+        content: str,
+        emit,
+        user_metadata: dict[str, object] | None = None,
+        turn_approval_mode: str = "manual",
+        request_id: str | None = None,
+        turn_id: str | None = None,
+        on_turn_created=None,
+        post_user_message=None,
+    ) -> None:
+        self.calls.append(
+            {
+                "session_id": session_id,
+                "content": content,
+                "user_metadata": user_metadata,
+                "turn_approval_mode": turn_approval_mode,
+                "request_id": request_id,
+            }
+        )
+        if callable(on_turn_created):
+            on_turn_created(turn_id or "dummy-turn")
+        await emit("progress", {"session_id": session_id, "state": "running"})
+        try:
+            while not self.release.is_set():
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        self.completed = True
+        await emit(
+            "final_response",
+            {
+                "session_id": session_id,
+                "content": "background-ok",
                 "finish_reason": "stop",
             },
         )
@@ -340,7 +393,7 @@ class MessageRouteTests(unittest.TestCase):
             self.assertEqual(runtime.calls[0]["turn_approval_mode"], "manual")
             self.assertEqual(runtime.calls[0]["user_metadata"]["approval_mode"], "manual")
 
-    def test_messages_with_image_updates_user_message_after_analysis(self) -> None:
+    def test_messages_with_image_registers_metadata_without_eager_parse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             session_store = SessionStore(root / "sessions")
@@ -360,19 +413,22 @@ class MessageRouteTests(unittest.TestCase):
             self.assertEqual(saved.messages[0].role, "user")
             self.assertEqual(saved.messages[0].content, "看看这张图")
             self.assertEqual(saved.messages[0].metadata["original_content"], "看看这张图")
-            self.assertEqual(saved.messages[0].metadata["attachments"][0]["analysis_status"], "parsed")
-            self.assertEqual(saved.messages[0].metadata["attachment_analysis"]["status"], "completed")
-            self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["status"], "completed")
-            self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["normalized_user_input"], "结合图片理解用户意图")
-            self.assertIn("/user_uploads/chat/", saved.messages[0].metadata["attachments"][0]["path"])
-            self.assertTrue(Path(saved.messages[0].metadata["attachments"][0]["parsed_markdown_path"]).exists())
+            attachment = saved.messages[0].metadata["attachments"][0]
+            self.assertEqual(attachment["analysis_status"], "saved")
+            self.assertEqual(attachment["order_index"], 1)
+            self.assertEqual(attachment["kind_index"], 1)
+            self.assertTrue(attachment["uploaded_at"])
+            self.assertIn("/user_uploads/chat/", attachment["path"])
+            self.assertNotIn("attachment_analysis", saved.messages[0].metadata)
+            self.assertNotIn("multimodal_parse", saved.messages[0].metadata)
             self.assertEqual(saved.messages[-1].role, "assistant")
 
             events = self._parse_sse_events(response)
             processed = next(payload for payload in events if payload["event"] == "attachment_processed")
             self.assertTrue(processed["data"]["ok"])
+            self.assertEqual(processed["data"]["status"], "registered")
 
-    def test_messages_with_image_timeout_keeps_turn_and_records_warning(self) -> None:
+    def test_messages_with_image_does_not_parse_on_upload_even_if_analyzer_would_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             session_store = SessionStore(root / "sessions")
@@ -391,21 +447,18 @@ class MessageRouteTests(unittest.TestCase):
             saved = session_store.get(session.session_id)
             self.assertEqual(saved.messages[0].role, "user")
             self.assertEqual(saved.messages[0].content, "看看这张图")
-            self.assertEqual(saved.messages[0].metadata["attachments"][0]["analysis_status"], "failed")
-            self.assertEqual(saved.messages[0].metadata["attachment_analysis"]["status"], "failed")
-            self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["status"], "failed")
-            self.assertEqual(saved.messages[0].metadata["multimodal_parse"]["frontend_message"], "附件解析超时，已跳过图片内容解析")
-            self.assertEqual(saved.messages[1].role, "system")
-            self.assertEqual(saved.messages[1].metadata["type"], "attachment_analysis_warning")
+            self.assertEqual(saved.messages[0].metadata["attachments"][0]["analysis_status"], "saved")
+            self.assertNotIn("attachment_analysis", saved.messages[0].metadata)
+            self.assertNotIn("multimodal_parse", saved.messages[0].metadata)
             self.assertEqual(saved.messages[-1].role, "assistant")
 
             events = self._parse_sse_events(response)
             processed = next(payload for payload in events if payload["event"] == "attachment_processed")
-            self.assertFalse(processed["data"]["ok"])
-            self.assertEqual(processed["data"]["category"], "timeout_error")
+            self.assertTrue(processed["data"]["ok"])
+            self.assertEqual(processed["data"]["status"], "registered")
             self.assertTrue(any(payload["event"] == "final_response" for payload in events))
 
-    def test_messages_with_text_attachment_saves_to_runtime_workspace_and_parses_before_reply(self) -> None:
+    def test_messages_with_text_attachment_saves_to_runtime_workspace_without_parsing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             session_store = SessionStore(root / "sessions")
@@ -430,10 +483,10 @@ class MessageRouteTests(unittest.TestCase):
             saved = session_store.get(session.session_id)
             attachment = saved.messages[0].metadata["attachments"][0]
             self.assertEqual(attachment["kind"], "text")
-            self.assertEqual(attachment["analysis_status"], "parsed")
+            self.assertEqual(attachment["analysis_status"], "saved")
             self.assertTrue(str(attachment["path"]).startswith(str((root / "runtime-workspace").resolve())))
-            self.assertTrue(Path(attachment["parsed_markdown_path"]).exists())
-            self.assertEqual(saved.messages[0].metadata["attachment_analysis"]["status"], "completed")
+            self.assertNotIn("parsed_markdown_path", attachment)
+            self.assertNotIn("attachment_analysis", saved.messages[0].metadata)
             self.assertNotIn("multimodal_parse", saved.messages[0].metadata)
             self.assertEqual(saved.messages[-1].role, "assistant")
 
@@ -442,8 +495,9 @@ class MessageRouteTests(unittest.TestCase):
             processed = next(payload for payload in events if payload["event"] == "attachment_processed")
             self.assertEqual(received["data"]["count"], 1)
             self.assertTrue(processed["data"]["ok"])
+            self.assertEqual(processed["data"]["status"], "registered")
 
-    def test_messages_with_large_attachment_emits_context_budget_warning(self) -> None:
+    def test_messages_with_large_attachment_has_no_budget_warning_before_parse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             session_store = SessionStore(root / "sessions")
@@ -467,14 +521,86 @@ class MessageRouteTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             saved = session_store.get(session.session_id)
-            warnings = saved.messages[0].metadata["attachment_analysis"]["warnings"]
-            self.assertTrue(warnings)
-            self.assertIn("仅注入部分片段", warnings[0])
+            self.assertNotIn("attachment_analysis", saved.messages[0].metadata)
 
             events = self._parse_sse_events(response)
             processed = next(payload for payload in events if payload["event"] == "attachment_processed")
             self.assertIn("warnings", processed["data"])
-            self.assertTrue(processed["data"]["warnings"])
+            self.assertFalse(processed["data"]["warnings"])
+
+    def test_parse_attachment_tool_parses_selected_attachment_on_demand(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "runtime-workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="parse-on-demand")
+            path_policy = PathAccessPolicy(
+                workspace=workspace.resolve(),
+                readable_roots=(workspace.resolve(),),
+                writable_roots=(workspace.resolve(),),
+                protected_roots=(),
+            )
+            context = BuiltinToolContext(
+                path_policy=path_policy,
+                sandbox=SimpleNamespace(limits=SimpleNamespace(timeout_seconds=30), execute_shell=None),
+                knowledge_base=SimpleNamespace(),
+                session_store=session_store,
+                multimodal_analyzer=_DummyMultimodalAnalyzer(),
+            )
+            tool = ParseAttachmentTool(context)
+
+            upload = UploadFile(filename="notes.txt", file=tempfile.SpooledTemporaryFile())
+            upload.file.write(b"line one\n\nline two\n")
+            upload.file.seek(0)
+
+            second_upload = UploadFile(filename="summary.txt", file=tempfile.SpooledTemporaryFile())
+            second_upload.file.write(b"another file\n")
+            second_upload.file.seek(0)
+
+            attachment_service = tool.attachment_service
+            attachments = asyncio.run(
+                attachment_service.save_uploads(
+                    session.session_id,
+                    "turn-1",
+                    [upload, second_upload],
+                )
+            )
+            session.messages.append(
+                SessionMessage(
+                    id="turn-1",
+                    role="user",
+                    content="先看第一个附件",
+                    metadata={
+                        "turn_id": "turn-1",
+                        "original_content": "先看第一个附件",
+                        "attachments": attachment_service.serialize(attachments),
+                    },
+                )
+            )
+            session_store.save(session)
+
+            result = asyncio.run(
+                tool.run(
+                    {
+                        "selector": {
+                            "order_index": 1,
+                        }
+                    },
+                    session.session_id,
+                )
+            )
+
+            self.assertTrue(result.success)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["filename"], "notes.txt")
+            self.assertEqual(payload["analysis_status"], "parsed")
+            self.assertIn("content_excerpt", payload)
+            message_update = result.metadata["session_message_updates"][0]
+            updated_attachments = message_update["metadata"]["attachments"]
+            self.assertEqual(updated_attachments[0]["analysis_status"], "parsed")
+            self.assertEqual(updated_attachments[1]["analysis_status"], "saved")
+            self.assertEqual(message_update["metadata"]["attachment_analysis"]["status"], "partial")
 
     def test_interrupt_route_persists_turn_interrupted_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -537,6 +663,7 @@ class MessageRouteTests(unittest.TestCase):
             self.assertEqual(saved.messages[-1].role, "system")
             self.assertEqual(saved.messages[-1].metadata["type"], "turn_interrupted")
             self.assertEqual(saved.messages[-1].metadata["turn_id"], turn_id)
+            self.assertEqual(saved.messages[-1].content, "上一次回合被用户中断，当前任务已停止。")
 
             audit_lines = (root / "audit" / f"{session.session_id}.log").read_text(encoding="utf-8").splitlines()
             self.assertTrue(audit_lines)
@@ -619,6 +746,57 @@ class ApprovalRouteTests(unittest.TestCase):
             json={"approval_request_id": request.approval_request_id},
         )
         self.assertEqual(conflict.status_code, 409)
+
+
+class MessageRouteAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_messages_disconnect_keeps_worker_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = _BackgroundMessageRuntime()
+            app = FastAPI()
+            app.state.runtime = runtime
+            app.state.settings = SimpleNamespace(paths=SimpleNamespace(audit_dir=root / "audit", data_dir=root / "data"))
+            app.state.scheduler = SimpleNamespace()
+            app.state.active_message_runs = {}
+
+            class _Request:
+                def __init__(self, app) -> None:
+                    self.app = app
+                    self.state = SimpleNamespace(request_id="req-bg")
+                    self.headers = {"content-type": "application/json"}
+                    self._disconnect_checks = 0
+
+                async def json(self) -> dict[str, object]:
+                    return {"content": "hello"}
+
+                async def is_disconnected(self) -> bool:
+                    self._disconnect_checks += 1
+                    return self._disconnect_checks >= 2
+
+            response = await send_message("session-1", _Request(app))
+            iterator = response.body_iterator
+            first_chunk = await anext(iterator)
+            self.assertIn(b'"event": "progress"', first_chunk)
+
+            with self.assertRaises(StopAsyncIteration):
+                await anext(iterator)
+
+            self.assertIn("session-1", app.state.active_message_runs)
+            self.assertFalse(runtime.cancelled)
+
+            runtime.release.set()
+
+            deadline = time.time() + 1.0
+            while time.time() < deadline and not runtime.completed:
+                await asyncio.sleep(0.01)
+
+            self.assertTrue(runtime.completed)
+
+            deadline = time.time() + 1.0
+            while time.time() < deadline and "session-1" in app.state.active_message_runs:
+                await asyncio.sleep(0.01)
+
+            self.assertNotIn("session-1", app.state.active_message_runs)
 
 
 class SkillsRouteTests(unittest.TestCase):

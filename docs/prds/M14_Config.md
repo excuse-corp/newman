@@ -75,7 +75,7 @@ provider:
 
 runtime:
   max_tool_depth: 20
-  context_compress_threshold: 0.8
+  context_compress_threshold: 0.85
   context_critical_threshold: 0.92
 
 sandbox:

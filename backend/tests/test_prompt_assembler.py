@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 
 from backend.memory.stable_context import StableContextLoader
-from backend.runtime.prompt_assembler import COMMENTARY_SYSTEM_GUARDRAIL, PromptAssembler
-from backend.sessions.models import SessionMessage, SessionRecord
+from backend.runtime.prompt_assembler import COMMENTARY_SYSTEM_GUARDRAIL, USER_INPUT_SYSTEM_GUARDRAIL, PromptAssembler
+from backend.sessions.models import CheckpointRecord, SessionMessage, SessionRecord
 
 
 class PromptAssemblerTests(unittest.TestCase):
@@ -24,6 +24,7 @@ class PromptAssemblerTests(unittest.TestCase):
 
             self.assertEqual(assembled[0]["role"], "system")
             self.assertTrue(assembled[0]["content"].startswith(COMMENTARY_SYSTEM_GUARDRAIL))
+            self.assertIn(USER_INPUT_SYSTEM_GUARDRAIL, assembled[0]["content"])
             self.assertIn("# Newman", assembled[0]["content"])
             self.assertIn("当前处于 Default mode", assembled[0]["content"])
             self.assertNotIn("## Approval Policy", assembled[0]["content"])
@@ -75,6 +76,38 @@ class PromptAssemblerTests(unittest.TestCase):
             self.assertIn("https://example.com", assistant_message["tool_calls"][0]["function"]["arguments"])
             self.assertEqual(tool_message["role"], "tool")
             self.assertEqual(tool_message["tool_call_id"], "call_1")
+
+    def test_checkpoint_retained_transcript_skips_archived_prefix_for_prompt_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp)
+            (memory_dir / "Newman.md").write_text("# Newman\n", encoding="utf-8")
+            (memory_dir / "USER.md").write_text("# USER\n", encoding="utf-8")
+            (memory_dir / "SKILLS_SNAPSHOT.md").write_text("# Skills\n", encoding="utf-8")
+            assembler = PromptAssembler(StableContextLoader(memory_dir))
+
+            session = SessionRecord(
+                session_id="session-1",
+                title="Checkpoint Test",
+                metadata={"checkpoint_active": True},
+                messages=[
+                    SessionMessage(id="u1", role="user", content="old request"),
+                    SessionMessage(id="a1", role="assistant", content="old answer"),
+                    SessionMessage(id="u2", role="user", content="fresh request"),
+                ],
+            )
+            checkpoint = CheckpointRecord(
+                session_id=session.session_id,
+                checkpoint_id="cp-1",
+                turn_range=[0, 2],
+                summary="Old request was completed.",
+                metadata={"transcript_retained": True, "compressed_message_count": 2},
+            )
+
+            assembled = assembler.assemble(session, "tools", checkpoint)
+
+            self.assertEqual(len(session.messages), 3)
+            self.assertIn("## Checkpoint Summary\nOld request was completed.", assembled[0]["content"])
+            self.assertEqual([message["content"] for message in assembled[1:]], ["fresh request"])
 
     def test_can_include_provider_state_for_tool_call_replay(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,7 +190,7 @@ class PromptAssemblerTests(unittest.TestCase):
                     "call_1": SessionMessage(
                         id="transient-1",
                         role="tool",
-                        content='{"dataBase64":"UkVBRE1FCg=="}',
+                        content='{"content":"README\\n","encoding":"utf-8","binary":false}',
                         metadata={"tool_call_id": "call_1", "tool": "read_file"},
                     )
                 },
@@ -166,7 +199,7 @@ class PromptAssemblerTests(unittest.TestCase):
             tool_message = assembled[-1]
             self.assertEqual(tool_message["role"], "tool")
             self.assertEqual(tool_message["tool_call_id"], "call_1")
-            self.assertEqual(tool_message["content"], '{"dataBase64":"UkVBRE1FCg=="}')
+            self.assertEqual(tool_message["content"], '{"content":"README\\n","encoding":"utf-8","binary":false}')
 
     def test_omits_failed_tool_protocol_messages_from_provider_replay(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -293,7 +326,6 @@ class PromptAssemblerTests(unittest.TestCase):
             self.assertEqual(assembled[0]["role"], "system")
             self.assertIn("当前处于 Plan mode", assembled[0]["content"])
             self.assertIn("`update_plan`", assembled[0]["content"])
-            self.assertIn("不要调用 `update_plan_draft`", assembled[0]["content"])
             self.assertIn("## Current Checklist", assembled[0]["content"])
             self.assertIn("先梳理接口", assembled[0]["content"])
 

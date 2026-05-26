@@ -68,8 +68,8 @@ TOOL_ERROR_MAP = {
         "error",
         "high",
         "工具执行异常",
-        "fatal",
-        "Stop the current action, inspect the error details, and surface the blocker clearly.",
+        "recoverable",
+        "Inspect the exception details, avoid repeating the same failing action, and try a narrower alternative step.",
     ),
     "fatal_error": ErrorDescriptor(
         "NEWMAN-TOOL-007",

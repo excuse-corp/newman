@@ -17,6 +17,11 @@ from backend.tools.workspace_fs import PathAccessPolicy, coerce_path_access_poli
 
 READ_CHUNK_SIZE = 2048
 STREAM_TRUNCATED_NOTICE = "\n...[输出已截断]\n"
+SANDBOX_PERMISSION_DENIED_PATTERNS = (
+    "read-only file system",
+    "operation not permitted",
+    "permission denied",
+)
 
 
 @dataclass(frozen=True)
@@ -123,20 +128,24 @@ class NativeSandbox:
         self,
         command: str,
         emit_output: ToolOutputEmitter | None = None,
+        *,
+        force_unsandboxed: bool = False,
     ) -> ToolExecutionResult:
-        if not self.config.enabled or self.config.mode == "danger-full-access":
+        if force_unsandboxed or not self.config.enabled or self.config.mode == "danger-full-access":
             result = await self._execute_direct(command, emit_output=emit_output)
             result.metadata.update(
                 {
                     "sandboxed": False,
                     "sandbox_backend": self.config.backend,
-                    "sandbox_mode": self.config.mode,
+                    "sandbox_mode": "unsandboxed-retry" if force_unsandboxed else self.config.mode,
                 }
             )
+            if force_unsandboxed:
+                result.metadata["sandbox_escalated"] = True
             return result
 
         if self.platform != "linux":
-            return ToolExecutionResult(
+            result = ToolExecutionResult(
                 success=False,
                 tool="sandbox",
                 action="execute",
@@ -148,8 +157,13 @@ class NativeSandbox:
                     "sandbox_mode": self.config.mode,
                 },
             )
+            return _mark_sandbox_escalation(
+                result,
+                reason="sandbox_unavailable",
+                summary="当前原生沙箱不可用，是否允许无沙箱重试一次？",
+            )
         if self._bwrap_executable is None:
-            return ToolExecutionResult(
+            result = ToolExecutionResult(
                 success=False,
                 tool="sandbox",
                 action="execute",
@@ -161,6 +175,11 @@ class NativeSandbox:
                     "sandbox_mode": self.config.mode,
                 },
             )
+            return _mark_sandbox_escalation(
+                result,
+                reason="sandbox_unavailable",
+                summary="当前原生沙箱不可用，是否允许无沙箱重试一次？",
+            )
 
         result = await self._execute_bwrap(command, emit_output=emit_output)
         result.metadata.update(
@@ -170,6 +189,12 @@ class NativeSandbox:
                 "sandbox_mode": self.config.mode,
             }
         )
+        if _looks_like_sandbox_permission_denial(result):
+            _mark_sandbox_escalation(
+                result,
+                reason="sandbox_permission_denied",
+                summary="Linux 原生沙箱阻止了本次执行，是否允许无沙箱重试一次？",
+            )
         return result
 
     async def _execute_direct(
@@ -363,6 +388,20 @@ def _result_from_stream_captures(
         stderr=stderr.render_text(),
         retryable=return_code != 0,
     )
+
+
+def _mark_sandbox_escalation(result: ToolExecutionResult, *, reason: str, summary: str) -> ToolExecutionResult:
+    result.metadata["sandbox_escalation_available"] = True
+    result.metadata["sandbox_escalation_reason"] = reason
+    result.metadata["sandbox_escalation_summary"] = summary
+    return result
+
+
+def _looks_like_sandbox_permission_denial(result: ToolExecutionResult) -> bool:
+    if result.success:
+        return False
+    detail = "\n".join(part for part in (result.summary, result.stderr) if part).lower()
+    return any(pattern in detail for pattern in SANDBOX_PERMISSION_DENIED_PATTERNS)
 
 
 async def _cleanup_process(proc: asyncio.subprocess.Process | None) -> None:

@@ -57,3 +57,28 @@ class RequestUserInputToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.category, "validation_error")
 
+    async def test_numbered_prompt_is_exposed_as_options(self) -> None:
+        tool = RequestUserInputTool()
+
+        result = await tool.run(
+            {
+                "kind": "free_text",
+                "prompt": (
+                    "请确认您的具体需求：1. 为所有信息管理部项目添加古勇？ "
+                    "2. 只为特定信息管理部项目添加古勇？ "
+                    "3. 添加一个新的信息管理部项目，网格员设为古勇？如果是这种情况，请提供项目名称。"
+                ),
+            },
+            session_id="session-1",
+        )
+
+        self.assertTrue(result.success)
+        awaiting = result.metadata[AWAITING_USER_INPUT_METADATA_KEY]
+        self.assertIsInstance(awaiting, dict)
+        assert isinstance(awaiting, dict)
+        options = awaiting["options"]
+        self.assertIsInstance(options, list)
+        self.assertEqual(len(options), 3)
+        self.assertEqual(options[0]["value"], "option_1")
+        self.assertIn("所有信息管理部", options[0]["label"])
+        self.assertIn("请提供项目名称", options[2]["description"])

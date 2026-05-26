@@ -45,6 +45,30 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
 
         self.assertEqual(state, {"reasoning_content": "需要先调用工具"})
 
+    def test_extract_response_provider_state_uses_configured_response_fields(self) -> None:
+        config = ModelConfig(
+            type="openai_compatible",
+            model="generic-model",
+            capabilities={"reasoning": {"response_fields": ["planner_state", "trace_notes"]}},
+        )
+
+        state = _extract_response_provider_state(
+            config,
+            {
+                "content": "ok",
+                "planner_state": "先确认结构",
+                "trace_notes": "再编辑文件",
+            },
+        )
+
+        self.assertEqual(
+            state,
+            {
+                "planner_state": "先确认结构",
+                "trace_notes": "再编辑文件",
+            },
+        )
+
     def test_build_payload_replays_reasoning_content_for_profiled_tool_call(self) -> None:
         config = ModelConfig(type="openai_compatible", model="mimo-v2.5")
         payload = _build_payload(
@@ -149,6 +173,39 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
         )
 
         self.assertEqual(payload["messages"][0]["reasoning_content"], "配置驱动的回放")
+
+    def test_build_payload_replays_configured_reasoning_fields(self) -> None:
+        config = ModelConfig(
+            type="openai_compatible",
+            model="generic-model",
+            capabilities={"reasoning": {"replay_fields": ["planner_state", "trace_notes"], "replay_required": True}},
+        )
+        payload = _build_payload(
+            config,
+            [
+                {
+                    "role": "assistant",
+                    "content": "我先调用工具。",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                    "provider_state": {
+                        "planner_state": "配置驱动的计划",
+                        "trace_notes": "配置驱动的回放",
+                    },
+                }
+            ],
+            tools=[],
+            stream=False,
+        )
+
+        assistant_message = payload["messages"][0]
+        self.assertEqual(assistant_message["planner_state"], "配置驱动的计划")
+        self.assertEqual(assistant_message["trace_notes"], "配置驱动的回放")
 
     def test_build_payload_allows_config_to_disable_profiled_reasoning_replay(self) -> None:
         config = ModelConfig(

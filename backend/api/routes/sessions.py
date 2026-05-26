@@ -12,7 +12,9 @@ from backend.api.sse.event_emitter import format_sse
 from backend.memory.compressor import (
     build_context_usage_snapshot,
     build_checkpoint_metadata,
-    split_session_messages,
+    checkpoint_archived_message_count,
+    microcompact_session,
+    model_visible_session_messages,
     summarize_messages,
 )
 from backend.runtime.collaboration_mode import (
@@ -23,7 +25,7 @@ from backend.runtime.collaboration_mode import (
     get_plan_draft,
 )
 from backend.runtime.workflow_state import AWAITING_USER_INPUT_METADATA_KEY, WORKFLOW_STATE_METADATA_KEY
-from backend.sessions.models import SessionMessage, SessionSummary
+from backend.sessions.models import SessionMessage, SessionSummary, utc_now
 
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -182,6 +184,16 @@ async def compress_session(session_id: str, request: Request):
     session = runtime.session_store.get(session_id)
     checkpoint = runtime.checkpoints.get(session_id)
     preserved = runtime.settings.runtime.context_compaction_preserve_recent
+    microcompact_count = microcompact_session(
+        session,
+        preserve_recent=preserved,
+        checkpoint=checkpoint,
+        artifact_dir=_microcompact_artifact_dir(runtime, session.session_id),
+    )
+    if microcompact_count:
+        session.metadata["last_compaction_stage"] = "microcompact"
+        session.metadata["last_microcompact_at"] = utc_now()
+        runtime.session_store.save(session)
     summary_result = await summarize_messages(
         runtime.provider,
         runtime.settings.provider,
@@ -193,26 +205,28 @@ async def compress_session(session_id: str, request: Request):
         request_kind="manual_context_compaction",
     )
     if not summary_result:
-        return {"compressed": False, "reason": "nothing_to_compress"}
-    _, preserved_messages = split_session_messages(session, preserve_recent=preserved)
+        return {"compressed": False, "reason": "nothing_to_compress", "microcompact_count": microcompact_count}
+    previous_archived_count = checkpoint_archived_message_count(session, checkpoint)
     original_count = len(session.messages)
-    session.messages = preserved_messages
+    archived_message_count = min(len(session.messages), previous_archived_count + summary_result.source_message_count)
     session.metadata["checkpoint_active"] = True
     runtime.session_store.save(session)
     checkpoint = runtime.checkpoints.save(
         session_id,
         summary_result.summary,
-        [0, max(0, original_count - len(preserved_messages))],
+        [0, archived_message_count],
         metadata=build_checkpoint_metadata(
             summary_result,
             preserve_recent=preserved,
             compression_level="manual",
             original_message_count=original_count,
+            archived_message_count=archived_message_count,
+            microcompact_count=microcompact_count,
         ),
     )
     session.metadata["checkpoint_restore_hint"] = checkpoint.checkpoint_id
     runtime.session_store.save(session)
-    return {"compressed": True, "checkpoint": checkpoint, "session": session}
+    return {"compressed": True, "checkpoint": checkpoint, "session": session, "microcompact_count": microcompact_count}
 
 
 @router.post("/{session_id}/restore-checkpoint")
@@ -333,6 +347,14 @@ def _build_context_usage(runtime, session, checkpoint) -> dict[str, object]:
     ).to_dict()
 
 
+def _microcompact_artifact_dir(runtime, session_id: str):
+    paths = getattr(getattr(runtime, "settings", None), "paths", None)
+    sessions_dir = getattr(paths, "sessions_dir", None)
+    if sessions_dir is None:
+        return None
+    return sessions_dir / "tool_outputs" / session_id
+
+
 def _build_session_context_messages(runtime, session, checkpoint) -> list[dict[str, object]]:
     prompt_assembler = getattr(runtime, "prompt_assembler", None)
     if prompt_assembler is not None and hasattr(runtime, "_tools_overview"):
@@ -352,6 +374,6 @@ def _build_session_history_messages(session, checkpoint) -> list[dict[str, objec
     )
     if checkpoint and not has_restored_checkpoint:
         messages.append({"role": "system", "content": f"## Checkpoint Summary\n{checkpoint.summary}"})
-    for item in session.messages:
+    for item in model_visible_session_messages(session, checkpoint):
         messages.append({"role": item.role, "content": item.content})
     return messages

@@ -75,6 +75,39 @@ class FakeStreamingTerminalTool(FakeTerminalTool):
         )
 
 
+class FakeEscalatingTerminalTool(FakeTerminalTool):
+    def __init__(self):
+        super().__init__()
+        self.escalated_calls: list[dict] = []
+
+    async def run_streaming(self, arguments, session_id: str, emit_output=None) -> ToolExecutionResult:
+        self.calls.append({"arguments": arguments, "session_id": session_id})
+        return ToolExecutionResult(
+            success=False,
+            tool=self.meta.name,
+            action="execute",
+            category="runtime_exception",
+            summary="执行失败",
+            stderr="permission denied",
+            retryable=True,
+            metadata={
+                "sandbox_escalation_available": True,
+                "sandbox_escalation_reason": "sandbox_permission_denied",
+                "sandbox_escalation_summary": "Linux 原生沙箱阻止了本次执行，是否允许无沙箱重试一次？",
+            },
+        )
+
+    async def run_streaming_escalated(self, arguments, session_id: str, emit_output=None) -> ToolExecutionResult:
+        self.escalated_calls.append({"arguments": arguments, "session_id": session_id})
+        return ToolExecutionResult(
+            success=True,
+            tool=self.meta.name,
+            action="execute",
+            summary="terminal complete (escalated)",
+            metadata={"sandbox_escalated": True},
+        )
+
+
 class FakeMCPTool(BaseTool):
     def __init__(self):
         self.calls: list[dict] = []
@@ -405,6 +438,104 @@ class TurnApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0][1]["delta"], "line 1\n")
         self.assertEqual(events[1][1]["stream"], "stderr")
         self.assertEqual(events[1][1]["delta"], "warn 1\n")
+
+    async def test_manual_mode_allows_sandbox_escalation_after_approval(self):
+        approvals = ApprovalManager()
+        orchestrator = ToolOrchestrator(AppConfig(), approvals)
+        tool = FakeEscalatingTerminalTool()
+        events: list[tuple[str, dict]] = []
+
+        async def emit(event: str, data: dict) -> None:
+            events.append((event, data))
+
+        task = asyncio.create_task(
+            orchestrator.execute(
+                tool,
+                {"command": "pwd"},
+                "session-escalate-manual",
+                emit,
+                turn_approval_mode="manual",
+            )
+        )
+
+        await asyncio.sleep(0)
+
+        self.assertEqual(events[0][0], "tool_approval_request")
+        approval_request_id = events[0][1]["approval_request_id"]
+        approvals.resolve(approval_request_id, True)
+
+        result = await task
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(tool.calls), 1)
+        self.assertEqual(len(tool.escalated_calls), 1)
+        self.assertTrue(result.metadata["sandbox_escalated"])
+        self.assertEqual(
+            [name for name, _ in events],
+            ["tool_approval_request", "tool_approval_resolved", "tool_retry_scheduled"],
+        )
+        self.assertEqual(events[2][1]["attempt"], 2)
+        self.assertEqual(events[2][1]["delay_seconds"], 0)
+
+    async def test_manual_mode_can_reject_sandbox_escalation(self):
+        approvals = ApprovalManager()
+        orchestrator = ToolOrchestrator(AppConfig(), approvals)
+        tool = FakeEscalatingTerminalTool()
+        events: list[tuple[str, dict]] = []
+
+        async def emit(event: str, data: dict) -> None:
+            events.append((event, data))
+
+        task = asyncio.create_task(
+            orchestrator.execute(
+                tool,
+                {"command": "pwd"},
+                "session-escalate-reject",
+                emit,
+                turn_approval_mode="manual",
+            )
+        )
+
+        await asyncio.sleep(0)
+
+        self.assertEqual(events[0][0], "tool_approval_request")
+        approval_request_id = events[0][1]["approval_request_id"]
+        approvals.resolve(approval_request_id, False)
+
+        result = await task
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.category, "permission_error")
+        self.assertEqual(len(tool.calls), 1)
+        self.assertEqual(len(tool.escalated_calls), 0)
+        self.assertEqual(
+            [name for name, _ in events],
+            ["tool_approval_request", "tool_approval_resolved"],
+        )
+        self.assertFalse(events[1][1]["approved"])
+
+    async def test_auto_allow_escalates_terminal_without_second_prompt(self):
+        approvals = ApprovalManager()
+        orchestrator = ToolOrchestrator(AppConfig(), approvals)
+        tool = FakeEscalatingTerminalTool()
+        events: list[tuple[str, dict]] = []
+
+        async def emit(event: str, data: dict) -> None:
+            events.append((event, data))
+
+        result = await orchestrator.execute(
+            tool,
+            {"command": "pwd"},
+            "session-escalate-auto",
+            emit,
+            turn_approval_mode="auto_allow",
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(tool.calls), 1)
+        self.assertEqual(len(tool.escalated_calls), 1)
+        self.assertEqual([name for name, _ in events], ["tool_retry_scheduled"])
+        self.assertTrue(result.metadata["sandbox_escalated"])
 
 
 if __name__ == "__main__":

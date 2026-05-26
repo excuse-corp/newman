@@ -184,18 +184,19 @@ def _build_payload(
 
 
 def _prepare_messages_for_payload(config: ModelConfig, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    replay_field = _reasoning_replay_field(config)
+    replay_fields = _reasoning_replay_fields(config)
     prepared: list[dict[str, Any]] = []
     for message in messages:
         next_message = {key: value for key, value in message.items() if key not in INTERNAL_MESSAGE_KEYS}
-        if replay_field and _message_has_tool_calls(message):
+        if replay_fields and _message_has_tool_calls(message):
             provider_state = message.get("provider_state")
-            value = ""
-            if isinstance(provider_state, dict):
-                raw_value = provider_state.get(replay_field)
-                if raw_value is not None:
-                    value = str(raw_value)
-            next_message[replay_field] = value
+            for replay_field in replay_fields:
+                value = ""
+                if isinstance(provider_state, dict):
+                    raw_value = provider_state.get(replay_field)
+                    if raw_value is not None:
+                        value = str(raw_value)
+                next_message[replay_field] = value
         prepared.append(next_message)
     return prepared
 
@@ -220,22 +221,46 @@ def _deep_merge_dicts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str
     return result
 
 
-def _reasoning_replay_field(config: ModelConfig) -> str | None:
+def _coerce_reasoning_field_names(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
+def _dedupe_reasoning_field_names(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        field = value.strip()
+        if not field or field in seen:
+            continue
+        seen.add(field)
+        result.append(field)
+    return result
+
+
+def _reasoning_replay_fields(config: ModelConfig) -> list[str]:
     reasoning = _model_capabilities(config).get("reasoning")
     if not isinstance(reasoning, dict) or not bool(reasoning.get("replay_required")):
-        return None
-    field = reasoning.get("replay_field") or reasoning.get("field") or DEFAULT_REASONING_CONTENT_FIELD
-    return str(field).strip() or None
+        return []
+    fields: list[str] = []
+    for key in ("replay_field", "replay_fields", "field", "fields"):
+        fields.extend(_coerce_reasoning_field_names(reasoning.get(key)))
+    if not fields:
+        fields.append(DEFAULT_REASONING_CONTENT_FIELD)
+    return _dedupe_reasoning_field_names(fields)
 
 
 def _reasoning_response_fields(config: ModelConfig) -> set[str]:
     fields = {DEFAULT_REASONING_CONTENT_FIELD}
     reasoning = _model_capabilities(config).get("reasoning")
     if isinstance(reasoning, dict):
-        for key in ("response_field", "replay_field", "field"):
-            raw_value = reasoning.get(key)
-            if isinstance(raw_value, str) and raw_value.strip():
-                fields.add(raw_value.strip())
+        for key in ("response_field", "response_fields", "replay_field", "replay_fields", "field", "fields"):
+            for field in _coerce_reasoning_field_names(reasoning.get(key)):
+                if field.strip():
+                    fields.add(field.strip())
     return fields
 
 

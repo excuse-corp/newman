@@ -6,9 +6,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from backend.config.schema import AppConfig
+from backend.runtime.output_paths import turn_output_dir
+from backend.sandbox.native_sandbox import NativeSandbox
+from backend.sandbox.resource_limits import ResourceLimits
 from backend.sandbox.linux_bwrap import build_bwrap_command
+from backend.tools.impl.terminal import TerminalTool
 from backend.tools.router import ToolRouter
 from backend.tools.registry import ToolRegistry
+from backend.tools.result import ToolExecutionResult
+from backend.tools.workspace_fs import build_path_access_policy
 
 
 class _FakeTerminalTool:
@@ -230,6 +236,123 @@ class TerminalPermissionTests(unittest.TestCase):
             self.assertIn(str(protected_dir), argv)
             self.assertIn("/dev/null", argv)
             self.assertIn(str(protected_file), argv)
+
+
+class NativeSandboxEscalationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_linux_sandbox_failure_offers_unsandboxed_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace)}})
+            sandbox = NativeSandbox(
+                workspace,
+                ResourceLimits(timeout_seconds=1, output_limit_bytes=1024),
+                settings.sandbox,
+            )
+            sandbox.platform = "darwin"
+
+            result = await sandbox.execute_shell("pwd")
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.category, "runtime_exception")
+            self.assertTrue(result.metadata["sandbox_escalation_available"])
+            self.assertEqual(result.metadata["sandbox_escalation_reason"], "sandbox_unavailable")
+
+    async def test_permission_denied_result_is_marked_for_sandbox_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace)}})
+            sandbox = NativeSandbox(
+                workspace,
+                ResourceLimits(timeout_seconds=1, output_limit_bytes=1024),
+                settings.sandbox,
+            )
+            sandbox.platform = "linux"
+            sandbox._bwrap_executable = "bwrap"
+
+            async def fake_execute_bwrap(command: str, emit_output=None) -> ToolExecutionResult:
+                return ToolExecutionResult(
+                    success=False,
+                    tool="sandbox",
+                    action="execute",
+                    category="runtime_exception",
+                    summary="执行失败",
+                    stderr="operation not permitted",
+                    retryable=True,
+                )
+
+            sandbox._execute_bwrap = fake_execute_bwrap  # type: ignore[method-assign]
+
+            result = await sandbox.execute_shell("pwd")
+
+            self.assertFalse(result.success)
+            self.assertTrue(result.metadata["sandboxed"])
+            self.assertTrue(result.metadata["sandbox_escalation_available"])
+            self.assertEqual(result.metadata["sandbox_escalation_reason"], "sandbox_permission_denied")
+
+
+class TerminalOutputReportingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_reports_changed_output_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace)}})
+            policy = build_path_access_policy(settings)
+            target = workspace / "report.xlsx"
+
+            class _FakeSandbox:
+                limits = SimpleNamespace(timeout_seconds=30)
+
+                async def execute_shell(self, command: str, emit_output=None, *, force_unsandboxed: bool = False):
+                    target.write_text("ok", encoding="utf-8")
+                    return ToolExecutionResult(success=True, tool="sandbox", action=command, summary="执行成功")
+
+            tool = TerminalTool(_FakeSandbox(), policy)
+
+            result = await tool.run({"command": "python modify.py report.xlsx"}, "session-1")
+
+            self.assertTrue(result.success)
+            self.assertIn("output_files", result.metadata)
+            self.assertEqual(len(result.metadata["output_files"]), 1)
+            self.assertEqual(result.metadata["output_files"][0]["path"], str(target.resolve()))
+            self.assertEqual(result.metadata["path"], str(target.resolve()))
+
+    async def test_terminal_reports_outputs_directory_files_without_explicit_command_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            outputs_dir = turn_output_dir(workspace, "session-1", "turn-1")
+            outputs_dir.mkdir(parents=True)
+            helper_script = workspace / "modify_excel.py"
+            helper_script.write_text("print('helper')", encoding="utf-8")
+            target = outputs_dir / "report.xlsx"
+            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace)}})
+            policy = build_path_access_policy(settings)
+
+            class _FakeSandbox:
+                limits = SimpleNamespace(timeout_seconds=30)
+
+                async def execute_shell(self, command: str, emit_output=None, *, force_unsandboxed: bool = False):
+                    helper_script.write_text("print('updated helper')", encoding="utf-8")
+                    target.write_text("ok", encoding="utf-8")
+                    return ToolExecutionResult(success=True, tool="sandbox", action=command, summary="执行成功")
+
+            tool = TerminalTool(_FakeSandbox(), policy)
+
+            result = await tool.run(
+                {
+                    "command": "python modify_excel.py",
+                    "__turn_output_dir": str(outputs_dir),
+                },
+                "session-1",
+            )
+
+            self.assertTrue(result.success)
+            self.assertIn("output_files", result.metadata)
+            output_paths = {item["path"] for item in result.metadata["output_files"]}
+            self.assertIn(str(target.resolve()), output_paths)
+            self.assertIn(str(helper_script.resolve()), output_paths)
 
 
 if __name__ == "__main__":

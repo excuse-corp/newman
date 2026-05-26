@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import tempfile
 import unittest
@@ -62,7 +61,8 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(result.success)
             payload = json.loads(result.stdout)
-            self.assertEqual(base64.b64decode(payload["dataBase64"]).decode("utf-8"), "hello\nworld\n")
+            self.assertEqual(payload["content"], "hello\nworld\n")
+            self.assertEqual(payload["encoding"], "utf-8")
 
     async def test_runtime_logs_can_be_read_without_exposing_audit_or_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,7 +93,8 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
             result = await ReadFileTool(policy).run({"path": str(backend_log)}, "session-logs")
             self.assertTrue(result.success)
             payload = json.loads(result.stdout)
-            self.assertEqual(base64.b64decode(payload["dataBase64"]).decode("utf-8"), "backend ready\n")
+            self.assertEqual(payload["content"], "backend ready\n")
+            self.assertEqual(payload["encoding"], "utf-8")
 
             audit_result = await ReadFileTool(policy).run({"path": str(audit_log)}, "session-logs")
             self.assertFalse(audit_result.success)

@@ -56,7 +56,7 @@ models:
 
 runtime:
   max_tool_depth: 30
-  context_compress_threshold: 0.8
+  context_compress_threshold: 0.85
   context_critical_threshold: 0.92
   context_compaction_preserve_recent: 4
   context_reply_reserve_tokens_large: 4096
@@ -68,6 +68,8 @@ runtime:
   context_compaction_max_failures: 3
   tool_retry_attempts: 3
   tool_retry_backoff_seconds: 1.0
+  provider_retry_attempts: 3
+  provider_retry_backoff_seconds: 1.0
 
 rag:
   postgres_dsn: "postgresql://postgres@127.0.0.1:65437/newman"

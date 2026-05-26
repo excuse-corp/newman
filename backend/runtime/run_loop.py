@@ -17,8 +17,8 @@ from backend.memory.checkpoint_store import CheckpointStore
 from backend.memory.compressor import (
     build_context_usage_snapshot,
     build_checkpoint_metadata,
+    checkpoint_archived_message_count,
     microcompact_session,
-    split_session_messages,
     summarize_messages,
 )
 from backend.memory.memory_extract import MemoryExtractor
@@ -31,12 +31,17 @@ from backend.rag.service import KnowledgeBaseService
 from backend.runtime.collaboration_mode import (
     PLAN_COLLABORATION_MODE,
     get_collaboration_mode,
-    get_plan_draft,
     get_session_plan,
     is_tool_allowed_in_mode,
 )
 from backend.runtime.feedback_writer import FeedbackWriter
-from backend.runtime.message_rendering import get_attachment_analysis, get_normalized_user_content
+from backend.runtime.message_rendering import get_attachment_analysis, get_normalized_user_content, is_attachment_edit_request
+from backend.runtime.output_paths import (
+    is_within_session_output_dir,
+    is_within_turn_output_dir,
+    output_root_dir,
+    turn_output_dir,
+)
 from backend.runtime.prompt_assembler import PromptAssembler
 from backend.runtime.result_normalizer import normalize_result
 from backend.runtime.session_task import SessionTask
@@ -53,6 +58,8 @@ from backend.runtime.workflow_state import (
     TURN_OUTCOME_TASK_COMPLETED,
     WORKFLOW_STATE_METADATA_KEY,
     build_pending_user_input_reply_metadata,
+    build_awaiting_user_input_payload,
+    build_workflow_state_payload,
     normalize_turn_outcome,
 )
 from backend.scheduler.task_store import TaskStore
@@ -125,6 +132,138 @@ def _dedupe_strings(values) -> list[str]:
     return result
 
 
+COMMON_PROVIDER_REASONING_STATE_FIELDS = (
+    "reasoning_content",
+    "reasoning",
+    "reasoning_text",
+    "thinking_content",
+    "thinking",
+    "thought_content",
+    "thoughts",
+    "thought",
+    "rationale",
+)
+PROVIDER_REASONING_FIELD_CAPABILITY_KEYS = (
+    "response_field",
+    "response_fields",
+    "replay_field",
+    "replay_fields",
+    "field",
+    "fields",
+    "state_field",
+    "state_fields",
+)
+PROVIDER_REASONING_TEXT_VALUE_KEYS = (
+    "content",
+    "text",
+    "reasoning_content",
+    "reasoning",
+    "reasoning_text",
+    "thinking_content",
+    "thinking",
+    "thought",
+    "thoughts",
+    "rationale",
+)
+PROVIDER_REASONING_KEY_RE = re.compile(r"(?:reasoning|think|thought|rationale|chain_of_thought|cot)", re.IGNORECASE)
+NON_REASONING_PROVIDER_STATE_KEYS = frozenset({"finish_reason", "stop_reason"})
+
+
+def _coerce_provider_reasoning_field_names(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        names: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                names.append(item)
+        return names
+    return []
+
+
+def _configured_provider_reasoning_state_fields(provider_config: object | None) -> list[str]:
+    capabilities = getattr(provider_config, "capabilities", None)
+    if not isinstance(capabilities, dict):
+        return []
+    reasoning = capabilities.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return []
+
+    fields: list[str] = []
+    for key in PROVIDER_REASONING_FIELD_CAPABILITY_KEYS:
+        fields.extend(_coerce_provider_reasoning_field_names(reasoning.get(key)))
+    return _dedupe_strings(fields)
+
+
+def _provider_reasoning_state_fields(provider_config: object | None) -> list[str]:
+    return _dedupe_strings(
+        [
+            *_configured_provider_reasoning_state_fields(provider_config),
+            *COMMON_PROVIDER_REASONING_STATE_FIELDS,
+        ]
+    )
+
+
+def _stringify_provider_reasoning_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return "\n\n".join(_dedupe_strings(_stringify_provider_reasoning_value(item) for item in value))
+    if isinstance(value, dict):
+        parts = [
+            _stringify_provider_reasoning_value(value[key])
+            for key in PROVIDER_REASONING_TEXT_VALUE_KEYS
+            if key in value
+        ]
+        return "\n\n".join(_dedupe_strings(parts))
+    return ""
+
+
+def _looks_like_provider_reasoning_state_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    normalized = key.strip().lower()
+    if not normalized or normalized in NON_REASONING_PROVIDER_STATE_KEYS:
+        return False
+    return bool(PROVIDER_REASONING_KEY_RE.search(normalized))
+
+
+def _extract_provider_state_reasoning(provider_state: object, provider_config: object | None = None) -> str:
+    if not isinstance(provider_state, dict):
+        return ""
+
+    fields = _provider_reasoning_state_fields(provider_config)
+    parts: list[str] = []
+    seen_keys = set()
+    for key in fields:
+        if key not in provider_state:
+            continue
+        seen_keys.add(key)
+        parts.append(_stringify_provider_reasoning_value(provider_state.get(key)))
+
+    for key, value in provider_state.items():
+        if key in seen_keys or not _looks_like_provider_reasoning_state_key(key):
+            continue
+        parts.append(_stringify_provider_reasoning_value(value))
+
+    return "\n\n".join(_dedupe_strings(parts))
+
+
+def _response_reasoning_for_commentary(response: ProviderResponse, provider_config: object | None = None) -> str:
+    return "\n\n".join(
+        _dedupe_strings(
+            [
+                response.thinking,
+                _extract_provider_state_reasoning(response.provider_state, provider_config),
+            ]
+        )
+    )
+
+
 COMMENTARY_FALLBACK_SYSTEM_PROMPT = """你负责把内部思考压缩成一条对用户可见的简短行动说明。
 
 输出规则：
@@ -151,7 +290,9 @@ TOOL_EVENT_OUTPUT_PREVIEW_MAX_CHARS = 8_000
 STRUCTURED_TOOL_PREAMBLE_RE = re.compile(r"(^|\n)\s*(?:#{1,6}\s+|\d+[.、]\s+|[-*]\s+)")
 HASH_PATH_SEGMENT_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
 PSEUDO_TOOL_NAMES = frozenset({"commentary", "thinking", "think"})
+PLAN_TOOL_NAMES = frozenset({"enter_plan_mode", "update_plan"})
 MAX_INVALID_TOOL_CALL_RECOVERY_ATTEMPTS = 1
+PLAN_TOOL_INVALID_CALL_RECOVERY_ATTEMPTS = 2
 ATTACHMENT_FIRST_REPLY_BLOCKED_TOOLS = frozenset(
     {
         "read_file",
@@ -382,7 +523,7 @@ def _build_single_tool_action_brief(tool_call: ToolCall, prefix: str, task: Sess
     if tool_name == "update_plan":
         return f"{prefix}把已知信息拆成执行步骤，便于按阶段推进。"
 
-    if tool_name in {"enter_plan_mode", "update_plan_draft", "exit_plan_mode"}:
+    if tool_name == "enter_plan_mode":
         return f"{prefix}更新当前协作流程，确保后续步骤可追踪。"
 
     return f"{prefix}调用 {tool_name}，获取完成这一步需要的信息。"
@@ -599,12 +740,12 @@ class NewmanRuntime:
             return None
         return build_pending_user_input_reply_metadata(session)
 
-    def _tools_overview(self) -> str:
+    def _tools_overview(self, task: SessionTask | None = None) -> str:
         overview = "\n\n".join(
             section
             for section in [
                 self.registry.describe(),
-                self._workspace_access_overview(),
+                self._workspace_access_overview(task) if task is not None else self._workspace_access_overview(),
             ]
             if section
         )
@@ -613,19 +754,67 @@ class NewmanRuntime:
             overview = f"{overview}\n\n## MCP Resources\n{resource_overview}"
         return overview
 
-    def _workspace_access_overview(self) -> str:
+    def _visible_tools_overview(self, provider_tools: list[dict[str, object]], task: SessionTask | None = None) -> str:
+        tool_lines: list[str] = []
+        for schema in provider_tools:
+            if not isinstance(schema, dict):
+                continue
+            function = schema.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name", "")).strip()
+            if not name:
+                continue
+            description = str(function.get("description", "")).strip()
+            if description:
+                formatted_description = description.replace("\n", "\n  ")
+                tool_lines.append(f"- {name}: {formatted_description}")
+            else:
+                tool_lines.append(f"- {name}")
+        tools_section = "\n".join(tool_lines) if tool_lines else "- No callable tools are available in this step."
+        workspace_access = ""
+        paths = getattr(getattr(self, "settings", None), "paths", None)
+        if getattr(paths, "workspace", None) is not None:
+            try:
+                workspace_access = self._workspace_access_overview(task) if task is not None else self._workspace_access_overview()
+            except Exception:
+                workspace_access = ""
+        overview = "\n\n".join(
+            section
+            for section in [
+                tools_section,
+                workspace_access,
+            ]
+            if section
+        )
+        describe_resources = getattr(getattr(self, "mcp_registry", None), "describe_resources", None)
+        resource_overview = describe_resources() if callable(describe_resources) else ""
+        if resource_overview:
+            overview = f"{overview}\n\n## MCP Resources\n{resource_overview}"
+        return overview
+
+    def _workspace_access_overview(self, task: SessionTask | None = None) -> str:
         policy = build_path_access_policy(self.settings)
-        output_dir = policy.workspace / "outputs"
+        output_root = output_root_dir(policy.workspace)
+        current_output_dir = self._current_turn_output_dir(task) if task is not None else None
         paths = getattr(self.settings, "paths", None)
         raw_data_dir = getattr(paths, "data_dir", policy.workspace.parent / "backend_data")
         data_dir = raw_data_dir if isinstance(raw_data_dir, Path) else Path(str(raw_data_dir))
         raw_audit_dir = getattr(paths, "audit_dir", data_dir / "audit")
         audit_dir = raw_audit_dir if isinstance(raw_audit_dir, Path) else Path(str(raw_audit_dir))
+        output_lines = [f"Per-turn output root for user deliverables: {output_root}"]
+        if current_output_dir is not None:
+            output_lines.append(f"Current turn output directory for user deliverables: {current_output_dir}")
+        else:
+            output_lines.append(
+                "Current turn output directory pattern for user deliverables: "
+                f"{output_root / '{session_id}' / '{turn_id}'}"
+            )
         return "\n".join(
             [
                 "## Workspace Access",
                 f"Runtime workspace (primary operation space): {policy.workspace}",
-                f"Primary output directory for user deliverables: {output_dir}",
+                *output_lines,
                 "",
                 "Runtime logs (read-only when permitted by configuration):",
                 f"- Backend log: {data_dir / 'run' / 'logs' / 'backend.log'}",
@@ -643,11 +832,17 @@ class NewmanRuntime:
                 "Protected roots (do not read or write; these override readable and writable roots):",
                 *_format_path_roots(policy.protected_roots),
                 "",
-                "When creating user-facing files, write them under the primary output directory unless the user asks for a different path. "
+                "When creating user-facing files, write them under the current turn output directory unless the user asks for a different path. "
+                "Only place final deliverables there; keep helper scripts and intermediate files elsewhere in the workspace. "
                 "Use a path relative to the runtime workspace when the target is inside it. "
                 "Project maintenance roots such as memory, skills, plugins, or tools are only for their specific maintenance tasks.",
             ]
         )
+
+    def _current_turn_output_dir(self, task: SessionTask | None) -> Path | None:
+        if task is None or not task.turn_id:
+            return None
+        return turn_output_dir(self.settings.paths.workspace, task.session.session_id, task.turn_id)
 
     def schedule_previous_session_extraction(self, exclude_session_id: str) -> dict[str, object]:
         previous = self.session_store.latest(exclude_session_ids={exclude_session_id}, require_messages=True)
@@ -709,6 +904,8 @@ class NewmanRuntime:
             path_policy=path_policy,
             sandbox=sandbox,
             knowledge_base=knowledge_base,
+            session_store=self.session_store,
+            multimodal_analyzer=self.multimodal_analyzer,
         )
         registry = ToolRegistry()
         for tool in load_builtin_tools(tool_context):
@@ -765,12 +962,15 @@ class NewmanRuntime:
             if checkpoint_ok is False:
                 await self._finalize_context_irreducible(task, turn_emit, request_id=request_id)
                 return
-            assembled = self._assemble_task_messages(task)
             if task.progress.force_no_tools_next:
                 provider_tools = []
                 task.progress.force_no_tools_next = False
             else:
                 provider_tools = self._provider_tools_for_turn(task)
+            assembled = self._assemble_task_messages(
+                task,
+                tools_overview=self._visible_tools_overview(provider_tools, task),
+            )
 
             try:
                 response = await self._stream_provider_response_with_retries(
@@ -801,6 +1001,7 @@ class NewmanRuntime:
                 response,
                 turn_emit,
                 request_id=request_id,
+                available_tool_names=_provider_tool_schema_names(provider_tools),
             )
             if invalid_tool_action == "continue":
                 continue
@@ -813,8 +1014,6 @@ class NewmanRuntime:
                 turn_emit,
                 group_id=group_id,
             )
-            for tool_call in response.tool_calls:
-                tool_call.arguments = self._prepare_tool_arguments(task, tool_call.name, tool_call.arguments)
 
             decision = decide_turn_step(response, task.progress)
 
@@ -826,6 +1025,15 @@ class NewmanRuntime:
                     request_id=request_id,
                 )
                 continue
+
+            if decision.action == "awaiting_user":
+                await self._finalize_awaiting_user_input_from_final_answer(
+                    task,
+                    turn_emit,
+                    decision,
+                    request_id=request_id,
+                )
+                return
 
             if not response.tool_calls:
                 final_content = decision.final_content or ""
@@ -958,6 +1166,9 @@ class NewmanRuntime:
                 metadata_updates = result.metadata.get("session_metadata_updates")
                 if isinstance(metadata_updates, dict):
                     task.session.metadata.update(metadata_updates)
+                message_updates = result.metadata.get("session_message_updates")
+                if isinstance(message_updates, list):
+                    self._apply_session_message_updates(task.session, message_updates)
                 task.session.messages.append(
                     self._build_tool_session_message(
                         task,
@@ -992,7 +1203,7 @@ class NewmanRuntime:
                 changed_path = result.metadata.get("path")
                 if isinstance(changed_path, str) and changed_path:
                     finished_payload["path"] = changed_path
-                for metadata_key in ("bytes", "content_type", "created"):
+                for metadata_key in ("bytes", "content_type", "created", "output_files"):
                     metadata_value = result.metadata.get(metadata_key)
                     if metadata_value is not None:
                         finished_payload[metadata_key] = metadata_value
@@ -1434,51 +1645,79 @@ class NewmanRuntime:
                 commentary_complete_pending = True
                 await flush_commentary()
 
-        async for chunk in self.provider.chat_stream(assembled, tools=tools):
-            if chunk.type == "text" and chunk.delta:
-                for event in parser.feed(chunk.delta):
-                    await consume_parse_event(event)
-            elif chunk.type == "tool_call_delta" and chunk.tool_call_delta:
-                delta = chunk.tool_call_delta
-                pending_key = f"pending:{delta.index}"
-                key = delta.id or pending_key
-                existing_progress = tool_argument_progress.get(key) or tool_argument_progress.get(pending_key)
-                existing_name = (
-                    existing_progress.get("name")
-                    if isinstance(existing_progress, dict) and isinstance(existing_progress.get("name"), str)
-                    else None
-                )
-                resolved_name = delta.name or existing_name
-                if resolved_name and not _is_provider_tool_name_allowed(resolved_name, allowed_tool_names):
-                    invalid_tool_call_indexes.add(delta.index)
-                    continue
-                if delta.index in invalid_tool_call_indexes or not resolved_name:
-                    continue
-                await prepare_for_tool_signal()
-                await emit_tool_argument_progress(chunk.tool_call_delta)
-            elif chunk.type == "tool_call" and chunk.tool_call:
-                if _is_provider_tool_name_allowed(chunk.tool_call.name, allowed_tool_names):
+        try:
+            async for chunk in self.provider.chat_stream(assembled, tools=tools):
+                if chunk.type == "text" and chunk.delta:
+                    for event in parser.feed(chunk.delta):
+                        await consume_parse_event(event)
+                elif chunk.type == "tool_call_delta" and chunk.tool_call_delta:
+                    delta = chunk.tool_call_delta
+                    pending_key = f"pending:{delta.index}"
+                    key = delta.id or pending_key
+                    existing_progress = tool_argument_progress.get(key) or tool_argument_progress.get(pending_key)
+                    existing_name = (
+                        existing_progress.get("name")
+                        if isinstance(existing_progress, dict) and isinstance(existing_progress.get("name"), str)
+                        else None
+                    )
+                    resolved_name = delta.name or existing_name
+                    if resolved_name and not _is_provider_tool_name_allowed(resolved_name, allowed_tool_names):
+                        invalid_tool_call_indexes.add(delta.index)
+                        continue
+                    if delta.index in invalid_tool_call_indexes or not resolved_name:
+                        continue
                     await prepare_for_tool_signal()
-                    tool_calls.append(chunk.tool_call)
-                    await flush_commentary(force=True)
-                else:
-                    invalid_tool_call_indexes.add(len(tool_calls) + len(invalid_tool_calls))
-                    invalid_tool_calls.append(chunk.tool_call)
-            elif chunk.type == "usage" and chunk.usage:
-                usage = chunk.usage
-            elif chunk.type == "provider_state" and chunk.provider_state:
-                provider_state.update(chunk.provider_state)
-            elif chunk.type == "done":
-                finish_reason = chunk.finish_reason or finish_reason
-                if chunk.usage:
+                    await emit_tool_argument_progress(chunk.tool_call_delta)
+                elif chunk.type == "tool_call" and chunk.tool_call:
+                    if _is_provider_tool_name_allowed(chunk.tool_call.name, allowed_tool_names):
+                        await prepare_for_tool_signal()
+                        tool_calls.append(chunk.tool_call)
+                        await flush_commentary(force=True)
+                    else:
+                        invalid_tool_call_indexes.add(len(tool_calls) + len(invalid_tool_calls))
+                        invalid_tool_calls.append(chunk.tool_call)
+                elif chunk.type == "usage" and chunk.usage:
                     usage = chunk.usage
+                elif chunk.type == "provider_state" and chunk.provider_state:
+                    provider_state.update(chunk.provider_state)
+                elif chunk.type == "done":
+                    finish_reason = chunk.finish_reason or finish_reason
+                    if chunk.usage:
+                        usage = chunk.usage
+        except ProviderError as exc:
+            details = dict(exc.details)
+            details.setdefault("partial_thinking_length", len("".join(thinking_parts)))
+            details.setdefault("partial_content_length", len("".join(content_parts)))
+            details.setdefault("partial_commentary_length", len("".join(commentary_parts)))
+            details.setdefault("partial_tool_call_count", len(tool_calls))
+            details.setdefault("partial_invalid_tool_call_count", len(invalid_tool_calls))
+            details.setdefault("partial_answer_visible", answer_visible)
+            details.setdefault("partial_commentary_visible", commentary_visible)
+            details.setdefault("partial_tool_signal_seen", tool_signal_seen or bool(tool_argument_progress))
+            details.setdefault(
+                "partial_response_visible",
+                answer_visible or commentary_visible or tool_signal_seen or bool(tool_argument_progress),
+            )
+            exc.details = details
+            raise
         for event in parser.flush():
             await consume_parse_event(event)
         await flush_deferred_answer(force=True)
         await flush_commentary(force=bool(tool_calls))
+        thinking = "\n\n".join(
+            _dedupe_strings(
+                [
+                    "".join(thinking_parts),
+                    _extract_provider_state_reasoning(
+                        provider_state,
+                        getattr(getattr(self, "settings", None), "provider", None),
+                    ),
+                ]
+            )
+        )
         response = ProviderResponse(
             content="".join(content_parts),
-            thinking="".join(thinking_parts),
+            thinking=thinking,
             commentary="".join(commentary_parts),
             tool_calls=tool_calls,
             invalid_tool_calls=invalid_tool_calls,
@@ -1545,13 +1784,91 @@ class NewmanRuntime:
                 details = dict(exc.details)
                 details["attempt_count"] = attempt
                 details["max_attempts"] = max_attempts
+                partial_response_visible = bool(details.get("partial_response_visible"))
+                if partial_response_visible and exc.retryable and attempt < max_attempts:
+                    details["retry_suppressed_reason"] = "partial_response_visible"
+                    details["retry_suppressed_message"] = "流式响应已向用户释放部分内容，为避免重复片段，本次不在同一条流上自动重试。"
                 exc.details = details
                 result = self._provider_error_result(exc)
-                if not exc.retryable or result.recovery_class != "recoverable" or attempt >= max_attempts:
+                will_retry = (
+                    exc.retryable
+                    and result.recovery_class == "recoverable"
+                    and attempt < max_attempts
+                    and not partial_response_visible
+                )
+                will_transport_fallback = self._should_attempt_provider_transport_fallback(
+                    result,
+                    partial_response_visible=partial_response_visible,
+                    will_retry=will_retry,
+                )
+                delay = self._provider_retry_backoff_seconds(attempt) if will_retry else 0.0
+                await self._emit_provider_stream_error(
+                    emit,
+                    result,
+                    provider=exc.provider,
+                    status_code=exc.status_code,
+                    attempt_count=attempt,
+                    max_attempts=max_attempts,
+                    will_retry=will_retry,
+                    delay_seconds=delay,
+                    partial_response_visible=partial_response_visible,
+                    partial_content_length=_coerce_int(details.get("partial_content_length")),
+                    partial_commentary_length=_coerce_int(details.get("partial_commentary_length")),
+                    partial_tool_call_count=_coerce_int(details.get("partial_tool_call_count")),
+                    will_transport_fallback=will_transport_fallback,
+                    group_id=group_id,
+                )
+                if will_retry:
+                    await emit(
+                        "provider_retry_scheduled",
+                        {
+                            **({"group_id": group_id} if group_id else {}),
+                            "provider": exc.provider,
+                            "attempt": attempt + 1,
+                            "delay_seconds": delay,
+                            "reason": result.summary,
+                            "category": result.category,
+                            "strategy": "stream_retry",
+                        },
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    continue
+
+                if will_transport_fallback:
+                    await emit(
+                        "provider_fallback_started",
+                        {
+                            **({"group_id": group_id} if group_id else {}),
+                            "provider": exc.provider,
+                            "from_category": result.category,
+                            "strategy": "non_stream_same_model",
+                        },
+                    )
+                    try:
+                        return await self._provider_non_stream_fallback(
+                            assembled,
+                            tools,
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            request_kind=request_kind,
+                            counts_toward_context_window=counts_toward_context_window,
+                            stream_error=result,
+                        )
+                    except ProviderError as fallback_exc:
+                        fallback_details = dict(fallback_exc.details)
+                        fallback_details.setdefault("transport_fallback_attempted", True)
+                        fallback_details.setdefault("transport_fallback_strategy", "non_stream_same_model")
+                        fallback_details.setdefault("transport_fallback_from", result.category)
+                        fallback_details.setdefault(
+                            "transport_fallback_message",
+                            "流式失败后已尝试同模型非流式兜底，仍未恢复。",
+                        )
+                        fallback_exc.details = fallback_details
+                        raise
+
+                if not will_retry:
                     raise
-                delay = self._provider_retry_backoff_seconds(attempt)
-                if delay > 0:
-                    await asyncio.sleep(delay)
         raise ProviderError(
             self.settings.provider.type,
             "upstream_error",
@@ -1560,11 +1877,16 @@ class NewmanRuntime:
         )
 
     def _provider_max_attempts(self) -> int:
-        retry_attempts = getattr(self.settings.runtime, "tool_retry_attempts", 0)
+        retry_attempts = getattr(self.settings.runtime, "provider_retry_attempts", None)
+        if retry_attempts is None:
+            retry_attempts = getattr(self.settings.runtime, "tool_retry_attempts", 0)
         return max(1, int(retry_attempts) + 1)
 
     def _provider_retry_backoff_seconds(self, attempt: int) -> float:
-        base_delay = max(0.0, float(getattr(self.settings.runtime, "tool_retry_backoff_seconds", 0.0)))
+        base_delay = getattr(self.settings.runtime, "provider_retry_backoff_seconds", None)
+        if base_delay is None:
+            base_delay = getattr(self.settings.runtime, "tool_retry_backoff_seconds", 0.0)
+        base_delay = max(0.0, float(base_delay))
         return base_delay * (2 ** max(0, attempt - 1))
 
     def _raise_for_empty_provider_response(self, response: ProviderResponse) -> None:
@@ -1687,15 +2009,22 @@ class NewmanRuntime:
         emit: EventEmitter,
         *,
         request_id: str | None = None,
+        available_tool_names: set[str] | None = None,
     ) -> Literal["continue", "finalized", "none"]:
         if not response.invalid_tool_calls:
             return "none"
 
         invalid_names = _dedupe_strings(tool_call.name for tool_call in response.invalid_tool_calls)
         task.progress.invalid_tool_call_count += len(response.invalid_tool_calls)
+        plan_tool_names_only = bool(invalid_names) and all(name in PLAN_TOOL_NAMES for name in invalid_names)
         disable_tools_next = bool(invalid_names) and all(name in PSEUDO_TOOL_NAMES for name in invalid_names)
+        recovery_limit = (
+            PLAN_TOOL_INVALID_CALL_RECOVERY_ATTEMPTS
+            if plan_tool_names_only
+            else MAX_INVALID_TOOL_CALL_RECOVERY_ATTEMPTS
+        )
 
-        if task.progress.invalid_tool_call_recovery_attempts < MAX_INVALID_TOOL_CALL_RECOVERY_ATTEMPTS:
+        if task.progress.invalid_tool_call_recovery_attempts < recovery_limit:
             task.progress.invalid_tool_call_recovery_attempts += 1
             if disable_tools_next:
                 task.progress.force_no_tools_next = True
@@ -1716,6 +2045,8 @@ class NewmanRuntime:
                         invalid_names,
                         response,
                         disable_tools_next=disable_tools_next,
+                        collaboration_mode=get_collaboration_mode(task.session).mode,
+                        available_tool_names=available_tool_names,
                     ),
                     metadata=self._build_message_metadata(
                         task.turn_id,
@@ -1740,7 +2071,11 @@ class NewmanRuntime:
             )
             return "continue"
 
-        fallback = self._build_invalid_tool_call_fallback(invalid_names, response)
+        fallback = self._build_invalid_tool_call_fallback(
+            invalid_names,
+            response,
+            available_tool_names=available_tool_names,
+        )
         assistant_message = self._build_assistant_message(
             task,
             fallback,
@@ -1774,9 +2109,14 @@ class NewmanRuntime:
         response: ProviderResponse,
         *,
         disable_tools_next: bool,
+        collaboration_mode: str | None = None,
+        available_tool_names: set[str] | None = None,
     ) -> str:
         names = ", ".join(invalid_names) if invalid_names else "unknown"
         commentary = response.commentary.strip() or "（空）"
+        available_tools_hint = self._format_available_tool_names_hint(available_tool_names)
+        available_tools_suffix = f"\n\n{available_tools_hint}" if available_tools_hint else ""
+        available_tools_block = f"{available_tools_hint}\n" if available_tools_hint else ""
         if disable_tools_next:
             return (
                 "你刚才返回了不可用的工具调用。"
@@ -1785,29 +2125,62 @@ class NewmanRuntime:
                 "下一步不要再调用任何工具。请直接基于当前上下文回答用户问题，并给出明确结果或阻塞原因。\n\n"
                 f"刚才的可见行动说明：{commentary}"
             )
+        if invalid_names and all(name in PLAN_TOOL_NAMES for name in invalid_names):
+            if collaboration_mode == PLAN_COLLABORATION_MODE:
+                return (
+                    "你刚才调用了当前 Plan mode 下不可用的计划工具："
+                    f"{names}。\n\n"
+                    "Plan mode 使用 `update_plan` 维护执行 checklist。"
+                    "如果还没有 checklist，下一步先调用 `update_plan`；如果已有 checklist，请继续使用当前可用的执行工具，并在步骤变化时用 `update_plan` 更新状态。"
+                    f"{available_tools_suffix}"
+                )
+            return (
+                "你刚才调用了当前 Default mode 下不可用的计划工具："
+                f"{names}。\n\n"
+                "Default mode 不使用 `update_plan`。"
+                "如果确实需要可见任务清单，下一步先调用 `enter_plan_mode`；否则直接继续执行，不要重复调用这些计划工具。"
+                f"{available_tools_suffix}"
+            )
         return (
             "你刚才返回了不可用的工具调用。"
             f"这些名称不在当前可用工具列表中：{names}。\n\n"
+            f"{available_tools_block}"
             "如果仍需要工具，请只使用系统提供的真实工具名；如果不需要工具，请直接回答用户。"
         )
 
-    def _build_invalid_tool_call_fallback(self, invalid_names: list[str], response: ProviderResponse) -> str:
+    def _build_invalid_tool_call_fallback(
+        self,
+        invalid_names: list[str],
+        response: ProviderResponse,
+        *,
+        available_tool_names: set[str] | None = None,
+    ) -> str:
         names = ", ".join(invalid_names) if invalid_names else "unknown"
         lines = [
             "当前任务没有完成：模型连续返回了不可用的工具调用，已阻止将其标记为完成。",
             f"不可用工具：{names}",
         ]
+        available_tools_hint = self._format_available_tool_names_hint(available_tool_names)
+        if available_tools_hint:
+            lines.append(available_tools_hint)
         if response.commentary.strip():
             lines.append(f"最后一次行动说明：{response.commentary.strip()}")
         lines.append("请重新发起任务，或调整工具提示与模型配置后重试。")
         return "\n".join(lines)
+
+    def _format_available_tool_names_hint(self, available_tool_names: set[str] | None) -> str:
+        names = sorted(name for name in available_tool_names or set() if isinstance(name, str) and name)
+        if not names:
+            return ""
+        return f"当前可用工具：{', '.join(names)}。"
 
     async def _generate_commentary_from_thinking(
         self,
         task: SessionTask,
         response: ProviderResponse,
     ) -> str:
-        thinking = response.thinking.strip()
+        provider_config = getattr(getattr(self, "settings", None), "provider", None)
+        thinking = _response_reasoning_for_commentary(response, provider_config).strip()
         if not thinking:
             return ""
         thinking_excerpt = thinking[:1600]
@@ -1947,6 +2320,81 @@ class NewmanRuntime:
             finish_reason="awaiting_user",
         )
 
+    async def _finalize_awaiting_user_input_from_final_answer(
+        self,
+        task: SessionTask,
+        emit: EventEmitter,
+        decision: TurnStepDecision,
+        *,
+        request_id: str | None = None,
+    ) -> None:
+        final_content = (decision.final_content or "").strip()
+        prompt = "请补充这些信息后我继续处理。"
+        if final_content:
+            content = final_content
+        else:
+            content = prompt
+
+        awaiting = build_awaiting_user_input_payload(
+            kind="free_text",
+            prompt=prompt,
+            content=content,
+            workflow_id=f"turn:{task.turn_id}",
+            data={
+                "source": "final_answer",
+                "completion_decision": decision.reason,
+            },
+        )
+        workflow_state = build_workflow_state_payload(awaiting)
+        extra_metadata = {
+            AWAITING_USER_INPUT_METADATA_KEY: awaiting,
+            WORKFLOW_STATE_METADATA_KEY: workflow_state,
+        }
+        assistant_message = self._build_assistant_message(
+            task,
+            content,
+            request_id=request_id,
+            finish_reason="awaiting_user",
+            turn_outcome=TURN_OUTCOME_AWAITING_USER,
+            extra_metadata=extra_metadata,
+        )
+        task.session.messages.append(assistant_message)
+        task.session.metadata.update(
+            {
+                AWAITING_USER_INPUT_METADATA_KEY: awaiting,
+                WORKFLOW_STATE_METADATA_KEY: workflow_state,
+            }
+        )
+        self.session_store.save(task.session)
+        await emit(
+            "workflow_state_changed",
+            {
+                "session_id": task.session.session_id,
+                "workflow_state": workflow_state,
+                "summary": content,
+            },
+        )
+        await emit(
+            "user_input_requested",
+            {
+                "session_id": task.session.session_id,
+                "awaiting_user_input": awaiting,
+                "summary": content,
+            },
+        )
+        await self._emit_final_response_message(
+            emit,
+            task,
+            assistant_message,
+            finish_reason="awaiting_user",
+        )
+        await self._emit_hooks(
+            "SessionEnd",
+            emit,
+            session_id=task.session.session_id,
+            finish_reason="awaiting_user",
+        )
+
     async def _finalize_tool_limit(
         self,
         task: SessionTask,
@@ -1978,7 +2426,10 @@ class NewmanRuntime:
             await self._finalize_context_irreducible(task, emit, request_id=request_id)
             return
 
-        assembled = self._assemble_task_messages(task)
+        assembled = self._assemble_task_messages(
+            task,
+            tools_overview=self._visible_tools_overview([], task),
+        )
         try:
             response = await self._stream_provider_response(
                 assembled,
@@ -2086,7 +2537,10 @@ class NewmanRuntime:
             await self._finalize_context_irreducible(task, emit, request_id=request_id)
             return
 
-        assembled = self._assemble_task_messages(task)
+        assembled = self._assemble_task_messages(
+            task,
+            tools_overview=self._visible_tools_overview([], task),
+        )
 
         finish_reason = "fatal_tool_error"
         try:
@@ -2308,6 +2762,12 @@ class NewmanRuntime:
             lines.append("建议：检查上游流式返回格式，确认没有提前截断或返回非法 JSON。")
         elif result.recommended_next_step:
             lines.append(f"建议：{result.recommended_next_step}")
+        retry_suppressed_message = result.metadata.get("retry_suppressed_message")
+        if isinstance(retry_suppressed_message, str) and retry_suppressed_message.strip():
+            lines.append(f"说明：{retry_suppressed_message.strip()}")
+        transport_fallback_message = result.metadata.get("transport_fallback_message")
+        if isinstance(transport_fallback_message, str) and transport_fallback_message.strip():
+            lines.append(f"说明：{transport_fallback_message.strip()}")
 
         return "\n".join(lines)
 
@@ -2367,6 +2827,19 @@ class NewmanRuntime:
                 return message
         return None
 
+    def _turn_has_attachment_metadata(self, session, turn_id: str) -> bool:
+        current_turn_message = self._current_turn_user_message(session, turn_id)
+        if current_turn_message is None:
+            return False
+        raw_attachments = current_turn_message.metadata.get("attachments")
+        if not isinstance(raw_attachments, list):
+            payload = get_attachment_analysis(current_turn_message)
+            if not isinstance(payload, dict):
+                return False
+            summaries = payload.get("attachment_summaries")
+            return isinstance(summaries, list) and any(isinstance(item, dict) for item in summaries)
+        return any(isinstance(item, dict) for item in raw_attachments)
+
     def _turn_has_parsed_attachment_context(self, session, turn_id: str) -> bool:
         current_turn_message = self._current_turn_user_message(session, turn_id)
         if current_turn_message is None:
@@ -2388,13 +2861,15 @@ class NewmanRuntime:
         return False
 
     def _should_block_file_browsing_tools_for_attachment_turn(self, task: SessionTask) -> bool:
-        return task.tool_depth == 0 and self._turn_has_parsed_attachment_context(task.session, task.turn_id or "")
+        return task.tool_depth == 0 and self._turn_has_attachment_metadata(task.session, task.turn_id or "")
 
     def _should_allow_skill_read_for_attachment_turn(self, task: SessionTask) -> bool:
         if not self._should_block_file_browsing_tools_for_attachment_turn(task):
             return False
         user_content = self._current_turn_user_content(task.session, task.turn_id)
         terms = self._skill_relevance_terms(user_content)
+        if is_attachment_edit_request(user_content):
+            terms.update(self._attachment_skill_hint_terms(task.session, task.turn_id or ""))
         if not terms:
             return False
         skill_registry = getattr(self, "skill_registry", None)
@@ -2425,6 +2900,29 @@ class NewmanRuntime:
                 return True
         return False
 
+    def _attachment_skill_hint_terms(self, session, turn_id: str) -> set[str]:
+        current_turn_message = self._current_turn_user_message(session, turn_id)
+        if current_turn_message is None:
+            return set()
+        raw_attachments = current_turn_message.metadata.get("attachments")
+        if not isinstance(raw_attachments, list):
+            return set()
+
+        terms: set[str] = set()
+        for item in raw_attachments:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "").strip().casefold()
+            extension = str(item.get("extension") or "").strip().casefold().lstrip(".")
+            filename = str(item.get("filename") or "").strip().casefold()
+            if kind == "spreadsheet" or extension in {"xls", "xlsx"} or filename.endswith((".xls", ".xlsx")):
+                terms.update({"excel", "xlsx", "xls", "spreadsheet", "表格"})
+            if kind == "presentation" or extension in {"ppt", "pptx"} or filename.endswith((".ppt", ".pptx")):
+                terms.update({"ppt", "pptx", "powerpoint", "presentation", "幻灯片", "演示文稿"})
+            if kind == "html" or extension in {"html", "htm"} or filename.endswith((".html", ".htm")):
+                terms.add("html")
+        return terms
+
     def _skill_relevance_terms(self, user_content: str | None) -> set[str]:
         normalized = (user_content or "").casefold().strip()
         if not normalized:
@@ -2446,11 +2944,19 @@ class NewmanRuntime:
         task: SessionTask,
         *,
         checkpoint=None,
+        tools_overview: str | None = None,
     ) -> list[dict]:
         resolved_checkpoint = checkpoint if checkpoint is not None else self.checkpoints.get(task.session.session_id)
+        if tools_overview is None:
+            try:
+                resolved_tools_overview = self._tools_overview(task)
+            except TypeError:
+                resolved_tools_overview = self._tools_overview()
+        else:
+            resolved_tools_overview = tools_overview
         messages = self.prompt_assembler.assemble(
             task.session,
-            self._tools_overview(),
+            resolved_tools_overview,
             resolved_checkpoint,
             tool_message_overrides=task.transient_tool_messages,
             include_provider_state=self._should_include_provider_state_for_provider(),
@@ -2529,21 +3035,6 @@ class NewmanRuntime:
         if mode == PLAN_COLLABORATION_MODE and tool_name != "update_plan" and get_session_plan(task.session) is None:
             return f"当前处于计划模式，必须先调用 update_plan 生成 checklist，然后才能使用 {tool_name}"
         return None
-
-    def _prepare_tool_arguments(
-        self,
-        task: SessionTask,
-        tool_name: str,
-        arguments: dict[str, object],
-    ) -> dict[str, object]:
-        prepared = dict(arguments)
-        if tool_name == "exit_plan_mode":
-            markdown = str(prepared.get("markdown", "")).strip()
-            if not markdown:
-                draft = get_plan_draft(task.session)
-                if draft is not None and draft.markdown.strip():
-                    prepared["markdown"] = draft.markdown
-        return prepared
 
     def _history_referenced_tool_names(self, session) -> set[str]:
         tool_names: set[str] = set()
@@ -2696,7 +3187,126 @@ class NewmanRuntime:
         )
         if isinstance(max_attempts_raw, int | float):
             result.metadata["max_attempts"] = int(max_attempts_raw)
+        for key in (
+            "partial_response_visible",
+            "partial_content_length",
+            "partial_commentary_length",
+            "partial_tool_call_count",
+            "retry_suppressed_reason",
+            "retry_suppressed_message",
+            "transport_fallback_attempted",
+            "transport_fallback_strategy",
+            "transport_fallback_from",
+            "transport_fallback_message",
+        ):
+            if key in error.details:
+                result.metadata[key] = error.details[key]
         return normalize_result(result)
+
+    async def _emit_provider_stream_error(
+        self,
+        emit: EventEmitter,
+        result: ToolExecutionResult,
+        *,
+        provider: str,
+        status_code: int | None,
+        attempt_count: int,
+        max_attempts: int,
+        will_retry: bool,
+        delay_seconds: float,
+        partial_response_visible: bool,
+        partial_content_length: int | None,
+        partial_commentary_length: int | None,
+        partial_tool_call_count: int | None,
+        will_transport_fallback: bool,
+        group_id: str | None = None,
+    ) -> None:
+        payload = {
+            **({"group_id": group_id} if group_id else {}),
+            "code": result.error_code,
+            "message": result.frontend_message or result.summary,
+            "summary": result.summary,
+            "provider": provider,
+            "tool": result.tool,
+            "category": result.category,
+            "severity": result.severity,
+            "risk_level": result.risk_level,
+            "recovery_class": result.recovery_class,
+            "retryable": result.retryable,
+            "attempt_count": attempt_count,
+            "max_attempts": max_attempts,
+            "will_retry": will_retry,
+            "delay_seconds": delay_seconds,
+            "will_transport_fallback": will_transport_fallback,
+            "partial_response_visible": partial_response_visible,
+        }
+        if status_code is not None:
+            payload["status_code"] = status_code
+        if partial_content_length is not None:
+            payload["partial_content_length"] = partial_content_length
+        if partial_commentary_length is not None:
+            payload["partial_commentary_length"] = partial_commentary_length
+        if partial_tool_call_count is not None:
+            payload["partial_tool_call_count"] = partial_tool_call_count
+        retry_suppressed_reason = result.metadata.get("retry_suppressed_reason")
+        if isinstance(retry_suppressed_reason, str):
+            payload["retry_suppressed_reason"] = retry_suppressed_reason
+        retry_suppressed_message = result.metadata.get("retry_suppressed_message")
+        if isinstance(retry_suppressed_message, str):
+            payload["retry_suppressed_message"] = retry_suppressed_message
+        await emit("stream_error", payload)
+
+    async def _provider_non_stream_fallback(
+        self,
+        assembled: list[dict[str, object]],
+        tools: list[dict[str, object]],
+        *,
+        session_id: str,
+        turn_id: str | None,
+        request_kind: str,
+        counts_toward_context_window: bool,
+        stream_error: ToolExecutionResult,
+    ) -> ProviderResponse:
+        response = await self.provider.chat(assembled, tools=tools)
+        self._raise_for_empty_provider_response(response)
+        record_model_usage(
+            self.usage_store,
+            ModelRequestContext(
+                request_kind=f"{request_kind}_non_stream_fallback",
+                model_config=self.settings.provider,
+                provider_type=self.settings.provider.type,
+                streaming=False,
+                counts_toward_context_window=counts_toward_context_window,
+                session_id=session_id,
+                turn_id=turn_id,
+                metadata={
+                    "fallback_strategy": "non_stream_same_model",
+                    "stream_error_category": stream_error.category,
+                    "stream_error_summary": stream_error.summary,
+                    "assembled_message_count": len(assembled),
+                    "tool_schema_count": len(tools),
+                    "estimated_input_tokens": self.provider.estimate_tokens(assembled),
+                    "response_content_length": len(response.content),
+                    "response_thinking_length": len(response.thinking),
+                    "response_commentary_length": len(response.commentary),
+                    "tool_call_count": len(response.tool_calls),
+                    "invalid_tool_call_count": len(response.invalid_tool_calls),
+                },
+            ),
+            response,
+        )
+        return response
+
+    def _should_attempt_provider_transport_fallback(
+        self,
+        result: ToolExecutionResult,
+        *,
+        partial_response_visible: bool,
+        will_retry: bool,
+    ) -> bool:
+        if will_retry or partial_response_visible:
+            return False
+        return result.category == "response_parse_error"
 
     async def _emit_fatal_error(
         self,
@@ -2750,49 +3360,63 @@ class NewmanRuntime:
     async def _maybe_checkpoint(self, task: SessionTask, emit: EventEmitter) -> bool:
         assembled = self._assemble_task_messages(task)
         latest_record = self._latest_context_record(task.session.session_id)
+        checkpoint = self.checkpoints.get(task.session.session_id)
         context_usage = build_context_usage_snapshot(
             self.provider,
             self.settings.provider,
             self.settings.runtime,
             assembled,
             task.session,
-            self.checkpoints.get(task.session.session_id),
+            checkpoint,
             latest_record=latest_record,
         )
         projected_next_prompt_tokens = context_usage.projected_next_prompt_tokens
         auto_compact_limit = context_usage.auto_compact_limit
-        if projected_next_prompt_tokens < auto_compact_limit:
+        if projected_next_prompt_tokens < context_usage.soft_compact_limit:
             self._reset_compaction_state(task)
             return True
 
-        if self._context_irreducible(task):
-            return False
+        hard_over_limit = projected_next_prompt_tokens >= auto_compact_limit
 
-        if self._compaction_fail_streak(task) >= self.settings.runtime.context_compaction_max_failures:
-            self._mark_compaction_failure(task, irreducible=True, reason="max_failures_reached")
-            return False
+        if hard_over_limit:
+            if self._context_irreducible(task):
+                return False
 
-        critical = context_usage.projected_pressure >= self.settings.runtime.context_critical_threshold
+            if self._compaction_fail_streak(task) >= self.settings.runtime.context_compaction_max_failures:
+                self._mark_compaction_failure(task, irreducible=True, reason="max_failures_reached")
+                return False
+
+        critical = context_usage.budget_pressure >= self.settings.runtime.context_critical_threshold
         preserve_recent = self.settings.runtime.context_compaction_preserve_recent
-        microcompact_count = microcompact_session(task.session, preserve_recent=preserve_recent)
-        if microcompact_count > 0:
+
+        original_count = len(task.session.messages)
+        microcompact_count = microcompact_session(
+            task.session,
+            preserve_recent=preserve_recent,
+            checkpoint=checkpoint,
+            artifact_dir=self._microcompact_artifact_dir(task.session.session_id),
+        )
+        if microcompact_count:
             task.session.metadata["last_compaction_stage"] = "microcompact"
+            task.session.metadata["last_microcompact_at"] = utc_now()
             self.session_store.save(task.session)
-            microcompact_usage = build_context_usage_snapshot(
+            context_usage = build_context_usage_snapshot(
                 self.provider,
                 self.settings.provider,
                 self.settings.runtime,
-                self._assemble_task_messages(task),
+                self._assemble_task_messages(task, checkpoint=checkpoint),
                 task.session,
-                self.checkpoints.get(task.session.session_id),
+                checkpoint,
                 latest_record=latest_record,
             )
-            if microcompact_usage.projected_next_prompt_tokens < microcompact_usage.auto_compact_limit:
+            projected_next_prompt_tokens = context_usage.projected_next_prompt_tokens
+            auto_compact_limit = context_usage.auto_compact_limit
+            hard_over_limit = projected_next_prompt_tokens >= auto_compact_limit
+            critical = context_usage.budget_pressure >= self.settings.runtime.context_critical_threshold
+            if projected_next_prompt_tokens < context_usage.soft_compact_limit:
                 self._reset_compaction_state(task)
                 return True
 
-        original_count = len(task.session.messages)
-        checkpoint = self.checkpoints.get(task.session.session_id)
         summary_result = await summarize_messages(
             self.provider,
             self.settings.provider,
@@ -2805,22 +3429,29 @@ class NewmanRuntime:
             request_kind="context_compaction",
         )
         if not summary_result:
+            if not hard_over_limit:
+                self._reset_compaction_state(task)
+                return True
             self._mark_compaction_failure(task, irreducible=True, reason="nothing_to_compress")
             return False
-        _, preserved_messages = split_session_messages(task.session, preserve_recent=preserve_recent)
-        task.session.messages = preserved_messages
+        archived_message_count = min(
+            len(task.session.messages),
+            checkpoint_archived_message_count(task.session, checkpoint) + summary_result.source_message_count,
+        )
         task.session.metadata["checkpoint_active"] = True
         task.session.metadata["last_compaction_stage"] = "checkpoint_compact"
         self.session_store.save(task.session)
         checkpoint = self.checkpoints.save(
             task.session.session_id,
             summary_result.summary,
-            [0, max(0, original_count - len(preserved_messages))],
+            [0, archived_message_count],
             metadata=build_checkpoint_metadata(
                 summary_result,
                 preserve_recent=preserve_recent,
                 compression_level="critical" if critical else "normal",
                 original_message_count=original_count,
+                archived_message_count=archived_message_count,
+                microcompact_count=microcompact_count,
             ),
         )
         task.session.metadata["checkpoint_restore_hint"] = checkpoint.checkpoint_id
@@ -2845,9 +3476,17 @@ class NewmanRuntime:
                 "checkpoint_id": checkpoint.checkpoint_id,
                 "summary": checkpoint.summary,
                 "compression_level": checkpoint.metadata.get("compression_level", "normal"),
+                "microcompact_count": microcompact_count,
             },
         )
         return not self._context_irreducible(task)
+
+    def _microcompact_artifact_dir(self, session_id: str) -> Path | None:
+        paths = getattr(self.settings, "paths", None)
+        sessions_dir = getattr(paths, "sessions_dir", None)
+        if sessions_dir is None:
+            return None
+        return Path(sessions_dir) / "tool_outputs" / session_id
 
     def _latest_context_record(self, session_id: str):
         if self.usage_store is None:
@@ -2980,18 +3619,43 @@ class NewmanRuntime:
             "analysis_status": "completed",
         }
 
-    def _build_turn_output_file_attachments(self, task: SessionTask, seen_paths: set[str]) -> list[dict[str, object]]:
+    def _build_turn_output_file_attachments(
+        self,
+        task: SessionTask,
+        seen_paths: set[str],
+    ) -> list[dict[str, object]]:
         attachments: list[dict[str, object]] = []
         for message in task.session.messages:
             if message.role != "tool":
                 continue
             metadata = message.metadata
-            if metadata.get("turn_id") != task.turn_id or metadata.get("success") is not True:
+            if metadata.get("turn_id") != task.turn_id:
+                continue
+            raw_output_files = metadata.get("output_files")
+            if isinstance(raw_output_files, list):
+                for raw_item in raw_output_files:
+                    if not isinstance(raw_item, dict):
+                        continue
+                    raw_path = raw_item.get("path")
+                    if not isinstance(raw_path, str) or not raw_path.strip():
+                        continue
+                    if not self._is_session_output_file(task, Path(raw_path)):
+                        continue
+                    attachment = self._build_file_attachment(
+                        Path(raw_path),
+                        summary=str(raw_item.get("summary") or metadata.get("summary") or "生成文件"),
+                        seen_paths=seen_paths,
+                    )
+                    if attachment is not None:
+                        attachments.append(attachment)
+            if metadata.get("success") is not True:
                 continue
             if metadata.get("tool") not in {"write_file", "edit_file"}:
                 continue
             raw_path = metadata.get("path")
             if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            if not self._is_session_output_file(task, Path(raw_path)):
                 continue
             attachment = self._build_file_attachment(
                 Path(raw_path),
@@ -3000,6 +3664,86 @@ class NewmanRuntime:
             )
             if attachment is not None:
                 attachments.append(attachment)
+        return attachments
+
+    def _current_turn_awaiting_user_reply(self, task: SessionTask) -> dict[str, object] | None:
+        if not task.turn_id:
+            return None
+        current_user_message = self._current_turn_user_message(task.session, task.turn_id)
+        if current_user_message is None:
+            return None
+        reply_metadata = current_user_message.metadata.get("responds_to_awaiting_user_input")
+        return reply_metadata if isinstance(reply_metadata, dict) else None
+
+    @staticmethod
+    def _awaiting_user_input_matches_reply(
+        awaiting_metadata: dict[str, object],
+        reply_metadata: dict[str, object],
+    ) -> bool:
+        awaiting_request_id = awaiting_metadata.get("request_id")
+        reply_request_id = reply_metadata.get("request_id")
+        if isinstance(awaiting_request_id, str) and awaiting_request_id and awaiting_request_id == reply_request_id:
+            return True
+
+        awaiting_workflow_id = awaiting_metadata.get("workflow_id")
+        reply_workflow_id = reply_metadata.get("workflow_id")
+        if isinstance(awaiting_workflow_id, str) and awaiting_workflow_id and awaiting_workflow_id == reply_workflow_id:
+            return True
+
+        return False
+
+    def _build_reply_parent_output_attachments(
+        self,
+        task: SessionTask,
+        seen_paths: set[str],
+    ) -> list[dict[str, object]]:
+        reply_metadata = self._current_turn_awaiting_user_reply(task)
+        if reply_metadata is None:
+            return []
+
+        attachments: list[dict[str, object]] = []
+        for message in reversed(task.session.messages):
+            if message.role != "assistant":
+                continue
+            parent_turn_id = message.metadata.get("turn_id")
+            if not isinstance(parent_turn_id, str) or not parent_turn_id or parent_turn_id == task.turn_id:
+                continue
+            awaiting_metadata = message.metadata.get(AWAITING_USER_INPUT_METADATA_KEY)
+            if not isinstance(awaiting_metadata, dict):
+                continue
+            if not self._awaiting_user_input_matches_reply(awaiting_metadata, reply_metadata):
+                continue
+
+            raw_attachments = message.metadata.get("attachments")
+            if not isinstance(raw_attachments, list):
+                continue
+            for raw_attachment in raw_attachments:
+                if not isinstance(raw_attachment, dict):
+                    continue
+                if raw_attachment.get("source") != "assistant_output":
+                    continue
+                raw_path = raw_attachment.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    continue
+                path = Path(raw_path)
+                if not is_within_turn_output_dir(
+                    path,
+                    self.settings.paths.workspace,
+                    task.session.session_id,
+                    parent_turn_id,
+                ):
+                    continue
+                attachment = self._build_file_attachment(
+                    path,
+                    summary=str(raw_attachment.get("summary") or "生成文件"),
+                    seen_paths=seen_paths,
+                )
+                if attachment is not None:
+                    attachments.append(attachment)
+
+            if attachments:
+                return attachments
+
         return attachments
 
     def _build_assistant_attachments(self, task: SessionTask, content: str) -> list[dict[str, object]]:
@@ -3020,7 +3764,15 @@ class NewmanRuntime:
                 attachments.append(attachment)
 
         attachments.extend(self._build_turn_output_file_attachments(task, seen_paths))
+        attachments.extend(self._build_reply_parent_output_attachments(task, seen_paths))
         return attachments
+
+    def _is_session_output_file(self, task: SessionTask, path: Path) -> bool:
+        return is_within_session_output_dir(
+            path,
+            self.settings.paths.workspace,
+            task.session.session_id,
+        )
 
     def _build_assistant_message(
         self,
@@ -3127,11 +3879,7 @@ class NewmanRuntime:
     def _clear_resolved_awaiting_user_input(self, task: SessionTask, turn_outcome: str) -> None:
         if turn_outcome == TURN_OUTCOME_AWAITING_USER:
             return
-        current_user_message = self._current_turn_user_message(task.session, task.turn_id or "")
-        if current_user_message is None:
-            return
-        reply_metadata = current_user_message.metadata.get("responds_to_awaiting_user_input")
-        if not isinstance(reply_metadata, dict):
+        if self._current_turn_awaiting_user_reply(task) is None:
             return
         task.session.metadata.pop(AWAITING_USER_INPUT_METADATA_KEY, None)
         workflow_state = task.session.metadata.get(WORKFLOW_STATE_METADATA_KEY)
@@ -3182,7 +3930,7 @@ class NewmanRuntime:
             "recommended_next_step": result.recommended_next_step,
             "content_persisted": persisted_output == model_output,
         }
-        for metadata_key in ("path", "bytes", "content_type", "created", "replacements"):
+        for metadata_key in ("path", "bytes", "content_type", "created", "replacements", "output_files"):
             metadata_value = result.metadata.get(metadata_key)
             if metadata_value is not None:
                 metadata[metadata_key] = metadata_value
@@ -3210,3 +3958,27 @@ class NewmanRuntime:
             await emit(event, payload)
 
         return emit_with_turn
+
+    def _apply_session_message_updates(self, session, updates: list[object]) -> None:
+        for raw_update in updates:
+            if not isinstance(raw_update, dict):
+                continue
+            message_id = str(raw_update.get("message_id") or "").strip()
+            if not message_id:
+                continue
+            for message in session.messages:
+                if message.id != message_id:
+                    continue
+                content = raw_update.get("content")
+                if isinstance(content, str):
+                    message.content = content
+                metadata = raw_update.get("metadata")
+                if isinstance(metadata, dict):
+                    message.metadata = dict(metadata)
+                break
+
+
+def _coerce_int(value: object) -> int | None:
+    if isinstance(value, int | float):
+        return int(value)
+    return None

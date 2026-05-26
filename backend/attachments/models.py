@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from datetime import datetime, timezone
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass(slots=True)
@@ -14,6 +19,9 @@ class SavedAttachment:
     size_bytes: int
     path: Path
     workspace_relative_path: str
+    uploaded_at: str = field(default_factory=utc_now)
+    order_index: int = 0
+    kind_index: int = 0
     source: str = "user_upload"
     summary: str = ""
     analysis_status: str = "saved"
@@ -33,6 +41,9 @@ class SavedAttachment:
             "size_bytes": self.size_bytes,
             "path": str(self.path),
             "workspace_relative_path": self.workspace_relative_path,
+            "uploaded_at": self.uploaded_at,
+            "order_index": self.order_index,
+            "kind_index": self.kind_index,
             "summary": self.summary,
             "analysis_status": self.analysis_status,
             "warnings": list(self.warnings),

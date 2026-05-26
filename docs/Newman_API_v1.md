@@ -387,13 +387,16 @@ text/event-stream
   "context_usage": {
     "effective_context_window": 95000,
     "auto_compact_limit": 86808,
+    "soft_compact_limit": 73786,
     "confirmed_prompt_tokens": 1248,
     "confirmed_pressure": 0.013136842105263158,
     "confirmed_request_kind": "session_turn",
     "confirmed_recorded_at": "2026-04-11T15:20:00+00:00",
     "projected_next_prompt_tokens": 1376,
     "projected_pressure": 0.01448421052631579,
+    "budget_pressure": 0.01585015205971892,
     "projection_source": "confirmed_plus_delta",
+    "projected_over_soft_limit": false,
     "projected_over_limit": false,
     "compaction_stage": null,
     "compaction_fail_streak": 0,
@@ -414,12 +417,14 @@ text/event-stream
 - `metadata.attachments[*].summary` 是单附件摘要；`metadata.multimodal_parse.normalized_user_input` 是给主模型和工具路由使用的整轮归一化请求，两者不要混用。
 - 若图片预解析失败，`metadata.multimodal_parse.status = "failed"`，并会额外追加一条 `role=system`、`metadata.type = "attachment_analysis_warning"` 的告警消息。
 - `context_usage.effective_context_window` 使用的是“有效上下文窗口”，当前定义为配置的模型 `context_window * 95%`。
-- `context_usage.auto_compact_limit` 是运行时真正用来判断自动压缩的阈值，已经扣除了回答预留、压缩预留和安全缓冲。
+- `context_usage.auto_compact_limit` 是运行时硬压缩线，已经扣除了回答预留、压缩预留和安全缓冲。
+- `context_usage.soft_compact_limit = auto_compact_limit * runtime.context_compress_threshold`，默认用于提前执行 checkpoint 压缩。
 - `context_usage.confirmed_*` 表示最近一次真实模型请求里已确认的 prompt 占用；只有最近一条 `counts_toward_context_window=true` 且 `usage_available=true` 的记录才会填充这些字段。
 - `context_usage.projected_*` 表示“如果现在再发起下一次模型请求”，运行时估算出的上下文占用与压力。
+- `context_usage.budget_pressure = projected_next_prompt_tokens / auto_compact_limit`，前端单圆环按这个值展示。
 - 若存在最近一次真实 usage 记录，且新消息增量可估算，则 `projection_source = "confirmed_plus_delta"`；否则会退回 `projection_source = "assembled_prompt_estimate"`。
 - 投影估算基于当前完整 prompt 组装结果，而不只是 `session.messages`：会一并考虑 Stable Memory、工具总览、checkpoint summary 和当前会话消息。
-- `projected_over_limit = true` 表示下一次请求的估算 prompt 已超过自动压缩阈值，不等同于一定超过模型硬 context window。
+- `projected_over_soft_limit = true` 表示下一次请求的估算 prompt 已超过软压缩线；`projected_over_limit = true` 表示已超过硬压缩线，不等同于一定超过模型硬 context window。
 - 若存在 `checkpoint.summary`，其内容现在是基于 LLM 生成的 handoff summary，而不是简单的消息逐条拼接文本。
 - `compaction_stage`、`compaction_fail_streak`、`context_irreducible` 和 `last_compaction_failure_reason` 用于前端展示压缩状态与失败原因。
 
@@ -563,9 +568,17 @@ text/event-stream
     "created_at": "2026-04-02T10:00:00+00:00",
     "metadata": {
       "preserve_recent": 4,
+      "preserve_unit": "segment",
       "compression_level": "manual",
       "original_message_count": 12,
       "compressed_message_count": 8,
+      "newly_compressed_message_count": 4,
+      "transcript_retained": true,
+      "microcompact_count": 1,
+      "compact_boundary": {
+        "type": "checkpoint_archived_prefix",
+        "message_count": 8
+      },
       "summary_strategy": "llm_handoff_summary",
       "summary_model": "qwen3-coder-plus",
       "summary_usage": {
@@ -578,23 +591,28 @@ text/event-stream
   "session": {
     "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
     "title": "供应商合同抽取",
-    "messages": []
-  }
+    "messages": ["...完整 transcript，省略..."]
+  },
+  "microcompact_count": 1
 }
 ```
 
 说明：
 
-- 手动压缩与自动压缩现在共用同一套逻辑：都会裁剪 session，并保留最近 `runtime.context_compaction_preserve_recent` 条消息；默认值为 `4`。
-- 实际保留时会尽量对齐同一 turn / tool group，避免把一轮消息从中间截断。
+- 手动压缩与自动压缩现在共用同一套逻辑：都会生成或刷新 checkpoint，并保留完整 `session.messages` 作为 UI/audit transcript。
+- prompt 组装时会使用 `checkpoint.summary + 未归档的新消息`，不会把已归档前缀再次拼入主模型请求。
+- 归档边界按最近完整 segment 保留，而不是按完整 `turn_id` 保留；同一 turn 里较早且已闭合的 tool group 可以被归档。
+- 达到压缩阈值时会先执行旧工具输出 microcompact；原始工具输出会尽量落盘到 `backend_data/sessions/tool_outputs/{session_id}/`，模型上下文只保留摘要和 artifact 引用。
 - `checkpoint.summary` 通过一次独立的 LLM handoff summary 请求生成，提示词参考 Codex 本地 compact 方案，要求输出“当前进展、关键约束、剩余工作、关键引用”等可供后续模型继续任务的摘要。
+- 该摘要会主动排除低价值内部过程细节，例如逐步工具流水、文件读写维护记录、workflow/request/turn 等内部标识，以及仅用于压测或填充上下文的噪声材料。
 - 若已存在旧 checkpoint，压缩请求会把旧 `summary` 与本轮将被裁剪的历史消息一起交给模型，要求产出一份“替换旧 summary 的刷新版摘要”，而不是简单字符串追加。
 - 若当前 provider 为 `mock`，或压缩摘要请求失败/返回空内容，则会退回到结构化归档摘要：保留旧 summary，并附加 `## Archived Message Snapshot` 文本快照。
-- 当当前会话消息数小于等于当前配置的保留数量时，没有可裁剪历史，接口会返回 `{"compressed": false, "reason": "nothing_to_compress"}`。
-- 压缩触发阈值基于有效上下文窗口计算：
-  - `effective_context_window = configured_context_window * 95%`
-  - `pressure = assembled_prompt_estimated_tokens / effective_context_window`
-  - 当 `pressure >= runtime.context_compress_threshold` 时自动触发压缩
+- 当 checkpoint 边界之后没有可归档 segment 时，接口会返回 `{"compressed": false, "reason": "nothing_to_compress"}`。
+- 压缩触发阈值基于可用 prompt 预算计算：
+  - `auto_compact_limit = effective_context_window - reply_reserve - compact_reserve - safety_buffer`
+  - `soft_compact_limit = auto_compact_limit * runtime.context_compress_threshold`
+  - 达到软线先执行 tool output microcompact，仍超线再执行 checkpoint 压缩；达到硬线后，压缩失败会阻断后续主模型请求
+- 前端聊天历史保持原样；压缩只通过当前 turn timeline 中的 `checkpoint_created` 小提示体现。
 
 ## 3.6 恢复 Checkpoint
 
@@ -2362,7 +2380,8 @@ multipart/form-data
     "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
     "checkpoint_id": "cp_xxx",
     "summary": "## Current Progress\n- 已完成首轮接口排查。\n\n## Important Context\n- 用户要求不要在主区暴露技术术语。\n\n## What Remains To Be Done\n- 继续对齐 Trace Timeline 的聚合规则。",
-    "compression_level": "critical"
+    "compression_level": "critical",
+    "microcompact_count": 1
   },
   "ts": 1741234567890
 }

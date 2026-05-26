@@ -71,6 +71,8 @@ class ToolDiscoveryTests(unittest.TestCase):
                     path_policy=policy,
                     sandbox=SimpleNamespace(limits=SimpleNamespace(timeout_seconds=30), execute_shell=None),
                     knowledge_base=SimpleNamespace(),
+                    session_store=None,
+                    multimodal_analyzer=None,
                 )
 
                 tools = load_builtin_tools(context)

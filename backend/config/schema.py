@@ -43,7 +43,7 @@ class ModelsConfig(BaseModel):
 
 class RuntimeConfig(BaseModel):
     max_tool_depth: int = 30
-    context_compress_threshold: float = 0.8
+    context_compress_threshold: float = 0.85
     context_critical_threshold: float = 0.92
     context_compaction_preserve_recent: int = 4
     context_reply_reserve_tokens_large: int = 4096
@@ -55,6 +55,8 @@ class RuntimeConfig(BaseModel):
     context_compaction_max_failures: int = 3
     tool_retry_attempts: int = 3
     tool_retry_backoff_seconds: float = 1.0
+    provider_retry_attempts: int = 3
+    provider_retry_backoff_seconds: float = 1.0
 
 
 class SandboxConfig(BaseModel):
