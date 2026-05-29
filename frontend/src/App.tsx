@@ -16,10 +16,12 @@ import logo from "./assets/newman-logo.png";
 import MessageContent, { type ChatAttachment, type HtmlPreviewPayload } from "./chat/MessageContent";
 import { escapeCodeHtml, highlightCode, inferLanguageFromPath } from "./chat/codeHighlight";
 import AutomationsPage from "./pages/AutomationsPage";
-import FilesLibraryPage from "./pages/FilesLibraryPage";
+import EvolutionPage from "./pages/EvolutionPage";
+import UsageDashboard from "./pages/UsageDashboard";
 import "./styles.css";
 
-type WorkspacePage = "chat" | "automations" | "memory" | "skills" | "files" | "settings";
+type WorkspacePage = "chat" | "automations" | "memory" | "skills" | "evolution" | "settings";
+type SettingsTab = "theme" | "config" | "plugins" | "usage";
 type MemoryKey = "memory" | "user";
 type TurnApprovalMode = "manual" | "auto_allow";
 type CollaborationModeName = "default" | "plan";
@@ -87,6 +89,32 @@ type AwaitingUserInputReplyMetadata = {
 type AwaitingUserInputSelection = {
   value: string;
   label: string;
+};
+
+type EnvironmentTimeContext = {
+  client_timezone: string;
+  client_local_now: string;
+};
+
+type EnvironmentLocationContext = {
+  city: string;
+  source: string;
+  precision: string;
+  captured_at_utc: string;
+  timezone_hint?: string;
+};
+
+type EnvironmentContextPayload = {
+  time: EnvironmentTimeContext;
+  location?: EnvironmentLocationContext;
+};
+
+type ResolvedLocationResponse = {
+  resolved: boolean;
+  city: string | null;
+  source: string;
+  precision: string;
+  captured_at_utc: string;
 };
 
 const DEFAULT_CONFIRM_AWAITING_OPTIONS: AwaitingUserInputOption[] = [
@@ -185,6 +213,25 @@ type SessionEventPayload = {
 type SessionEventsResponse = {
   session_id: string;
   events: SessionEventPayload[];
+};
+
+type SessionUsageRecord = {
+  request_id: string;
+  session_id: string | null;
+  turn_id: string | null;
+  request_kind: string;
+  usage_available: boolean;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  created_at: string;
+};
+
+type SessionUsageResponse = {
+  session_id: string;
+  records: SessionUsageRecord[];
+  available: boolean;
+  error?: string;
 };
 
 type SessionAuditResponse = {
@@ -294,6 +341,16 @@ type ChatTurn = {
   timeline: TimelineNode[];
   status: TurnStatus;
   isLive: boolean;
+  usage: TurnUsageSummary | null;
+  durationMs: number | null;
+};
+
+type TurnUsageSummary = {
+  requestCount: number;
+  missingCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
 };
 
 type LiveTurnState = {
@@ -427,23 +484,6 @@ type ChatSession = {
   sourceTaskId: string | null;
 };
 
-type KnowledgeDocument = {
-  document_id: string;
-  title: string;
-  source_path: string;
-  stored_path: string;
-  size_bytes: number;
-  content_type: string;
-  parser: string;
-  chunk_count: number;
-  page_count: number | null;
-  imported_at: string;
-};
-
-type KnowledgeDocumentsResponse = {
-  documents: KnowledgeDocument[];
-};
-
 type PluginRecord = {
   name: string;
   version: string;
@@ -504,7 +544,7 @@ const navItems: Array<{ id: Exclude<WorkspacePage, "settings">; label: string; h
   { id: "automations", label: "Automations", hint: "定时" },
   { id: "memory", label: "Memory", hint: "记忆" },
   { id: "skills", label: "Skills", hint: "技能" },
-  { id: "files", label: "Files", hint: "文件" }
+  { id: "evolution", label: "Evolution", hint: "进化" }
 ];
 
 const approvalModeMeta: Record<
@@ -601,6 +641,33 @@ const uiThemeOptions: Array<{
   }
 ];
 
+const settingsTabOptions: Array<{
+  id: SettingsTab;
+  label: string;
+  description: string;
+}> = [
+  {
+    id: "theme",
+    label: "界面主题",
+    description: "切换当前工作台主题。"
+  },
+  {
+    id: "config",
+    label: "项目配置",
+    description: "编辑并重载 newman.yaml。"
+  },
+  {
+    id: "plugins",
+    label: "插件与异常",
+    description: "管理插件启停并查看加载问题。"
+  },
+  {
+    id: "usage",
+    label: "Token 消耗",
+    description: "查看真实模型 usage 聚合。"
+  }
+];
+
 const LEFT_MIN = 180;
 const LEFT_MAX = 360;
 const HANDLE_WIDTH = 8;
@@ -609,6 +676,8 @@ const HTML_PREVIEW_MAX = 920;
 const HTML_PREVIEW_DEFAULT = 760;
 const HTML_PREVIEW_MAIN_MIN = 360;
 const TURN_APPROVAL_MODE_STORAGE_KEY = "newman-turn-approval-mode";
+const ENVIRONMENT_CITY_CACHE_KEY = "newman-environment-city-cache";
+const ENVIRONMENT_CITY_GEOLOCATION_TTL_MS = 6 * 60 * 60 * 1000;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -629,7 +698,7 @@ function isWorkspacePage(value: string | null): value is WorkspacePage {
     value === "automations" ||
     value === "memory" ||
     value === "skills" ||
-    value === "files" ||
+    value === "evolution" ||
     value === "settings"
   );
 }
@@ -640,6 +709,117 @@ function isUiTheme(value: string | null): value is UiTheme {
 
 function isTurnApprovalMode(value: string | null): value is TurnApprovalMode {
   return value === "manual" || value === "auto_allow";
+}
+
+function isSettingsTab(value: string | null): value is SettingsTab {
+  return value === "theme" || value === "config" || value === "plugins" || value === "usage";
+}
+
+function localTimezone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
+function padTimePart(value: number) {
+  return String(Math.trunc(Math.abs(value))).padStart(2, "0");
+}
+
+function toLocalIsoString(value: Date) {
+  const year = value.getFullYear();
+  const month = padTimePart(value.getMonth() + 1);
+  const day = padTimePart(value.getDate());
+  const hour = padTimePart(value.getHours());
+  const minute = padTimePart(value.getMinutes());
+  const second = padTimePart(value.getSeconds());
+  const offsetMinutes = -value.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffsetMinutes = Math.abs(offsetMinutes);
+  const offsetHours = padTimePart(Math.floor(absoluteOffsetMinutes / 60));
+  const offsetRemainder = padTimePart(absoluteOffsetMinutes % 60);
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}${sign}${offsetHours}:${offsetRemainder}`;
+}
+
+function writeCachedEnvironmentLocation(timezone: string, location: EnvironmentLocationContext, ttlMs: number) {
+  const expiresAtUtc = new Date(Date.now() + ttlMs).toISOString();
+  window.localStorage.setItem(
+    ENVIRONMENT_CITY_CACHE_KEY,
+    JSON.stringify({
+      timezone,
+      expires_at_utc: expiresAtUtc,
+      location,
+    })
+  );
+}
+
+function readCachedEnvironmentLocation(timezone: string): EnvironmentLocationContext | null {
+  const raw = window.localStorage.getItem(ENVIRONMENT_CITY_CACHE_KEY);
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as {
+      timezone?: unknown;
+      expires_at_utc?: unknown;
+      location?: EnvironmentLocationContext;
+    };
+    if (parsed.timezone !== timezone) {
+      return null;
+    }
+    if (typeof parsed.expires_at_utc !== "string" || !parsed.expires_at_utc) {
+      return null;
+    }
+    const expiresAt = Date.parse(parsed.expires_at_utc);
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      return null;
+    }
+    const location = parsed.location;
+    if (!location || typeof location.city !== "string" || !location.city.trim()) {
+      window.localStorage.removeItem(ENVIRONMENT_CITY_CACHE_KEY);
+      return null;
+    }
+    if (location.source === "timezone_inference") {
+      window.localStorage.removeItem(ENVIRONMENT_CITY_CACHE_KEY);
+      return null;
+    }
+    return location;
+  } catch {
+    return null;
+  }
+}
+
+function buildEnvironmentContext(location: EnvironmentLocationContext | null | undefined): EnvironmentContextPayload {
+  const now = new Date();
+  const payload: EnvironmentContextPayload = {
+    time: {
+      client_timezone: localTimezone(),
+      client_local_now: toLocalIsoString(now),
+    },
+  };
+  if (location) {
+    payload.location = location;
+  }
+  return payload;
+}
+
+function getCurrentGeolocationPosition(options: PositionOptions): Promise<GeolocationPosition> {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error("Geolocation unavailable"));
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(resolve, reject, options);
+  });
+}
+
+async function readGeolocationPermissionState(): Promise<PermissionState | "unsupported"> {
+  if (!navigator.geolocation || !navigator.permissions?.query) {
+    return "unsupported";
+  }
+  try {
+    const status = await navigator.permissions.query({ name: "geolocation" as PermissionName });
+    return status.state;
+  } catch {
+    return "unsupported";
+  }
 }
 
 function formatCompactionStage(stage: string | null | undefined) {
@@ -730,6 +910,68 @@ function formatTokenCount(value: number | null | undefined) {
     return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
   }
   return `${Math.max(0, Math.round(value))}`;
+}
+
+function readUsageTokenCount(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+}
+
+function buildTurnUsageSummaries(records: SessionUsageRecord[]) {
+  const summaries: Record<string, TurnUsageSummary> = {};
+  records.forEach((record) => {
+    if (!record.turn_id) {
+      return;
+    }
+    const current =
+      summaries[record.turn_id] ??
+      {
+        requestCount: 0,
+        missingCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+      };
+    const inputTokens = readUsageTokenCount(record.input_tokens);
+    const outputTokens = readUsageTokenCount(record.output_tokens);
+    const totalTokens = readUsageTokenCount(record.total_tokens) || inputTokens + outputTokens;
+    current.requestCount += 1;
+    current.inputTokens += inputTokens;
+    current.outputTokens += outputTokens;
+    current.totalTokens += totalTokens;
+    if (!record.usage_available || totalTokens <= 0) {
+      current.missingCount += 1;
+    }
+    summaries[record.turn_id] = current;
+  });
+  return summaries;
+}
+
+function formatTurnTokenUsage(usage: TurnUsageSummary | null | undefined) {
+  if (!usage || usage.requestCount <= 0) {
+    return null;
+  }
+  if (usage.totalTokens <= 0) {
+    return "-- tokens";
+  }
+  return `${new Intl.NumberFormat("zh-CN").format(usage.totalTokens)} tokens`;
+}
+
+function formatTurnDuration(durationMs: number | null | undefined) {
+  if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0) {
+    return null;
+  }
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) {
+    return `${minutes}m${padTimePart(seconds)}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainderMinutes = minutes % 60;
+  return `${hours}h${padTimePart(remainderMinutes)}m${padTimePart(seconds)}s`;
 }
 
 function makeAttachmentId(seed: string, index: number) {
@@ -1153,12 +1395,6 @@ const TOOL_SEMANTIC_MAP: Record<
     cardType: "plan",
     runningText: "我先切换到计划模式",
     completedText: "已经进入计划模式"
-  },
-  search_knowledge_base: {
-    label: "search_knowledge_base",
-    cardType: "search",
-    runningText: "我先检索一下知识资料",
-    completedText: "知识结果我已经找到了"
   }
 };
 
@@ -1622,6 +1858,8 @@ type MessageHoverShellProps = {
   copyValue?: string | null;
   copyLabel: string;
   showMeta?: boolean;
+  turnUsage?: TurnUsageSummary | null;
+  durationMs?: number | null;
   children: ReactNode;
 };
 
@@ -1632,12 +1870,16 @@ function MessageHoverShell({
   copyValue,
   copyLabel,
   showMeta = true,
+  turnUsage = null,
+  durationMs = null,
   children,
 }: MessageHoverShellProps) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const canCopy = Boolean(copyValue && copyValue.trim());
   const copyTitle =
     copyState === "copied" ? "已复制" : copyState === "failed" ? "复制失败，请重试" : `复制${copyLabel}`;
+  const tokenLabel = formatTurnTokenUsage(turnUsage);
+  const durationLabel = formatTurnDuration(durationMs);
 
   function resetCopyState() {
     setCopyState("idle");
@@ -1681,6 +1923,24 @@ function MessageHoverShell({
           <span className="message-hover-time" aria-label={`消息时间 ${formatDateTime(timestamp)}`}>
             {formatMessageTime(timestamp)}
           </span>
+          {tokenLabel ? (
+            <span
+              className="message-hover-stat"
+              aria-label={`本轮 token 消耗 ${tokenLabel}`}
+              title={`本轮 token 消耗 ${tokenLabel}`}
+            >
+              {tokenLabel}
+            </span>
+          ) : null}
+          {durationLabel ? (
+            <span
+              className="message-hover-stat"
+              aria-label={`本轮耗时 ${durationLabel}`}
+              title={`本轮耗时 ${durationLabel}`}
+            >
+              {durationLabel}
+            </span>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -1699,7 +1959,7 @@ function resolveTimelineNodeIcon(node: TimelineNode): TimelineMarkerIconName {
   if (toolName === "read_file" || toolName === "read_file_range") return "file";
   if (toolName === "write_file") return "file_plus";
   if (toolName === "edit_file") return "file_edit";
-  if (toolName === "search_files" || toolName === "search_knowledge_base") return "search";
+  if (toolName === "search_files") return "search";
   if (toolName === "grep") return "code_search";
   if (toolName === "fetch_url") return "globe";
   if (toolName === "terminal") return "terminal";
@@ -1969,11 +2229,6 @@ function inferResultCount(toolName: string | null | undefined, output: string | 
     return 0;
   }
 
-  if (toolName === "search_knowledge_base") {
-    const hits = trimmed.split("\n").filter((line) => /^\[\d+\]/.test(line.trim())).length;
-    return hits || null;
-  }
-
   if (toolName === "search_files" || toolName === "grep") {
     const hits = trimmed
       .split("\n")
@@ -2068,9 +2323,6 @@ function resolveProgressPrimaryText(
     }
     if (toolName === "grep") {
       return `已找到 ${count} 处匹配`;
-    }
-    if (toolName === "search_knowledge_base") {
-      return `已找到 ${count} 条知识结果`;
     }
   }
 
@@ -3931,6 +4183,41 @@ function parseTimestamp(value: string | null | undefined) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function computeTurnDurationMs(
+  userMessageCreatedAt: string,
+  answerCreatedAt: string | null | undefined,
+  status: TurnStatus,
+  turnEvents: SessionEventPayload[]
+) {
+  const startedAt = parseTimestamp(userMessageCreatedAt);
+  if (startedAt === null) {
+    return null;
+  }
+
+  const endCandidates: number[] = [];
+  const answerTimestamp = parseTimestamp(answerCreatedAt);
+  if (answerTimestamp !== null) {
+    endCandidates.push(answerTimestamp);
+  }
+
+  turnEvents.forEach((event) => {
+    if (
+      event.event === "turn_completed" ||
+      event.event === "final_response" ||
+      event.event === "turn_interrupted" ||
+      event.event === "error"
+    ) {
+      endCandidates.push(event.ts);
+    }
+  });
+
+  if (endCandidates.length === 0) {
+    return status === "running" ? null : 0;
+  }
+
+  return Math.max(0, Math.max(...endCandidates) - startedAt);
+}
+
 function readTurnId(value: Record<string, unknown>) {
   const turnId = value.turn_id;
   return typeof turnId === "string" && turnId ? turnId : null;
@@ -4260,7 +4547,12 @@ function resolveTurnIdForEvent(
   return turns[turns.length - 1]?.id ?? null;
 }
 
-function buildChatTurns(sessionId: string, messages: SessionMessageRecord[], sessionEvents: SessionEventPayload[]) {
+function buildChatTurns(
+  sessionId: string,
+  messages: SessionMessageRecord[],
+  sessionEvents: SessionEventPayload[],
+  turnUsageById: Record<string, TurnUsageSummary>
+) {
   const turns: ChatTurn[] = [];
   const turnsById = new Map<string, ChatTurn>();
   const toolMessagesByTurn = new Map<string, SessionMessageRecord[]>();
@@ -4287,7 +4579,9 @@ function buildChatTurns(sessionId: string, messages: SessionMessageRecord[], ses
       answer: null,
       timeline: [],
       status: "running",
-      isLive: false
+      isLive: false,
+      usage: turnUsageById[turnId] ?? null,
+      durationMs: null,
     };
     turns.push(turn);
     turnsById.set(turnId, turn);
@@ -4521,6 +4815,13 @@ function buildChatTurns(sessionId: string, messages: SessionMessageRecord[], ses
       );
     }
     turn.timeline = nextTimeline;
+    turn.usage = turnUsageById[turn.id] ?? null;
+    turn.durationMs = computeTurnDurationMs(
+      turn.userMessage.createdAt,
+      turn.answer?.createdAt,
+      turn.status,
+      turnEvents
+    );
   });
 
   return turns;
@@ -4569,7 +4870,14 @@ function buildLiveTurn(liveTurn: LiveTurnState, sessionEvents: SessionEventPaylo
     answer: liveTurn.answer,
     timeline: nextTimeline,
     status: liveTurn.status,
-    isLive: true
+    isLive: true,
+    usage: null,
+    durationMs: computeTurnDurationMs(
+      liveTurn.userMessage.createdAt,
+      liveTurn.answer.createdAt,
+      liveTurn.status,
+      turnEvents
+    ),
   };
 }
 
@@ -4770,6 +5078,10 @@ function App() {
     const stored = window.localStorage.getItem("newman-active-page");
     return isWorkspacePage(stored) ? stored : "chat";
   });
+  const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>(() => {
+    const stored = window.localStorage.getItem("newman-settings-tab");
+    return isSettingsTab(stored) ? stored : "theme";
+  });
   const [uiTheme, setUiTheme] = useState<UiTheme>(() => {
     const stored = window.localStorage.getItem("newman-ui-theme");
     return isUiTheme(stored) ? stored : "classic";
@@ -4786,6 +5098,7 @@ function App() {
   const [awaitingInputSelections, setAwaitingInputSelections] = useState<Record<string, AwaitingUserInputSelection>>({});
   const [awaitingInputDrafts, setAwaitingInputDrafts] = useState<Record<string, string>>({});
   const [sessionEvents, setSessionEvents] = useState<SessionEventPayload[]>([]);
+  const [activeTurnUsageById, setActiveTurnUsageById] = useState<Record<string, TurnUsageSummary>>({});
   const [liveSessionEvents, setLiveSessionEvents] = useState<SessionEventPayload[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
@@ -4837,9 +5150,6 @@ function App() {
   const [workspaceView, setWorkspaceView] = useState<WorkspaceBrowserResponse | null>(null);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
-  const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocument[]>([]);
-  const [knowledgeLoading, setKnowledgeLoading] = useState(false);
-  const [knowledgeError, setKnowledgeError] = useState<string | null>(null);
   const [plugins, setPlugins] = useState<PluginRecord[]>([]);
   const [pluginErrors, setPluginErrors] = useState<PluginLoadError[]>([]);
   const [pluginsLoading, setPluginsLoading] = useState(false);
@@ -4877,6 +5187,10 @@ function App() {
     const stored = window.localStorage.getItem(TURN_APPROVAL_MODE_STORAGE_KEY);
     return isTurnApprovalMode(stored) ? stored : "manual";
   });
+  const [environmentLocation, setEnvironmentLocation] = useState<EnvironmentLocationContext | null>(() => {
+    const timezone = localTimezone();
+    return readCachedEnvironmentLocation(timezone);
+  });
   const [htmlPreview, setHtmlPreview] = useState<HtmlPreviewState | null>(null);
   const [htmlPreviewView, setHtmlPreviewView] = useState<HtmlPreviewView>("preview");
   const conversationPaneRef = useRef<HTMLElement | null>(null);
@@ -4894,6 +5208,9 @@ function App() {
   const attachmentPreviewUrlsRef = useRef<string[]>([]);
   const liveAttachmentUrlsRef = useRef<string[]>([]);
   const liveSessionEventQueueRef = useRef<SessionEventPayload[]>([]);
+  const environmentLocationRef = useRef<EnvironmentLocationContext | null>(environmentLocation);
+  const environmentLocationRefreshRef = useRef<Promise<EnvironmentLocationContext | null> | null>(null);
+  const environmentLocationPromptAttemptedRef = useRef(false);
   const liveSessionEventFlushFrameRef = useRef<number | null>(null);
   const liveAnswerQueueRef = useRef<LiveAnswerQueueItem[]>([]);
   const liveAnswerFlushFrameRef = useRef<number | null>(null);
@@ -4928,6 +5245,81 @@ function App() {
     liveAnswerQueueRef.current = [];
     pendingFinalAnswerRef.current = null;
     resolveLiveAnswerDrain();
+  };
+
+  const refreshEnvironmentLocation = async ({
+    allowPrompt,
+  }: {
+    allowPrompt: boolean;
+  }): Promise<EnvironmentLocationContext | null> => {
+    if (environmentLocationRefreshRef.current) {
+      return environmentLocationRefreshRef.current;
+    }
+
+    const task = (async () => {
+      const timezone = localTimezone();
+      const fallbackLocation =
+        readCachedEnvironmentLocation(timezone) ??
+        environmentLocationRef.current;
+      const permissionState = await readGeolocationPermissionState();
+
+      if (!allowPrompt) {
+        if (permissionState !== "granted") {
+          return fallbackLocation;
+        }
+      } else {
+        if (permissionState === "denied") {
+          return fallbackLocation;
+        }
+        if (permissionState === "prompt") {
+          if (environmentLocationPromptAttemptedRef.current) {
+            return fallbackLocation;
+          }
+          environmentLocationPromptAttemptedRef.current = true;
+        }
+      }
+
+      try {
+        const position = await getCurrentGeolocationPosition({
+          enableHighAccuracy: false,
+          timeout: allowPrompt ? 5000 : 2500,
+          maximumAge: 15 * 60 * 1000,
+        });
+        const resolved = await fetchJson<ResolvedLocationResponse>(`${apiBase}/api/runtime/location/resolve`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+          }),
+        });
+        if (!resolved.resolved || !resolved.city) {
+          return fallbackLocation;
+        }
+        const nextLocation: EnvironmentLocationContext = {
+          city: resolved.city,
+          source: resolved.source || "browser_geolocation",
+          precision: resolved.precision || "city",
+          captured_at_utc: resolved.captured_at_utc || new Date().toISOString(),
+          timezone_hint: timezone,
+        };
+        writeCachedEnvironmentLocation(timezone, nextLocation, ENVIRONMENT_CITY_GEOLOCATION_TTL_MS);
+        setEnvironmentLocation(nextLocation);
+        return nextLocation;
+      } catch {
+        return fallbackLocation;
+      }
+    })();
+
+    const trackedTask = task.finally(() => {
+      if (environmentLocationRefreshRef.current === trackedTask) {
+        environmentLocationRefreshRef.current = null;
+      }
+    });
+    environmentLocationRefreshRef.current = trackedTask;
+    return trackedTask;
   };
 
   useEffect(() => {
@@ -5216,8 +5608,20 @@ function App() {
   }, [activeSessionId]);
 
   useEffect(() => {
+    environmentLocationRef.current = environmentLocation;
+  }, [environmentLocation]);
+
+  useEffect(() => {
+    void refreshEnvironmentLocation({ allowPrompt: false });
+  }, [apiBase]);
+
+  useEffect(() => {
     window.localStorage.setItem("newman-active-page", activePage);
   }, [activePage]);
+
+  useEffect(() => {
+    window.localStorage.setItem("newman-settings-tab", activeSettingsTab);
+  }, [activeSettingsTab]);
 
   useEffect(() => {
     window.localStorage.setItem("newman-ui-theme", uiTheme);
@@ -5259,6 +5663,7 @@ function App() {
     setHtmlPreviewView("preview");
     setActiveAwaitingUserInput(null);
     setAwaitingInputSelections({});
+    setActiveTurnUsageById({});
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -5369,7 +5774,9 @@ function App() {
 
       const storedId = preferredId === undefined ? activeSessionIdRef.current : preferredId;
       if (storedId && nextSessions.some((item) => item.id === storedId)) {
-        setActiveSessionId(storedId);
+        if (preferredId === undefined || activeSessionIdRef.current === preferredId) {
+          setActiveSessionId(storedId);
+        }
       } else if (!activeSessionIdRef.current && nextSessions[0]?.id) {
         setActiveSessionId(nextSessions[0].id);
       } else if (storedId && !nextSessions.some((item) => item.id === storedId)) {
@@ -5419,6 +5826,21 @@ function App() {
         }
       }
 
+      let nextTurnUsageById: Record<string, TurnUsageSummary> = {};
+      try {
+        const usageUrl = new URL(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/usage`);
+        usageUrl.searchParams.set("limit", "500");
+        const usage = await fetchJson<SessionUsageResponse>(usageUrl.toString(), { signal });
+        if (usage.available) {
+          nextTurnUsageById = buildTurnUsageSummaries(usage.records);
+        }
+      } catch (usageError) {
+        if (signal?.aborted) {
+          return;
+        }
+        console.warn("Failed to load session usage", { sessionId, usageError });
+      }
+
       if (signal?.aborted || activeSessionIdRef.current !== sessionId) {
         return false;
       }
@@ -5438,6 +5860,7 @@ function App() {
         return nextSelection ? { [nextAwaiting.requestId]: nextSelection } : {};
       });
       setSessionEvents(dedupedEvents);
+      setActiveTurnUsageById(nextTurnUsageById);
       setChatSessions((currentSessions) =>
         currentSessions.map((session) =>
           session.id === sessionId
@@ -5921,24 +6344,6 @@ function App() {
     }
   }
 
-  async function loadKnowledgeDocuments(signal?: AbortSignal) {
-    setKnowledgeLoading(true);
-    setKnowledgeError(null);
-
-    try {
-      const data = await fetchJson<KnowledgeDocumentsResponse>(`${apiBase}/api/knowledge/documents`, { signal });
-      if (signal?.aborted) return;
-      setKnowledgeDocuments(data.documents);
-    } catch (error) {
-      if (signal?.aborted) return;
-      setKnowledgeError(error instanceof Error ? error.message : "资料列表加载失败");
-    } finally {
-      if (!signal?.aborted) {
-        setKnowledgeLoading(false);
-      }
-    }
-  }
-
   async function loadProjectConfig(signal?: AbortSignal) {
     setConfigLoading(true);
     setConfigError(null);
@@ -6070,8 +6475,8 @@ ${markup}
   const liveTurnRequestId = liveTurn?.requestId ?? null;
   const liveTurnServerTurnId = liveTurn?.serverTurnId ?? null;
   const persistedTurns = useMemo(
-    () => buildChatTurns(activeSessionDetail?.session_id ?? "", activeSessionDetail?.messages ?? [], sessionEvents),
-    [activeSessionDetail?.session_id, activeSessionDetail?.messages, sessionEvents]
+    () => buildChatTurns(activeSessionDetail?.session_id ?? "", activeSessionDetail?.messages ?? [], sessionEvents, activeTurnUsageById),
+    [activeSessionDetail?.session_id, activeSessionDetail?.messages, sessionEvents, activeTurnUsageById]
   );
   const visiblePersistedTurns = useMemo(
     () => persistedTurns.filter((turn) => !turnMatchesLiveTurn(turn, liveTurn)),
@@ -6140,6 +6545,8 @@ ${markup}
   const activeApprovalMode = approvalModeMeta[turnApprovalMode];
   const currentCollaborationMode = activeCollaborationMode?.mode ?? "default";
   const composerDisplayMode = pendingComposerMode ?? currentCollaborationMode;
+  const activeSettingsTabOption =
+    settingsTabOptions.find((option) => option.id === activeSettingsTab) ?? settingsTabOptions[0];
   const activePlanSteps = getPlanSteps(activePlan);
   const activePlanProgress = getPlanProgress(activePlan);
   const showComposerPlanTray = composerDisplayMode === "plan" && activePlanSteps.length > 0 && hasIncompletePlanSteps(activePlan);
@@ -6703,6 +7110,8 @@ ${markup}
       resetLiveSessionEventQueue();
       setLiveSessionEvents([]);
       switchPage("chat");
+      const environmentContext = buildEnvironmentContext(environmentLocationRef.current);
+      void refreshEnvironmentLocation({ allowPrompt: true });
 
       const response =
         submittedAttachments.length > 0
@@ -6715,6 +7124,7 @@ ${markup}
                 body.append("attachments", attachment.file, attachment.filename);
               });
               body.append("approval_mode", turnApprovalMode);
+              body.append("environment_context", JSON.stringify(environmentContext));
               return fetch(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
                 method: "POST",
                 body,
@@ -6730,6 +7140,7 @@ ${markup}
               body: JSON.stringify({
                 content: trimmed,
                 approval_mode: turnApprovalMode,
+                environment_context: environmentContext,
               }),
             });
 
@@ -7301,6 +7712,7 @@ ${markup}
       if (nextSessions.length === 0) {
         setActiveSessionDetail(null);
         setSessionEvents([]);
+        setActiveTurnUsageById({});
       }
     }
     setOpenSessionMenuId(null);
@@ -8459,6 +8871,8 @@ ${markup}
                                   copyValue={showAssistantMessageMeta ? assistantCopyValue : null}
                                   copyLabel="回复"
                                   showMeta={showAssistantMessageMeta && Boolean(turn.answer)}
+                                  turnUsage={turn.usage}
+                                  durationMs={turn.durationMs}
                                 >
                                   <div className="trace-bubble wide final answer-bubble">
                                     {awaitingInput ? (
@@ -8590,6 +9004,8 @@ ${markup}
             }}
           />
         ) : null}
+
+        {activePage === "evolution" ? <EvolutionPage apiBase={apiBase} /> : null}
 
         {activePage === "skills" ? (
           <section className="workspace-page skills-workspace-page">
@@ -9004,38 +9420,39 @@ ${markup}
           </section>
         ) : null}
 
-        {activePage === "files" ? (
-          <FilesLibraryPage apiBase={apiBase} onClose={() => switchPage("chat")} />
-        ) : null}
-
         {activePage === "settings" ? (
           <section className="workspace-page settings-page">
             <div className="workspace-page-head">
               <div>
-                <p className="workspace-eyebrow">Settings / Theme / Plugins</p>
-                <h2>集中切换界面主题、编辑项目配置，并查看插件状态与加载异常</h2>
-                <div className="workspace-page-meta">
-                  <span className="workspace-pill accent">
-                    当前主题 {uiThemeOptions.find((option) => option.id === uiTheme)?.label ?? "原版暖白"}
-                  </span>
-                  <span className="workspace-pill">{plugins.filter((plugin) => plugin.enabled).length} 个已启用插件</span>
-                  <span className="workspace-pill subtle">{pluginErrors.length} 条加载告警</span>
-                  <span className="workspace-pill subtle">
-                    workspace {projectConfigEffectiveWorkspace ? extractName(projectConfigEffectiveWorkspace) : "读取中"}
-                  </span>
-                </div>
-                <p className="workspace-tiny-note">界面默认使用系统字体栈，首页标题像素字改为本地 Ark Pixel，不再依赖外链字体服务。</p>
+                <h2>{activeSettingsTabOption.label}</h2>
               </div>
               <div className="workspace-page-actions">
-                <button
-                  type="button"
-                  className="workspace-secondary-button"
-                  onClick={() => void rescanPlugins()}
-                  disabled={pluginsLoading}
-                >
-                  {pluginsLoading ? "扫描中..." : "重新扫描插件"}
-                </button>
+                {activeSettingsTab === "plugins" ? (
+                  <button
+                    type="button"
+                    className="workspace-secondary-button"
+                    onClick={() => void rescanPlugins()}
+                    disabled={pluginsLoading}
+                  >
+                    {pluginsLoading ? "扫描中..." : "重新扫描插件"}
+                  </button>
+                ) : null}
               </div>
+            </div>
+
+            <div className="workspace-tabbar" role="tablist" aria-label="设置分区">
+              {settingsTabOptions.map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  role="tab"
+                  className={`workspace-tab ${activeSettingsTab === option.id ? "active" : ""}`}
+                  aria-selected={activeSettingsTab === option.id}
+                  onClick={() => setActiveSettingsTab(option.id)}
+                >
+                  {option.label}
+                </button>
+              ))}
             </div>
 
             {configError ? <div className="workspace-alert error">{configError}</div> : null}
@@ -9044,214 +9461,224 @@ ${markup}
             {pluginsNotice ? <div className="workspace-alert success">{pluginsNotice}</div> : null}
 
             <div className="workspace-stack">
-              <article className="workspace-card">
-                <div className="workspace-card-head">
-                  <div>
-                    <h3>界面主题</h3>
-                    <p>保留当前原版配色，同时新增一套按参考图提炼的主题，可随时切换。</p>
-                  </div>
-                </div>
-
-                <div className="workspace-card-body">
-                  <div className="theme-grid">
-                    {uiThemeOptions.map((option) => {
-                      const active = option.id === uiTheme;
-                      return (
-                        <button
-                          key={option.id}
-                          type="button"
-                          className={`theme-card ${active ? "active" : ""}`}
-                          onClick={() => setUiTheme(option.id)}
-                          aria-pressed={active}
-                        >
-                          <div className={`theme-card-preview ${option.previewClass}`} aria-hidden="true">
-                            <span className="theme-preview-rail" />
-                            <span className="theme-preview-stage" />
-                            <span className="theme-preview-panel theme-preview-panel-hero" />
-                            <span className="theme-preview-panel theme-preview-panel-body" />
-                          </div>
-
-                          <div className="theme-card-copy">
-                            <p className="theme-card-kicker">{option.kicker}</p>
-                            <div className="theme-card-headline">
-                              <strong>{option.label}</strong>
-                              <span className={`workspace-pill ${active ? "accent" : "subtle"}`}>{active ? "当前使用" : "点击切换"}</span>
-                            </div>
-                            <p>{option.description}</p>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              </article>
-
-              <article className="workspace-card">
-                <div className="workspace-card-head">
-                  <div>
-                    <h3>项目配置</h3>
-                    <p>{projectConfigPath || "正在定位 newman.yaml"}</p>
-                  </div>
-                  <div className="workspace-inline-actions">
-                    <button
-                      type="button"
-                      className="workspace-secondary-button"
-                      onClick={() => void saveProjectConfig()}
-                      disabled={configLoading || configSaving || !hasProjectConfigChanges}
-                    >
-                      {configSaving ? "保存中..." : "保存配置"}
-                    </button>
-                    <button
-                      type="button"
-                      className="workspace-primary-button"
-                      onClick={() => void reloadProjectConfig()}
-                      disabled={configLoading || configReloading || configSaving}
-                    >
-                      {configReloading ? "Reload 中..." : "Reload 生效"}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="workspace-card-body">
-                  {configLoading ? <div className="workspace-empty">正在加载 newman.yaml...</div> : null}
-
-                  {!configLoading ? (
-                    <>
-                      <div className="workspace-info-grid">
-                        <div className="workspace-mini-card">
-                          <span className="workspace-mini-label">当前生效 workspace</span>
-                          <strong>{projectConfigEffectiveWorkspace || "未识别"}</strong>
-                        </div>
-                        <div className="workspace-mini-card">
-                          <span className="workspace-mini-label">编辑状态</span>
-                          <strong>{hasProjectConfigChanges ? "有未保存修改" : "磁盘内容已同步"}</strong>
-                        </div>
-                      </div>
-
-                      <div className="workspace-detail-block">
-                        <span className="workspace-field-label">生效顺序</span>
-                        <p className="workspace-copy">
-                          {projectConfigSourcePriority.length > 0
-                            ? projectConfigSourcePriority.join(" > ")
-                            : "environment > ~/.newman/config.yaml > newman.yaml > defaults.yaml"}
-                        </p>
-                      </div>
-
-                      <div className="workspace-detail-block">
-                        <span className="workspace-field-label">说明</span>
-                        <p className="workspace-copy">
-                          保存只会写回项目根目录的 <code>newman.yaml</code>。点击 Reload 后，新的 runtime、scheduler 和 channels
-                          才会切到这份配置。
-                        </p>
-                      </div>
-
-                      {configWarnings.length > 0 ? (
-                        <div className="workspace-detail-block">
-                          <span className="workspace-field-label">重载提示</span>
-                          <div className="workspace-list">
-                            {configWarnings.map((warning) => (
-                              <div key={warning} className="workspace-list-row static">
-                                <p className="workspace-row-copy">{warning}</p>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      ) : null}
-
-                      <div className="workspace-detail-block">
-                        <span className="workspace-field-label">newman.yaml</span>
-                        <textarea
-                          className="workspace-editor"
-                          value={projectConfigDraft}
-                          onChange={(event) => {
-                            setProjectConfigDraft(event.target.value);
-                            setConfigNotice(null);
-                            setConfigError(null);
-                          }}
-                          spellCheck={false}
-                        />
-                      </div>
-                    </>
-                  ) : null}
-                </div>
-              </article>
-
-              <article className="workspace-card">
-                <div className="workspace-card-head">
-                  <div>
-                    <h3>插件列表</h3>
-                    <p>保留当前工作台风格，只补管理页面，不改整体视觉语义。</p>
-                  </div>
-                </div>
-
-                <div className="workspace-card-body">
-                  {pluginsLoading && plugins.length === 0 ? <div className="workspace-empty">正在加载插件...</div> : null}
-
-                  {!pluginsLoading || plugins.length > 0 ? (
-                    <div className="plugin-grid">
-                      {plugins.map((plugin) => (
-                        <article key={plugin.name} className="plugin-card">
-                          <div className="plugin-card-head">
-                            <div>
-                              <h4>{plugin.name}</h4>
-                              <p>v{plugin.version}</p>
-                            </div>
-                            <span className={`workspace-pill ${plugin.enabled ? "accent" : "subtle"}`}>
-                              {plugin.enabled ? "已启用" : "已停用"}
-                            </span>
-                          </div>
-                          <p className="plugin-card-copy">{plugin.description || "暂无插件描述"}</p>
-                          <div className="plugin-card-stats">
-                            <span>{plugin.skill_count} Skills</span>
-                            <span>{plugin.hook_count} Hooks</span>
-                            <span>{plugin.mcp_server_count} MCP</span>
-                          </div>
-                          <p className="plugin-card-path">{plugin.plugin_path}</p>
-                          <button
-                            type="button"
-                            className={plugin.enabled ? "workspace-danger-button" : "workspace-primary-button"}
-                            onClick={() => void togglePluginEnabled(plugin)}
-                            disabled={pluginBusyName === plugin.name}
-                          >
-                            {pluginBusyName === plugin.name ? "处理中..." : plugin.enabled ? "停用插件" : "启用插件"}
-                          </button>
-                        </article>
-                      ))}
+              {activeSettingsTab === "theme" ? (
+                <article className="workspace-card">
+                  <div className="workspace-card-head">
+                    <div>
+                      <h3>界面主题</h3>
+                      <p>保留当前原版配色，同时新增一套按参考图提炼的主题，可随时切换。</p>
                     </div>
-                  ) : null}
-                </div>
-              </article>
-
-              <article className="workspace-card">
-                <div className="workspace-card-head">
-                  <div>
-                    <h3>加载异常</h3>
-                    <p>如果插件目录有清单、版本或权限问题，会集中显示在这里。</p>
                   </div>
-                </div>
 
-                <div className="workspace-card-body">
-                  {pluginErrors.length === 0 ? (
-                    <div className="workspace-empty">当前没有插件加载异常。</div>
-                  ) : (
-                    <div className="workspace-list">
-                      {pluginErrors.map((error, index) => (
-                        <div key={`${error.plugin_path}-${index}`} className="workspace-list-row static">
-                          <div className="workspace-list-row-main">
-                            <span className="workspace-item-mark error">ERR</span>
-                            <strong>{error.plugin_name || extractName(error.plugin_path)}</strong>
+                  <div className="workspace-card-body">
+                    <div className="theme-grid">
+                      {uiThemeOptions.map((option) => {
+                        const active = option.id === uiTheme;
+                        return (
+                          <button
+                            key={option.id}
+                            type="button"
+                            className={`theme-card ${active ? "active" : ""}`}
+                            onClick={() => setUiTheme(option.id)}
+                            aria-pressed={active}
+                          >
+                            <div className={`theme-card-preview ${option.previewClass}`} aria-hidden="true">
+                              <span className="theme-preview-rail" />
+                              <span className="theme-preview-stage" />
+                              <span className="theme-preview-panel theme-preview-panel-hero" />
+                              <span className="theme-preview-panel theme-preview-panel-body" />
+                            </div>
+
+                            <div className="theme-card-copy">
+                              <p className="theme-card-kicker">{option.kicker}</p>
+                              <div className="theme-card-headline">
+                                <strong>{option.label}</strong>
+                                <span className={`workspace-pill ${active ? "accent" : "subtle"}`}>{active ? "当前使用" : "点击切换"}</span>
+                              </div>
+                              <p>{option.description}</p>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </article>
+              ) : null}
+
+              {activeSettingsTab === "config" ? (
+                <article className="workspace-card">
+                  <div className="workspace-card-head">
+                    <div>
+                      <h3>项目配置</h3>
+                      <p>{projectConfigPath || "正在定位 newman.yaml"}</p>
+                    </div>
+                    <div className="workspace-inline-actions">
+                      <button
+                        type="button"
+                        className="workspace-secondary-button"
+                        onClick={() => void saveProjectConfig()}
+                        disabled={configLoading || configSaving || !hasProjectConfigChanges}
+                      >
+                        {configSaving ? "保存中..." : "保存配置"}
+                      </button>
+                      <button
+                        type="button"
+                        className="workspace-primary-button"
+                        onClick={() => void reloadProjectConfig()}
+                        disabled={configLoading || configReloading || configSaving}
+                      >
+                        {configReloading ? "Reload 中..." : "Reload 生效"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="workspace-card-body">
+                    {configLoading ? <div className="workspace-empty">正在加载 newman.yaml...</div> : null}
+
+                    {!configLoading ? (
+                      <>
+                        <div className="workspace-info-grid">
+                          <div className="workspace-mini-card">
+                            <span className="workspace-mini-label">当前生效 workspace</span>
+                            <strong>{projectConfigEffectiveWorkspace || "未识别"}</strong>
                           </div>
-                          <p className="workspace-row-copy">
-                            {error.message}
-                            <br />
-                            {error.plugin_path}
+                          <div className="workspace-mini-card">
+                            <span className="workspace-mini-label">编辑状态</span>
+                            <strong>{hasProjectConfigChanges ? "有未保存修改" : "磁盘内容已同步"}</strong>
+                          </div>
+                        </div>
+
+                        <div className="workspace-detail-block">
+                          <span className="workspace-field-label">生效顺序</span>
+                          <p className="workspace-copy">
+                            {projectConfigSourcePriority.length > 0
+                              ? projectConfigSourcePriority.join(" > ")
+                              : "environment > ~/.newman/config.yaml > newman.yaml > defaults.yaml"}
                           </p>
                         </div>
-                      ))}
+
+                        <div className="workspace-detail-block">
+                          <span className="workspace-field-label">说明</span>
+                          <p className="workspace-copy">
+                            保存只会写回项目根目录的 <code>newman.yaml</code>。点击 Reload 后，新的 runtime、scheduler 和 channels
+                            才会切到这份配置。
+                          </p>
+                        </div>
+
+                        {configWarnings.length > 0 ? (
+                          <div className="workspace-detail-block">
+                            <span className="workspace-field-label">重载提示</span>
+                            <div className="workspace-list">
+                              {configWarnings.map((warning) => (
+                                <div key={warning} className="workspace-list-row static">
+                                  <p className="workspace-row-copy">{warning}</p>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+
+                        <div className="workspace-detail-block">
+                          <span className="workspace-field-label">newman.yaml</span>
+                          <textarea
+                            className="workspace-editor"
+                            value={projectConfigDraft}
+                            onChange={(event) => {
+                              setProjectConfigDraft(event.target.value);
+                              setConfigNotice(null);
+                              setConfigError(null);
+                            }}
+                            spellCheck={false}
+                          />
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+                </article>
+              ) : null}
+
+              {activeSettingsTab === "plugins" ? (
+                <>
+                  <article className="workspace-card">
+                    <div className="workspace-card-head">
+                      <div>
+                        <h3>插件列表</h3>
+                        <p>保留当前工作台风格，只补管理页面，不改整体视觉语义。</p>
+                      </div>
                     </div>
-                  )}
-                </div>
-              </article>
+
+                    <div className="workspace-card-body">
+                      {pluginsLoading && plugins.length === 0 ? <div className="workspace-empty">正在加载插件...</div> : null}
+
+                      {!pluginsLoading || plugins.length > 0 ? (
+                        <div className="plugin-grid">
+                          {plugins.map((plugin) => (
+                            <article key={plugin.name} className="plugin-card">
+                              <div className="plugin-card-head">
+                                <div>
+                                  <h4>{plugin.name}</h4>
+                                  <p>v{plugin.version}</p>
+                                </div>
+                                <span className={`workspace-pill ${plugin.enabled ? "accent" : "subtle"}`}>
+                                  {plugin.enabled ? "已启用" : "已停用"}
+                                </span>
+                              </div>
+                              <p className="plugin-card-copy">{plugin.description || "暂无插件描述"}</p>
+                              <div className="plugin-card-stats">
+                                <span>{plugin.skill_count} Skills</span>
+                                <span>{plugin.hook_count} Hooks</span>
+                                <span>{plugin.mcp_server_count} MCP</span>
+                              </div>
+                              <p className="plugin-card-path">{plugin.plugin_path}</p>
+                              <button
+                                type="button"
+                                className={plugin.enabled ? "workspace-danger-button" : "workspace-primary-button"}
+                                onClick={() => void togglePluginEnabled(plugin)}
+                                disabled={pluginBusyName === plugin.name}
+                              >
+                                {pluginBusyName === plugin.name ? "处理中..." : plugin.enabled ? "停用插件" : "启用插件"}
+                              </button>
+                            </article>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  </article>
+
+                  <article className="workspace-card">
+                    <div className="workspace-card-head">
+                      <div>
+                        <h3>加载异常</h3>
+                        <p>如果插件目录有清单、版本或权限问题，会集中显示在这里。</p>
+                      </div>
+                    </div>
+
+                    <div className="workspace-card-body">
+                      {pluginErrors.length === 0 ? (
+                        <div className="workspace-empty">当前没有插件加载异常。</div>
+                      ) : (
+                        <div className="workspace-list">
+                          {pluginErrors.map((error, index) => (
+                            <div key={`${error.plugin_path}-${index}`} className="workspace-list-row static">
+                              <div className="workspace-list-row-main">
+                                <span className="workspace-item-mark error">ERR</span>
+                                <strong>{error.plugin_name || extractName(error.plugin_path)}</strong>
+                              </div>
+                              <p className="workspace-row-copy">
+                                {error.message}
+                                <br />
+                                {error.plugin_path}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </article>
+                </>
+              ) : null}
+
+              {activeSettingsTab === "usage" ? <UsageDashboard apiBase={apiBase} embedded /> : null}
             </div>
           </section>
         ) : null}

@@ -72,7 +72,8 @@ projected_pressure = projected_next_prompt_tokens / effective_context_window
 effective_context_window = configured_context_window * 95%
 ```
 
-它是所有确认值、预测值和压缩预算的统一分母。
+它是所有确认值、预测值和压缩预算的统一分母，也直接承担当前运行时的硬压缩线。
+为了兼容已有前端和 API，返回结构里仍保留 `auto_compact_limit` 字段，但它的值等于 `effective_context_window`。
 
 ---
 
@@ -129,19 +130,13 @@ effective_context_window = configured_context_window * 95%
 
 ---
 
-## 5. 自动压缩采用预算制
+## 5. 自动压缩采用纯比例硬线
 
-自动压缩使用预算制上限：
+自动压缩使用纯比例硬线：
 
 ```text
-auto_compact_limit =
-  effective_context_window
-  - reply_reserve_tokens
-  - compact_reserve_tokens
-  - safety_buffer_tokens
+auto_compact_limit = effective_context_window
 ```
-
-`auto_compact_limit` 也可称为 `usable_prompt_budget`。
 
 软压缩线：
 
@@ -166,65 +161,26 @@ if checkpoint compact cannot reduce enough and projected_next_prompt_tokens >= a
     context_irreducible
 ```
 
-### 5.1 预算项含义
-
-`reply_reserve_tokens`
-
-- 为主回复预留的输出空间
-
-`compact_reserve_tokens`
-
-- 为压缩摘要请求和压缩后摘要注入预留的空间
-
-`safety_buffer_tokens`
-
-- 为 token 估算误差、工具 schema 波动、checkpoint 注入变化等保留的安全边际
-
-### 5.2 默认预算值
-
-`reply_reserve_tokens`
-
-- `effective_context_window >= 64k`：`4096`
-- `effective_context_window < 64k`：`2048`
-
-`compact_reserve_tokens`
-
-- 统一为：`2048`
-
-`safety_buffer_tokens`
-
-- `effective_context_window >= 128k`：`4096`
-- `64k <= effective_context_window < 128k`：`2048`
-- `effective_context_window < 64k`：`1024`
-
-### 5.3 预算示例
+### 5.1 比例示例
 
 假设：
 
 - `configured_context_window = 200000`
 - `effective_context_window = 190000`
 
-则默认预算为：
+则硬压缩线为：
 
 ```text
-reply_reserve_tokens = 4096
-compact_reserve_tokens = 2048
-safety_buffer_tokens = 4096
-```
-
-因此：
-
-```text
-auto_compact_limit = 190000 - 4096 - 2048 - 4096 = 179760
+auto_compact_limit = 190000
 ```
 
 默认软压缩线为：
 
 ```text
-soft_compact_limit = 179760 * 0.85 = 152796
+soft_compact_limit = 190000 * 0.85 = 161500
 ```
 
-这时，下一次主请求预计达到 `152796` token 以上会尝试 checkpoint 压缩；达到 `179760` token 以上则属于必须压缩的硬线。
+这时，下一次主请求预计达到 `161500` token 以上会尝试 checkpoint 压缩；达到 `190000` token 以上则属于必须压缩的硬线。
 
 ---
 
@@ -502,15 +458,15 @@ POST /api/sessions/{session_id}/restore-checkpoint
 ```json
 {
   "effective_context_window": 190000,
-  "auto_compact_limit": 179760,
-  "soft_compact_limit": 152796,
+  "auto_compact_limit": 190000,
+  "soft_compact_limit": 161500,
   "confirmed_prompt_tokens": 8200,
   "confirmed_pressure": 0.0431,
   "confirmed_request_kind": "session_turn",
   "confirmed_recorded_at": "2026-04-16T09:30:00Z",
   "projected_next_prompt_tokens": 12140,
   "projected_pressure": 0.0639,
-  "budget_pressure": 0.0675,
+  "budget_pressure": 0.0639,
   "projected_over_soft_limit": false,
   "projected_over_limit": false,
   "projection_source": "confirmed_plus_delta"
@@ -573,7 +529,7 @@ Newman 的上下文压缩方案可以概括为：
 
 - UI 圆环展示 `projected_next_prompt_tokens / auto_compact_limit`
 - 自动压缩依据下一条主请求的 `projected_next_prompt_tokens`
-- 压缩阈值使用预算制 `soft_compact_limit` 和 `auto_compact_limit`
+- 压缩阈值使用纯比例硬线 `soft_compact_limit` 和 `auto_compact_limit`
 - 压缩检查发生在每一次主模型请求前
 - 压缩保留单位是最近完整 segment，而不是完整 `turn_id`
 - 压缩不删除 `session.messages`，只改变 prompt 组装所使用的历史范围

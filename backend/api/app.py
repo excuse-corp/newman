@@ -11,18 +11,19 @@ from backend.api.routes.approvals import router as approvals_router
 from backend.api.routes.audit import router as audit_router
 from backend.api.routes.channels import router as channels_router
 from backend.api.routes.config import router as config_router
-from backend.api.routes.knowledge import router as knowledge_router
+from backend.api.routes.evolution import router as evolution_router
 from backend.api.routes.mcp import router as mcp_router
 from backend.api.routes.messages import router as messages_router
 from backend.api.routes.plugins import router as plugins_router
+from backend.api.routes.runtime_location import router as runtime_location_router
 from backend.api.routes.scheduler import router as scheduler_router
 from backend.api.routes.sessions import router as sessions_router
 from backend.api.routes.skills import router as skills_router
 from backend.api.routes.tools import router as tools_router
+from backend.api.routes.usage import router as usage_router
 from backend.api.routes.workspace import router as workspace_router
 from backend.channels.service import ChannelService
 from backend.config.loader import get_settings, log_settings_report
-from backend.rag.service import KnowledgeBaseService
 from backend.runtime.run_loop import NewmanRuntime
 from backend.scheduler.scheduler_engine import SchedulerEngine
 
@@ -36,6 +37,7 @@ def create_app() -> FastAPI:
     app.state.settings = settings
     app.state.runtime = NewmanRuntime(settings)
     app.state.scheduler = SchedulerEngine(app.state.runtime.scheduler_store, app.state.runtime)
+    app.state.runtime.tool_context.scheduler_engine = app.state.scheduler
     if hasattr(app.state.scheduler, "set_session_busy_checker"):
         app.state.scheduler.set_session_busy_checker(lambda session_id: session_id in app.state.active_message_runs)
     app.state.channels = ChannelService(settings, app.state.runtime)
@@ -55,11 +57,13 @@ def create_app() -> FastAPI:
     app.include_router(approvals_router)
     app.include_router(audit_router)
     app.include_router(config_router)
-    app.include_router(knowledge_router)
     app.include_router(workspace_router)
     app.include_router(plugins_router)
     app.include_router(skills_router)
     app.include_router(tools_router)
+    app.include_router(runtime_location_router)
+    app.include_router(usage_router)
+    app.include_router(evolution_router)
     app.include_router(mcp_router)
     app.include_router(scheduler_router)
     app.include_router(channels_router)
@@ -78,14 +82,6 @@ def create_app() -> FastAPI:
     @app.get("/healthz")
     async def healthz():
         runtime = app.state.runtime
-        knowledge_base = KnowledgeBaseService(
-            settings.paths.knowledge_dir,
-            settings.paths.workspace,
-            settings.models,
-            settings.rag,
-            settings.paths.chroma_dir,
-            app.state.runtime.usage_store,
-        )
         sandbox_health = runtime.exec_sandbox.health() if runtime.exec_sandbox else None
         return {
             "ok": True,
@@ -94,7 +90,6 @@ def create_app() -> FastAPI:
             "sandbox_enabled": settings.sandbox.enabled,
             "sandbox": sandbox_health.__dict__ if sandbox_health else None,
             "tools": [tool.meta.name for tool in runtime.registry.list_tools()],
-            "knowledge_documents": len(knowledge_base.list_documents()),
             "plugins_enabled": len([item for item in runtime.plugin_service.list_plugins() if item.enabled]),
             "scheduler_running": bool(app.state.scheduler._running),
             "channels_enabled": len([item for item in app.state.channels.list_status() if item["enabled"]]),
@@ -104,7 +99,6 @@ def create_app() -> FastAPI:
     async def readyz():
         return {
             "ok": True,
-            "knowledge_dir": str(settings.paths.knowledge_dir),
             "sessions_dir": str(settings.paths.sessions_dir),
             "plugins_dir": str(settings.paths.plugins_dir),
             "skills_dir": str(settings.paths.skills_dir),

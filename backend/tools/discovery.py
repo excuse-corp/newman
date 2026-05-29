@@ -9,19 +9,21 @@ from backend.tools.base import BaseTool
 
 if TYPE_CHECKING:
     from backend.sessions.session_store import SessionStore
-    from backend.rag.service import KnowledgeBaseService
     from backend.providers.multimodal import MultimodalAnalyzer
     from backend.sandbox.native_sandbox import NativeSandbox
+    from backend.scheduler.scheduler_engine import SchedulerEngine
+    from backend.scheduler.task_store import TaskStore
     from backend.tools.workspace_fs import PathAccessPolicy
 
 
-@dataclass(frozen=True)
+@dataclass
 class BuiltinToolContext:
     path_policy: "PathAccessPolicy"
     sandbox: "NativeSandbox"
-    knowledge_base: "KnowledgeBaseService"
     session_store: "SessionStore | None" = None
     multimodal_analyzer: "MultimodalAnalyzer | None" = None
+    scheduler_store: "TaskStore | None" = None
+    scheduler_engine: "SchedulerEngine | None" = None
 
 
 def load_builtin_tools(context: BuiltinToolContext) -> list[BaseTool]:

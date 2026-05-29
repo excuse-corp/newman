@@ -546,7 +546,8 @@ Newman 统一采用四类记忆对象：
 #### D. Long-term Memory
 
 - `MEMORY.md`
-- 跨会话重要信息
+- 跨会话重要信息与 Newman 自动沉淀的可复用经验
+- 当前自进化 MVP 会自动向 `MEMORY.md` 追加经验，并将其注入 Stable Context
 
 ### 10.2 上下文压缩策略
 

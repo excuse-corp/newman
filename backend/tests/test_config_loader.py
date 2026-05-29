@@ -91,7 +91,6 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertIn("server:", project_config_text)
             self.assertIn("runtime:", project_config_text)
             self.assertIn("provider_retry_attempts:", project_config_text)
-            self.assertIn("rag:", project_config_text)
             self.assertIn("sandbox:", project_config_text)
             self.assertIn("permissions:", project_config_text)
             self.assertNotIn("models:", project_config_text)
@@ -156,40 +155,13 @@ class ConfigLoaderTests(unittest.TestCase):
                     timeout: 60
                     max_tokens: 512
                     temperature: 0.2
-                  embedding:
-                    type: "mock"
-                    model: "embed"
-                    endpoint: null
-                    api_key: null
-                    context_window: null
-                    embedding_dimension: 2
-                    timeout: 60
-                    max_tokens: 1
-                    temperature: 0.0
-                  reranker:
-                    type: "mock"
-                    model: "rerank"
-                    endpoint: null
-                    api_key: null
-                    context_window: 1000
-                    embedding_dimension: null
-                    timeout: 60
-                    max_tokens: 512
-                    temperature: 0.0
                 runtime:
                   max_tool_depth: 20
                   context_compress_threshold: 0.85
-                  context_critical_threshold: 0.92
                   tool_retry_attempts: 3
                   tool_retry_backoff_seconds: 1.0
                   provider_retry_attempts: 3
                   provider_retry_backoff_seconds: 1.0
-                rag:
-                  postgres_dsn: "postgresql://postgres@127.0.0.1:65437/newman"
-                  chroma_collection: "knowledge_chunks"
-                  lexical_candidate_count: 24
-                  vector_candidate_count: 24
-                  hybrid_candidate_count: 32
                 sandbox:
                   enabled: true
                   backend: "linux_bwrap"
@@ -215,8 +187,6 @@ class ConfigLoaderTests(unittest.TestCase):
                   sessions_dir: "backend_data/sessions"
                   memory_dir: "backend_data/memory"
                   audit_dir: "backend_data/audit"
-                  knowledge_dir: "backend_data/knowledge"
-                  chroma_dir: "backend_data/chroma"
                   plugins_dir: "plugins"
                   skills_dir: "skills"
                   mcp_dir: "backend_data/mcp"

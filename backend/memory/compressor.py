@@ -47,9 +47,6 @@ class ContextCompactionBudget:
     effective_context_window: int
     auto_compact_limit: int
     soft_compact_limit: int
-    reply_reserve_tokens: int
-    compact_reserve_tokens: int
-    safety_buffer_tokens: int
 
 
 @dataclass(frozen=True)
@@ -313,31 +310,13 @@ def estimate_pressure(provider: BaseProvider, messages: list[dict], max_context_
 
 def build_context_compaction_budget(model_config: ModelConfig, runtime_config: RuntimeConfig) -> ContextCompactionBudget:
     effective_context_window = model_config.effective_context_window or model_config.context_window or 8_000
-    reply_reserve_tokens = (
-        runtime_config.context_reply_reserve_tokens_large
-        if effective_context_window >= 64_000
-        else runtime_config.context_reply_reserve_tokens_small
-    )
-    if effective_context_window >= 128_000:
-        safety_buffer_tokens = runtime_config.context_safety_buffer_tokens_large
-    elif effective_context_window >= 64_000:
-        safety_buffer_tokens = runtime_config.context_safety_buffer_tokens_medium
-    else:
-        safety_buffer_tokens = runtime_config.context_safety_buffer_tokens_small
-    compact_reserve_tokens = runtime_config.context_compact_reserve_tokens
-    auto_compact_limit = max(
-        effective_context_window - reply_reserve_tokens - compact_reserve_tokens - safety_buffer_tokens,
-        1,
-    )
+    auto_compact_limit = max(effective_context_window, 1)
     soft_threshold = min(max(float(runtime_config.context_compress_threshold), 0.0), 1.0)
     soft_compact_limit = max(int(auto_compact_limit * soft_threshold), 1)
     return ContextCompactionBudget(
         effective_context_window=effective_context_window,
         auto_compact_limit=auto_compact_limit,
         soft_compact_limit=soft_compact_limit,
-        reply_reserve_tokens=reply_reserve_tokens,
-        compact_reserve_tokens=compact_reserve_tokens,
-        safety_buffer_tokens=safety_buffer_tokens,
     )
 
 

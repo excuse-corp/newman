@@ -15,34 +15,10 @@ fake_rows.dict_row = object()
 fake_types = types.ModuleType("psycopg.types")
 fake_json = types.ModuleType("psycopg.types.json")
 fake_json.Jsonb = lambda value: value
-fake_chromadb = types.ModuleType("chromadb")
-
-
-class _FakeCollection:
-    def upsert(self, *args, **kwargs):
-        return None
-
-    def delete(self, *args, **kwargs):
-        return None
-
-    def query(self, *args, **kwargs):
-        return {"ids": [[]], "distances": [[]], "metadatas": [[]], "documents": [[]]}
-
-
-class _FakePersistentClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def get_or_create_collection(self, *args, **kwargs):
-        return _FakeCollection()
-
-
-fake_chromadb.PersistentClient = _FakePersistentClient
 sys.modules.setdefault("psycopg", fake_psycopg)
 sys.modules.setdefault("psycopg.rows", fake_rows)
 sys.modules.setdefault("psycopg.types", fake_types)
 sys.modules.setdefault("psycopg.types.json", fake_json)
-sys.modules.setdefault("chromadb", fake_chromadb)
 
 from backend.config.schema import AppConfig
 from backend.memory.checkpoint_store import CheckpointStore
@@ -57,7 +33,6 @@ from backend.tools.impl.read_file import ReadFileTool
 from backend.tools.impl.request_user_input import RequestUserInputTool
 from backend.tools.impl.write_file import WriteFileTool
 from backend.tools.permission_context import PermissionContext
-from backend.tools.provider_exposure import CORE_TOOL_GROUP, EDITING_TOOL_GROUP, EXECUTION_TOOL_GROUP
 from backend.tools.registry import ToolRegistry
 from backend.tools.result import ToolExecutionResult
 
@@ -672,7 +647,7 @@ class PostUserMessageHookTests(unittest.IsolatedAsyncioTestCase):
             )
             runtime.reload_ecosystem = lambda: None
             runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
             runtime._assemble_task_messages = lambda task, **kwargs: [{"role": "user", "content": task.session.messages[-1].content}]
             runtime._provider_tools_for_turn = lambda task: []
             runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
@@ -704,6 +679,70 @@ class PostUserMessageHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runtime.provider.calls[0]["messages"][0]["content"], "更新后的用户消息")
             self.assertTrue(any(event == "final_response" for event, _ in events))
 
+    async def test_handle_message_adds_server_time_to_environment_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_dir = Path(tmp)
+            session_store = SessionStore(sessions_dir)
+            session = session_store.create(title="time-context")
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.provider = _DummyProvider()
+            runtime.usage_store = None
+            runtime.session_store = session_store
+            runtime.hook_manager = _DummyHookManager()
+            runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
+            runtime.settings = SimpleNamespace(
+                provider=SimpleNamespace(
+                    model="dummy-model",
+                    type="mock",
+                    context_window=None,
+                    effective_context_window=None,
+                ),
+                approval=_DummyApproval(),
+                runtime=SimpleNamespace(max_tool_depth=30),
+            )
+            runtime.reload_ecosystem = lambda: None
+            runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
+            runtime._tools_overview = lambda task=None: "tools"
+            runtime._assemble_task_messages = lambda task, **kwargs: [{"role": "user", "content": task.session.messages[-1].content}]
+            runtime._provider_tools_for_turn = lambda task: []
+            runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
+
+            async def fake_maybe_checkpoint(task, emit):
+                return None
+
+            runtime._maybe_checkpoint = fake_maybe_checkpoint
+
+            async def emit(event: str, data: dict[str, object]) -> None:
+                return None
+
+            await runtime.handle_message(
+                session.session_id,
+                "现在几点",
+                emit,
+                turn_id="turn-ctx-1",
+                user_metadata={
+                    "environment_context": {
+                        "time": {
+                            "client_timezone": "Asia/Shanghai",
+                            "client_local_now": "2026-05-27T16:12:29+08:00",
+                        },
+                        "location": {
+                            "city": "Shanghai",
+                            "source": "browser_geolocation",
+                            "precision": "city",
+                        },
+                    }
+                },
+            )
+
+            saved = session_store.get(session.session_id)
+            environment_context = saved.messages[0].metadata["environment_context"]
+            self.assertIn("server_received_at_utc", environment_context["time"])
+            self.assertEqual(environment_context["time"]["client_timezone"], "Asia/Shanghai")
+            self.assertIsInstance(environment_context["time"]["clock_skew_seconds"], int)
+            self.assertEqual(environment_context["location"]["city"], "Shanghai")
+
 
 class WorkflowAwaitingUserRunLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_user_input_finishes_turn_as_awaiting_user(self) -> None:
@@ -721,7 +760,7 @@ class WorkflowAwaitingUserRunLoopTests(unittest.IsolatedAsyncioTestCase):
             runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
             runtime.reload_ecosystem = lambda: None
             runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
             runtime._assemble_task_messages = lambda task, **kwargs: [{"role": "user", "content": task.session.messages[-1].content}]
             runtime._provider_tools_for_turn = lambda task: [request_tool.to_provider_schema()]
             runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
@@ -785,7 +824,7 @@ class WorkflowAwaitingUserRunLoopTests(unittest.IsolatedAsyncioTestCase):
             runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
             runtime.reload_ecosystem = lambda: None
             runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
             runtime._assemble_task_messages = lambda task, **kwargs: [{"role": "user", "content": task.session.messages[-1].content}]
             runtime._provider_tools_for_turn = lambda task: [request_tool.to_provider_schema()]
             runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
@@ -842,7 +881,7 @@ class TurnCompletionGateTests(unittest.IsolatedAsyncioTestCase):
             runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
             runtime.reload_ecosystem = lambda: None
             runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
             runtime._assemble_task_messages = lambda task, **kwargs: [
                 {"role": message.role, "content": message.content}
                 for message in task.session.messages
@@ -919,7 +958,7 @@ class TurnCompletionGateTests(unittest.IsolatedAsyncioTestCase):
             runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
             runtime.reload_ecosystem = lambda: None
             runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
             runtime._assemble_task_messages = lambda task, **kwargs: [
                 {"role": message.role, "content": message.content}
                 for message in task.session.messages
@@ -1025,7 +1064,7 @@ class ProviderFailureHandlingTests(unittest.IsolatedAsyncioTestCase):
         )
         runtime.reload_ecosystem = lambda: None
         runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
-        runtime._tools_overview = lambda: "tools"
+        runtime._tools_overview = lambda task=None: "tools"
         runtime._assemble_task_messages = lambda task, **kwargs: [{"role": "user", "content": task.session.messages[-1].content}]
         runtime._provider_tools_for_turn = lambda task: []
         runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
@@ -1337,7 +1376,7 @@ class ContextCompactionGuardTests(unittest.IsolatedAsyncioTestCase):
             )
 
             runtime = object.__new__(NewmanRuntime)
-            runtime.provider = _FixedEstimateSummaryProvider(80_000)
+            runtime.provider = _FixedEstimateSummaryProvider(90_000)
             runtime.usage_store = None
             runtime.session_store = session_store
             runtime.settings = SimpleNamespace(provider=settings.provider, runtime=settings.runtime)
@@ -1392,7 +1431,7 @@ class ContextCompactionGuardTests(unittest.IsolatedAsyncioTestCase):
             )
             runtime.reload_ecosystem = lambda: None
             runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
             runtime._assemble_task_messages = lambda task, **kwargs: [{"role": "user", "content": task.session.messages[-1].content}]
             runtime._provider_tools_for_turn = lambda task: []
             runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
@@ -1466,13 +1505,13 @@ class FatalToolFinalizeTests(unittest.IsolatedAsyncioTestCase):
                 approval=_DummyApproval(),
                 runtime=SimpleNamespace(max_tool_depth=30),
             )
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
 
             task = SessionTask(session=session, permission_context=PermissionContext(), turn_id="turn-1")
             result = normalize_result(
                 ToolExecutionResult(
                     success=False,
-                    tool="search_knowledge_base",
+                    tool="read_file",
                     action="search",
                     category="runtime_exception",
                     summary="未找到 bwrap，无法启用 Linux 原生沙箱",
@@ -1529,7 +1568,7 @@ class FatalToolFinalizeTests(unittest.IsolatedAsyncioTestCase):
                 approval=_DummyApproval(),
                 runtime=SimpleNamespace(max_tool_depth=30),
             )
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
 
             task = SessionTask(session=session, permission_context=PermissionContext(), turn_id="turn-1")
             result = normalize_result(
@@ -1594,7 +1633,7 @@ class FatalToolFinalizeTests(unittest.IsolatedAsyncioTestCase):
                 approval=_DummyApproval(),
                 runtime=SimpleNamespace(max_tool_depth=3),
             )
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
 
             task = SessionTask(session=session, permission_context=PermissionContext(), turn_id="turn-1")
 
@@ -1616,8 +1655,8 @@ class ResultClassificationTests(unittest.TestCase):
         result = normalize_result(
             ToolExecutionResult(
                 success=False,
-                tool="search_knowledge_base",
-                action="search",
+                tool="read_file",
+                action="read",
                 category="runtime_exception",
                 summary="Collection expecting embedding with dimension of 256, got 4096",
             )
@@ -1726,7 +1765,7 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
             runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
             runtime.reload_ecosystem = lambda: None
             runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
             runtime._assemble_task_messages = lambda task, **kwargs: [{"role": "user", "content": task.session.messages[-1].content}]
             runtime._provider_tools_for_turn = lambda task: [{"type": "function", "function": {"name": "read_file"}}]
             runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
@@ -2817,23 +2856,16 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             self.assertIn(f"- {protected.resolve()}", overview)
             self.assertIn("When creating user-facing files", overview)
 
-    def test_visible_tools_overview_lists_only_current_turn_tools(self) -> None:
+    def test_tools_overview_includes_workspace_and_mcp_resources(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=Path("/tmp/workspace")))
         runtime._workspace_access_overview = lambda task=None: "## Workspace Access\nworkspace"
-        runtime.mcp_registry = SimpleNamespace(describe_resources=lambda: "")
+        runtime.mcp_registry = SimpleNamespace(describe_resources=lambda: "## MCP Resources\n- server1")
 
-        overview = runtime._visible_tools_overview(
-            [
-                {"type": "function", "function": {"name": "read_file", "description": "Read a file"}},
-                {"type": "function", "function": {"name": "terminal", "description": "Run a command"}},
-            ]
-        )
+        overview = runtime._tools_overview()
 
-        self.assertIn("- read_file: Read a file", overview)
-        self.assertIn("- terminal: Run a command", overview)
-        self.assertNotIn("write_file", overview)
         self.assertIn("## Workspace Access", overview)
+        self.assertIn("## MCP Resources", overview)
 
     def test_current_turn_user_content_prefers_multimodal_normalized_input(self) -> None:
         runtime = object.__new__(NewmanRuntime)
@@ -2894,7 +2926,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
     def test_provider_tools_require_update_plan_first_when_plan_missing(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.registry = SimpleNamespace(
-            tools_for_provider=lambda permission_context, active_groups=None: [
+            tools_for_provider=lambda permission_context: [
                 {"type": "function", "function": {"name": "read_file"}},
                 {"type": "function", "function": {"name": "update_plan"}},
                 {"type": "function", "function": {"name": "write_file"}},
@@ -2929,7 +2961,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
     def test_provider_tools_allow_execution_after_plan_exists(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.registry = SimpleNamespace(
-            tools_for_provider=lambda permission_context, active_groups=None: [
+            tools_for_provider=lambda permission_context: [
                 {"type": "function", "function": {"name": "read_file"}},
                 {"type": "function", "function": {"name": "update_plan"}},
                 {"type": "function", "function": {"name": "write_file"}},
@@ -2979,20 +3011,15 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
 
     def test_provider_tools_hide_plan_only_tools_in_default_mode(self) -> None:
         runtime = object.__new__(NewmanRuntime)
-        captured_groups: list[set[str] | None] = []
 
-        def tools_for_provider(permission_context, active_groups=None):
-            captured_groups.append(set(active_groups) if active_groups is not None else None)
-            return [
+        runtime.registry = SimpleNamespace(
+            tools_for_provider=lambda permission_context: [
                 {"type": "function", "function": {"name": "read_file"}},
                 {"type": "function", "function": {"name": "write_file"}},
                 {"type": "function", "function": {"name": "terminal"}},
                 {"type": "function", "function": {"name": "enter_plan_mode"}},
                 {"type": "function", "function": {"name": "update_plan"}},
             ]
-
-        runtime.registry = SimpleNamespace(
-            tools_for_provider=tools_for_provider
         )
 
         task = SessionTask(
@@ -3007,15 +3034,11 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             [tool["function"]["name"] for tool in tools],
             ["read_file", "write_file", "terminal", "enter_plan_mode"],
         )
-        self.assertEqual(
-            captured_groups[0],
-            {CORE_TOOL_GROUP, EDITING_TOOL_GROUP, EXECUTION_TOOL_GROUP},
-        )
 
     def test_provider_tools_hide_file_browsing_tools_on_first_attachment_answer(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.registry = SimpleNamespace(
-            tools_for_provider=lambda permission_context, active_groups=None: [
+            tools_for_provider=lambda permission_context: [
                 {"type": "function", "function": {"name": "read_file"}},
                 {"type": "function", "function": {"name": "read_file_range"}},
                 {"type": "function", "function": {"name": "list_dir"}},
@@ -3076,7 +3099,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
 
             runtime = object.__new__(NewmanRuntime)
             runtime.registry = SimpleNamespace(
-                tools_for_provider=lambda permission_context, active_groups=None: [
+                tools_for_provider=lambda permission_context: [
                     {"type": "function", "function": {"name": "read_file"}},
                     {"type": "function", "function": {"name": "read_file_range"}},
                     {"type": "function", "function": {"name": "list_dir"}},
@@ -3144,7 +3167,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
 
             runtime = object.__new__(NewmanRuntime)
             runtime.registry = SimpleNamespace(
-                tools_for_provider=lambda permission_context, active_groups=None: [
+                tools_for_provider=lambda permission_context: [
                     {"type": "function", "function": {"name": "read_file"}},
                     {"type": "function", "function": {"name": "read_file_range"}},
                     {"type": "function", "function": {"name": "list_dir"}},
@@ -3209,7 +3232,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
     def test_provider_tools_keep_file_browsing_tools_after_attachment_turn_has_already_used_tools(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.registry = SimpleNamespace(
-            tools_for_provider=lambda permission_context, active_groups=None: [
+            tools_for_provider=lambda permission_context: [
                 {"type": "function", "function": {"name": "read_file"}},
                 {"type": "function", "function": {"name": "search_files"}},
             ]
@@ -3326,7 +3349,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
                 ]
             )
             runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
-            runtime._tools_overview = lambda: "tools"
+            runtime._tools_overview = lambda task=None: "tools"
 
             task = SessionTask(
                 session=SessionRecord(session_id="session-1", title="repair", messages=[]),
@@ -3363,7 +3386,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             ]
         )
         runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
-        runtime._tools_overview = lambda: "tools"
+        runtime._tools_overview = lambda task=None: "tools"
         runtime.settings = SimpleNamespace(provider=SimpleNamespace(type="openai_compatible"))
 
         task = SessionTask(
@@ -3389,7 +3412,7 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             ]
         )
         runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
-        runtime._tools_overview = lambda: "tools"
+        runtime._tools_overview = lambda task=None: "tools"
         runtime.settings = SimpleNamespace(provider=SimpleNamespace(type="openai_compatible"))
 
         task = SessionTask(

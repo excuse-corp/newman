@@ -146,12 +146,14 @@ Do not skip it. Use the user's language. Do not put final-answer content inside 
 
 ### 3.2 Stable Context
 
-`stable_context` 由下面 4 段内容按顺序拼起来，中间用两个换行分隔：
+`stable_context` 由下面内容按顺序拼起来，中间用两个换行分隔：
 
 1. `backend_data/memory/Newman.md`
 2. `backend_data/memory/USER.md`
-3. `backend_data/memory/SKILLS_SNAPSHOT.md`
-4. `## Tooling Overview\n{tools_overview}`
+3. `backend_data/memory/MEMORY.md`
+4. `backend_data/memory/SKILLS_SNAPSHOT.md`
+5. `backend_data/memory/TOOLS_SNAPSHOT.md`
+6. 可选的 `## Tooling Overview\n{tools_overview}`
 
 拼接逻辑等价于：
 
@@ -160,13 +162,17 @@ Do not skip it. Use the user's language. Do not put final-answer content inside 
 
 {USER.md}
 
+{MEMORY.md}
+
 {SKILLS_SNAPSHOT.md}
+
+{TOOLS_SNAPSHOT.md}
 
 ## Tooling Overview
 {tools_overview}
 ```
 
-### 3.3 这 4 段现在分别是什么
+### 3.3 这些稳定上下文段分别是什么
 
 #### 3.3.1 `Newman.md`
 
@@ -202,7 +208,13 @@ Do not skip it. Use the user's language. Do not put final-answer content inside 
 <!-- END AUTO USER MEMORY -->
 ```
 
-#### 3.3.3 `SKILLS_SNAPSHOT.md`
+#### 3.3.3 `MEMORY.md`
+
+这里注入的是整个 [backend_data/memory/MEMORY.md](/root/newman/backend_data/memory/MEMORY.md) 文件全文。
+
+它用于保存 Newman 通过自进化自动沉淀的跨 session 经验，例如工作流经验、错误恢复经验、工具使用经验和完成标准。它不是 session 流水账，也不存放一次性项目事实。
+
+#### 3.3.4 `SKILLS_SNAPSHOT.md`
 
 这里注入的是整个 [backend_data/memory/SKILLS_SNAPSHOT.md](/root/newman/backend_data/memory/SKILLS_SNAPSHOT.md) 文件全文。
 
@@ -221,7 +233,11 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 - Do not read multiple skills up front unless the user explicitly asks for a comparison.
 ```
 
-#### 3.3.4 `Tooling Overview`
+#### 3.3.5 `TOOLS_SNAPSHOT.md`
+
+这里注入的是当前工具快照文件，用于让模型看到工具清单的稳定摘要。具体路径和权限仍以运行时工具 schema 与工具规格为准。
+
+#### 3.3.6 `Tooling Overview`
 
 这是一个纯文本工具总览，不是工具 schema 本体。作用是让模型在 system prompt 里知道“有哪些工具、它们大致做什么”。
 

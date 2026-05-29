@@ -30,11 +30,15 @@ server:
 runtime:
   max_tool_depth: 30
   context_compress_threshold: 0.85
-  context_critical_threshold: 0.92
   tool_retry_attempts: 3
   tool_retry_backoff_seconds: 1.0
   provider_retry_attempts: 3
   provider_retry_backoff_seconds: 1.0
+
+evolution:
+  enabled: true
+  turn_interval: 20
+  overlap_user_turns: 6
 
 rag:
   chroma_collection: "knowledge_chunks"
@@ -104,6 +108,7 @@ paths:
   mcp_dir: "backend_data/mcp"
   scheduler_dir: "backend_data/scheduler"
   channels_dir: "backend_data/channels"
+  evolution_dir: "backend_data/evolution"
 """
 
 
@@ -368,13 +373,12 @@ def get_settings(project_root: str | None = None) -> AppConfig:
         settings.paths.sessions_dir,
         settings.paths.memory_dir,
         settings.paths.audit_dir,
-        settings.paths.knowledge_dir,
-        settings.paths.chroma_dir,
         settings.paths.plugins_dir,
         settings.paths.skills_dir,
         settings.paths.mcp_dir,
         settings.paths.scheduler_dir,
         settings.paths.channels_dir,
+        settings.paths.evolution_dir,
     ]:
         path.mkdir(parents=True, exist_ok=True)
 

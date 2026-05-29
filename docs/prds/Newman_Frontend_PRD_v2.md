@@ -141,7 +141,7 @@ Newman 前端是一个面向单用户、本地优先的 Agent 工作台，而不
 - RAG 引用与证据展示
 - 会话恢复和压缩操作入口
 - 插件管理入口
-- Memory / Skills / Files 工作区页面
+- Memory / Skills / Evolution 工作区页面
 
 ### 5.2 前端不负责
 
@@ -168,7 +168,7 @@ Newman 前端是一个面向单用户、本地优先的 Agent 工作台，而不
 - `Chat`
 - `Memory`
 - `Skills`
-- `Files`
+- `Evolution`
 
 
 ### 6.2 页面层级
@@ -182,7 +182,7 @@ App Shell
 │   └── Evidence Drawer
 ├── Memory Workspace
 ├── Skills Workspace
-├── Files Workspace
+├── Evolution Log
 └── Settings / Plugins
 ```
 
@@ -585,18 +585,20 @@ P1 可增加：
 
 ---
 
-## 7.9 Files Workspace
+## 7.9 Evolution Log
 
 ### 目标
 
-帮助用户理解当前工作区与知识文件，而不是做完整文件管理器。
+让用户看到 Newman 自动做了哪些自进化，并能检查 diff、验证结果和回滚。
 
 ### MVP 范围
 
-- 当前工作区路径展示
-- 最近上传或引用文件
-- 文档解析状态
-- 快速跳转到引用文件
+- 自进化运行列表
+- 触发来源与状态
+- 变更文件列表
+- unified diff 预览
+- 验证错误展示
+- 整次 run 回滚按钮
 
 ---
 
@@ -1154,7 +1156,7 @@ MVP 移动端策略：
 
 ### P1 验收
 
-- Memory / Skills / Files 页面可用
+- Memory / Skills / Evolution 页面可用
 - 插件管理页可用
 - 错误恢复状态可视化完整
 - 引用展示支持跳转原始文件
@@ -1199,7 +1201,7 @@ Newman 前端的核心不是“把 AI 结果展示出来”，而是把一次 Ag
 以下需求已明确保留为待办，暂不在本轮强行固化：
 
 - Evidence Drawer 的右侧信息架构还需继续细化，`Trace / Tool IO / 引用` 的具体字段和交互暂未定稿
-- Memory / Skills / Files 三个工作区的深度产品化仍是待办，当前先保持基础可用
+- Memory / Skills / Evolution 三个工作区的深度产品化仍是待办，当前先保持基础可用
 - 移动端工作台的抽屉滑层、输入栏吸附与更完整适配仍是待办
 - 刷新页面后的连续性已补齐基础恢复：当前会话、工作区页、栏宽、最近选中的 trace、待审批请求，以及最近一次可见的流式回答内容
 - 更完整的 SSE 断点续传仍是后续专项待办；当前只能恢复“最后一次可见状态”，不能把原流继续接上

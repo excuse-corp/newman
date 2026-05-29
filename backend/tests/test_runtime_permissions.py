@@ -14,34 +14,10 @@ fake_rows.dict_row = object()
 fake_types = types.ModuleType("psycopg.types")
 fake_json = types.ModuleType("psycopg.types.json")
 fake_json.Jsonb = lambda value: value
-fake_chromadb = types.ModuleType("chromadb")
-
-
-class _FakeCollection:
-    def upsert(self, *args, **kwargs):
-        return None
-
-    def delete(self, *args, **kwargs):
-        return None
-
-    def query(self, *args, **kwargs):
-        return {"ids": [[]], "distances": [[]], "metadatas": [[]], "documents": [[]]}
-
-
-class _FakePersistentClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def get_or_create_collection(self, *args, **kwargs):
-        return _FakeCollection()
-
-
-fake_chromadb.PersistentClient = _FakePersistentClient
 sys.modules.setdefault("psycopg", fake_psycopg)
 sys.modules.setdefault("psycopg.rows", fake_rows)
 sys.modules.setdefault("psycopg.types", fake_types)
 sys.modules.setdefault("psycopg.types.json", fake_json)
-sys.modules.setdefault("chromadb", fake_chromadb)
 
 from backend.runtime.run_loop import NewmanRuntime
 

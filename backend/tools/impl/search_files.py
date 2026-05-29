@@ -6,7 +6,6 @@ from typing import Any
 
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.discovery import BuiltinToolContext
-from backend.tools.provider_exposure import CORE_TOOL_GROUP
 from backend.tools.result import ToolExecutionResult
 from backend.tools.workspace_fs import (
     PathAccessPolicy,
@@ -43,7 +42,6 @@ class SearchFilesTool(BaseTool):
             approval_behavior="safe",
             timeout_seconds=15,
             allowed_paths=[str(path) for path in self.policy.readable_roots],
-            provider_group=CORE_TOOL_GROUP,
             alias_of="search_files" if name == "grep" else None,
         )
 

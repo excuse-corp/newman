@@ -51,7 +51,7 @@ async def send_message(session_id: str, request: Request):
         if scheduler.has_active_scheduler_session(session_id):
             raise HTTPException(status_code=409, detail="当前会话已有定时任务在运行，请先等待完成")
 
-    content, uploads, approval_mode = await _parse_request_payload(request)
+    content, uploads, approval_mode, environment_context = await _parse_request_payload(request)
     if not content.strip() and not uploads:
         raise ValueError("content 不能为空，或者至少上传一个附件")
     provisional_turn_id = uuid4().hex
@@ -92,6 +92,8 @@ async def send_message(session_id: str, request: Request):
                     "original_content": content,
                     "input_modalities": _infer_input_modalities(content, serialized_attachments),
                 }
+                if environment_context is not None:
+                    metadata["environment_context"] = environment_context
 
                 post_user_message = None
                 if saved_attachments:
@@ -248,20 +250,34 @@ async def interrupt_message(session_id: str, request: Request):
     }
 
 
-async def _parse_request_payload(request: Request) -> tuple[str, list[UploadFile], str]:
+async def _parse_request_payload(request: Request) -> tuple[str, list[UploadFile], str, object | None]:
     content_type = request.headers.get("content-type", "")
     if content_type.startswith("application/json"):
         body = await request.json()
         content = str(body.get("content", "")).strip()
         approval_mode = normalize_turn_approval_mode(body.get("approval_mode"))
-        return content, [], approval_mode
+        return content, [], approval_mode, body.get("environment_context")
 
     form = await request.form()
     content = str(form.get("content", "")).strip()
     uploads = [item for item in form.getlist("attachments") if isinstance(item, UploadFile)]
     uploads.extend(item for item in form.getlist("images") if isinstance(item, UploadFile))
     approval_mode = normalize_turn_approval_mode(form.get("approval_mode"))
-    return content, uploads, approval_mode
+    return content, uploads, approval_mode, _parse_form_environment_context(form.get("environment_context"))
+
+
+def _parse_form_environment_context(raw: object) -> object | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("environment_context 不是合法 JSON") from exc
+    return raw
 
 
 def _maybe_refresh_session_title(session, user_message: SessionMessage) -> None:

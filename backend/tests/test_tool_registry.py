@@ -16,7 +16,7 @@ class _FakeTool(BaseTool):
 
 
 class ToolRegistryExposureTests(unittest.TestCase):
-    def test_provider_schema_includes_allowed_paths_in_description(self) -> None:
+    def test_provider_schema_has_clean_description(self) -> None:
         tool = _FakeTool(
             ToolMeta(
                 name="write_file",
@@ -32,10 +32,8 @@ class ToolRegistryExposureTests(unittest.TestCase):
         schema = tool.to_provider_schema()
 
         description = schema["function"]["description"]
-        self.assertIn("Create a file", description)
-        self.assertIn("Path access for this tool", description)
-        self.assertIn("- /workspace", description)
-        self.assertIn("- /workspace/skills", description)
+        self.assertEqual(description, "Create a file")
+        self.assertNotIn("Path access", description)
 
     def test_describe_omits_alias_tools(self) -> None:
         registry = ToolRegistry()
@@ -69,7 +67,7 @@ class ToolRegistryExposureTests(unittest.TestCase):
         self.assertIn("list_dir", overview)
         self.assertNotIn("list_files", overview)
 
-    def test_tools_for_provider_filters_by_group_alias_and_permission(self) -> None:
+    def test_tools_for_provider_filters_by_alias_and_permission(self) -> None:
         registry = ToolRegistry()
         registry.register(
             _FakeTool(
@@ -80,7 +78,6 @@ class ToolRegistryExposureTests(unittest.TestCase):
                     risk_level="low",
                     approval_behavior="safe",
                     timeout_seconds=1,
-                    provider_group="core",
                 )
             )
         )
@@ -93,7 +90,6 @@ class ToolRegistryExposureTests(unittest.TestCase):
                     risk_level="low",
                     approval_behavior="safe",
                     timeout_seconds=1,
-                    provider_group="core",
                     alias_of="search_files",
                 )
             )
@@ -107,19 +103,20 @@ class ToolRegistryExposureTests(unittest.TestCase):
                     risk_level="high",
                     approval_behavior="confirmable",
                     timeout_seconds=1,
-                    provider_group="execution",
                 )
             )
         )
 
-        schemas = registry.tools_for_provider(PermissionContext(), active_groups={"core"})
-        self.assertEqual([item["function"]["name"] for item in schemas], ["read_file"])
+        schemas = registry.tools_for_provider(PermissionContext())
+        names = [item["function"]["name"] for item in schemas]
+        self.assertIn("read_file", names)
+        self.assertIn("terminal", names)
+        self.assertNotIn("grep", names)
 
-        expanded = registry.tools_for_provider(PermissionContext(), active_groups={"core", "execution"})
-        self.assertEqual([item["function"]["name"] for item in expanded], ["read_file", "terminal"])
-
-        denied = registry.tools_for_provider(PermissionContext(deny_rules={"read_file"}), active_groups={"core", "execution"})
-        self.assertEqual([item["function"]["name"] for item in denied], ["terminal"])
+        denied = registry.tools_for_provider(PermissionContext(deny_rules={"read_file"}))
+        denied_names = [item["function"]["name"] for item in denied]
+        self.assertNotIn("read_file", denied_names)
+        self.assertIn("terminal", denied_names)
 
 
 if __name__ == "__main__":

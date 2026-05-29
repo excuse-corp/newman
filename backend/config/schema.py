@@ -37,26 +37,29 @@ class ModelConfig(BaseModel):
 class ModelsConfig(BaseModel):
     primary: ModelConfig = Field(default_factory=ModelConfig)
     multimodal: ModelConfig = Field(default_factory=ModelConfig)
-    embedding: ModelConfig = Field(default_factory=ModelConfig)
-    reranker: ModelConfig = Field(default_factory=ModelConfig)
 
 
 class RuntimeConfig(BaseModel):
     max_tool_depth: int = 30
     context_compress_threshold: float = 0.85
-    context_critical_threshold: float = 0.92
     context_compaction_preserve_recent: int = 4
-    context_reply_reserve_tokens_large: int = 4096
-    context_reply_reserve_tokens_small: int = 2048
-    context_compact_reserve_tokens: int = 2048
-    context_safety_buffer_tokens_large: int = 4096
-    context_safety_buffer_tokens_medium: int = 2048
-    context_safety_buffer_tokens_small: int = 1024
     context_compaction_max_failures: int = 3
     tool_retry_attempts: int = 3
     tool_retry_backoff_seconds: float = 1.0
     provider_retry_attempts: int = 3
     provider_retry_backoff_seconds: float = 1.0
+
+
+class EvolutionConfig(BaseModel):
+    enabled: bool = True
+    turn_interval: int = 20
+    overlap_user_turns: int = 6
+    max_context_messages: int = 120
+    max_tool_output_chars: int = 2_000
+    max_memory_updates_per_run: int = 8
+    max_skill_updates_per_run: int = 3
+    max_skill_file_bytes: int = 200_000
+    max_skill_total_bytes: int = 700_000
 
 
 class SandboxConfig(BaseModel):
@@ -92,27 +95,18 @@ class PermissionsConfig(BaseModel):
     protected_paths: list[Path] = Field(default_factory=list)
 
 
-class RagConfig(BaseModel):
-    postgres_dsn: str = "postgresql://postgres@127.0.0.1:65437/newman"
-    chroma_collection: str = "knowledge_chunks"
-    lexical_candidate_count: int = 24
-    vector_candidate_count: int = 24
-    hybrid_candidate_count: int = 32
-
-
 class PathsConfig(BaseModel):
     workspace: Path = Path.cwd()
     data_dir: Path = Path("backend_data")
     sessions_dir: Path = Path("backend_data/sessions")
     memory_dir: Path = Path("backend_data/memory")
     audit_dir: Path = Path("backend_data/audit")
-    knowledge_dir: Path = Path("backend_data/knowledge")
-    chroma_dir: Path = Path("backend_data/chroma")
     plugins_dir: Path = Path("plugins")
     skills_dir: Path = Path("skills")
     mcp_dir: Path = Path("backend_data/mcp")
     scheduler_dir: Path = Path("backend_data/scheduler")
     channels_dir: Path = Path("backend_data/channels")
+    evolution_dir: Path = Path("backend_data/evolution")
 
 
 class ChannelPlatformConfig(BaseModel):
@@ -129,8 +123,9 @@ class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
-    rag: RagConfig = Field(default_factory=RagConfig)
+    postgres_dsn: str = "postgresql://postgres@127.0.0.1:65437/newman"
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)

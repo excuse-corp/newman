@@ -339,7 +339,9 @@ cd /root/newman
 - 后端依赖：`backend/pyproject.toml`
 - 默认配置：`backend/config/defaults.yaml`
 - API 文档：`docs/Newman_API_v1.md`
+- 自进化机制：`docs/self_evolution.md`
 - 稳定记忆：`backend_data/memory/`
+- 自进化日志与快照：`backend_data/evolution/`
 
 ## 说明
 

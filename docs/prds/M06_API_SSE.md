@@ -101,6 +101,12 @@ api/
 | POST | `/api/sessions/{id}/messages` | 发送消息（返回 SSE 流） |
 | POST | `/api/sessions/{id}/approve` | 审批通过 |
 | POST | `/api/sessions/{id}/reject` | 审批拒绝 |
+| GET | `/api/evolution/runs` | 获取自进化运行列表 |
+| GET | `/api/evolution/runs/{run_id}` | 获取自进化运行详情 |
+| POST | `/api/evolution/run` | 手动触发一次自进化 |
+| POST | `/api/evolution/runs/{run_id}/rollback` | 回滚一次自进化 |
+
+说明：自进化后台任务当前以 REST 查询为主，不依赖某条消息 SSE 流实时推送。
 
 ---
 

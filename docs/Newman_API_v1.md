@@ -1,6 +1,6 @@
-# Newman API 文档 v1.5
+# Newman API 文档 v1.6
 
-2026 · Phase 4 基线接口 + Stable Memory 抽取 + 轻量多阶段规划 + Linux 原生沙箱 + 多模态输入归一化
+2026 · Phase 4 基线接口 + 自进化日志 + 轻量多阶段规划 + Linux 原生沙箱 + 多模态输入归一化
 
 本文档对应当前已落地的 FastAPI 接口与 SSE 事件协议实现，覆盖：
 
@@ -10,6 +10,7 @@
 - Phase 4.5：轻量多阶段任务规划、文件导航与安全编辑工具
 - Phase 4.6：Linux 原生终端沙箱（bubblewrap）
 - Phase 4.7：图文联合解析与归一化用户输入
+- Phase 4.8：全自动自进化（MEMORY.md + Skill 目录更新）与 Evolution Log
 
 代码入口：
 
@@ -20,6 +21,8 @@
 - [multimodal.py](/root/newman/backend/providers/multimodal.py)
 - [config.py](/root/newman/backend/api/routes/config.py)
 - [workspace.py](/root/newman/backend/api/routes/workspace.py)
+- [evolution.py](/root/newman/backend/api/routes/evolution.py)
+- [evolution/service.py](/root/newman/backend/evolution/service.py)
 - [plugins.py](/root/newman/backend/api/routes/plugins.py)
 - [tools.py](/root/newman/backend/api/routes/tools.py)
 - [mcp.py](/root/newman/backend/api/routes/mcp.py)
@@ -189,7 +192,7 @@ x-request-id: <uuid>
   "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
   "title": "供应商合同抽取",
   "created": true,
-  "memory_extraction": {
+  "evolution": {
     "scheduled": true,
     "trigger": "new_session_created",
     "source_session_id": "9a62e9e8a71e4de8bf4f7f721f0a5b22",
@@ -198,18 +201,12 @@ x-request-id: <uuid>
 }
 ```
 
-说明：
-
 - `/api/sessions` 返回普通 JSON，适合常规创建流程。
 - 若前端需要把“会话创建成功”也纳入统一事件流，可使用 `/api/sessions/stream`。
-
-说明：
-
-- 创建新会话不会等待稳定记忆抽取完成。
-- 后端会在响应返回后，后台异步对“上一个非空会话”执行 `USER.md` 稳定偏好抽取。
-- 抽取时优先使用对应会话的 checkpoint JSON；若存在保留中的近期消息，则一并作为补充上下文。
-- 抽取结果会合并到 `backend_data/memory/USER.md`。
-- `mock` provider 下不会调度抽取任务，此时 `memory_extraction.scheduled = false`，`reason = "mock_provider"`。
+- 创建新会话不会等待自进化完成。
+- 后端会在响应返回后，后台异步对“上一个非空会话”执行一次 `new_session_created` 自进化。
+- 自进化只自动处理 `MEMORY.md` 经验沉淀与 Skill 目录更新；不会自动改权限、系统 prompt、后端/前端代码或安装插件。
+- `mock` provider 下不会调度自进化任务，此时 `evolution.scheduled = false`，`reason = "mock_provider"`。
 
 ## 3.2 获取会话列表
 
@@ -248,7 +245,7 @@ text/event-stream
     "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
     "title": "供应商合同抽取",
     "created": true,
-    "memory_extraction": {
+    "evolution": {
       "scheduled": true,
       "trigger": "new_session_created",
       "source_session_id": "9a62e9e8a71e4de8bf4f7f721f0a5b22",
@@ -386,15 +383,15 @@ text/event-stream
   "checkpoint": null,
   "context_usage": {
     "effective_context_window": 95000,
-    "auto_compact_limit": 86808,
-    "soft_compact_limit": 73786,
+    "auto_compact_limit": 95000,
+    "soft_compact_limit": 80750,
     "confirmed_prompt_tokens": 1248,
     "confirmed_pressure": 0.013136842105263158,
     "confirmed_request_kind": "session_turn",
     "confirmed_recorded_at": "2026-04-11T15:20:00+00:00",
     "projected_next_prompt_tokens": 1376,
     "projected_pressure": 0.01448421052631579,
-    "budget_pressure": 0.01585015205971892,
+    "budget_pressure": 0.01448421052631579,
     "projection_source": "confirmed_plus_delta",
     "projected_over_soft_limit": false,
     "projected_over_limit": false,
@@ -417,7 +414,7 @@ text/event-stream
 - `metadata.attachments[*].summary` 是单附件摘要；`metadata.multimodal_parse.normalized_user_input` 是给主模型和工具路由使用的整轮归一化请求，两者不要混用。
 - 若图片预解析失败，`metadata.multimodal_parse.status = "failed"`，并会额外追加一条 `role=system`、`metadata.type = "attachment_analysis_warning"` 的告警消息。
 - `context_usage.effective_context_window` 使用的是“有效上下文窗口”，当前定义为配置的模型 `context_window * 95%`。
-- `context_usage.auto_compact_limit` 是运行时硬压缩线，已经扣除了回答预留、压缩预留和安全缓冲。
+- `context_usage.auto_compact_limit` 目前与 `effective_context_window` 等值，继续保留这个字段名是为了兼容现有前端和 API。
 - `context_usage.soft_compact_limit = auto_compact_limit * runtime.context_compress_threshold`，默认用于提前执行 checkpoint 压缩。
 - `context_usage.confirmed_*` 表示最近一次真实模型请求里已确认的 prompt 占用；只有最近一条 `counts_toward_context_window=true` 且 `usage_available=true` 的记录才会填充这些字段。
 - `context_usage.projected_*` 表示“如果现在再发起下一次模型请求”，运行时估算出的上下文占用与压力。
@@ -608,8 +605,8 @@ text/event-stream
 - 若已存在旧 checkpoint，压缩请求会把旧 `summary` 与本轮将被裁剪的历史消息一起交给模型，要求产出一份“替换旧 summary 的刷新版摘要”，而不是简单字符串追加。
 - 若当前 provider 为 `mock`，或压缩摘要请求失败/返回空内容，则会退回到结构化归档摘要：保留旧 summary，并附加 `## Archived Message Snapshot` 文本快照。
 - 当 checkpoint 边界之后没有可归档 segment 时，接口会返回 `{"compressed": false, "reason": "nothing_to_compress"}`。
-- 压缩触发阈值基于可用 prompt 预算计算：
-  - `auto_compact_limit = effective_context_window - reply_reserve - compact_reserve - safety_buffer`
+- 压缩触发阈值基于纯比例硬线计算：
+  - `auto_compact_limit = effective_context_window`
   - `soft_compact_limit = auto_compact_limit * runtime.context_compress_threshold`
   - 达到软线先执行 tool output microcompact，仍超线再执行 checkpoint 压缩；达到硬线后，压缩失败会阻断后续主模型请求
 - 前端聊天历史保持原样；压缩只通过当前 turn timeline 中的 `checkpoint_created` 小提示体现。
@@ -631,7 +628,7 @@ text/event-stream
     "created_at": "2026-04-02T10:00:00+00:00",
     "metadata": {
       "preserve_recent": 4,
-      "compression_level": "normal",
+      "compression_level": "automatic",
       "original_message_count": 18
     }
   },
@@ -1047,7 +1044,7 @@ text/event-stream
     },
     "memory": {
       "path": "/root/newman/backend_data/memory/MEMORY.md",
-      "content": "# MEMORY.md\n\n长期记忆内容 ...",
+      "content": "# MEMORY.md\n\n<!-- BEGIN AUTO EVOLUTION MEMORY -->\n## Learned Experience\n\n- 前端修改后应运行构建检查，并在必要时验证实际渲染。\n<!-- END AUTO EVOLUTION MEMORY -->",
       "updated_at": "2026-04-09T08:30:00+00:00"
     },
     "skills": {
@@ -1063,6 +1060,8 @@ text/event-stream
 
 - `latest_updated_at` 用于前端展示“最近一次记忆更新时间”。
 - 若某个 memory 文件尚不存在，则其 `content` 为空字符串，`updated_at` 为 `null`。
+- `MEMORY.md` 会被注入 Stable Context，用于保存 Newman 自动沉淀的跨 session 经验。
+- `USER.md` 仍用于用户偏好和长期协作约定；当前自进化 MVP 的自动经验写入目标是 `MEMORY.md`。
 
 ## 7.2 更新 Stable Memory 文件
 
@@ -1074,6 +1073,10 @@ text/event-stream
 - `user`
 - `memory`
 - `skills`
+
+说明：
+
+- 该接口是人工编辑入口；全自动自进化写入 `MEMORY.md` 时不通过该 API，而是由后端 `EvolutionService` 直接写文件并记录 evolution run。
 
 请求体：
 
@@ -1172,6 +1175,117 @@ text/event-stream
 
 ---
 
+## 7.4 自进化接口
+
+自进化接口服务前端 Evolution Log 页面。当前实现是**全自动、无事前审批**：
+
+- 正常触发：新 session 创建时总结上一个 session；当前 session 每累计 20 个 user turn 做一次增量总结。
+- 自动范围：更新 `backend_data/memory/MEMORY.md`，以及修改对应 Skill 目录内的 `SKILL.md`、脚本、`requirements.txt`、参考文档等文件。
+- 不自动处理：权限配置、系统 prompt、后端/前端代码、插件安装、高权限工具新增。
+- 保障机制：每次运行保存快照、diff、验证结果；验证失败自动回滚；前端可事后手动回滚整次运行。
+
+### 7.4.1 获取自进化运行列表
+
+`GET /api/evolution/runs?limit=50`
+
+响应示例：
+
+```json
+{
+  "runs": [
+    {
+      "run_id": "ev_xxx",
+      "trigger": "new_session_created",
+      "source_session_id": "9a62e9e8a71e4de8bf4f7f721f0a5b22",
+      "status": "applied",
+      "created_at": "2026-05-29T08:00:00+00:00",
+      "updated_at": "2026-05-29T08:00:12+00:00",
+      "summary": "memory 更新 1 项；skill 文件更新 2 项",
+      "message_range": [0, 18],
+      "user_turn_count": 7,
+      "changes": [
+        {
+          "change_id": "chg_xxx",
+          "kind": "memory_update",
+          "action": "append",
+          "target_path": "/root/newman/backend_data/memory/MEMORY.md",
+          "summary": "新增 1 条经验记忆",
+          "reason": "会话中完成标准依赖构建验证。",
+          "diff": "--- a/.../MEMORY.md\n+++ b/.../MEMORY.md\n...",
+          "before_exists": true,
+          "snapshot_path": "/root/newman/backend_data/evolution/snapshots/ev_xxx/abc.before",
+          "validation_status": "passed",
+          "validation_errors": []
+        }
+      ],
+      "errors": [],
+      "metadata": {}
+    }
+  ]
+}
+```
+
+### 7.4.2 获取自进化运行详情
+
+`GET /api/evolution/runs/{run_id}`
+
+响应体：
+
+```json
+{
+  "run": {
+    "run_id": "ev_xxx",
+    "trigger": "turn_interval",
+    "status": "partial",
+    "changes": [],
+    "errors": []
+  }
+}
+```
+
+### 7.4.3 手动触发自进化
+
+`POST /api/evolution/run`
+
+请求体：
+
+```json
+{
+  "session_id": "9a62e9e8a71e4de8bf4f7f721f0a5b22",
+  "trigger": "manual"
+}
+```
+
+说明：
+
+- 该接口主要用于调试和手动补跑；常规使用不需要前端主动调用。
+- `trigger` 支持 `manual`、`new_session_created`、`turn_interval`。
+- 当前 provider 为 `mock` 时会跳过自进化。
+
+### 7.4.4 回滚一次自进化
+
+`POST /api/evolution/runs/{run_id}/rollback`
+
+响应体：
+
+```json
+{
+  "run": {
+    "run_id": "ev_xxx",
+    "status": "rolled_back",
+    "summary": "已回滚本次自进化变更"
+  }
+}
+```
+
+说明：
+
+- 回滚会按该 run 记录的快照恢复所有变更文件。
+- 如果某个文件是自进化中新建的，回滚时会删除该文件。
+- 回滚后会执行 `reload_ecosystem()`，使 Skill 快照与工具快照重新同步。
+
+---
+
 ## 八、知识库接口
 
 ## 8.1 导入知识文档
@@ -1220,7 +1334,7 @@ text/event-stream
 
 说明：
 
-- Files Workspace 中的“最近上传或引用文件”“文档解析状态”可直接基于该接口返回的结构化字段渲染。
+- 前端如需展示“最近上传或引用文件”“文档解析状态”，可直接基于该接口返回的结构化字段渲染。
 - 若前端需要打开某个知识文件正文，可结合 `stored_path` 调用 `GET /api/workspace/files?path=...`。
 
 ## 8.3 上传知识文档
@@ -2268,6 +2382,8 @@ multipart/form-data
 - `tool_approval_resolved`
 - `tool_error_feedback`
 - `checkpoint_created`
+- `evolution_run_started`（保留事件名，当前后台自进化主要通过 REST 查询）
+- `evolution_run_completed`（保留事件名，当前后台自进化主要通过 REST 查询）
 - `turn_interrupted`
 - `final_response`
 - `stream_completed`
@@ -2280,6 +2396,7 @@ multipart/form-data
 - `answer_started` 已实现，用于标记“当前子轮次开始进入正式回答阶段”；它适合作为 timeline 的“开始回答”节点来源，但不是回答完成信号。
 - 前端当前应以 `final_response` 作为“本轮回答结束”的主信号；`assistant_done` 还未单独实现。
 - `memory_updated` 还未实现为 SSE 事件。前端若要看到最新 Memory 内容，当前应通过 `GET /api/workspace/memory` 主动刷新。
+- 自进化运行当前不挂在某条 `/messages` SSE 流上；前端 Evolution Log 通过 `GET /api/evolution/runs` 主动刷新。
 - `turn_interrupted` 会由 `POST /api/sessions/{session_id}/interrupt` 持久化到审计日志和事件历史；若当前消息流仍处于活跃状态，也会实时推回同一条 `/messages` SSE 连接。
 - 为了支持“单 turn 单回答槽位”渲染，当前推荐前端同时消费三类数据：`assistant_delta` 的流式文本、`final_response` 的完成信号，以及 `GET /api/sessions/{session_id}` 返回的持久化 `assistant` 消息。
 
@@ -2380,7 +2497,7 @@ multipart/form-data
     "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
     "checkpoint_id": "cp_xxx",
     "summary": "## Current Progress\n- 已完成首轮接口排查。\n\n## Important Context\n- 用户要求不要在主区暴露技术术语。\n\n## What Remains To Be Done\n- 继续对齐 Trace Timeline 的聚合规则。",
-    "compression_level": "critical",
+    "compression_level": "automatic",
     "microcompact_count": 1
   },
   "ts": 1741234567890
@@ -2600,6 +2717,7 @@ fatal 错误事件示例：
 - MCP 目前是 bridge 基线，不是完整官方 MCP 协议栈
 - Scheduler 当前使用内置 cron 解析与轮询执行
 - Channels 当前返回标准化 webhook 响应，尚未接入真实飞书/企微发送端
+- 自进化当前只覆盖 `MEMORY.md` 和 Skill 目录；不会自动修改系统 prompt、权限配置、后端/前端代码或安装插件
 
 ## 十五、前端联调待办
 
@@ -2607,6 +2725,7 @@ fatal 错误事件示例：
 
 - `assistant_done` SSE 事件未实现，当前以前端消费 `final_response` 代替
 - `memory_updated` SSE 事件未实现，当前 Memory 仍以 REST 刷新为主
+- Evolution Log 已通过 REST 闭环，后台自进化暂不依赖消息流 SSE 推送
 - Evidence Drawer 的 `Trace / Tool IO / 引用` 三标签结构尚未定稿，当前前端右侧仍以摘要 + Raw JSON 为主
 - 刷新页面后，前端现已能恢复当前会话、工作区页、栏宽、最近选中的 trace，并尽量恢复待审批请求和最近一次可见的流式回答内容
 - 当前仍不支持真正的 SSE 断点续传；如果浏览器刷新时网络流被中断，页面只能恢复“最后一次可见状态”，不能继续复用原连接

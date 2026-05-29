@@ -636,8 +636,8 @@ input {
   width: 100%;
   min-height: 34px;
   border: 1px solid #d5cbc0;
-  border-radius: 8px;
-  background: #f1e9de;
+  border-radius: 2px;
+  background: transparent;
   color: #544c43;
   font-size: 0.78rem;
   font-weight: 600;
@@ -649,7 +649,7 @@ input {
   border-color: #121214;
   background: #121214;
   color: #ffffff;
-  box-shadow: 0 8px 14px rgba(8, 10, 18, 0.12);
+  box-shadow: none;
 }
 
 .center-stage {
@@ -1087,9 +1087,9 @@ input {
   align-items: center;
   min-height: 28px;
   padding: 0 10px;
-  border-radius: 999px;
+  border-radius: 2px;
   border: 1px solid #ddd2c2;
-  background: rgba(255, 255, 255, 0.86);
+  background: transparent;
   color: #64584c;
   font-size: 0.78rem;
   font-weight: 700;
@@ -1105,6 +1105,50 @@ input {
 .workspace-pill.subtle {
   background: #f3eee6;
   color: #7a7064;
+}
+
+.workspace-tabbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0;
+  width: 100%;
+  padding: 0;
+  border: 1px solid rgba(91, 74, 58, 0.15);
+  border-radius: 2px;
+  background: transparent;
+}
+
+.workspace-tab {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0 14px;
+  border-radius: 0;
+  color: #72685f;
+  font-size: 0.8rem;
+  font-weight: 650;
+  line-height: 1.2;
+  white-space: nowrap;
+  transition:
+    background-color 0.18s ease,
+    color 0.18s ease;
+}
+
+.workspace-tab:hover {
+  color: #302922;
+}
+
+.workspace-tab + .workspace-tab {
+  border-left: 1px solid rgba(91, 74, 58, 0.12);
+}
+
+.workspace-tab.active {
+  background: rgba(18, 18, 20, 0.06);
+  color: #1f1b18;
+  box-shadow: none;
 }
 
 .workspace-grid {
@@ -1134,9 +1178,9 @@ input {
   flex-direction: column;
   min-height: 0;
   border: 1px solid #e3d9ce;
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.92);
-  box-shadow: 0 12px 28px rgba(17, 17, 17, 0.04);
+  border-radius: 2px;
+  background: transparent;
+  box-shadow: none;
 }
 
 .workspace-card-head {
@@ -1180,15 +1224,15 @@ input {
 .workspace-empty {
   padding: 12px 14px;
   border: 1px solid #e3d7cb;
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.9);
+  border-radius: 2px;
+  background: transparent;
   color: #5b544b;
   font-size: 0.9rem;
 }
 
 .workspace-alert.error {
   border-color: #f0cbc6;
-  background: #fff6f4;
+  background: transparent;
   color: #a14840;
 }
 
@@ -1216,13 +1260,11 @@ input {
   justify-content: center;
   min-height: 38px;
   padding: 0 14px;
-  border-radius: 12px;
+  border-radius: 2px;
   font-size: 0.88rem;
   font-weight: 600;
   white-space: nowrap;
   transition:
-    transform 0.18s ease,
-    box-shadow 0.18s ease,
     background-color 0.18s ease,
     border-color 0.18s ease,
     color 0.18s ease;
@@ -1231,7 +1273,7 @@ input {
 .workspace-primary-button:hover,
 .workspace-secondary-button:hover,
 .workspace-danger-button:hover {
-  transform: translateY(-1px);
+  transform: none;
 }
 
 .workspace-primary-button {
@@ -1309,20 +1351,18 @@ input {
   width: 100%;
   padding: 12px 14px;
   border: 1px solid #e1d8cd;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.92);
+  border-radius: 2px;
+  background: transparent;
   text-align: left;
   transition:
     border-color 0.18s ease,
-    box-shadow 0.18s ease,
-    background-color 0.18s ease,
-    transform 0.18s ease;
+    background-color 0.18s ease;
 }
 
 .skills-item:hover {
-  transform: translateY(-1px);
+  transform: none;
   border-color: #d4c3ad;
-  background: #fbf7f0;
+  background: rgba(18, 18, 20, 0.02);
 }
 
 .skills-item.active {
@@ -2172,25 +2212,23 @@ input {
   width: 100%;
   padding: 14px;
   border: 1px solid #e1d8cd;
-  border-radius: 20px;
-  background: rgba(255, 255, 255, 0.92);
+  border-radius: 2px;
+  background: transparent;
   text-align: left;
   transition:
-    transform 0.18s ease,
     border-color 0.18s ease,
-    box-shadow 0.18s ease,
     background-color 0.18s ease;
 }
 
 .theme-card:hover {
-  transform: translateY(-1px);
+  transform: none;
   border-color: #d4c3ad;
-  box-shadow: 0 14px 26px rgba(17, 17, 17, 0.06);
+  box-shadow: none;
 }
 
 .theme-card.active {
   border-color: #b99670;
-  box-shadow: 0 0 0 2px rgba(177, 139, 99, 0.12);
+  box-shadow: none;
 }
 
 .theme-card-preview {
@@ -2199,7 +2237,7 @@ input {
   width: 100%;
   min-height: 144px;
   aspect-ratio: 16 / 10;
-  border-radius: 18px;
+  border-radius: 2px;
   border: 1px solid rgba(0, 0, 0, 0.08);
   background: #f6f1e9;
 }
@@ -2326,8 +2364,8 @@ input {
 .workspace-mini-card {
   padding: 12px 14px;
   border: 1px solid #e7dfd5;
-  border-radius: 16px;
-  background: #fbf9f6;
+  border-radius: 2px;
+  background: transparent;
 }
 
 .workspace-mini-label {
@@ -2394,20 +2432,18 @@ input {
   width: 100%;
   padding: 12px 14px;
   border: 1px solid #e1d8cd;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.92);
+  border-radius: 2px;
+  background: transparent;
   text-align: left;
   transition:
     border-color 0.18s ease,
-    box-shadow 0.18s ease,
-    background-color 0.18s ease,
-    transform 0.18s ease;
+    background-color 0.18s ease;
 }
 
 .workspace-list-row:hover {
-  transform: translateY(-1px);
+  transform: none;
   border-color: #d4c3ad;
-  background: #fbf7f0;
+  background: rgba(18, 18, 20, 0.02);
 }
 
 .workspace-list-row.static {
@@ -2505,9 +2541,9 @@ input {
   gap: 10px;
   padding: 14px;
   border: 1px solid #e2d8cb;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.9);
-  box-shadow: 0 10px 24px rgba(17, 17, 17, 0.03);
+  border-radius: 2px;
+  background: transparent;
+  box-shadow: none;
 }
 
 .document-card-head {
@@ -2553,8 +2589,18 @@ input {
   gap: 12px;
   padding: 16px;
   border: 1px solid #e2d8cb;
-  border-radius: 18px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.95) 0%, rgba(249, 245, 238, 0.92) 100%);
+  border-radius: 2px;
+  background: transparent;
+  transition:
+    border-color 0.18s ease,
+    background-color 0.18s ease;
+}
+
+.plugin-card:hover {
+  transform: none;
+  border-color: #d4c3ad;
+  background: rgba(18, 18, 20, 0.02);
+  box-shadow: none;
 }
 
 .plugin-card-head {
@@ -2656,15 +2702,15 @@ input {
 .memory-loading-card {
   padding: 12px 14px;
   border: 1px solid #e3d7cb;
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.9);
+  border-radius: 2px;
+  background: transparent;
   color: #544f48;
   font-size: 0.9rem;
 }
 
 .memory-alert.error {
   border-color: #f0cbc6;
-  background: #fff6f4;
+  background: transparent;
   color: #a14840;
 }
 
@@ -2681,9 +2727,9 @@ input {
   flex-direction: column;
   min-height: 0;
   border: 1px solid #e3d9ce;
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.92);
-  box-shadow: 0 12px 28px rgba(17, 17, 17, 0.04);
+  border-radius: 2px;
+  background: transparent;
+  box-shadow: none;
 }
 
 .memory-editor-head {
@@ -3318,8 +3364,9 @@ input {
 .message-hover-meta {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  min-height: 20px;
+  gap: 10px;
+  min-height: 24px;
+  flex-wrap: wrap;
   opacity: 0;
   transform: translateY(-3px);
   pointer-events: none;
@@ -3330,6 +3377,7 @@ input {
 
 .message-hover-meta.align-start {
   justify-content: flex-start;
+  align-self: flex-start;
 }
 
 .message-hover-meta.align-end {
@@ -3345,11 +3393,12 @@ input {
 }
 
 .message-hover-copy,
-.message-hover-time {
+.message-hover-time,
+.message-hover-stat {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 18px;
+  min-height: 22px;
   border: 0;
   background: transparent;
   box-shadow: none;
@@ -3385,17 +3434,22 @@ input {
 }
 
 .message-hover-copy-icon {
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
 }
 
-.message-hover-time {
+.message-hover-time,
+.message-hover-stat {
   padding: 0;
-  font-size: 0.72rem;
-  line-height: 1.1;
+  font-size: 0.8rem;
+  line-height: 1.15;
   font-family: inherit;
-  font-weight: 400;
+  font-weight: 500;
   letter-spacing: 0;
+}
+
+.message-hover-stat {
+  white-space: nowrap;
 }
 
 .trace-column {
@@ -6269,11 +6323,9 @@ input {
 
 .screen-shell[data-theme="coral"] .rail-nav-item.active,
 .screen-shell[data-theme="coral"] .settings-trigger.active {
-  background: linear-gradient(135deg, var(--theme-accent) 0%, var(--theme-accent-strong) 100%);
+  background: var(--theme-accent);
   color: var(--theme-accent-text);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.2),
-    0 16px 26px rgba(255, 94, 82, 0.24);
+  box-shadow: none;
 }
 
 .screen-shell[data-theme="coral"] .rail-nav-item.active small {
@@ -6424,8 +6476,8 @@ input {
 .screen-shell[data-theme="coral"] .drawer-card,
 .screen-shell[data-theme="coral"] .right-drawer {
   border-color: rgba(176, 132, 98, 0.18);
-  background: rgba(255, 250, 243, 0.88);
-  box-shadow: var(--theme-card-shadow);
+  background: transparent;
+  box-shadow: none;
 }
 
 .screen-shell[data-theme="coral"] .chat-session-loading-spinner {
@@ -7022,7 +7074,8 @@ input {
 }
 
 .screen-shell[data-theme="coral"] .message-hover-copy,
-.screen-shell[data-theme="coral"] .message-hover-time {
+.screen-shell[data-theme="coral"] .message-hover-time,
+.screen-shell[data-theme="coral"] .message-hover-stat {
   color: #7f6052;
 }
 

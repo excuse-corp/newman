@@ -27,6 +27,8 @@ EVENT_TYPES = [
     "scheduler_run_completed",
     "scheduler_run_skipped",
     "checkpoint_created",
+    "evolution_run_started",
+    "evolution_run_completed",
     "attachment_received",
     "attachment_processed",
     "turn_interrupted",

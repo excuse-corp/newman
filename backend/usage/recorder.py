@@ -27,6 +27,7 @@ def record_model_usage(
     context: ModelRequestContext,
     response: ProviderResponse,
 ) -> ModelUsageRecord:
+    total_tokens = response.usage.total_tokens or (response.usage.input_tokens + response.usage.output_tokens)
     record = ModelUsageRecord(
         request_id=uuid4().hex,
         session_id=context.session_id,
@@ -38,10 +39,10 @@ def record_model_usage(
         model=response.model or context.model_config.model,
         context_window=context.model_config.context_window,
         effective_context_window=context.model_config.effective_context_window,
-        usage_available=response.usage.total_tokens > 0,
+        usage_available=total_tokens > 0,
         input_tokens=response.usage.input_tokens,
         output_tokens=response.usage.output_tokens,
-        total_tokens=response.usage.total_tokens,
+        total_tokens=total_tokens,
         finish_reason=response.finish_reason,
         metadata=dict(context.metadata),
     )

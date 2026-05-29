@@ -12,7 +12,6 @@ from backend.runtime.message_rendering import get_original_user_content
 from backend.sessions.models import SessionMessage
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.discovery import BuiltinToolContext
-from backend.tools.provider_exposure import CORE_TOOL_GROUP
 from backend.tools.result import ToolExecutionResult
 
 _ATTACHMENT_KINDS = ["image", "document", "spreadsheet", "presentation", "text", "json", "html"]
@@ -67,7 +66,6 @@ class ParseAttachmentTool(BaseTool):
             risk_level="low",
             approval_behavior="safe",
             timeout_seconds=120,
-            provider_group=CORE_TOOL_GROUP,
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:

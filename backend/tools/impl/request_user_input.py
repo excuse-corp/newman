@@ -12,7 +12,6 @@ from backend.runtime.workflow_state import (
 )
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.discovery import BuiltinToolContext
-from backend.tools.provider_exposure import CORE_TOOL_GROUP
 from backend.tools.result import ToolExecutionResult
 
 
@@ -80,7 +79,6 @@ class RequestUserInputTool(BaseTool):
             risk_level="low",
             approval_behavior="safe",
             timeout_seconds=5,
-            provider_group=CORE_TOOL_GROUP,
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:

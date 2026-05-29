@@ -11,6 +11,8 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from backend.config.schema import AppConfig
+from backend.evolution.service import EvolutionService
+from backend.evolution.store import EvolutionStore
 from backend.hooks.hook_manager import HookManager
 from backend.mcp.registry import MCPRegistry
 from backend.memory.checkpoint_store import CheckpointStore
@@ -27,13 +29,13 @@ from backend.plugin_runtime.service import PluginService
 from backend.providers.base import ProviderError, ProviderResponse, TokenUsage, ToolCall, ToolCallDelta
 from backend.providers.multimodal import MultimodalAnalyzer
 from backend.providers.factory import build_provider
-from backend.rag.service import KnowledgeBaseService
 from backend.runtime.collaboration_mode import (
     PLAN_COLLABORATION_MODE,
     get_collaboration_mode,
     get_session_plan,
     is_tool_allowed_in_mode,
 )
+from backend.runtime.environment_context import build_environment_context
 from backend.runtime.feedback_writer import FeedbackWriter
 from backend.runtime.message_rendering import get_attachment_analysis, get_normalized_user_content, is_attachment_edit_request
 from backend.runtime.output_paths import (
@@ -71,14 +73,6 @@ from backend.tools.orchestrator import ToolOrchestrator
 from backend.tools.approval_policy import DEFAULT_TURN_APPROVAL_MODE, TurnApprovalMode
 from backend.tools.discovery import BuiltinToolContext, load_builtin_tools
 from backend.tools.permission_context import PermissionContext
-from backend.tools.provider_exposure import (
-    CORE_TOOL_GROUP,
-    EDITING_TOOL_GROUP,
-    EXECUTION_TOOL_GROUP,
-    KNOWLEDGE_TOOL_GROUP,
-    NETWORK_TOOL_GROUP,
-    infer_provider_tool_groups,
-)
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import ToolRouter, analyze_terminal_command
 from backend.tools.result import ToolExecutionResult
@@ -689,7 +683,7 @@ class NewmanRuntime:
     def __init__(self, settings: AppConfig):
         self.settings = settings
         self.provider = build_provider(settings.provider)
-        self.usage_store = PostgresModelUsageStore(settings.rag.postgres_dsn)
+        self.usage_store = PostgresModelUsageStore(settings.postgres_dsn)
         self.multimodal_analyzer = MultimodalAnalyzer(settings.models.multimodal, self.usage_store)
         self.session_store = SessionStore(settings.paths.sessions_dir)
         self.thread_manager = ThreadManager(self.session_store)
@@ -705,6 +699,7 @@ class NewmanRuntime:
             self.usage_store,
         )
         self._background_tasks: set[asyncio.Task] = set()
+        self._evolution_sessions_in_progress: set[str] = set()
         self.stable_context = StableContextLoader(settings.paths.memory_dir)
         self.prompt_assembler = PromptAssembler(self.stable_context)
         self.feedback_writer = FeedbackWriter()
@@ -715,6 +710,7 @@ class NewmanRuntime:
             settings.paths.data_dir / "plugin_state.json",
         )
         self.skill_registry = SkillRegistry(self.plugin_service, settings.paths.memory_dir)
+        self.evolution_store = EvolutionStore(settings.paths.evolution_dir)
         self.hook_manager = HookManager(self.plugin_service)
         self.mcp_registry = MCPRegistry(settings.paths.mcp_dir / "servers.yaml", workspace=settings.paths.workspace)
         self.scheduler_store = TaskStore(settings.paths.scheduler_dir / "tasks.json")
@@ -722,6 +718,19 @@ class NewmanRuntime:
         self.router = ToolRouter(self.registry, settings)
         self.orchestrator = ToolOrchestrator(settings, self.approvals)
         self.exec_sandbox: NativeSandbox | None = None
+        self.evolution_service = EvolutionService(
+            settings=settings,
+            provider=self.provider,
+            model_config=settings.provider,
+            provider_type=settings.provider.type,
+            session_store=self.session_store,
+            checkpoints=self.checkpoints,
+            plugin_service=self.plugin_service,
+            skill_registry=self.skill_registry,
+            store=self.evolution_store,
+            reload_ecosystem=self.reload_ecosystem,
+            usage_store=self.usage_store,
+        )
         self.reload_ecosystem()
 
     def close(self) -> None:
@@ -732,6 +741,11 @@ class NewmanRuntime:
         self.skill_registry.sync_snapshot()
         self.registry = self._build_registry(self.settings.paths.workspace)
         self.router = ToolRouter(self.registry, self.settings)
+        self.registry.sync_tool_snapshot(
+            spec_dir=self.settings.paths.data_dir / "tool_specs",
+            memory_dir=self.settings.paths.memory_dir,
+            permission_context=PermissionContext(),
+        )
 
     def _pending_user_input_reply_metadata(self, session_id: str) -> dict[str, object] | None:
         try:
@@ -741,20 +755,27 @@ class NewmanRuntime:
         return build_pending_user_input_reply_metadata(session)
 
     def _tools_overview(self, task: SessionTask | None = None) -> str:
-        overview = "\n\n".join(
-            section
-            for section in [
-                self.registry.describe(),
-                self._workspace_access_overview(task) if task is not None else self._workspace_access_overview(),
-            ]
-            if section
-        )
+        sections = []
+        workspace = self._workspace_access_overview(task) if task is not None else self._workspace_access_overview()
+        if workspace:
+            sections.append(workspace)
         resource_overview = self.mcp_registry.describe_resources()
         if resource_overview:
-            overview = f"{overview}\n\n## MCP Resources\n{resource_overview}"
-        return overview
+            sections.append(f"## MCP Resources\n{resource_overview}")
+        return "\n\n".join(sections)
 
-    def _visible_tools_overview(self, provider_tools: list[dict[str, object]], task: SessionTask | None = None) -> str:
+    def _resolve_tools_overview(self, task: SessionTask | None = None) -> str:
+        try:
+            return self._tools_overview(task)
+        except TypeError:
+            return self._tools_overview()
+
+    def _visible_tools_overview(
+        self,
+        provider_tools: list[dict[str, object]],
+        task: SessionTask | None = None,
+    ) -> str:
+        sections: list[str] = []
         tool_lines: list[str] = []
         for schema in provider_tools:
             if not isinstance(schema, dict):
@@ -762,36 +783,23 @@ class NewmanRuntime:
             function = schema.get("function")
             if not isinstance(function, dict):
                 continue
-            name = str(function.get("name", "")).strip()
-            if not name:
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
                 continue
-            description = str(function.get("description", "")).strip()
-            if description:
-                formatted_description = description.replace("\n", "\n  ")
-                tool_lines.append(f"- {name}: {formatted_description}")
+            description = function.get("description")
+            if isinstance(description, str) and description.strip():
+                tool_lines.append(f"- {name}: {description.strip()}")
             else:
                 tool_lines.append(f"- {name}")
-        tools_section = "\n".join(tool_lines) if tool_lines else "- No callable tools are available in this step."
-        workspace_access = ""
-        paths = getattr(getattr(self, "settings", None), "paths", None)
-        if getattr(paths, "workspace", None) is not None:
-            try:
-                workspace_access = self._workspace_access_overview(task) if task is not None else self._workspace_access_overview()
-            except Exception:
-                workspace_access = ""
-        overview = "\n\n".join(
-            section
-            for section in [
-                tools_section,
-                workspace_access,
-            ]
-            if section
-        )
-        describe_resources = getattr(getattr(self, "mcp_registry", None), "describe_resources", None)
-        resource_overview = describe_resources() if callable(describe_resources) else ""
+        if tool_lines:
+            sections.append("## Tooling Overview\n" + "\n".join(tool_lines))
+        workspace = self._workspace_access_overview(task) if task is not None else self._workspace_access_overview()
+        if workspace:
+            sections.append(workspace)
+        resource_overview = self.mcp_registry.describe_resources()
         if resource_overview:
-            overview = f"{overview}\n\n## MCP Resources\n{resource_overview}"
-        return overview
+            sections.append(f"## MCP Resources\n{resource_overview}")
+        return "\n\n".join(sections)
 
     def _workspace_access_overview(self, task: SessionTask | None = None) -> str:
         policy = build_path_access_policy(self.settings)
@@ -845,6 +853,9 @@ class NewmanRuntime:
         return turn_output_dir(self.settings.paths.workspace, task.session.session_id, task.turn_id)
 
     def schedule_previous_session_extraction(self, exclude_session_id: str) -> dict[str, object]:
+        return self.schedule_previous_session_evolution(exclude_session_id)
+
+    def schedule_previous_session_evolution(self, exclude_session_id: str) -> dict[str, object]:
         previous = self.session_store.latest(exclude_session_ids={exclude_session_id}, require_messages=True)
         if previous is None:
             return {
@@ -853,7 +864,67 @@ class NewmanRuntime:
                 "source_session_id": None,
                 "reason": "no_previous_session",
             }
-        return self.schedule_user_memory_extraction(previous.session_id, "new_session_created")
+        return self.schedule_evolution(previous.session_id, "new_session_created")
+
+    def schedule_turn_interval_evolution(self, session_id: str) -> dict[str, object]:
+        evolution_service = getattr(self, "evolution_service", None)
+        if evolution_service is None:
+            return {
+                "scheduled": False,
+                "trigger": "turn_interval",
+                "source_session_id": session_id,
+                "reason": "evolution_service_unavailable",
+            }
+        try:
+            session = self.session_store.get(session_id)
+        except FileNotFoundError:
+            return {
+                "scheduled": False,
+                "trigger": "turn_interval",
+                "source_session_id": session_id,
+                "reason": "session_not_found",
+            }
+        if not evolution_service.should_run_for_turn_interval(session):
+            return {
+                "scheduled": False,
+                "trigger": "turn_interval",
+                "source_session_id": session_id,
+                "reason": "turn_interval_not_reached",
+            }
+        return self.schedule_evolution(session_id, "turn_interval")
+
+    def schedule_evolution(self, session_id: str, trigger: str) -> dict[str, object]:
+        if not self.settings.evolution.enabled:
+            return {
+                "scheduled": False,
+                "trigger": trigger,
+                "source_session_id": session_id,
+                "reason": "evolution_disabled",
+            }
+        if self.settings.provider.type == "mock":
+            return {
+                "scheduled": False,
+                "trigger": trigger,
+                "source_session_id": session_id,
+                "reason": "mock_provider",
+            }
+        if session_id in self._evolution_sessions_in_progress:
+            return {
+                "scheduled": False,
+                "trigger": trigger,
+                "source_session_id": session_id,
+                "reason": "already_running",
+            }
+        self._evolution_sessions_in_progress.add(session_id)
+        task = asyncio.create_task(self._run_evolution(session_id, trigger))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return {
+            "scheduled": True,
+            "trigger": trigger,
+            "source_session_id": session_id,
+            "reason": "background_task_started",
+        }
 
     def schedule_user_memory_extraction(self, session_id: str, trigger: str) -> dict[str, object]:
         if self.settings.provider.type == "mock":
@@ -879,6 +950,14 @@ class NewmanRuntime:
         except Exception as exc:
             print(f"[memory] extraction failed for session {session_id} ({trigger}): {exc}")
 
+    async def _run_evolution(self, session_id: str, trigger: str) -> None:
+        try:
+            await self.evolution_service.run_for_session(session_id, trigger)  # type: ignore[arg-type]
+        except Exception as exc:
+            print(f"[evolution] run failed for session {session_id} ({trigger}): {exc}")
+        finally:
+            self._evolution_sessions_in_progress.discard(session_id)
+
     def _build_registry(self, workspace: Path) -> ToolRegistry:
         limits = ResourceLimits(
             timeout_seconds=self.settings.sandbox.timeout,
@@ -892,21 +971,14 @@ class NewmanRuntime:
             path_policy=path_policy,
         )
         self.exec_sandbox = sandbox
-        knowledge_base = KnowledgeBaseService(
-            self.settings.paths.knowledge_dir,
-            workspace,
-            self.settings.models,
-            self.settings.rag,
-            self.settings.paths.chroma_dir,
-            self.usage_store,
-        )
-        tool_context = BuiltinToolContext(
+        self.tool_context = BuiltinToolContext(
             path_policy=path_policy,
             sandbox=sandbox,
-            knowledge_base=knowledge_base,
             session_store=self.session_store,
             multimodal_analyzer=self.multimodal_analyzer,
+            scheduler_store=self.scheduler_store,
         )
+        tool_context = self.tool_context
         registry = ToolRegistry()
         for tool in load_builtin_tools(tool_context):
             registry.register(tool)
@@ -930,6 +1002,9 @@ class NewmanRuntime:
         self.reload_ecosystem()
         resolved_turn_id = turn_id or uuid4().hex
         extra_user_metadata = dict(user_metadata or {})
+        extra_user_metadata["environment_context"] = build_environment_context(
+            extra_user_metadata.get("environment_context")
+        )
         pending_reply = self._pending_user_input_reply_metadata(session_id)
         if pending_reply is not None:
             extra_user_metadata["responds_to_awaiting_user_input"] = pending_reply
@@ -969,7 +1044,7 @@ class NewmanRuntime:
                 provider_tools = self._provider_tools_for_turn(task)
             assembled = self._assemble_task_messages(
                 task,
-                tools_overview=self._visible_tools_overview(provider_tools, task),
+                tools_overview=self._resolve_tools_overview(task),
             )
 
             try:
@@ -1053,8 +1128,6 @@ class NewmanRuntime:
                     assistant_message,
                     finish_reason=decision.finish_reason,
                 )
-                if self.memory_extractor.looks_like_explicit_persistence_signal(content):
-                    self.schedule_user_memory_extraction(task.session.session_id, "explicit_user_request")
                 await self._emit_hooks(
                     "SessionEnd",
                     turn_emit,
@@ -2428,7 +2501,7 @@ class NewmanRuntime:
 
         assembled = self._assemble_task_messages(
             task,
-            tools_overview=self._visible_tools_overview([], task),
+            tools_overview=self._resolve_tools_overview(task),
         )
         try:
             response = await self._stream_provider_response(
@@ -2539,7 +2612,7 @@ class NewmanRuntime:
 
         assembled = self._assemble_task_messages(
             task,
-            tools_overview=self._visible_tools_overview([], task),
+            tools_overview=self._resolve_tools_overview(task),
         )
 
         finish_reason = "fatal_tool_error"
@@ -2968,23 +3041,9 @@ class NewmanRuntime:
         return getattr(provider, "type", None) == "openai_compatible"
 
     def _provider_tools_for_turn(self, task: SessionTask) -> list[dict[str, object]]:
-        user_content = self._current_turn_user_content(task.session, task.turn_id)
         mode = get_collaboration_mode(task.session).mode
         plan_missing = mode == PLAN_COLLABORATION_MODE and get_session_plan(task.session) is None
-        if mode == PLAN_COLLABORATION_MODE:
-            provider_tools = self.registry.tools_for_provider(
-                task.permission_context,
-                active_groups={
-                    CORE_TOOL_GROUP,
-                    EDITING_TOOL_GROUP,
-                    EXECUTION_TOOL_GROUP,
-                    KNOWLEDGE_TOOL_GROUP,
-                    NETWORK_TOOL_GROUP,
-                },
-            )
-        else:
-            active_groups = infer_provider_tool_groups(user_content)
-            provider_tools = self.registry.tools_for_provider(task.permission_context, active_groups=active_groups)
+        provider_tools = self.registry.tools_for_provider(task.permission_context)
         filtered_tools = [
             schema
             for schema in provider_tools
@@ -3356,6 +3415,10 @@ class NewmanRuntime:
             if isinstance(group_id, str) and group_id:
                 payload["group_id"] = group_id
             await emit("hook_triggered", payload)
+        if event == "SessionEnd":
+            session_id = data.get("session_id")
+            if isinstance(session_id, str) and session_id and hasattr(self, "evolution_service"):
+                self.schedule_turn_interval_evolution(session_id)
 
     async def _maybe_checkpoint(self, task: SessionTask, emit: EventEmitter) -> bool:
         assembled = self._assemble_task_messages(task)
@@ -3386,7 +3449,6 @@ class NewmanRuntime:
                 self._mark_compaction_failure(task, irreducible=True, reason="max_failures_reached")
                 return False
 
-        critical = context_usage.budget_pressure >= self.settings.runtime.context_critical_threshold
         preserve_recent = self.settings.runtime.context_compaction_preserve_recent
 
         original_count = len(task.session.messages)
@@ -3412,7 +3474,6 @@ class NewmanRuntime:
             projected_next_prompt_tokens = context_usage.projected_next_prompt_tokens
             auto_compact_limit = context_usage.auto_compact_limit
             hard_over_limit = projected_next_prompt_tokens >= auto_compact_limit
-            critical = context_usage.budget_pressure >= self.settings.runtime.context_critical_threshold
             if projected_next_prompt_tokens < context_usage.soft_compact_limit:
                 self._reset_compaction_state(task)
                 return True
@@ -3448,7 +3509,7 @@ class NewmanRuntime:
             metadata=build_checkpoint_metadata(
                 summary_result,
                 preserve_recent=preserve_recent,
-                compression_level="critical" if critical else "normal",
+                compression_level="automatic",
                 original_message_count=original_count,
                 archived_message_count=archived_message_count,
                 microcompact_count=microcompact_count,
@@ -3475,7 +3536,7 @@ class NewmanRuntime:
                 "session_id": task.session.session_id,
                 "checkpoint_id": checkpoint.checkpoint_id,
                 "summary": checkpoint.summary,
-                "compression_level": checkpoint.metadata.get("compression_level", "normal"),
+                "compression_level": checkpoint.metadata.get("compression_level", "automatic"),
                 "microcompact_count": microcompact_count,
             },
         )

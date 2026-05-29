@@ -44,6 +44,7 @@ config/
     user_template.md      # User Memory 模板
     memory_template.md    # Long-term Memory 模板
     skills_snapshot_template.md # Skills 快照初始化模板
+    tools_snapshot_template.md  # Tools 快照初始化模板
     error_feedback.md     # 运行时错误反馈模板
 ```
 
@@ -76,7 +77,13 @@ provider:
 runtime:
   max_tool_depth: 20
   context_compress_threshold: 0.85
-  context_critical_threshold: 0.92
+
+evolution:
+  enabled: true
+  turn_interval: 20
+  overlap_user_turns: 6
+  max_context_messages: 120
+  max_tool_output_chars: 2000
 
 sandbox:
   enabled: true
@@ -96,6 +103,12 @@ approval:
     - "process_spawn"
     - "terminal_mutation_or_unknown"
     - "danger_full_access_terminal"
+
+paths:
+  memory_dir: "backend_data/memory"
+  skills_dir: "skills"
+  plugins_dir: "plugins"
+  evolution_dir: "backend_data/evolution"
 ```
 
 ### 环境变量覆盖规则
@@ -106,6 +119,9 @@ NEWMAN_PROVIDER_MODEL=deepseek-chat
 
 NEWMAN_RUNTIME_MAX_TOOL_DEPTH=30
 → runtime.max_tool_depth = 30
+
+NEWMAN_EVOLUTION_ENABLED=false
+→ evolution.enabled = false
 ```
 
 ---
@@ -136,6 +152,7 @@ NEWMAN_RUNTIME_MAX_TOOL_DEPTH=30
 - Pydantic v2 Schema 校验
 - 历史 `provider.*` 到 `models.primary.*` 的兼容映射
 - Prompt 模板独立存放于 `backend/config/prompts/`
+- Evolution 配置项和 `paths.evolution_dir`
 - 启动日志输出最终生效配置及来源摘要
 
 当前说明：

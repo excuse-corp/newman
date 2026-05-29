@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Iterable
 
 import psycopg
@@ -37,6 +38,10 @@ CREATE INDEX IF NOT EXISTS idx_model_usage_turn_created_at
     ON model_usage_records(turn_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_model_usage_context_records
     ON model_usage_records(session_id, counts_toward_context_window, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_model_usage_created_at
+    ON model_usage_records(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_model_usage_model_created_at
+    ON model_usage_records(model, created_at DESC);
 """
 
 
@@ -104,6 +109,40 @@ class PostgresModelUsageStore:
                 LIMIT %s
                 """,
                 (session_id, limit),
+            )
+            rows = cur.fetchall()
+        return [self._record_from_row(row) for row in rows]
+
+    def list_records_window(
+        self,
+        *,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+    ) -> list[ModelUsageRecord]:
+        self.ensure_schema()
+        clauses: list[str] = []
+        params: list[object] = []
+        if start_at is not None:
+            clauses.append("created_at >= %s")
+            params.append(start_at)
+        if end_at is not None:
+            clauses.append("created_at < %s")
+            params.append(end_at)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    request_id, session_id, turn_id, request_kind,
+                    counts_toward_context_window, streaming,
+                    provider_type, model, context_window, effective_context_window,
+                    usage_available, input_tokens, output_tokens, total_tokens,
+                    finish_reason, created_at, metadata
+                FROM model_usage_records
+                {where_sql}
+                ORDER BY created_at DESC
+                """,
+                tuple(params),
             )
             rows = cur.fetchall()
         return [self._record_from_row(row) for row in rows]

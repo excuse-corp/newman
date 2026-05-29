@@ -22,7 +22,6 @@ class ToolMeta:
     force_user_confirmation: bool = False
     requires_approval: bool | None = None
     allowed_paths: list[str] | None = None
-    provider_group: str = "core"
     alias_of: str | None = None
 
     def __post_init__(self) -> None:
@@ -50,20 +49,11 @@ class BaseTool(ABC):
         return await self.run(arguments, session_id)
 
     def to_provider_schema(self) -> dict[str, Any]:
-        description = self.meta.description
-        if self.meta.allowed_paths:
-            allowed_paths = "\n".join(f"- {path}" for path in self.meta.allowed_paths)
-            description = (
-                f"{description}\n\n"
-                "Path access for this tool:\n"
-                "Use only paths under these allowed roots:\n"
-                f"{allowed_paths}"
-            )
         return {
             "type": "function",
             "function": {
                 "name": self.meta.name,
-                "description": description,
+                "description": self.meta.description,
                 "parameters": self.meta.input_schema,
             },
         }

@@ -82,6 +82,11 @@ def get_attachment_analysis(message: SessionMessage) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def get_environment_context(message: SessionMessage) -> dict[str, Any] | None:
+    payload = message.metadata.get("environment_context")
+    return payload if isinstance(payload, dict) else None
+
+
 def get_normalized_user_content(message: SessionMessage) -> str:
     attachment_analysis = get_attachment_analysis(message)
     if attachment_analysis and str(attachment_analysis.get("status") or "").strip() in {"completed", "partial"}:
@@ -122,16 +127,22 @@ def build_user_message_title(message: SessionMessage) -> str:
 
 def build_user_message_for_provider(message: SessionMessage) -> str:
     payload = get_attachment_analysis(message) or get_multimodal_parse(message)
+    environment_context = get_environment_context(message)
     attachments = _attachment_items(message)
     original = get_original_user_content(message).strip()
 
-    if not attachments and not payload:
+    if not attachments and not payload and not environment_context:
         return message.content
 
     lines = [
         "## User Original Request",
         original or _EMPTY_USER_TEXT,
     ]
+
+    runtime_context_lines = _runtime_context_lines(environment_context)
+    if runtime_context_lines:
+        lines.extend(["", "## Runtime Context"])
+        lines.extend(runtime_context_lines)
 
     if attachments:
         lines.extend(["", "## Uploaded Attachments"])
@@ -209,6 +220,42 @@ def build_user_message_for_provider(message: SessionMessage) -> str:
     if frontend_message:
         lines.append(f"- Detail: {frontend_message}")
     return "\n".join(lines)
+
+
+def _runtime_context_lines(environment_context: dict[str, Any] | None) -> list[str]:
+    if not isinstance(environment_context, dict):
+        return []
+    lines: list[str] = []
+    time_context = environment_context.get("time")
+    if isinstance(time_context, dict):
+        server_time = str(time_context.get("server_received_at_utc") or "").strip()
+        client_timezone = str(time_context.get("client_timezone") or "").strip()
+        client_local_now = str(time_context.get("client_local_now") or "").strip()
+        if server_time:
+            lines.append(f"- Server received at (UTC): {server_time}")
+        if client_local_now and client_timezone:
+            lines.append(f"- Client local time: {client_local_now} ({client_timezone})")
+        elif client_local_now:
+            lines.append(f"- Client local time: {client_local_now}")
+        elif client_timezone:
+            lines.append(f"- Client timezone: {client_timezone}")
+        clock_skew = time_context.get("clock_skew_seconds")
+        if isinstance(clock_skew, int | float):
+            lines.append(f"- Client/server clock skew: {int(clock_skew)} seconds")
+
+    location_context = environment_context.get("location")
+    if isinstance(location_context, dict):
+        city = str(location_context.get("city") or "").strip()
+        if city:
+            source = str(location_context.get("source") or "").strip()
+            precision = str(location_context.get("precision") or "").strip()
+            detail_bits = [item for item in (source, precision) if item]
+            detail = f" ({', '.join(detail_bits)})" if detail_bits else ""
+            lines.append(f"- Approximate city: {city}{detail}")
+        captured_at = str(location_context.get("captured_at_utc") or "").strip()
+        if captured_at:
+            lines.append(f"- Location captured at (UTC): {captured_at}")
+    return lines
 
 
 def _attachment_items(message: SessionMessage) -> list[dict[str, Any]]:

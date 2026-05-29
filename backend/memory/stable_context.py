@@ -5,13 +5,17 @@ from pathlib import Path
 MEMORY_FILES = {
     "newman": "Newman.md",
     "user": "USER.md",
+    "memory": "MEMORY.md",
     "skills": "SKILLS_SNAPSHOT.md",
+    "tools": "TOOLS_SNAPSHOT.md",
 }
 
 MEMORY_TEMPLATES = {
     "newman": "newman_template.md",
     "user": "user_template.md",
+    "memory": "memory_template.md",
     "skills": "skills_snapshot_template.md",
+    "tools": "tools_snapshot_template.md",
 }
 
 
@@ -40,13 +44,15 @@ class StableContextLoader:
             for key, filename in MEMORY_FILES.items()
         }
 
-    def build(self, tools_overview: str) -> str:
+    def build(self, tools_overview: str = "") -> str:
         context = self.load()
-        return "\n\n".join(
-            [
-                context["newman"],
-                context["user"],
-                context["skills"],
-                f"## Tooling Overview\n{tools_overview}",
-            ]
-        )
+        sections = [
+            context["newman"],
+            context["user"],
+            context["memory"],
+            context["skills"],
+            context["tools"],
+        ]
+        if tools_overview:
+            sections.append(f"## Tooling Overview\n{tools_overview}")
+        return "\n\n".join(sections)

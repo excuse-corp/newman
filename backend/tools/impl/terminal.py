@@ -10,7 +10,6 @@ from typing import Any
 from backend.sandbox.native_sandbox import NativeSandbox
 from backend.tools.base import BaseTool, ToolMeta, ToolOutputEmitter
 from backend.tools.discovery import BuiltinToolContext
-from backend.tools.provider_exposure import EXECUTION_TOOL_GROUP
 from backend.tools.router import analyze_terminal_command
 from backend.tools.result import ToolExecutionResult
 from backend.tools.workspace_fs import (
@@ -50,7 +49,6 @@ class TerminalTool(BaseTool):
             risk_level="high",
             timeout_seconds=sandbox.limits.timeout_seconds,
             approval_behavior="confirmable",
-            provider_group=EXECUTION_TOOL_GROUP,
             allowed_paths=allowed or None,
         )
 

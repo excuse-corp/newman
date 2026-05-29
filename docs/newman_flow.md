@@ -33,11 +33,13 @@ NewmanRuntime
 ├── session_store            # Session 持久化存储
 ├── thread_manager           # 会话生命周期管理
 ├── checkpoints              # 上下文压缩 checkpoint 存储
-├── memory_extractor         # 用户记忆提取器
-├── stable_context           # 稳定上下文加载器（Newman.md / USER.md / SKILLS_SNAPSHOT.md）
+├── memory_extractor         # 用户偏好提取器（兼容旧 USER.md 流程）
+├── stable_context           # 稳定上下文加载器（Newman.md / USER.md / MEMORY.md / SKILLS_SNAPSHOT.md / TOOLS_SNAPSHOT.md）
 ├── prompt_assembler         # Prompt 拼装器
 ├── plugin_service           # 插件服务
 ├── skill_registry           # 技能注册表
+├── evolution_store          # 自进化运行记录、快照与事件日志
+├── evolution_service        # 自进化分析、应用、验证与回滚
 ├── hook_manager             # 钩子管理器
 ├── mcp_registry             # MCP 服务器注册表
 ├── registry                 # 工具注册表（ToolRegistry）
@@ -100,9 +102,11 @@ POST /api/sessions
 ThreadManager.create_or_restore()
         │
         ├── 新建 → SessionStore.create() → 返回 session_id
-        │           └── schedule_previous_session_extraction()  # 后台提取上一个会话的记忆
+        │           └── schedule_previous_session_evolution()  # 后台总结上一个会话并自动进化
         └── 恢复 → SessionStore.get(session_id)
 ```
+
+自进化不会阻塞创建会话响应。`mock` provider 下会跳过调度。
 
 ### 3.2 发送消息（核心入口）
 
@@ -376,6 +380,7 @@ RunLoop 结束的 7 种方式：
 
 1. finalize（正常结束）
    └── LLM 返回有效最终回答 → emit("answer_complete") → emit("SessionEnd")
+                                      └── 达到 20 个 user turn 时后台 schedule_evolution("turn_interval")
 
 2. finalize_blocked（收口被拦截）
    └── LLM 连续返回无效回答 → 输出阻塞信息
@@ -433,6 +438,7 @@ SessionRecord
 - Session 文件：`backend_data/sessions/{date}_{session_id}.json`
 - 审计日志：`backend_data/audit/{session_id}.log`（每行一个 JSON 事件）
 - Checkpoint：与 session 同目录，压缩后的上下文摘要
+- Evolution：`backend_data/evolution/runs/*.json`、`snapshots/`、`events.jsonl`
 
 ### 8.3 上下文压缩
 
@@ -524,7 +530,53 @@ LLM 看到：
 
 ---
 
-## 十一、完整时序图
+## 十一、自进化
+
+### 11.1 触发点
+
+```
+新建 session
+  └── schedule_previous_session_evolution()
+        └── 后台总结上一个非空 session
+
+SessionEnd
+  └── 当前 session 用户 turn 数距离上次 evolution >= 20
+        └── schedule_evolution(trigger="turn_interval")
+```
+
+### 11.2 执行链路
+
+```
+EvolutionService.run_for_session()
+        │
+        ├── 构造 EvolutionContext
+        │   ├── trigger / session 元数据
+        │   ├── checkpoint summary
+        │   ├── 上次 evolution 后的消息 + 少量重叠上下文
+        │   ├── MEMORY.md / USER.md
+        │   ├── 最近 evolution run 摘要
+        │   └── skill 列表
+        │
+        ├── LLM 分析
+        │   ├── memory_updates
+        │   └── skill_update_requests
+        │
+        ├── 自动写 MEMORY.md
+        │
+        ├── 对每个 skill 读取目录文本文件
+        │   └── LLM 输出 file_operations
+        │
+        ├── 保存快照并应用文件操作
+        ├── parse / py_compile / reload_ecosystem 验证
+        ├── 失败自动回滚
+        └── 写入 backend_data/evolution/runs/{run_id}.json
+```
+
+自进化不走工具审批，也不让模型直接调用工具改文件。模型只输出结构化计划和文件操作，真正落盘、验证、回滚由后端确定性执行。
+
+---
+
+## 十二、完整时序图
 
 ```
 用户                  前端                 API                 RunLoop              LLM               工具/沙箱

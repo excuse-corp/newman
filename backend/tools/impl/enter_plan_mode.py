@@ -5,7 +5,6 @@ from typing import Any
 from backend.runtime.collaboration_mode import PLAN_COLLABORATION_MODE, build_collaboration_mode_payload
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.discovery import BuiltinToolContext
-from backend.tools.provider_exposure import CORE_TOOL_GROUP
 from backend.tools.result import ToolExecutionResult
 
 
@@ -28,7 +27,6 @@ class EnterPlanModeTool(BaseTool):
             approval_behavior="confirmable",
             force_user_confirmation=True,
             timeout_seconds=5,
-            provider_group=CORE_TOOL_GROUP,
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:

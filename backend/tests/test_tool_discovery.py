@@ -70,7 +70,6 @@ class ToolDiscoveryTests(unittest.TestCase):
                 context = BuiltinToolContext(
                     path_policy=policy,
                     sandbox=SimpleNamespace(limits=SimpleNamespace(timeout_seconds=30), execute_shell=None),
-                    knowledge_base=SimpleNamespace(),
                     session_store=None,
                     multimodal_analyzer=None,
                 )

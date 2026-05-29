@@ -51,8 +51,8 @@ class UpdatePlanDraftRequest(BaseModel):
 async def create_session(payload: CreateSessionRequest, request: Request):
     runtime = request.app.state.runtime
     session, created = runtime.thread_manager.create_or_restore(title=payload.title)
-    memory_extraction = (
-        runtime.schedule_previous_session_extraction(session.session_id)
+    evolution = (
+        runtime.schedule_previous_session_evolution(session.session_id)
         if created
         else {
             "scheduled": False,
@@ -65,7 +65,7 @@ async def create_session(payload: CreateSessionRequest, request: Request):
         "session_id": session.session_id,
         "title": session.title,
         "created": created,
-        "memory_extraction": memory_extraction,
+        "evolution": evolution,
     }
 
 
@@ -76,8 +76,8 @@ async def create_session_stream(payload: CreateSessionRequest, request: Request)
 
     async def event_stream():
         session, created = runtime.thread_manager.create_or_restore(title=payload.title)
-        memory_extraction = (
-            runtime.schedule_previous_session_extraction(session.session_id)
+        evolution = (
+            runtime.schedule_previous_session_evolution(session.session_id)
             if created
             else {
                 "scheduled": False,
@@ -90,7 +90,7 @@ async def create_session_stream(payload: CreateSessionRequest, request: Request)
             "session_id": session.session_id,
             "title": session.title,
             "created": created,
-            "memory_extraction": memory_extraction,
+            "evolution": evolution,
         }
         yield format_sse("session_created", data, request_id=request_id)
 

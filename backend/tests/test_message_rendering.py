@@ -11,6 +11,38 @@ class MessageRenderingTests(unittest.TestCase):
         self.assertTrue(is_attachment_edit_request("把这份表里新增一行，并回写文件"))
         self.assertFalse(is_attachment_edit_request("总结一下这个附件讲了什么"))
 
+    def test_renders_runtime_context_for_plain_user_message(self) -> None:
+        message = SessionMessage(
+            id="user-ctx-1",
+            role="user",
+            content="现在几点，今天适合安排会议吗？",
+            metadata={
+                "original_content": "现在几点，今天适合安排会议吗？",
+                "environment_context": {
+                    "time": {
+                        "server_received_at_utc": "2026-05-27T08:12:31+00:00",
+                        "client_timezone": "Asia/Shanghai",
+                        "client_local_now": "2026-05-27T16:12:29+08:00",
+                        "clock_skew_seconds": -2,
+                    },
+                    "location": {
+                        "city": "Shanghai",
+                        "source": "browser_geolocation",
+                        "precision": "city",
+                        "captured_at_utc": "2026-05-27T08:00:00+00:00",
+                    },
+                },
+            },
+        )
+
+        rendered = build_user_message_for_provider(message)
+
+        self.assertIn("## Runtime Context", rendered)
+        self.assertIn("Server received at (UTC): 2026-05-27T08:12:31+00:00", rendered)
+        self.assertIn("Client local time: 2026-05-27T16:12:29+08:00 (Asia/Shanghai)", rendered)
+        self.assertIn("Client/server clock skew: -2 seconds", rendered)
+        self.assertIn("Approximate city: Shanghai (browser_geolocation, city)", rendered)
+
     def test_attachment_editing_prompt_prefers_skill_over_parse_tool(self) -> None:
         message = SessionMessage(
             id="user-1",

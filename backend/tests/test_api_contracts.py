@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import json
 import os
 import sys
@@ -12,7 +13,8 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 fake_psycopg = types.ModuleType("psycopg")
 fake_psycopg.connect = lambda *args, **kwargs: None
@@ -21,34 +23,10 @@ fake_rows.dict_row = object()
 fake_types = types.ModuleType("psycopg.types")
 fake_json = types.ModuleType("psycopg.types.json")
 fake_json.Jsonb = lambda value: value
-fake_chromadb = types.ModuleType("chromadb")
-
-
-class _FakeCollection:
-    def upsert(self, *args, **kwargs):
-        return None
-
-    def delete(self, *args, **kwargs):
-        return None
-
-    def query(self, *args, **kwargs):
-        return {"ids": [[]], "distances": [[]], "metadatas": [[]], "documents": [[]]}
-
-
-class _FakePersistentClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def get_or_create_collection(self, *args, **kwargs):
-        return _FakeCollection()
-
-
-fake_chromadb.PersistentClient = _FakePersistentClient
 sys.modules.setdefault("psycopg", fake_psycopg)
 sys.modules.setdefault("psycopg.rows", fake_rows)
 sys.modules.setdefault("psycopg.types", fake_types)
 sys.modules.setdefault("psycopg.types.json", fake_json)
-sys.modules.setdefault("chromadb", fake_chromadb)
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -57,18 +35,18 @@ from starlette.datastructures import UploadFile
 from backend.api.middleware.error_handler import install_error_handlers
 from backend.api.routes.approvals import router as approvals_router
 from backend.api.routes.config import router as config_router
-from backend.api.routes.knowledge import router as knowledge_router
 from backend.api.routes.messages import ActiveSessionRun, router as messages_router, send_message
 from backend.api.routes.plugins import router as plugins_router
+from backend.api.routes.runtime_location import router as runtime_location_router
 from backend.api.routes.sessions import router as sessions_router
 from backend.api.routes.skills import router as skills_router
 from backend.api.routes.tools import router as tools_router
+from backend.api.routes.usage import router as usage_router
 from backend.api.routes.workspace import router as workspace_router
 from backend.config.schema import AppConfig
 from backend.config.loader import reload_settings
 from backend.plugin_runtime.service import PluginService
 from backend.providers.base import ProviderError
-from backend.rag.models import KnowledgeDocument
 from backend.sessions.models import SessionMessage
 from backend.sessions.session_store import SessionStore
 from backend.skill_runtime.registry import SkillRegistry
@@ -79,6 +57,7 @@ from backend.tools.impl.parse_attachment import ParseAttachmentTool
 from backend.tools.impl.read_file import ReadFileTool
 from backend.tools.result import ToolExecutionResult
 from backend.tools.workspace_fs import PathAccessPolicy
+from backend.usage.models import ModelUsageRecord
 
 
 class _DummySessionStore:
@@ -284,6 +263,34 @@ class _DummyMCPRegistry:
         return []
 
 
+class _DummyUsageStore:
+    def __init__(self, records: list[ModelUsageRecord]):
+        self.records = records
+
+    def list_records_window(self, *, start_at=None, end_at=None) -> list[ModelUsageRecord]:
+        def in_window(record: ModelUsageRecord) -> bool:
+            created_at = datetime.fromisoformat(record.created_at)
+            if start_at is not None and created_at < start_at:
+                return False
+            if end_at is not None and created_at >= end_at:
+                return False
+            return True
+
+        return sorted(
+            [record for record in self.records if in_window(record)],
+            key=lambda record: record.created_at,
+            reverse=True,
+        )
+
+
+class _DummySessionSummaryStore:
+    def __init__(self, items):
+        self._items = items
+
+    def list(self):
+        return list(self._items)
+
+
 class _DummyContextProvider:
     async def chat(self, messages, tools=None, **kwargs):
         raise AssertionError("chat should not be called in this test")
@@ -377,6 +384,36 @@ class MessageRouteTests(unittest.TestCase):
             self.assertEqual(runtime.calls[0]["turn_approval_mode"], "auto_allow")
             self.assertEqual(runtime.calls[0]["user_metadata"]["approval_mode"], "auto_allow")
 
+    def test_messages_json_parses_environment_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = _DummyMessageRuntime()
+            settings = SimpleNamespace(paths=SimpleNamespace(audit_dir=root / "audit", data_dir=root / "data"))
+            client = TestClient(_build_app(messages_router, runtime=runtime, settings=settings))
+
+            response = client.post(
+                "/api/sessions/session-1/messages",
+                json={
+                    "content": "hello",
+                    "environment_context": {
+                        "time": {
+                            "client_timezone": "Asia/Shanghai",
+                            "client_local_now": "2026-05-27T16:12:29+08:00",
+                        },
+                        "location": {
+                            "city": "Shanghai",
+                            "source": "browser_geolocation",
+                            "precision": "city",
+                        },
+                    },
+                },
+            )
+
+            self.assertEqual(response.status_code, 200)
+            environment_context = runtime.calls[0]["user_metadata"]["environment_context"]
+            self.assertEqual(environment_context["time"]["client_timezone"], "Asia/Shanghai")
+            self.assertEqual(environment_context["location"]["city"], "Shanghai")
+
     def test_messages_form_defaults_approval_mode_to_manual(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -392,6 +429,38 @@ class MessageRouteTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(runtime.calls[0]["turn_approval_mode"], "manual")
             self.assertEqual(runtime.calls[0]["user_metadata"]["approval_mode"], "manual")
+
+    def test_messages_form_parses_environment_context_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = _DummyMessageRuntime()
+            settings = SimpleNamespace(paths=SimpleNamespace(audit_dir=root / "audit", data_dir=root / "data"))
+            client = TestClient(_build_app(messages_router, runtime=runtime, settings=settings))
+
+            response = client.post(
+                "/api/sessions/session-1/messages",
+                data={
+                    "content": "hello from form",
+                    "environment_context": json.dumps(
+                        {
+                            "time": {
+                                "client_timezone": "Asia/Shanghai",
+                                "client_local_now": "2026-05-27T16:12:29+08:00",
+                            },
+                            "location": {
+                                "city": "Shanghai",
+                                "source": "browser_geolocation",
+                                "precision": "city",
+                            },
+                        }
+                    ),
+                },
+            )
+
+            self.assertEqual(response.status_code, 200)
+            environment_context = runtime.calls[0]["user_metadata"]["environment_context"]
+            self.assertEqual(environment_context["time"]["client_local_now"], "2026-05-27T16:12:29+08:00")
+            self.assertEqual(environment_context["location"]["source"], "browser_geolocation")
 
     def test_messages_with_image_registers_metadata_without_eager_parse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -544,7 +613,6 @@ class MessageRouteTests(unittest.TestCase):
             context = BuiltinToolContext(
                 path_policy=path_policy,
                 sandbox=SimpleNamespace(limits=SimpleNamespace(timeout_seconds=30), execute_shell=None),
-                knowledge_base=SimpleNamespace(),
                 session_store=session_store,
                 multimodal_analyzer=_DummyMultimodalAnalyzer(),
             )
@@ -674,6 +742,38 @@ class MessageRouteTests(unittest.TestCase):
             queued_payload = json.loads(event_queue.get_nowait().decode("utf-8").removeprefix("data: ").strip())
             self.assertEqual(queued_payload["event"], "turn_interrupted")
             self.assertEqual(queued_payload["data"]["turn_id"], turn_id)
+
+
+class RuntimeLocationRouteTests(unittest.TestCase):
+    def test_resolve_location_returns_city(self) -> None:
+        client = TestClient(_build_app(runtime_location_router))
+
+        with patch("backend.api.routes.runtime_location._reverse_geocode_city", new=AsyncMock(return_value="Shanghai")):
+            response = client.post(
+                "/api/runtime/location/resolve",
+                json={"latitude": 31.2304, "longitude": 121.4737},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["resolved"])
+        self.assertEqual(payload["city"], "Shanghai")
+        self.assertEqual(payload["source"], "browser_geolocation")
+        self.assertEqual(payload["precision"], "city")
+
+    def test_resolve_location_returns_unresolved_payload_when_lookup_fails(self) -> None:
+        client = TestClient(_build_app(runtime_location_router))
+
+        with patch("backend.api.routes.runtime_location._reverse_geocode_city", new=AsyncMock(return_value=None)):
+            response = client.post(
+                "/api/runtime/location/resolve",
+                json={"latitude": 31.2304, "longitude": 121.4737},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["resolved"])
+        self.assertIsNone(payload["city"])
 
 
 class ApprovalRouteTests(unittest.TestCase):
@@ -1239,35 +1339,6 @@ class WorkspaceRouteTests(unittest.TestCase):
             self.assertEqual(response.text, "hello attachment")
 
 
-class KnowledgeRouteTests(unittest.TestCase):
-    def test_document_detail_returns_preview_markdown(self) -> None:
-        document = KnowledgeDocument(
-            document_id="doc-1",
-            title="demo.md",
-            source_path="/tmp/demo.md",
-            stored_path="/tmp/stored-demo.md",
-            size_bytes=128,
-            content_type="text/markdown",
-            parser="markdown",
-            chunk_count=3,
-            page_count=None,
-        )
-        service = SimpleNamespace(
-            get_document=lambda document_id: document if document_id == "doc-1" else None,
-            build_document_preview=lambda document_id: "# demo.md\n\npreview",
-        )
-
-        with patch("backend.api.routes.knowledge._service", return_value=service):
-            client = TestClient(_build_app(knowledge_router, settings=SimpleNamespace()))
-
-            response = client.get("/api/knowledge/documents/doc-1")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["document"]["document_id"], "doc-1")
-        self.assertIn("preview", payload["preview_markdown"])
-
-
 class SessionRouteTests(unittest.TestCase):
     def test_session_detail_returns_collaboration_mode_and_plans(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1377,6 +1448,123 @@ class SessionEventsRouteTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["events"], [])
+
+
+class UsageRouteTests(unittest.TestCase):
+    def test_usage_summary_aggregates_actual_usage_and_missing_records(self) -> None:
+        today_key = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        records = [
+            ModelUsageRecord(
+                request_id="u1",
+                session_id="session-a",
+                turn_id="turn-1",
+                request_kind="session_turn",
+                streaming=True,
+                provider_type="openai_compatible",
+                model="gpt-5",
+                usage_available=True,
+                input_tokens=120,
+                output_tokens=30,
+                total_tokens=150,
+                created_at=f"{today_key}T10:00:00+08:00",
+            ),
+            ModelUsageRecord(
+                request_id="u2",
+                session_id="session-a",
+                turn_id="turn-2",
+                request_kind="memory_extraction",
+                streaming=False,
+                provider_type="openai_compatible",
+                model="gpt-5",
+                usage_available=True,
+                input_tokens=40,
+                output_tokens=10,
+                total_tokens=50,
+                created_at=f"{today_key}T11:00:00+08:00",
+            ),
+            ModelUsageRecord(
+                request_id="u3",
+                session_id="session-b",
+                turn_id="turn-3",
+                request_kind="session_turn",
+                streaming=True,
+                provider_type="anthropic_compatible",
+                model="claude-sonnet-4.5",
+                usage_available=False,
+                input_tokens=0,
+                output_tokens=0,
+                total_tokens=0,
+                created_at=f"{today_key}T12:00:00+08:00",
+            ),
+        ]
+        runtime = SimpleNamespace(
+            usage_store=_DummyUsageStore(records),
+            session_store=_DummySessionSummaryStore(
+                [
+                    SimpleNamespace(session_id="session-a", title="合同审查"),
+                    SimpleNamespace(session_id="session-b", title="日报总结"),
+                ]
+            ),
+        )
+        client = TestClient(_build_app(usage_router, runtime=runtime))
+
+        response = client.get("/api/usage/summary?days=1&tz=Asia/Shanghai")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["totals"]["request_count"], 2)
+        self.assertEqual(payload["totals"]["total_tokens"], 200)
+        self.assertEqual(payload["totals"]["usage_missing_count"], 1)
+        self.assertEqual(payload["by_model"][0]["model"], "gpt-5")
+        self.assertEqual(payload["by_session"][0]["session_title"], "合同审查")
+        self.assertEqual(payload["recent_records"][0]["session_title"], "日报总结")
+
+    def test_usage_summary_filters_model(self) -> None:
+        today_key = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        records = [
+            ModelUsageRecord(
+                request_id="u1",
+                session_id="session-a",
+                request_kind="session_turn",
+                streaming=True,
+                provider_type="openai_compatible",
+                model="gpt-5",
+                usage_available=True,
+                input_tokens=100,
+                output_tokens=20,
+                total_tokens=120,
+                created_at=f"{today_key}T09:00:00+08:00",
+            ),
+            ModelUsageRecord(
+                request_id="u2",
+                session_id="session-b",
+                request_kind="session_turn",
+                streaming=True,
+                provider_type="openai_compatible",
+                model="minimax-m2.5",
+                usage_available=True,
+                input_tokens=80,
+                output_tokens=10,
+                total_tokens=90,
+                created_at=f"{today_key}T10:00:00+08:00",
+            ),
+        ]
+        runtime = SimpleNamespace(
+            usage_store=_DummyUsageStore(records),
+            session_store=_DummySessionSummaryStore([]),
+        )
+        client = TestClient(_build_app(usage_router, runtime=runtime))
+
+        response = client.get("/api/usage/summary?days=1&tz=Asia/Shanghai&model=gpt-5")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["filters"]["model"], "gpt-5")
+        self.assertEqual(payload["totals"]["total_tokens"], 120)
+        self.assertEqual(len(payload["by_model"]), 1)
+        self.assertEqual(payload["by_model"][0]["model"], "gpt-5")
+        self.assertIn("minimax-m2.5", payload["available_models"])
 
 
 if __name__ == "__main__":
