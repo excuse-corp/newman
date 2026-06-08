@@ -97,10 +97,7 @@ def _build_plugin_detail(runtime, plugin_name: str) -> dict:
     plugin = runtime.plugin_service.get_plugin(plugin_name)
     record = runtime.plugin_service.plugin_record(plugin_name)
     manifest_content = runtime.plugin_service.read_plugin_manifest_content(plugin_name)
-    tool_names = sorted(
-        tool.meta.name
-        for tool in runtime.mcp_registry.build_tools(plugin.manifest.mcp_servers)
-    )
+    tool_names = _plugin_mcp_tool_names(runtime, plugin.manifest.mcp_servers, enabled=record.enabled)
     hook_handlers = [
         {
             "event": hook.event,
@@ -122,3 +119,28 @@ def _build_plugin_detail(runtime, plugin_name: str) -> dict:
         "tool_names": tool_names,
         "available": True,
     }
+
+
+def _plugin_mcp_tool_names(runtime, mcp_servers: list[dict], *, enabled: bool) -> list[str]:
+    if not enabled:
+        return []
+    server_names = {
+        server.get("name")
+        for server in mcp_servers
+        if isinstance(server, dict) and isinstance(server.get("name"), str)
+    }
+    if not server_names:
+        return []
+    registry = getattr(runtime, "registry", None)
+    list_tools = getattr(registry, "list_tools", None)
+    if not callable(list_tools):
+        return []
+    names: list[str] = []
+    for tool in list_tools():
+        meta = getattr(tool, "meta", None)
+        name = getattr(meta, "name", None)
+        if not isinstance(name, str):
+            continue
+        if any(name.startswith(f"mcp__{server_name}__") for server_name in server_names):
+            names.append(name)
+    return sorted(names)

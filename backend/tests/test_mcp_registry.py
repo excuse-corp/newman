@@ -12,6 +12,9 @@ from pathlib import Path
 
 from backend.mcp.models import MCPResourceSpec, MCPServerConfig, MCPToolSpec
 from backend.mcp.registry import MCPRegistry
+from backend.sessions.session_store import SessionStore
+from backend.tools.discovery import BuiltinToolContext
+from backend.tools.impl.activate_mcp_tool import ACTIVE_MCP_TOOLS_METADATA_KEY, ActivateMCPTool
 
 
 class _JsonMCPHandler(BaseHTTPRequestHandler):
@@ -186,6 +189,17 @@ class MCPRegistryTests(unittest.TestCase):
             self.assertEqual(status.tool_count, 1)
             self.assertEqual(status.resource_count, 1)
             self.assertIn("inline-context", registry.describe_resources())
+            snapshot_dir = Path(tmp) / "snapshots" / "inline-demo"
+            self.assertTrue((snapshot_dir / "SERVER.md").exists())
+            self.assertTrue((snapshot_dir / "TOOLS_SNAPSHOT.md").exists())
+            snapshot_text = (snapshot_dir / "TOOLS_SNAPSHOT.md").read_text(encoding="utf-8")
+            self.assertIn("activate_mcp_tool", snapshot_text)
+            self.assertIn("echo_inline", snapshot_text)
+            self.assertIn("mcp__inline-demo__echo_inline", snapshot_text)
+            self.assertEqual(registry.mcp_tool_name("inline-demo", "echo_inline"), "mcp__inline-demo__echo_inline")
+            overview = registry.describe_tool_snapshots()
+            self.assertIn(str(snapshot_dir / "TOOLS_SNAPSHOT.md"), overview)
+            self.assertIn("Inline echo", overview)
             self.assertTrue(result.success)
             registry.close()
 
@@ -396,6 +410,48 @@ class MCPRegistryTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
+
+    def test_activate_mcp_tool_records_session_metadata_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = MCPRegistry(root / "servers.yaml")
+            registry.upsert_server(
+                MCPServerConfig(
+                    name="inline-demo",
+                    transport="inline",
+                    tools=[
+                        MCPToolSpec(
+                            name="echo_inline",
+                            description="Inline echo",
+                            input_schema={"type": "object", "properties": {}},
+                            risk_level="low",
+                        )
+                    ],
+                )
+            )
+            registry.build_tools()
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create("activate mcp")
+            session.metadata[ACTIVE_MCP_TOOLS_METADATA_KEY] = ["mcp__existing__tool"]
+            session_store.save(session)
+            tool = ActivateMCPTool(
+                BuiltinToolContext(
+                    path_policy=None,
+                    sandbox=None,
+                    session_store=session_store,
+                    mcp_registry=registry,
+                )
+            )
+
+            result = asyncio.run(
+                tool.run({"server": "inline-demo", "tool": "echo_inline"}, session.session_id)
+            )
+
+            self.assertTrue(result.success)
+            self.assertEqual(
+                result.metadata["session_metadata_updates"][ACTIVE_MCP_TOOLS_METADATA_KEY],
+                ["mcp__existing__tool", "mcp__inline-demo__echo_inline"],
+            )
 
 
 if __name__ == "__main__":

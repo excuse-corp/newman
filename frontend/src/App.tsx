@@ -7983,6 +7983,28 @@ ${markup}
     }
   };
 
+  const deletePlugin = async (plugin: PluginRecord) => {
+    if (!window.confirm(`确认删除插件「${plugin.name}」吗？`)) {
+      return;
+    }
+
+    setPluginBusyName(plugin.name);
+    setPluginsError(null);
+    setPluginsNotice(null);
+
+    try {
+      await fetchJson<{ deleted: boolean; plugin_name: string }>(`${apiBase}/api/plugins/${encodeURIComponent(plugin.name)}`, {
+        method: "DELETE"
+      });
+      setPlugins((currentPlugins) => currentPlugins.filter((item) => item.name !== plugin.name));
+      setPluginsNotice(`已删除 ${plugin.name}`);
+    } catch (error) {
+      setPluginsError(error instanceof Error ? error.message : "插件删除失败");
+    } finally {
+      setPluginBusyName(null);
+    }
+  };
+
   const rescanPlugins = async () => {
     setPluginsLoading(true);
     setPluginsError(null);
@@ -9611,34 +9633,52 @@ ${markup}
                       {pluginsLoading && plugins.length === 0 ? <div className="workspace-empty">正在加载插件...</div> : null}
 
                       {!pluginsLoading || plugins.length > 0 ? (
-                        <div className="plugin-grid">
+                        <div className="plugin-list" role="table" aria-label="插件列表">
+                          <div className="plugin-list-head" role="row">
+                            <span role="columnheader">插件</span>
+                            <span role="columnheader">能力</span>
+                            <span role="columnheader">路径</span>
+                            <span role="columnheader">操作</span>
+                          </div>
                           {plugins.map((plugin) => (
-                            <article key={plugin.name} className="plugin-card">
-                              <div className="plugin-card-head">
-                                <div>
-                                  <h4>{plugin.name}</h4>
-                                  <p>v{plugin.version}</p>
+                            <div key={plugin.name} className="plugin-list-row" role="row">
+                              <div className="plugin-list-main" role="cell">
+                                <div className="plugin-list-title-row">
+                                  <strong>{plugin.name}</strong>
+                                  <span className="plugin-list-version">v{plugin.version}</span>
+                                  <span className={`workspace-pill ${plugin.enabled ? "accent" : "subtle"}`}>
+                                    {plugin.enabled ? "已启用" : "已停用"}
+                                  </span>
                                 </div>
-                                <span className={`workspace-pill ${plugin.enabled ? "accent" : "subtle"}`}>
-                                  {plugin.enabled ? "已启用" : "已停用"}
-                                </span>
+                                <p>{plugin.description || "暂无插件描述"}</p>
                               </div>
-                              <p className="plugin-card-copy">{plugin.description || "暂无插件描述"}</p>
-                              <div className="plugin-card-stats">
+                              <div className="plugin-list-stats" role="cell">
                                 <span>{plugin.skill_count} Skills</span>
                                 <span>{plugin.hook_count} Hooks</span>
                                 <span>{plugin.mcp_server_count} MCP</span>
                               </div>
-                              <p className="plugin-card-path">{plugin.plugin_path}</p>
-                              <button
-                                type="button"
-                                className={plugin.enabled ? "workspace-danger-button" : "workspace-primary-button"}
-                                onClick={() => void togglePluginEnabled(plugin)}
-                                disabled={pluginBusyName === plugin.name}
-                              >
-                                {pluginBusyName === plugin.name ? "处理中..." : plugin.enabled ? "停用插件" : "启用插件"}
-                              </button>
-                            </article>
+                              <p className="plugin-list-path" role="cell" title={plugin.plugin_path}>
+                                {plugin.plugin_path}
+                              </p>
+                              <div className="plugin-list-actions" role="cell">
+                                <button
+                                  type="button"
+                                  className={plugin.enabled ? "workspace-secondary-button" : "workspace-primary-button"}
+                                  onClick={() => void togglePluginEnabled(plugin)}
+                                  disabled={pluginBusyName === plugin.name}
+                                >
+                                  {pluginBusyName === plugin.name ? "处理中..." : plugin.enabled ? "停用" : "启用"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="workspace-danger-button"
+                                  onClick={() => void deletePlugin(plugin)}
+                                  disabled={pluginBusyName === plugin.name}
+                                >
+                                  删除
+                                </button>
+                              </div>
+                            </div>
                           ))}
                         </div>
                       ) : null}

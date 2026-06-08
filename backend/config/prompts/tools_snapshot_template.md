@@ -1,10 +1,17 @@
 ## Tools
-All tools are available via function calling. For full parameter details and path permissions, read the tool's spec file using `read_file`.
+Callable tools are provided via function calling in the current turn.
+Use the provider tool definitions as the source of truth for available tool names and parameter schemas.
 
-### Available tools
-- No tools are currently loaded.
+### Tool specs
+Generated tool spec files contain path permissions, risk level, approval behavior, timeout, and parameter details.
+- Spec path pattern: `backend_data/tool_specs/{tool_name}.md`
+- Read a spec file only when parameters, path permissions, or risk details are unclear.
 
 ### How to use tools
-- All listed tools are always available. Choose the right tool based on the task.
-- Before calling a tool with complex parameters, read its spec file for full details.
-- Do not call tools not listed above.
+- Choose only tools present in the current provider tool list.
+- Do not invent tool names or call tools that are absent from the current provider tool list.
+
+## MCP Servers
+When MCP servers are configured, this file includes server summaries and tool snapshot paths.
+MCP tools are grouped by server and are not exposed to the provider by default.
+Read the server tool snapshot first, then call `activate_mcp_tool` to expose one specific MCP tool schema.

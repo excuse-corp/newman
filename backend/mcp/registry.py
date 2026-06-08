@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from backend.mcp.client import MCPClient
 from backend.mcp.config import MCPConfigStore
 from backend.mcp.models import MCPResourceRecord, MCPServerConfig, MCPServerStatus, utc_timestamp
 from backend.mcp.resource_adapter import adapt_resources
+from backend.mcp.snapshot import (
+    MCPServerSnapshotInfo,
+    describe_mcp_server_snapshots,
+    safe_server_snapshot_name,
+    write_mcp_server_snapshots,
+)
 from backend.mcp.tool_adapter import MCPToolAdapter
 from backend.tools.base import BaseTool
 
@@ -13,10 +20,13 @@ from backend.tools.base import BaseTool
 class MCPRegistry:
     def __init__(self, config_path: Path, workspace: Path | None = None):
         self.store = MCPConfigStore(config_path)
+        self.snapshot_dir = config_path.parent / "snapshots"
         self.workspace = workspace.resolve() if workspace is not None else None
         self._statuses: list[MCPServerStatus] = []
         self._resources: list[MCPResourceRecord] = []
         self._clients: dict[str, MCPClient] = {}
+        self._server_snapshots: list[MCPServerSnapshotInfo] = []
+        self._tool_names_by_server: dict[str, set[str]] = {}
 
     def close(self) -> None:
         for client in self._clients.values():
@@ -39,6 +49,7 @@ class MCPRegistry:
             raise FileNotFoundError(f"MCP server not found: {server_name}")
         self.store.save([item for item in items if item.name != server_name])
         self._discard_client(server_name)
+        self._remove_snapshot_dir(server_name)
 
     def reconnect_server(self, server_name: str) -> MCPServerStatus:
         server = next((item for item in self.store.load() if item.name == server_name), None)
@@ -55,7 +66,10 @@ class MCPRegistry:
         tools: list[BaseTool] = []
         self._statuses = []
         self._resources = []
+        self._server_snapshots = []
+        self._tool_names_by_server = {}
         active_names: set[str] = set()
+        active_snapshot_names: set[str] = set()
         merged_servers: dict[str, MCPServerConfig] = {server.name: server for server in self.store.load()}
         if plugin_configs:
             for item in plugin_configs:
@@ -64,18 +78,21 @@ class MCPRegistry:
 
         for server in merged_servers.values():
             active_names.add(server.name)
+            active_snapshot_names.add(safe_server_snapshot_name(server.name))
             if not server.enabled:
                 self._discard_client(server.name)
-                self._statuses.append(
-                    MCPServerStatus(
-                        name=server.name,
-                        transport=server.transport,
-                        enabled=False,
-                        tool_count=0,
-                        resource_count=0,
-                        status="disabled",
-                        last_checked_at=utc_timestamp(),
-                    )
+                status = MCPServerStatus(
+                    name=server.name,
+                    transport=server.transport,
+                    enabled=False,
+                    tool_count=0,
+                    resource_count=0,
+                    status="disabled",
+                    last_checked_at=utc_timestamp(),
+                )
+                self._statuses.append(status)
+                self._server_snapshots.append(
+                    write_mcp_server_snapshots(self.snapshot_dir, server, status, [], [])
                 )
                 continue
 
@@ -85,34 +102,40 @@ class MCPRegistry:
                 resources = client.list_resources()
                 self._resources.extend(adapt_resources(server, resources))
                 tools.extend(MCPToolAdapter(server, spec, client) for spec in specs)
-                self._statuses.append(
-                    MCPServerStatus(
-                        name=server.name,
-                        transport=server.transport,
-                        enabled=True,
-                        tool_count=len(specs),
-                        resource_count=len(resources),
-                        status="connected",
-                        last_checked_at=utc_timestamp(),
-                    )
+                self._tool_names_by_server[server.name] = {spec.name for spec in specs}
+                status = MCPServerStatus(
+                    name=server.name,
+                    transport=server.transport,
+                    enabled=True,
+                    tool_count=len(specs),
+                    resource_count=len(resources),
+                    status="connected",
+                    last_checked_at=utc_timestamp(),
+                )
+                self._statuses.append(status)
+                self._server_snapshots.append(
+                    write_mcp_server_snapshots(self.snapshot_dir, server, status, specs, resources)
                 )
             except Exception as exc:
-                self._statuses.append(
-                    MCPServerStatus(
-                        name=server.name,
-                        transport=server.transport,
-                        enabled=True,
-                        tool_count=0,
-                        resource_count=0,
-                        status="error",
-                        detail=str(exc),
-                        last_checked_at=utc_timestamp(),
-                    )
+                status = MCPServerStatus(
+                    name=server.name,
+                    transport=server.transport,
+                    enabled=True,
+                    tool_count=0,
+                    resource_count=0,
+                    status="error",
+                    detail=str(exc),
+                    last_checked_at=utc_timestamp(),
+                )
+                self._statuses.append(status)
+                self._server_snapshots.append(
+                    write_mcp_server_snapshots(self.snapshot_dir, server, status, [], [])
                 )
 
         stale_names = set(self._clients) - active_names
         for server_name in stale_names:
             self._discard_client(server_name)
+        self._remove_stale_snapshot_dirs(active_snapshot_names)
 
         return tools
 
@@ -135,6 +158,28 @@ class MCPRegistry:
             for resource in self._resources
         )
 
+    def describe_tool_snapshots(self) -> str:
+        if not self._statuses:
+            self.build_tools()
+        return describe_mcp_server_snapshots(self._server_snapshots)
+
+    def has_tool(self, server_name: str, tool_name: str) -> bool:
+        if not self._statuses:
+            self.build_tools()
+        return tool_name in self._tool_names_by_server.get(server_name, set())
+
+    def mcp_tool_name(self, server_name: str, tool_name: str) -> str | None:
+        if tool_name.startswith("mcp__"):
+            prefix = f"mcp__{server_name}__"
+            if tool_name.startswith(prefix):
+                raw_tool_name = tool_name.removeprefix(prefix)
+                if self.has_tool(server_name, raw_tool_name):
+                    return tool_name
+            return None
+        if not self.has_tool(server_name, tool_name):
+            return None
+        return f"mcp__{server_name}__{tool_name}"
+
     def _get_client(self, server: MCPServerConfig) -> MCPClient:
         signature = server.model_dump_json()
         existing = self._clients.get(server.name)
@@ -150,3 +195,15 @@ class MCPRegistry:
         client = self._clients.pop(server_name, None)
         if client is not None:
             client.close()
+
+    def _remove_snapshot_dir(self, server_name: str) -> None:
+        path = self.snapshot_dir / safe_server_snapshot_name(server_name)
+        if path.exists():
+            shutil.rmtree(path)
+
+    def _remove_stale_snapshot_dirs(self, active_snapshot_names: set[str]) -> None:
+        if not self.snapshot_dir.exists():
+            return
+        for path in self.snapshot_dir.iterdir():
+            if path.is_dir() and path.name not in active_snapshot_names:
+                shutil.rmtree(path)

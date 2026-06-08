@@ -24,7 +24,8 @@ USER_INPUT_SYSTEM_GUARDRAIL = (
     "approve content, or revise requirements before you can continue the task, call the "
     "`request_user_input` tool. Do not present that question as a normal final answer. "
     "When the user can choose among known alternatives, pass them as structured options instead of "
-    "only embedding a numbered list in the prompt. "
+    "only embedding a numbered list in the prompt. If the request asks the user to approve or revise a preview, "
+    "put the preview itself in the tool's `content` argument. "
     "A final answer is only for completed work or an answer that does not need the user to reply "
     "before the workflow can continue."
 )

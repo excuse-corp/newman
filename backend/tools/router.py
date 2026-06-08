@@ -26,7 +26,7 @@ class ToolRouter:
         if tool.meta.name == "terminal":
             return self._terminal_static_checks(str(arguments.get("command", "")))
         if tool.meta.name.startswith("mcp__"):
-            return self._mcp_static_checks(arguments)
+            return self._mcp_tool_static_checks(tool, arguments)
         if "path" not in arguments:
             return checks
 
@@ -60,7 +60,10 @@ class ToolRouter:
             checks.append("read_outside_readable_paths")
         return checks
 
-    def _mcp_static_checks(self, arguments: dict) -> list[str]:
+    def _mcp_tool_static_checks(self, tool: BaseTool, arguments: dict) -> list[str]:
+        server = getattr(tool, "server", None)
+        if getattr(server, "argument_path_guard", True) is False:
+            return []
         return validate_mcp_argument_paths(self.path_policy, arguments)
 
     def _terminal_static_checks(self, command: str) -> list[str]:

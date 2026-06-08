@@ -76,43 +76,61 @@ def _make_test_registry() -> ToolRegistry:
 
 
 class ToolSnapshotTests(unittest.TestCase):
-    def test_render_snapshot_lists_primary_tools(self) -> None:
+    def test_render_snapshot_uses_provider_tools_as_source_of_truth(self) -> None:
         registry = _make_test_registry()
         with tempfile.TemporaryDirectory() as tmp:
             spec_dir = Path(tmp) / "specs"
             lines = render_tools_snapshot(registry.list_tools(), spec_dir, PermissionContext())
             text = "\n".join(lines)
-            self.assertIn("read_file", text)
-            self.assertIn("google_search", text)
+            self.assertIn("provider tool definitions", text)
+            self.assertIn("current provider tool list", text)
+            self.assertNotIn("`read_file`", text)
+            self.assertNotIn("google_search", text)
             self.assertNotIn("grep", text)
 
-    def test_render_snapshot_excludes_denied_tools(self) -> None:
+    def test_render_snapshot_does_not_expand_denied_tools(self) -> None:
         registry = _make_test_registry()
         with tempfile.TemporaryDirectory() as tmp:
             spec_dir = Path(tmp) / "specs"
             ctx = PermissionContext(deny_rules={"google_search"})
             lines = render_tools_snapshot(registry.list_tools(), spec_dir, ctx)
             text = "\n".join(lines)
-            self.assertIn("read_file", text)
+            self.assertIn("Callable tools are provided via function calling", text)
             self.assertNotIn("google_search", text)
 
-    def test_render_snapshot_includes_required_params(self) -> None:
+    def test_render_snapshot_does_not_repeat_required_params(self) -> None:
         registry = _make_test_registry()
         with tempfile.TemporaryDirectory() as tmp:
             spec_dir = Path(tmp) / "specs"
             lines = render_tools_snapshot(registry.list_tools(), spec_dir, PermissionContext())
             text = "\n".join(lines)
-            self.assertIn("Required: path", text)
-            self.assertIn("Required: q", text)
+            self.assertNotIn("Required: path", text)
+            self.assertNotIn("Required: q", text)
 
-    def test_render_snapshot_includes_spec_path(self) -> None:
+    def test_render_snapshot_includes_spec_path_pattern(self) -> None:
         registry = _make_test_registry()
         with tempfile.TemporaryDirectory() as tmp:
             spec_dir = Path(tmp) / "specs"
             lines = render_tools_snapshot(registry.list_tools(), spec_dir, PermissionContext())
             text = "\n".join(lines)
-            self.assertIn("read_file.md", text)
-            self.assertIn("google_search.md", text)
+            self.assertIn(str(spec_dir / "{tool_name}.md"), text)
+            self.assertNotIn("read_file.md", text)
+            self.assertNotIn("google_search.md", text)
+
+    def test_render_snapshot_includes_mcp_server_overview(self) -> None:
+        registry = _make_test_registry()
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_dir = Path(tmp) / "specs"
+            lines = render_tools_snapshot(
+                registry.list_tools(),
+                spec_dir,
+                PermissionContext(),
+                mcp_server_overview="- `demo` snapshot: `/tmp/demo/TOOLS_SNAPSHOT.md`",
+            )
+            text = "\n".join(lines)
+            self.assertIn("## MCP Servers", text)
+            self.assertIn("activate_mcp_tool", text)
+            self.assertIn("/tmp/demo/TOOLS_SNAPSHOT.md", text)
 
 
 class ToolSpecGeneratorTests(unittest.TestCase):
@@ -167,8 +185,8 @@ class ToolSpecGeneratorTests(unittest.TestCase):
             snapshot_path = memory_dir / "TOOLS_SNAPSHOT.md"
             self.assertTrue(snapshot_path.exists())
             content = snapshot_path.read_text()
-            self.assertIn("read_file", content)
-            self.assertIn("google_search", content)
+            self.assertIn("provider tool definitions", content)
+            self.assertNotIn("google_search", content)
             self.assertTrue((spec_dir / "read_file.md").exists())
 
 

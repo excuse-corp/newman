@@ -60,7 +60,6 @@ from backend.runtime.workflow_state import (
     TURN_OUTCOME_TASK_COMPLETED,
     WORKFLOW_STATE_METADATA_KEY,
     build_pending_user_input_reply_metadata,
-    build_awaiting_user_input_payload,
     build_workflow_state_payload,
     normalize_turn_outcome,
 )
@@ -72,6 +71,7 @@ from backend.tools.approval import ApprovalManager
 from backend.tools.orchestrator import ToolOrchestrator
 from backend.tools.approval_policy import DEFAULT_TURN_APPROVAL_MODE, TurnApprovalMode
 from backend.tools.discovery import BuiltinToolContext, load_builtin_tools
+from backend.tools.impl.activate_mcp_tool import ACTIVE_MCP_TOOLS_METADATA_KEY
 from backend.tools.permission_context import PermissionContext
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import ToolRouter, analyze_terminal_command
@@ -124,6 +124,20 @@ def _dedupe_strings(values) -> list[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def _merge_visible_sections(first: str, second: str) -> str:
+    first = first.strip()
+    second = second.strip()
+    if not first:
+        return second
+    if not second:
+        return first
+    if first in second:
+        return second
+    if second in first:
+        return first
+    return f"{first}\n\n{second}"
 
 
 COMMON_PROVIDER_REASONING_STATE_FIELDS = (
@@ -745,6 +759,7 @@ class NewmanRuntime:
             spec_dir=self.settings.paths.data_dir / "tool_specs",
             memory_dir=self.settings.paths.memory_dir,
             permission_context=PermissionContext(),
+            mcp_server_overview=self.mcp_registry.describe_tool_snapshots(),
         )
 
     def _pending_user_input_reply_metadata(self, session_id: str) -> dict[str, object] | None:
@@ -977,6 +992,7 @@ class NewmanRuntime:
             session_store=self.session_store,
             multimodal_analyzer=self.multimodal_analyzer,
             scheduler_store=self.scheduler_store,
+            mcp_registry=self.mcp_registry,
         )
         tool_context = self.tool_context
         registry = ToolRegistry()
@@ -1100,15 +1116,6 @@ class NewmanRuntime:
                     request_id=request_id,
                 )
                 continue
-
-            if decision.action == "awaiting_user":
-                await self._finalize_awaiting_user_input_from_final_answer(
-                    task,
-                    turn_emit,
-                    decision,
-                    request_id=request_id,
-                )
-                return
 
             if not response.tool_calls:
                 final_content = decision.final_content or ""
@@ -1235,6 +1242,7 @@ class NewmanRuntime:
                             scheduler_run_mode=scheduler_run_mode,
                         )
                 result = normalize_result(result)
+                result = self._merge_request_user_input_preface(result, response.content)
                 task.progress.record_tool_result(result)
                 metadata_updates = result.metadata.get("session_metadata_updates")
                 if isinstance(metadata_updates, dict):
@@ -1581,30 +1589,34 @@ class NewmanRuntime:
                 )
             deferred_answer_deltas.clear()
 
-        async def prepare_for_tool_signal() -> None:
+        async def prepare_for_tool_signal(tool_name: str | None = None) -> None:
             nonlocal answer_visible, answer_started_emitted, commentary_complete_pending, tool_signal_seen
             if tool_signal_seen:
                 return
             tool_signal_seen = True
-            leaked_answer = self._recover_tool_preamble_commentary("".join(content_parts))
+            preserve_answer = tool_name == "request_user_input"
+            leaked_answer = "" if preserve_answer else self._recover_tool_preamble_commentary("".join(content_parts))
             if answer_visible:
-                content_parts.clear()
-                deferred_answer_deltas.clear()
-                answer_visible = False
-                answer_started_emitted = False
-                await emit(
-                    "assistant_delta",
-                    {
-                        "content": "",
-                        "delta": "",
-                        "model": self.settings.provider.model,
-                        "reset": True,
-                    },
-                )
+                if preserve_answer:
+                    deferred_answer_deltas.clear()
+                else:
+                    content_parts.clear()
+                    deferred_answer_deltas.clear()
+                    answer_visible = False
+                    answer_started_emitted = False
+                    await emit(
+                        "assistant_delta",
+                        {
+                            "content": "",
+                            "delta": "",
+                            "model": self.settings.provider.model,
+                            "reset": True,
+                        },
+                    )
             elif leaked_answer:
                 content_parts.clear()
                 deferred_answer_deltas.clear()
-            elif content_parts:
+            elif content_parts and not preserve_answer:
                 content_parts.clear()
                 deferred_answer_deltas.clear()
             if leaked_answer and not commentary_parts:
@@ -1739,11 +1751,11 @@ class NewmanRuntime:
                         continue
                     if delta.index in invalid_tool_call_indexes or not resolved_name:
                         continue
-                    await prepare_for_tool_signal()
+                    await prepare_for_tool_signal(resolved_name)
                     await emit_tool_argument_progress(chunk.tool_call_delta)
                 elif chunk.type == "tool_call" and chunk.tool_call:
                     if _is_provider_tool_name_allowed(chunk.tool_call.name, allowed_tool_names):
-                        await prepare_for_tool_signal()
+                        await prepare_for_tool_signal(chunk.tool_call.name)
                         tool_calls.append(chunk.tool_call)
                         await flush_commentary(force=True)
                     else:
@@ -2393,81 +2405,6 @@ class NewmanRuntime:
             finish_reason="awaiting_user",
         )
 
-    async def _finalize_awaiting_user_input_from_final_answer(
-        self,
-        task: SessionTask,
-        emit: EventEmitter,
-        decision: TurnStepDecision,
-        *,
-        request_id: str | None = None,
-    ) -> None:
-        final_content = (decision.final_content or "").strip()
-        prompt = "请补充这些信息后我继续处理。"
-        if final_content:
-            content = final_content
-        else:
-            content = prompt
-
-        awaiting = build_awaiting_user_input_payload(
-            kind="free_text",
-            prompt=prompt,
-            content=content,
-            workflow_id=f"turn:{task.turn_id}",
-            data={
-                "source": "final_answer",
-                "completion_decision": decision.reason,
-            },
-        )
-        workflow_state = build_workflow_state_payload(awaiting)
-        extra_metadata = {
-            AWAITING_USER_INPUT_METADATA_KEY: awaiting,
-            WORKFLOW_STATE_METADATA_KEY: workflow_state,
-        }
-        assistant_message = self._build_assistant_message(
-            task,
-            content,
-            request_id=request_id,
-            finish_reason="awaiting_user",
-            turn_outcome=TURN_OUTCOME_AWAITING_USER,
-            extra_metadata=extra_metadata,
-        )
-        task.session.messages.append(assistant_message)
-        task.session.metadata.update(
-            {
-                AWAITING_USER_INPUT_METADATA_KEY: awaiting,
-                WORKFLOW_STATE_METADATA_KEY: workflow_state,
-            }
-        )
-        self.session_store.save(task.session)
-        await emit(
-            "workflow_state_changed",
-            {
-                "session_id": task.session.session_id,
-                "workflow_state": workflow_state,
-                "summary": content,
-            },
-        )
-        await emit(
-            "user_input_requested",
-            {
-                "session_id": task.session.session_id,
-                "awaiting_user_input": awaiting,
-                "summary": content,
-            },
-        )
-        await self._emit_final_response_message(
-            emit,
-            task,
-            assistant_message,
-            finish_reason="awaiting_user",
-        )
-        await self._emit_hooks(
-            "SessionEnd",
-            emit,
-            session_id=task.session.session_id,
-            finish_reason="awaiting_user",
-        )
-
     async def _finalize_tool_limit(
         self,
         task: SessionTask,
@@ -2851,6 +2788,58 @@ class NewmanRuntime:
             return f"{commentary}\n\n{content}"
         return commentary or content
 
+    def _merge_request_user_input_preface(
+        self,
+        result: ToolExecutionResult,
+        preface_content: str,
+    ) -> ToolExecutionResult:
+        preface = preface_content.strip()
+        if (
+            not preface
+            or not result.success
+            or result.tool != "request_user_input"
+            or normalize_turn_outcome(result.metadata.get("turn_outcome"), fallback="") != TURN_OUTCOME_AWAITING_USER
+        ):
+            return result
+
+        awaiting_raw = result.metadata.get(AWAITING_USER_INPUT_METADATA_KEY)
+        if not isinstance(awaiting_raw, dict):
+            return result
+
+        metadata = dict(result.metadata)
+        awaiting = dict(awaiting_raw)
+        existing_content = str(awaiting.get("content") or "").strip()
+        awaiting["content"] = _merge_visible_sections(preface, existing_content)
+
+        workflow_state_raw = metadata.get(WORKFLOW_STATE_METADATA_KEY)
+        workflow_state = dict(workflow_state_raw) if isinstance(workflow_state_raw, dict) else build_workflow_state_payload(awaiting)
+        workflow_awaiting_raw = workflow_state.get("awaiting")
+        if isinstance(workflow_awaiting_raw, dict):
+            workflow_awaiting = dict(workflow_awaiting_raw)
+            workflow_awaiting["content"] = awaiting["content"]
+            workflow_state["awaiting"] = workflow_awaiting
+
+        response_payload_raw = metadata.get("assistant_response")
+        response_payload = dict(response_payload_raw) if isinstance(response_payload_raw, dict) else {}
+        rendered = _merge_visible_sections(
+            preface,
+            str(response_payload.get("content") or result.stdout or result.summary or "").strip(),
+        )
+        response_payload["content"] = rendered
+
+        metadata[AWAITING_USER_INPUT_METADATA_KEY] = awaiting
+        metadata[WORKFLOW_STATE_METADATA_KEY] = workflow_state
+        metadata["assistant_response"] = response_payload
+        metadata_updates = dict(metadata.get("session_metadata_updates") or {})
+        metadata_updates[AWAITING_USER_INPUT_METADATA_KEY] = awaiting
+        metadata_updates[WORKFLOW_STATE_METADATA_KEY] = workflow_state
+        metadata["session_metadata_updates"] = metadata_updates
+
+        result.metadata = metadata
+        result.stdout = rendered
+        result.persisted_output = rendered
+        return result
+
     def _parse_response_text(self, text: str) -> tuple[str, str]:
         parser = ThinkTagStreamParser()
         commentary_parts: list[str] = []
@@ -3043,27 +3032,35 @@ class NewmanRuntime:
     def _provider_tools_for_turn(self, task: SessionTask) -> list[dict[str, object]]:
         mode = get_collaboration_mode(task.session).mode
         plan_missing = mode == PLAN_COLLABORATION_MODE and get_session_plan(task.session) is None
-        provider_tools = self.registry.tools_for_provider(task.permission_context)
+        provider_tools = [
+            schema
+            for schema in self.registry.tools_for_provider(task.permission_context)
+            if self._should_expose_tool_for_task(task, self._provider_schema_tool_name(schema))
+        ]
         filtered_tools = [
             schema
             for schema in provider_tools
-            if is_tool_allowed_in_mode(str(schema.get("function", {}).get("name", "")), mode)
+            if is_tool_allowed_in_mode(self._provider_schema_tool_name(schema), mode)
         ]
         if plan_missing:
             return [
                 schema
                 for schema in filtered_tools
-                if str(schema.get("function", {}).get("name", "")) == "update_plan"
+                if self._provider_schema_tool_name(schema) == "update_plan"
             ]
         existing_names = {
-            str(schema.get("function", {}).get("name", ""))
+            self._provider_schema_tool_name(schema)
             for schema in filtered_tools
             if isinstance(schema, dict)
         }
         registry_get = getattr(self.registry, "get", None)
         if callable(registry_get):
             for tool_name in sorted(self._history_referenced_tool_names(task.session)):
-                if tool_name in existing_names or not is_tool_allowed_in_mode(tool_name, mode):
+                if (
+                    tool_name in existing_names
+                    or not self._should_expose_tool_for_task(task, tool_name)
+                    or not is_tool_allowed_in_mode(tool_name, mode)
+                ):
                     continue
                 if not task.permission_context.can_expose(tool_name):
                     continue
@@ -3080,9 +3077,35 @@ class NewmanRuntime:
             filtered_tools = [
                 schema
                 for schema in filtered_tools
-                if str(schema.get("function", {}).get("name", "")) not in blocked_tools
+                if self._provider_schema_tool_name(schema) not in blocked_tools
             ]
         return filtered_tools
+
+    def _provider_schema_tool_name(self, schema: dict[str, object]) -> str:
+        if not isinstance(schema, dict):
+            return ""
+        function = schema.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            if isinstance(name, str):
+                return name
+        name = schema.get("name")
+        return name if isinstance(name, str) else ""
+
+    def _active_mcp_tool_names_for_task(self, task: SessionTask) -> set[str]:
+        raw_active_tools = task.session.metadata.get(ACTIVE_MCP_TOOLS_METADATA_KEY)
+        if not isinstance(raw_active_tools, list):
+            return set()
+        return {
+            item
+            for item in raw_active_tools
+            if isinstance(item, str) and item.startswith("mcp__")
+        }
+
+    def _should_expose_tool_for_task(self, task: SessionTask, tool_name: str) -> bool:
+        if not tool_name.startswith("mcp__"):
+            return True
+        return tool_name in self._active_mcp_tool_names_for_task(task)
 
     def _is_tool_allowed_for_task(self, task: SessionTask, tool_name: str) -> bool:
         return self._tool_disallow_reason_for_task(task, tool_name) is None
@@ -3093,6 +3116,8 @@ class NewmanRuntime:
             return f"{tool_name} 在当前 {mode} 模式下不可用"
         if mode == PLAN_COLLABORATION_MODE and tool_name != "update_plan" and get_session_plan(task.session) is None:
             return f"当前处于计划模式，必须先调用 update_plan 生成 checklist，然后才能使用 {tool_name}"
+        if tool_name.startswith("mcp__") and tool_name not in self._active_mcp_tool_names_for_task(task):
+            return f"MCP tool 尚未激活：{tool_name}。先读取对应 MCP server 的 TOOLS_SNAPSHOT.md，再调用 activate_mcp_tool。"
         return None
 
     def _history_referenced_tool_names(self, session) -> set[str]:

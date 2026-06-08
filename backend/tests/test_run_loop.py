@@ -31,6 +31,7 @@ from backend.sessions.models import SessionMessage, SessionRecord
 from backend.sessions.session_store import SessionStore
 from backend.tools.impl.read_file import ReadFileTool
 from backend.tools.impl.request_user_input import RequestUserInputTool
+from backend.tools.impl.activate_mcp_tool import ACTIVE_MCP_TOOLS_METADATA_KEY
 from backend.tools.impl.write_file import WriteFileTool
 from backend.tools.permission_context import PermissionContext
 from backend.tools.registry import ToolRegistry
@@ -505,6 +506,43 @@ class _DummyRequestUserInputProvider:
         return 0
 
 
+class _DummyRequestUserInputWithPreviewProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, tools=None, **kwargs):
+        raise AssertionError("chat should not be called in this test")
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        if self.calls > 1:
+            raise AssertionError("run loop should stop after request_user_input")
+        yield ProviderChunk(
+            type="text",
+            delta=(
+                "【项目管理员表预览】字段：姓名、邮箱、角色、部门、手机号。"
+                "样例数据：张三/项目经理/研发部，李四/管理员/运营部，王五/观察员/财务部。"
+            ),
+        )
+        yield ProviderChunk(
+            type="tool_call",
+            tool_call=ToolCall(
+                id="tool-1",
+                name="request_user_input",
+                arguments={
+                    "kind": "confirm",
+                    "skill_name": "teable",
+                    "phase": "table_preview",
+                    "prompt": "以上设计是否可以继续创建？",
+                },
+            ),
+        )
+        yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
 class _DummyFinalUserInputRequestProvider:
     def __init__(self) -> None:
         self.calls = 0
@@ -515,14 +553,16 @@ class _DummyFinalUserInputRequestProvider:
     async def chat_stream(self, messages, tools=None, **kwargs):
         self.calls += 1
         if self.calls > 1:
-            raise AssertionError("run loop should stop after converting final answer to awaiting_user")
+            raise AssertionError("run loop should stop after final answer")
         yield ProviderChunk(
             type="text",
             delta=(
-                "我需要先向您确认具体要添加的项目信息，才能继续处理。\n\n"
-                "我需要知道：\n"
-                "1. 项目名称是什么？\n"
-                "2. 预算金额是多少？"
+                "信息已经收集充分，这是一份完整调研报告。\n\n"
+                "GitHub MCP Server 是 GitHub 官方提供的 MCP 服务，可以让 Agent 查询仓库、管理 Issue、"
+                "处理 Pull Request、查看 Actions 和安全告警。接入 Newman 时可以采用远程 MCP 或本地 Docker "
+                "两种方案。远程方式部署成本最低，本地方式更适合需要完全控制运行环境的场景。\n\n"
+                "接入前需要你提供 GitHub Personal Access Token，建议只授予 repo 和 read:org 等最小必要权限。"
+                "如果要继续落地，我可以下一步帮你创建插件配置。要搞吗？"
             ),
         )
         yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
@@ -809,7 +849,67 @@ class WorkflowAwaitingUserRunLoopTests(unittest.IsolatedAsyncioTestCase):
             completed_payload = next(data for event, data in events if event == "turn_completed")
             self.assertEqual(completed_payload["turn_outcome"], "awaiting_user")
 
-    async def test_final_answer_requesting_user_input_is_converted_to_awaiting_user(self) -> None:
+    async def test_request_user_input_preface_is_merged_into_awaiting_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_store = SessionStore(Path(tmp))
+            session = session_store.create(title="teable")
+            provider = _DummyRequestUserInputWithPreviewProvider()
+            request_tool = RequestUserInputTool()
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.provider = provider
+            runtime.usage_store = None
+            runtime.session_store = session_store
+            runtime.hook_manager = _DummyHookManager()
+            runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
+            runtime.reload_ecosystem = lambda: None
+            runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
+            runtime._tools_overview = lambda task=None: "tools"
+            runtime._assemble_task_messages = lambda task, **kwargs: [{"role": "user", "content": task.session.messages[-1].content}]
+            runtime._provider_tools_for_turn = lambda task: [request_tool.to_provider_schema()]
+            runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
+            runtime.feedback_writer = SimpleNamespace(build=lambda result: "")
+            runtime.settings = SimpleNamespace(
+                provider=SimpleNamespace(
+                    model="dummy-model",
+                    type="mock",
+                    context_window=None,
+                    effective_context_window=None,
+                ),
+                approval=_DummyApproval(),
+                runtime=SimpleNamespace(max_tool_depth=30),
+            )
+            runtime.router = SimpleNamespace(
+                route=lambda tool_name, arguments: request_tool,
+                static_checks=lambda tool, arguments: [],
+            )
+
+            async def execute_tool(tool, arguments, session_id, emit, **kwargs):
+                return await tool.run(arguments, session_id)
+
+            runtime.orchestrator = SimpleNamespace(execute=execute_tool)
+
+            async def fake_maybe_checkpoint(task, emit):
+                return True
+
+            runtime._maybe_checkpoint = fake_maybe_checkpoint
+
+            events: list[tuple[str, dict[str, object]]] = []
+
+            async def emit(event: str, data: dict[str, object]) -> None:
+                events.append((event, data))
+
+            await runtime.handle_message(session.session_id, "创建项目管理员表", emit, turn_id="turn-1")
+
+            saved = session_store.get(session.session_id)
+            final_payload = next(data for event, data in events if event == "final_response")
+            awaiting = final_payload["awaiting_user_input"]
+            self.assertIn("项目管理员表预览", final_payload["content"])
+            self.assertIsInstance(awaiting, dict)
+            self.assertIn("项目管理员表预览", awaiting["content"])
+            self.assertIn("项目管理员表预览", saved.metadata["awaiting_user_input"]["content"])
+
+    async def test_final_answer_requesting_user_input_stays_final_answer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session_store = SessionStore(Path(tmp))
             session = session_store.create(title="excel")
@@ -854,15 +954,14 @@ class WorkflowAwaitingUserRunLoopTests(unittest.IsolatedAsyncioTestCase):
 
             saved = session_store.get(session.session_id)
             self.assertEqual(provider.calls, 1)
-            self.assertEqual(saved.messages[-1].metadata["turn_outcome"], "awaiting_user")
-            self.assertIn("awaiting_user_input", saved.metadata)
-            awaiting = saved.metadata["awaiting_user_input"]
-            self.assertEqual(awaiting["kind"], "free_text")
-            self.assertIn("项目名称", awaiting["content"])
-            self.assertTrue(any(event == "user_input_requested" for event, _ in events))
+            self.assertEqual(saved.messages[-1].role, "assistant")
+            self.assertEqual(saved.messages[-1].metadata["turn_outcome"], "answered")
+            self.assertNotIn("awaiting_user_input", saved.metadata)
+            self.assertFalse(any(event == "user_input_requested" for event, _ in events))
             final_payload = next(data for event, data in events if event == "final_response")
-            self.assertEqual(final_payload["finish_reason"], "awaiting_user")
-            self.assertEqual(final_payload["turn_outcome"], "awaiting_user")
+            self.assertEqual(final_payload["finish_reason"], "stop")
+            self.assertEqual(final_payload["turn_outcome"], "answered")
+            self.assertIn("GitHub Personal Access Token", final_payload["content"])
 
 
 class TurnCompletionGateTests(unittest.IsolatedAsyncioTestCase):
@@ -2256,6 +2355,40 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(events[0][1]["content"], "再读取 README 了解产品整体介绍")
 
+    async def test_request_user_input_preserves_preview_answer(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.provider = _DummyRequestUserInputWithPreviewProvider()
+        runtime.usage_store = None
+        runtime.settings = SimpleNamespace(
+            provider=SimpleNamespace(
+                model="dummy-model",
+                type="mock",
+                context_window=None,
+                effective_context_window=None,
+            )
+        )
+
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def emit(event: str, data: dict[str, object]) -> None:
+            events.append((event, data))
+
+        response = await runtime._stream_provider_response(
+            [{"role": "system", "content": "test"}],
+            [{"name": "request_user_input"}],
+            emit,
+            session_id="session-1",
+            turn_id="turn-1",
+            request_kind="session_turn",
+            counts_toward_context_window=True,
+            group_id="turn-1:group:input",
+        )
+
+        self.assertIn("项目管理员表预览", response.content)
+        self.assertEqual(response.commentary, "")
+        self.assertEqual(len(response.tool_calls), 1)
+        self.assertFalse(any(event == "assistant_delta" and data.get("reset") is True for event, data in events))
+
     async def test_answer_started_emits_once_when_tool_backed_turn_enters_final_answer(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.provider = _DummyProvider()
@@ -3034,6 +3167,86 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             [tool["function"]["name"] for tool in tools],
             ["read_file", "write_file", "terminal", "enter_plan_mode"],
         )
+
+    def test_provider_tools_hide_inactive_mcp_tools_until_activated(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.registry = SimpleNamespace(
+            tools_for_provider=lambda permission_context: [
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "function", "function": {"name": "activate_mcp_tool"}},
+                {"type": "function", "function": {"name": "mcp__demo__search"}},
+            ]
+        )
+        session = SessionRecord(session_id="session-1", title="default", messages=[])
+        task = SessionTask(session=session, permission_context=PermissionContext(), turn_id="turn-1")
+
+        tools = runtime._provider_tools_for_turn(task)
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["read_file", "activate_mcp_tool"],
+        )
+
+        session.metadata[ACTIVE_MCP_TOOLS_METADATA_KEY] = ["mcp__demo__search"]
+        tools = runtime._provider_tools_for_turn(task)
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["read_file", "activate_mcp_tool", "mcp__demo__search"],
+        )
+
+    def test_provider_tools_do_not_readd_inactive_mcp_tools_from_history(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        mcp_schema = {"type": "function", "function": {"name": "mcp__demo__search"}}
+
+        def registry_get(tool_name: str):
+            if tool_name == "mcp__demo__search":
+                return SimpleNamespace(to_provider_schema=lambda: mcp_schema)
+            raise KeyError(tool_name)
+
+        runtime.registry = SimpleNamespace(
+            tools_for_provider=lambda permission_context: [
+                {"type": "function", "function": {"name": "read_file"}}
+            ],
+            get=registry_get,
+        )
+        session = SessionRecord(
+            session_id="session-1",
+            title="history",
+            messages=[
+                SessionMessage(
+                    id="a1",
+                    role="assistant",
+                    content="",
+                    metadata={
+                        "tool_calls": [
+                            {"id": "call_1", "name": "mcp__demo__search", "arguments": {}}
+                        ]
+                    },
+                )
+            ],
+        )
+        task = SessionTask(session=session, permission_context=PermissionContext(), turn_id="turn-1")
+
+        tools = runtime._provider_tools_for_turn(task)
+        self.assertEqual([tool["function"]["name"] for tool in tools], ["read_file"])
+
+        session.metadata[ACTIVE_MCP_TOOLS_METADATA_KEY] = ["mcp__demo__search"]
+        tools = runtime._provider_tools_for_turn(task)
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["read_file", "mcp__demo__search"],
+        )
+
+    def test_inactive_mcp_tool_calls_are_disallowed(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        session = SessionRecord(session_id="session-1", title="default", messages=[])
+        task = SessionTask(session=session, permission_context=PermissionContext(), turn_id="turn-1")
+
+        reason = runtime._tool_disallow_reason_for_task(task, "mcp__demo__search")
+        self.assertIsNotNone(reason)
+        self.assertIn("尚未激活", reason or "")
+
+        session.metadata[ACTIVE_MCP_TOOLS_METADATA_KEY] = ["mcp__demo__search"]
+        self.assertIsNone(runtime._tool_disallow_reason_for_task(task, "mcp__demo__search"))
 
     def test_provider_tools_hide_file_browsing_tools_on_first_attachment_answer(self) -> None:
         runtime = object.__new__(NewmanRuntime)

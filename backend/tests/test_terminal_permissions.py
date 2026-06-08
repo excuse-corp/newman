@@ -32,6 +32,12 @@ class _FakeMCPTool:
         self.meta = SimpleNamespace(name="mcp__demo__fs_reader")
 
 
+class _FakeMCPToolWithoutPathGuard:
+    def __init__(self) -> None:
+        self.meta = SimpleNamespace(name="mcp__api__request")
+        self.server = SimpleNamespace(argument_path_guard=False)
+
+
 class TerminalPermissionTests(unittest.TestCase):
     def test_terminal_static_checks_deny_protected_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -180,6 +186,21 @@ class TerminalPermissionTests(unittest.TestCase):
 
             self.assertEqual(len(reasons), 1)
             self.assertTrue(reasons[0].startswith("mcp_path_outside_workspace:"))
+
+    def test_mcp_static_checks_can_skip_api_path_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+
+            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace)}})
+            router = ToolRouter(ToolRegistry(), settings)
+
+            reasons = router.static_checks(
+                _FakeMCPToolWithoutPathGuard(),
+                {"path": "/tables/create"},
+            )
+
+            self.assertEqual(reasons, [])
 
     def test_mcp_static_checks_deny_protected_workspace_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -39,10 +39,11 @@ class ToolRegistry:
         spec_dir: Path,
         memory_dir: Path,
         permission_context: PermissionContext,
+        mcp_server_overview: str = "",
     ) -> None:
         tools = self._primary_tools()
         generate_all_tool_specs(tools, spec_dir)
-        lines = render_tools_snapshot(tools, spec_dir, permission_context)
+        lines = render_tools_snapshot(tools, spec_dir, permission_context, mcp_server_overview=mcp_server_overview)
         snapshot_path = memory_dir / "TOOLS_SNAPSHOT.md"
         snapshot_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

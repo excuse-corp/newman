@@ -24,7 +24,9 @@ class RequestUserInputTool(BaseTool):
                 "as confirmation, option selection, or free-form revisions. Do not use a normal final answer when the "
                 "next step must wait for the user. When the user can choose from known alternatives, use kind='choice' "
                 "and pass concise options with label/value/description instead of embedding a numbered list only in "
-                "the prompt. Use kind='free_text' only when the user must type custom information."
+                "the prompt. If the user is approving or revising specific content, include that full preview in "
+                "the content field instead of relying on previously streamed assistant text. Use kind='free_text' "
+                "only when the user must type custom information."
             ),
             input_schema={
                 "type": "object",

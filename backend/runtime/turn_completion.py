@@ -7,13 +7,12 @@ from typing import Literal
 from backend.providers.base import ProviderResponse
 from backend.runtime.workflow_state import (
     TURN_OUTCOME_ANSWERED,
-    TURN_OUTCOME_AWAITING_USER,
     TURN_OUTCOME_BLOCKED,
 )
 from backend.tools.result import ToolExecutionResult
 
 
-TurnStepAction = Literal["continue", "finalize", "finalize_blocked", "finalize_failed", "awaiting_user"]
+TurnStepAction = Literal["continue", "finalize", "finalize_blocked", "finalize_failed"]
 
 MAX_RECOVERY_ATTEMPTS = 2
 MAX_FINALIZATION_ATTEMPTS = 1
@@ -29,13 +28,6 @@ COMPLETION_SIGNAL_PATTERNS = (
     re.compile(r"(?:位置|路径|目录|文件|日志|原因|失败|受限|权限|阻塞|无法|不能|已经|已|完成|保存在|生成|结果)"),
     re.compile(r"(?:located|path|file|log|reason|failed|blocked|permission|cannot|done|saved|generated|result)", re.I),
 )
-USER_INPUT_REQUEST_PATTERNS = (
-    re.compile(r"(?:需要|请|麻烦).{0,24}(?:您|你|用户).{0,24}(?:提供|补充|确认|选择|回复|告诉|填写)", re.I),
-    re.compile(r"(?:需要|请|麻烦).{0,24}(?:提供|补充|确认|选择|回复|告诉|填写).{0,24}(?:信息|内容|选项|需求|问题)", re.I),
-    re.compile(r"(?:才能|才可以|后).{0,12}(?:继续|处理|执行|推进)", re.I),
-    re.compile(r"(?:please|need you to|could you|can you).{0,48}(?:provide|confirm|choose|select|reply|tell me|fill)", re.I),
-)
-QUESTION_MARKERS = ("?", "？", "：", ":", "1.", "1、", "- ")
 RECOVERABLE_FAILURE_GATE_REASONS = frozenset(
     {
         "empty_final_answer",
@@ -104,15 +96,6 @@ def decide_turn_step(response: ProviderResponse, progress: TurnProgressState) ->
         return TurnStepDecision(action="continue", reason="tool_calls_present", finish_reason=response.finish_reason)
 
     candidate = final_candidate_from_response(response)
-    if looks_like_user_input_request(candidate):
-        return TurnStepDecision(
-            action="awaiting_user",
-            reason="user_input_request_final_answer",
-            final_content=candidate,
-            finish_reason="awaiting_user",
-            turn_outcome=TURN_OUTCOME_AWAITING_USER,
-        )
-
     gate_reason = final_answer_gate_reason(candidate, progress)
     if gate_reason is None:
         return TurnStepDecision(
@@ -171,15 +154,6 @@ def final_answer_gate_reason(candidate: str, progress: TurnProgressState) -> str
         return "unresolved_tool_failure_without_result"
 
     return None
-
-
-def looks_like_user_input_request(candidate: str) -> bool:
-    normalized = " ".join(candidate.split()).strip()
-    if not normalized:
-        return False
-    if not any(pattern.search(normalized) for pattern in USER_INPUT_REQUEST_PATTERNS):
-        return False
-    return any(marker in normalized for marker in QUESTION_MARKERS)
 
 
 def build_recovery_instruction(progress: TurnProgressState, rejected_answer: str) -> str:

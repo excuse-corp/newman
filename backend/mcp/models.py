@@ -39,6 +39,7 @@ class MCPServerConfig(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     enabled: bool = True
     requires_approval: bool = False
+    argument_path_guard: bool = True
     timeout_seconds: int = 20
     headers: dict[str, str] = Field(default_factory=dict)
     tools: list[MCPToolSpec] = Field(default_factory=list)
@@ -76,4 +77,3 @@ class MCPServerStatus(BaseModel):
     status: str
     detail: str = ""
     last_checked_at: str = Field(default_factory=utc_timestamp)
-

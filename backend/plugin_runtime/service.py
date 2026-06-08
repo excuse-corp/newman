@@ -254,8 +254,38 @@ class PluginService:
         self.ensure_fresh()
         configs: list[dict] = []
         for plugin in self.enabled_plugins():
-            configs.extend(plugin.manifest.mcp_servers)
+            configs.extend(
+                self._resolve_plugin_mcp_config(plugin, config)
+                for config in plugin.manifest.mcp_servers
+            )
         return configs
+
+    def _resolve_plugin_mcp_config(self, plugin: LoadedPlugin, config: dict) -> dict:
+        payload = dict(config)
+        if payload.get("transport") != "stdio":
+            return payload
+
+        plugin_root = plugin.root_path.resolve()
+        payload["command"] = self._resolve_stdio_path_values(plugin_root, payload.get("command"))
+        payload["args"] = self._resolve_stdio_path_values(plugin_root, payload.get("args"))
+        env = dict(payload.get("env") or {})
+        env.setdefault("NEWMAN_PLUGIN_ROOT", str(plugin_root))
+        env.setdefault("NEWMAN_PLUGIN_NAME", plugin.manifest.name)
+        payload["env"] = env
+        return payload
+
+    def _resolve_stdio_path_values(self, plugin_root: Path, value: object) -> object:
+        if isinstance(value, list):
+            return [self._resolve_stdio_path_values(plugin_root, item) for item in value]
+        if not isinstance(value, str) or not value.strip():
+            return value
+        path = Path(value)
+        if path.is_absolute():
+            return value
+        candidate = (plugin_root / path).resolve()
+        if candidate.exists():
+            return str(candidate)
+        return value
 
     def _standalone_skills(self) -> list[SkillDescriptor]:
         if not self.skills_dir.exists():

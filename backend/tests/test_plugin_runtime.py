@@ -77,6 +77,42 @@ class PluginServiceTests(unittest.TestCase):
             self.assertEqual(plugins[0].name, "demo-plugin")
             self.assertEqual(service.list_skills()[0].plugin_name, "demo-plugin")
 
+    def test_mcp_server_configs_resolve_plugin_relative_stdio_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugins_dir = root / "plugins"
+            skills_dir = root / "skills"
+            state_path = root / "state" / "plugin_state.json"
+            plugins_dir.mkdir(parents=True, exist_ok=True)
+            skills_dir.mkdir(parents=True, exist_ok=True)
+            plugin_dir = plugins_dir / "tool_plugin"
+            script_path = plugin_dir / "mcp" / "server.py"
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+            script_path.write_text("print('ok')\n", encoding="utf-8")
+            _write_plugin(
+                plugins_dir,
+                "tool_plugin",
+                """
+                name: tool-plugin
+                version: 1.0.0
+                mcp_servers:
+                  - name: tool-server
+                    transport: stdio
+                    command:
+                      - python
+                    args:
+                      - mcp/server.py
+                """,
+            )
+            service = PluginService(plugins_dir, skills_dir, state_path)
+
+            configs = service.mcp_server_configs()
+
+            self.assertEqual(configs[0]["command"], ["python"])
+            self.assertEqual(configs[0]["args"], [str(script_path.resolve())])
+            self.assertEqual(configs[0]["env"]["NEWMAN_PLUGIN_ROOT"], str(plugin_dir.resolve()))
+            self.assertEqual(configs[0]["env"]["NEWMAN_PLUGIN_NAME"], "tool-plugin")
+
 
 class HookManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_handler_hook_executes_and_returns_message(self) -> None:

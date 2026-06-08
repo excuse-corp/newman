@@ -259,7 +259,11 @@ class _DummyRegistry:
 
 
 class _DummyMCPRegistry:
+    def __init__(self):
+        self.build_calls = 0
+
     def build_tools(self, plugin_configs=None):
+        self.build_calls += 1
         return []
 
 
@@ -1067,6 +1071,12 @@ class PluginsRouteTests(unittest.TestCase):
                 hooks:
                   - event: FileChanged
                     message: watched
+                mcp_servers:
+                  - name: demo-server
+                    transport: inline
+                    tools:
+                      - name: echo
+                        description: Echo
                 """,
             )
             _write_plugin(
@@ -1080,7 +1090,7 @@ class PluginsRouteTests(unittest.TestCase):
             )
 
             service = PluginService(plugins_dir, skills_dir, state_path)
-            runtime = _SkillRuntime(service, memory_dir, ["read_file"])
+            runtime = _SkillRuntime(service, memory_dir, ["read_file", "mcp__demo-server__echo"])
             settings = SimpleNamespace(paths=SimpleNamespace(workspace=root))
             client = TestClient(_build_app(plugins_router, runtime=runtime, settings=settings))
 
@@ -1094,6 +1104,8 @@ class PluginsRouteTests(unittest.TestCase):
             self.assertEqual(payload["name"], "demo-plugin")
             self.assertEqual(payload["manifest"]["version"], "1.0.0")
             self.assertEqual(payload["hook_handlers"][0]["event"], "FileChanged")
+            self.assertEqual(payload["tool_names"], ["mcp__demo-server__echo"])
+            self.assertEqual(runtime.mcp_registry.build_calls, 0)
 
             imported = client.post("/api/plugins/import", json={"source_path": "imports/import_plugin"})
             self.assertEqual(imported.status_code, 200)
@@ -1118,6 +1130,8 @@ class PluginsRouteTests(unittest.TestCase):
             disabled = client.post("/api/plugins/demo-plugin/disable")
             self.assertEqual(disabled.status_code, 200)
             self.assertFalse(disabled.json()["plugin"]["enabled"])
+            self.assertEqual(disabled.json()["plugin"]["tool_names"], [])
+            self.assertEqual(runtime.mcp_registry.build_calls, 0)
 
             enabled = client.post("/api/plugins/demo-plugin/enable")
             self.assertEqual(enabled.status_code, 200)
