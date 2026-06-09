@@ -20,7 +20,7 @@ class ListDirectoryTool(BaseTool):
         self.workspace = self.policy.workspace
         self.meta = ToolMeta(
             name=name,
-            description=description or "List files and directories inside the workspace.",
+            description=description or "List files and directories from the allowed readable paths.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -106,6 +106,6 @@ def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
         ListDirectoryTool(
             context.path_policy,
             name="list_files",
-            description="Alias of list_dir. List files and directories inside the workspace.",
+            description="Alias of list_dir. List files and directories from the allowed readable paths.",
         ),
     ]

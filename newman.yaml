@@ -49,6 +49,7 @@ permissions:
   readable_paths:
     - "."
   writable_paths:
+    - "test_runtimespace"
     - "backend_data/memory"
     - "skills"
     - "plugins"
@@ -64,6 +65,8 @@ channels:
 
 paths:
   workspace: "/root/newman/test_runtimespace"
+  browse_root: "/root/newman"
+  output_root: "/root/newman/test_runtimespace/outputs/chat"
   data_dir: "backend_data"
   sessions_dir: "backend_data/sessions"
   memory_dir: "backend_data/memory"

@@ -40,6 +40,7 @@ from backend.api.routes.plugins import router as plugins_router
 from backend.api.routes.runtime_location import router as runtime_location_router
 from backend.api.routes.sessions import router as sessions_router
 from backend.api.routes.skills import router as skills_router
+from backend.api.routes.subagents import router as subagents_router
 from backend.api.routes.tools import router as tools_router
 from backend.api.routes.usage import router as usage_router
 from backend.api.routes.workspace import router as workspace_router
@@ -50,6 +51,9 @@ from backend.providers.base import ProviderError
 from backend.sessions.models import SessionMessage
 from backend.sessions.session_store import SessionStore
 from backend.skill_runtime.registry import SkillRegistry
+from backend.subagents.manager import MultiAgentManager
+from backend.subagents.models import MultiAgentRun, SubagentTask
+from backend.subagents.store import MultiAgentStore
 from backend.tools.approval import ApprovalManager, ApprovalRequest
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.discovery import BuiltinToolContext
@@ -610,6 +614,8 @@ class MessageRouteTests(unittest.TestCase):
             session = session_store.create(title="parse-on-demand")
             path_policy = PathAccessPolicy(
                 workspace=workspace.resolve(),
+                browse_root=workspace.resolve(),
+                output_root=workspace.resolve() / "outputs" / "chat",
                 readable_roots=(workspace.resolve(),),
                 writable_roots=(workspace.resolve(),),
                 protected_roots=(),
@@ -709,7 +715,26 @@ class MessageRouteTests(unittest.TestCase):
 
             worker = _InterruptWorker()
             event_queue: asyncio.Queue[bytes] = asyncio.Queue()
-            runtime = SimpleNamespace(session_store=session_store)
+            subagent_manager = MultiAgentManager(AppConfig(), MultiAgentStore(root / "subagents"))
+            subagent_run = MultiAgentRun(
+                run_id="run-interrupt",
+                parent_session_id=session.session_id,
+                parent_turn_id=turn_id,
+                mode="parallel",
+                status="running",
+            )
+            subagent_task = SubagentTask(
+                task_id="task-interrupt",
+                run_id=subagent_run.run_id,
+                parent_session_id=session.session_id,
+                parent_turn_id=turn_id,
+                child_session_id="child-interrupt",
+                name="worker",
+                assignment_prompt="Keep working.",
+                status="running",
+            )
+            subagent_manager.store.save_run(subagent_run, [subagent_task])
+            runtime = SimpleNamespace(session_store=session_store, subagent_manager=subagent_manager)
             settings = SimpleNamespace(paths=SimpleNamespace(audit_dir=root / "audit", data_dir=root / "data"))
             client = TestClient(_build_app(messages_router, runtime=runtime, settings=settings))
             client.app.state.active_message_runs = {
@@ -743,9 +768,176 @@ class MessageRouteTests(unittest.TestCase):
             self.assertEqual(event_payload["event"], "turn_interrupted")
             self.assertEqual(event_payload["data"]["turn_id"], turn_id)
 
-            queued_payload = json.loads(event_queue.get_nowait().decode("utf-8").removeprefix("data: ").strip())
-            self.assertEqual(queued_payload["event"], "turn_interrupted")
-            self.assertEqual(queued_payload["data"]["turn_id"], turn_id)
+            subagent_record = subagent_manager.store.get_record(subagent_run.run_id)
+            self.assertEqual(subagent_record.run.status, "cancelled")
+            self.assertEqual(subagent_record.run.cancel_reason, "parent_interrupted")
+            saved_subagent_task = subagent_record.tasks[subagent_task.task_id]
+            self.assertEqual(saved_subagent_task.status, "cancelled")
+            self.assertEqual(saved_subagent_task.cancel_reason, "parent_interrupted")
+            self.assertEqual(saved_subagent_task.result.degraded_reason, "cancelled")
+
+
+class MultiAgentRouteTests(unittest.TestCase):
+    def test_get_multiagent_run_route_returns_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = MultiAgentManager(AppConfig(), MultiAgentStore(root / "subagents"))
+            run = MultiAgentRun(
+                run_id="run-1",
+                parent_session_id="parent-session",
+                parent_turn_id="turn-1",
+                mode="parallel",
+            )
+            task = SubagentTask(
+                task_id="task-1",
+                run_id=run.run_id,
+                parent_session_id=run.parent_session_id,
+                parent_turn_id=run.parent_turn_id,
+                child_session_id="child-1",
+                name="worker",
+                assignment_prompt="Do the work.",
+            )
+            manager.store.save_run(run, [task])
+            runtime = SimpleNamespace(subagent_manager=manager)
+            client = TestClient(_build_app(subagents_router, runtime=runtime, settings=SimpleNamespace()))
+
+            response = client.get("/api/multiagent/runs/run-1")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["run"]["run_id"], "run-1")
+            self.assertEqual(payload["tasks"][0]["task_id"], "task-1")
+
+    def test_get_multiagent_task_route_returns_run_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = MultiAgentManager(AppConfig(), MultiAgentStore(root / "subagents"))
+            run = MultiAgentRun(
+                run_id="run-1",
+                parent_session_id="parent-session",
+                parent_turn_id="turn-1",
+                mode="parallel",
+            )
+            task = SubagentTask(
+                task_id="task-1",
+                run_id=run.run_id,
+                parent_session_id=run.parent_session_id,
+                parent_turn_id=run.parent_turn_id,
+                child_session_id="child-1",
+                name="worker",
+                assignment_prompt="Do the work.",
+            )
+            manager.store.save_run(run, [task])
+            runtime = SimpleNamespace(subagent_manager=manager)
+            client = TestClient(_build_app(subagents_router, runtime=runtime, settings=SimpleNamespace()))
+
+            response = client.get("/api/multiagent/tasks/task-1")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["task"]["task_id"], "task-1")
+            self.assertEqual(payload["run"]["run_id"], "run-1")
+
+    def test_cancel_task_route_marks_pending_task_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = MultiAgentManager(AppConfig(), MultiAgentStore(root / "subagents"))
+            run = MultiAgentRun(
+                run_id="run-1",
+                parent_session_id="parent-session",
+                parent_turn_id="turn-1",
+                mode="parallel",
+            )
+            task = SubagentTask(
+                task_id="task-1",
+                run_id=run.run_id,
+                parent_session_id=run.parent_session_id,
+                parent_turn_id=run.parent_turn_id,
+                child_session_id="child-1",
+                name="worker",
+                assignment_prompt="Do the work.",
+            )
+            manager.store.save_run(run, [task])
+            runtime = SimpleNamespace(subagent_manager=manager)
+            client = TestClient(_build_app(subagents_router, runtime=runtime, settings=SimpleNamespace()))
+
+            response = client.post("/api/multiagent/tasks/task-1/cancel", json={"reason": "user_requested"})
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertTrue(payload["accepted"])
+            self.assertEqual(payload["status"], "cancelled")
+            saved_task = manager.store.get_task("task-1")
+            self.assertEqual(saved_task.status, "cancelled")
+            self.assertEqual(saved_task.result.degraded_reason, "cancelled")
+
+    def test_cancel_run_route_marks_request_on_running_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = MultiAgentManager(AppConfig(), MultiAgentStore(root / "subagents"))
+            run = MultiAgentRun(
+                run_id="run-1",
+                parent_session_id="parent-session",
+                parent_turn_id="turn-1",
+                mode="parallel",
+                status="running",
+            )
+            task = SubagentTask(
+                task_id="task-1",
+                run_id=run.run_id,
+                parent_session_id=run.parent_session_id,
+                parent_turn_id=run.parent_turn_id,
+                child_session_id="child-1",
+                name="worker",
+                assignment_prompt="Do the work.",
+                status="running",
+            )
+            manager.store.save_run(run, [task])
+            runtime = SimpleNamespace(subagent_manager=manager)
+            client = TestClient(_build_app(subagents_router, runtime=runtime, settings=SimpleNamespace()))
+
+            response = client.post("/api/multiagent/runs/run-1/cancel", json={"reason": "user_requested"})
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertTrue(payload["accepted"])
+            self.assertEqual(payload["status"], "cancelled")
+            saved_record = manager.store.get_record("run-1")
+            self.assertEqual(saved_record.run.status, "cancelled")
+            self.assertIsNotNone(saved_record.run.cancel_requested_at)
+            self.assertEqual(saved_record.tasks["task-1"].status, "cancelled")
+            self.assertEqual(saved_record.tasks["task-1"].current_activity, "Cancelled")
+            self.assertEqual(saved_record.tasks["task-1"].result.degraded_reason, "cancelled")
+
+    def test_list_session_multiagent_runs_filters_by_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="parent")
+            manager = MultiAgentManager(AppConfig(), MultiAgentStore(root / "subagents"))
+            first = MultiAgentRun(
+                run_id="run-1",
+                parent_session_id=session.session_id,
+                parent_turn_id="turn-1",
+                mode="parallel",
+            )
+            second = MultiAgentRun(
+                run_id="run-2",
+                parent_session_id=session.session_id,
+                parent_turn_id="turn-2",
+                mode="parallel",
+            )
+            manager.store.save_run(first, [])
+            manager.store.save_run(second, [])
+            runtime = SimpleNamespace(session_store=session_store, subagent_manager=manager)
+            client = TestClient(_build_app(sessions_router, runtime=runtime, settings=SimpleNamespace()))
+
+            response = client.get(f"/api/sessions/{session.session_id}/multiagent-runs", params={"turn_id": "turn-1"})
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["session_id"], session.session_id)
+            self.assertEqual([item["run"]["run_id"] for item in payload["runs"]], ["run-1"])
 
 
 class RuntimeLocationRouteTests(unittest.TestCase):
@@ -808,6 +1000,15 @@ class ApprovalRouteTests(unittest.TestCase):
         )
         self.assertEqual(approved.status_code, 200)
         self.assertTrue(approved.json()["approved"])
+        approvals.discard(request.approval_request_id, resolved_approved=True)
+
+        repeated_approved = client.post(
+            "/api/sessions/session-1/reject",
+            json={"approval_request_id": request.approval_request_id},
+        )
+        self.assertEqual(repeated_approved.status_code, 200)
+        self.assertTrue(repeated_approved.json()["approved"])
+        self.assertTrue(repeated_approved.json()["already_resolved"])
 
         second = ApprovalRequest(
             approval_request_id="apr-2",
@@ -850,6 +1051,82 @@ class ApprovalRouteTests(unittest.TestCase):
             json={"approval_request_id": request.approval_request_id},
         )
         self.assertEqual(conflict.status_code, 409)
+
+    def test_multiagent_approval_queue_and_resolution_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            approvals = ApprovalManager()
+            manager = MultiAgentManager(AppConfig(), MultiAgentStore(root / "subagents"))
+            run = MultiAgentRun(
+                run_id="run-1",
+                parent_session_id="parent-session",
+                parent_turn_id="turn-1",
+                mode="parallel",
+            )
+            task = SubagentTask(
+                task_id="task-1",
+                run_id=run.run_id,
+                parent_session_id=run.parent_session_id,
+                parent_turn_id=run.parent_turn_id,
+                child_session_id="child-1",
+                name="worker",
+                assignment_prompt="Do the work.",
+            )
+            manager.store.save_run(run, [task])
+
+            pending = ApprovalRequest(
+                approval_request_id="apr-sub-1",
+                session_id=task.child_session_id,
+                turn_id=task.task_id,
+                tool_name="terminal",
+                arguments={"command": "pwd"},
+                reason="terminal_mutation_or_unknown",
+            )
+            approvals._pending[pending.approval_request_id] = pending
+
+            runtime = SimpleNamespace(
+                approvals=approvals,
+                subagent_manager=manager,
+                settings=SimpleNamespace(approval=SimpleNamespace(timeout_seconds=120)),
+            )
+            client = TestClient(_build_app(approvals_router, runtime=runtime))
+
+            queue = client.get(f"/api/sessions/{run.parent_session_id}/multiagent-approvals")
+            self.assertEqual(queue.status_code, 200)
+            payload = queue.json()
+            self.assertEqual(payload["session_id"], run.parent_session_id)
+            self.assertEqual(payload["pending"][0]["approval_request_id"], pending.approval_request_id)
+            self.assertEqual(payload["pending"][0]["task_id"], task.task_id)
+            self.assertEqual(payload["pending"][0]["child_session_id"], task.child_session_id)
+
+            approved = client.post(
+                f"/api/sessions/{run.parent_session_id}/multiagent-approvals/{pending.approval_request_id}/approve"
+            )
+            self.assertEqual(approved.status_code, 200)
+            self.assertTrue(approved.json()["approved"])
+
+            second = ApprovalRequest(
+                approval_request_id="apr-sub-2",
+                session_id=task.child_session_id,
+                turn_id=task.task_id,
+                tool_name="write_file",
+                arguments={"path": "demo.txt", "content": "ok"},
+                reason="requires_approval",
+            )
+            approvals._pending[second.approval_request_id] = second
+            rejected = client.post(
+                f"/api/sessions/{run.parent_session_id}/multiagent-approvals/{second.approval_request_id}/reject"
+            )
+            self.assertEqual(rejected.status_code, 200)
+            self.assertFalse(rejected.json()["approved"])
+            approvals.discard(second.approval_request_id, resolved_approved=False)
+
+            repeated = client.post(
+                f"/api/sessions/{run.parent_session_id}/multiagent-approvals/{second.approval_request_id}/approve"
+            )
+            self.assertEqual(repeated.status_code, 200)
+            self.assertFalse(repeated.json()["approved"])
+            self.assertTrue(repeated.json()["already_resolved"])
 
 
 class MessageRouteAsyncTests(unittest.IsolatedAsyncioTestCase):
@@ -1279,6 +1556,8 @@ class ToolsRouteTests(unittest.TestCase):
                 def __init__(self):
                     policy = PathAccessPolicy(
                         workspace=workspace,
+                        browse_root=workspace,
+                        output_root=workspace / "outputs" / "chat",
                         readable_roots=(workspace, Path(__file__).resolve().parents[1] / "tools"),
                         writable_roots=(workspace, Path(__file__).resolve().parents[1] / "tools"),
                         protected_roots=(),

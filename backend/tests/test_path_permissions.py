@@ -13,15 +13,18 @@ from backend.tools.workspace_fs import PathAccessPolicy, build_path_access_polic
 
 
 class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_build_path_access_policy_treats_workspace_as_writable_operation_space(self) -> None:
+    async def test_build_path_access_policy_splits_browse_output_and_writable_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
+            browse_root = root / "browse"
+            output_root = workspace / "outputs" / "chat"
             writable = workspace / "skills"
             workspace.mkdir()
+            browse_root.mkdir()
             writable.mkdir()
             settings = SimpleNamespace(
-                paths=SimpleNamespace(workspace=workspace),
+                paths=SimpleNamespace(workspace=workspace, browse_root=browse_root, output_root=output_root),
                 permissions=SimpleNamespace(
                     readable_paths=[],
                     writable_paths=[writable],
@@ -32,13 +35,22 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
             policy = build_path_access_policy(settings)
 
             self.assertIn(workspace.resolve(), policy.readable_roots)
-            self.assertIn(workspace.resolve(), policy.writable_roots)
+            self.assertIn(browse_root.resolve(), policy.readable_roots)
+            self.assertIn(output_root.resolve(), policy.writable_roots)
+            self.assertNotIn(workspace.resolve(), policy.writable_roots)
             self.assertIn(writable.resolve(), policy.writable_roots)
 
             result = await WriteFileTool(policy).run({"path": "outputs/result.html", "content": "<html></html>"}, "session-0")
 
-            self.assertTrue(result.success)
-            self.assertTrue((workspace / "outputs" / "result.html").exists())
+            self.assertFalse(result.success)
+
+            output_result = await WriteFileTool(policy).run(
+                {"path": str(output_root / "result.html"), "content": "<html></html>"},
+                "session-0",
+            )
+
+            self.assertTrue(output_result.success)
+            self.assertTrue((output_root / "result.html").exists())
 
     async def test_read_file_can_read_from_additional_readable_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,6 +64,8 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
 
             policy = PathAccessPolicy(
                 workspace=workspace,
+                browse_root=workspace,
+                output_root=workspace / "outputs" / "chat",
                 readable_roots=(workspace, shared),
                 writable_roots=(workspace,),
                 protected_roots=(),
@@ -63,6 +77,36 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["content"], "hello\nworld\n")
             self.assertEqual(payload["encoding"], "utf-8")
+
+    async def test_relative_read_uses_browse_root_but_relative_write_uses_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            browse_root = root / "browse"
+            workspace.mkdir()
+            browse_root.mkdir()
+            (browse_root / "guide.md").write_text("from browse\n", encoding="utf-8")
+
+            settings = SimpleNamespace(
+                paths=SimpleNamespace(workspace=workspace, browse_root=browse_root, output_root=workspace / "outputs" / "chat"),
+                permissions=SimpleNamespace(
+                    readable_paths=[],
+                    writable_paths=[workspace],
+                    protected_paths=[],
+                ),
+            )
+            policy = build_path_access_policy(settings)
+
+            read_result = await ReadFileTool(policy).run({"path": "guide.md"}, "session-relative")
+            write_result = await WriteFileTool(policy).run(
+                {"path": "note.txt", "content": "from workspace\n"},
+                "session-relative",
+            )
+
+            self.assertTrue(read_result.success)
+            self.assertTrue(write_result.success)
+            self.assertTrue((workspace / "note.txt").exists())
+            self.assertFalse((browse_root / "note.txt").exists())
 
     async def test_runtime_logs_can_be_read_without_exposing_audit_or_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -116,6 +160,8 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
 
             policy = PathAccessPolicy(
                 workspace=workspace,
+                browse_root=workspace,
+                output_root=workspace / "outputs" / "chat",
                 readable_roots=(workspace, readonly),
                 writable_roots=(workspace,),
                 protected_roots=(),
@@ -138,6 +184,8 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
 
             policy = PathAccessPolicy(
                 workspace=workspace,
+                browse_root=workspace,
+                output_root=workspace / "outputs" / "chat",
                 readable_roots=(workspace,),
                 writable_roots=(workspace,),
                 protected_roots=(),
@@ -158,6 +206,8 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
 
             policy = PathAccessPolicy(
                 workspace=workspace,
+                browse_root=workspace,
+                output_root=workspace / "outputs" / "chat",
                 readable_roots=(workspace,),
                 writable_roots=(workspace,),
                 protected_roots=(),
@@ -191,6 +241,8 @@ class PathPermissionToolTests(unittest.IsolatedAsyncioTestCase):
 
             policy = PathAccessPolicy(
                 workspace=workspace,
+                browse_root=workspace,
+                output_root=workspace / "outputs" / "chat",
                 readable_roots=(workspace, managed),
                 writable_roots=(workspace, managed),
                 protected_roots=(),

@@ -368,7 +368,7 @@ class TurnApprovalTests(unittest.IsolatedAsyncioTestCase):
             {"path": "/tmp/outside.txt"},
             "session-mcp-deny",
             emit,
-            extra_reasons=["mcp_path_outside_workspace:/tmp/outside.txt"],
+            extra_reasons=["mcp_read_outside_readable_paths:/tmp/outside.txt"],
             turn_approval_mode="manual",
         )
 

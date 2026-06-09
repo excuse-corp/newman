@@ -19,6 +19,7 @@ from backend.api.routes.runtime_location import router as runtime_location_route
 from backend.api.routes.scheduler import router as scheduler_router
 from backend.api.routes.sessions import router as sessions_router
 from backend.api.routes.skills import router as skills_router
+from backend.api.routes.subagents import router as subagents_router
 from backend.api.routes.tools import router as tools_router
 from backend.api.routes.usage import router as usage_router
 from backend.api.routes.workspace import router as workspace_router
@@ -54,6 +55,7 @@ def create_app() -> FastAPI:
 
     app.include_router(sessions_router)
     app.include_router(messages_router)
+    app.include_router(subagents_router)
     app.include_router(approvals_router)
     app.include_router(audit_router)
     app.include_router(config_router)

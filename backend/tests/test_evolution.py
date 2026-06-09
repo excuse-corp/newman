@@ -90,6 +90,14 @@ class _EvolutionProvider(BaseProvider):
         return 0
 
 
+class _UsageStore:
+    def __init__(self) -> None:
+        self.records = []
+
+    def record(self, record) -> None:
+        self.records.append(record)
+
+
 def _extract_payload(content: str) -> dict:
     start = content.index("{")
     end = content.rindex("}") + 1
@@ -123,7 +131,7 @@ def _build_settings(root: Path) -> AppConfig:
     )
 
 
-def _build_service(root: Path) -> tuple[EvolutionService, SessionStore, PluginService]:
+def _build_service(root: Path, usage_store=None) -> tuple[EvolutionService, SessionStore, PluginService]:
     settings = _build_settings(root)
     for path in [
         settings.paths.sessions_dir,
@@ -162,7 +170,7 @@ def _build_service(root: Path) -> tuple[EvolutionService, SessionStore, PluginSe
         skill_registry=skill_registry,
         store=EvolutionStore(settings.paths.evolution_dir),
         reload_ecosystem=reload_ecosystem,
-        usage_store=None,
+        usage_store=usage_store,
     )
     return service, session_store, plugin_service
 
@@ -185,6 +193,21 @@ class EvolutionServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("修改前端后运行构建检查", skill_md)
             self.assertTrue((root / "skills" / "frontend-debug" / "scripts" / "check_build.py").exists())
             self.assertGreaterEqual(len(run.changes), 2)
+
+    async def test_run_records_evolution_model_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            usage_store = _UsageStore()
+            service, session_store, _ = _build_service(root, usage_store=usage_store)
+            session = session_store.create("Frontend fix")
+            session_store.append_message(session.session_id, SessionMessage(id="u1", role="user", content="修一下前端页面"))
+            session_store.append_message(session.session_id, SessionMessage(id="a1", role="assistant", content="已修复并通过构建。"))
+
+            await service.run_for_session(session.session_id, "new_session_created")
+
+            self.assertEqual([record.request_kind for record in usage_store.records], ["evolution_analysis", "evolution_skill_update"])
+            self.assertEqual(sum(record.total_tokens for record in usage_store.records), 340)
+            self.assertTrue(all(record.session_id == session.session_id for record in usage_store.records))
 
     async def test_rollback_restores_changed_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,3 +237,18 @@ class EvolutionServiceTests(unittest.IsolatedAsyncioTestCase):
             session.messages.append(SessionMessage(id="u19", role="user", content="继续"))
             self.assertTrue(service.should_run_for_turn_interval(session))
 
+    def test_memory_updates_are_capped_to_one_item_and_80_chars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, _, _ = _build_service(Path(tmp))
+            long_text = "这是一条过长的经验记忆" * 10
+
+            updates = service._normalize_memory_updates(
+                [
+                    {"text": long_text, "reason": "too long"},
+                    {"text": "短经验会被保留用于后续任务。", "reason": "valid"},
+                    {"text": "第二条短经验不会在同次写入。", "reason": "over limit"},
+                ]
+            )
+
+            self.assertEqual(updates, [{"text": "短经验会被保留用于后续任务。", "reason": "valid"}])
+            self.assertLessEqual(len(updates[0]["text"]), 80)

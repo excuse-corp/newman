@@ -237,11 +237,11 @@ def _collect_output_candidates(
 
 
 def _list_primary_output_files(policy: PathAccessPolicy, *, turn_output_dir: Path | None = None) -> tuple[Path, ...]:
-    output_dir = turn_output_dir or (policy.workspace / "outputs")
+    output_dir = turn_output_dir or policy.output_root
     if not output_dir.exists():
         return ()
     try:
-        return tuple(iter_workspace_files(output_dir, policy.workspace, include_hidden=False))
+        return tuple(iter_workspace_files(output_dir, policy.browse_root, include_hidden=False))
     except OSError:
         return ()
 

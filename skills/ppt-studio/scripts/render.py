@@ -60,7 +60,7 @@ def layout_all(theme, slides):
         if "page" not in slide:
             slide["page"] = idx + 1
         try:
-            els = TEMPLATES[tname](slide, theme)
+            els = TEMPLATES[tname](slide.get("data", {}), theme)
         except Exception as e:
             raise ValueError(f"slide {idx + 1} ({tname}): {e}") from e
         all_elements.append(els)

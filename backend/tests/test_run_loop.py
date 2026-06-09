@@ -545,27 +545,60 @@ class _DummyRequestUserInputWithPreviewProvider:
 
 class _DummyFinalUserInputRequestProvider:
     def __init__(self) -> None:
-        self.calls = 0
+        self.stream_calls = 0
+        self.judge_calls = 0
 
     async def chat(self, messages, tools=None, **kwargs):
-        raise AssertionError("chat should not be called in this test")
+        self.judge_calls += 1
+        return ProviderResponse(
+            content=json.dumps(
+                {
+                    "decision": "ask_user",
+                    "reason": "needs_token_before_plugin_setup",
+                    "instruction": "当前任务继续依赖用户提供 GitHub Personal Access Token。下一步必须调用 request_user_input，不要输出普通最终回答。",
+                    "turn_outcome": "awaiting_user",
+                },
+                ensure_ascii=False,
+            ),
+            usage=TokenUsage(),
+            model="dummy-model",
+            finish_reason="stop",
+        )
 
     async def chat_stream(self, messages, tools=None, **kwargs):
-        self.calls += 1
-        if self.calls > 1:
-            raise AssertionError("run loop should stop after final answer")
-        yield ProviderChunk(
-            type="text",
-            delta=(
-                "信息已经收集充分，这是一份完整调研报告。\n\n"
-                "GitHub MCP Server 是 GitHub 官方提供的 MCP 服务，可以让 Agent 查询仓库、管理 Issue、"
-                "处理 Pull Request、查看 Actions 和安全告警。接入 Newman 时可以采用远程 MCP 或本地 Docker "
-                "两种方案。远程方式部署成本最低，本地方式更适合需要完全控制运行环境的场景。\n\n"
-                "接入前需要你提供 GitHub Personal Access Token，建议只授予 repo 和 read:org 等最小必要权限。"
-                "如果要继续落地，我可以下一步帮你创建插件配置。要搞吗？"
-            ),
-        )
-        yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+        self.stream_calls += 1
+        if self.stream_calls == 1:
+            yield ProviderChunk(
+                type="text",
+                delta=(
+                    "信息已经收集充分，这是一份完整调研报告。\n\n"
+                    "GitHub MCP Server 是 GitHub 官方提供的 MCP 服务，可以让 Agent 查询仓库、管理 Issue、"
+                    "处理 Pull Request、查看 Actions 和安全告警。接入 Newman 时可以采用远程 MCP 或本地 Docker "
+                    "两种方案。远程方式部署成本最低，本地方式更适合需要完全控制运行环境的场景。\n\n"
+                    "接入前需要你提供 GitHub Personal Access Token，建议只授予 repo 和 read:org 等最小必要权限。"
+                    "如果要继续落地，我可以下一步帮你创建插件配置。要搞吗？"
+                ),
+            )
+            yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+            return
+        if self.stream_calls == 2:
+            yield ProviderChunk(
+                type="tool_call",
+                tool_call=ToolCall(
+                    id="tool-1",
+                    name="request_user_input",
+                    arguments={
+                        "kind": "confirm",
+                        "skill_name": "github-mcp",
+                        "phase": "credentials",
+                        "content": "接入前需要你提供 GitHub Personal Access Token，建议只授予 repo 和 read:org 等最小必要权限。",
+                        "prompt": "是否继续，并在下一条消息中提供可用的 GitHub Personal Access Token？",
+                    },
+                ),
+            )
+            yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+            return
+        raise AssertionError("run loop should stop after request_user_input")
 
     def estimate_tokens(self, messages) -> int:
         return 0
@@ -596,6 +629,68 @@ class _DummyCompletionGateProvider:
             yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
             return
         yield ProviderChunk(type="text", delta="系统运行日志在 `backend_data/run/logs/backend.log` 和 `backend_data/run/logs/frontend.log`。会话审计日志在 `backend_data/audit/{session_id}.log`，默认受保护，不能直接读取。")
+        yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+
+    def estimate_tokens(self, messages) -> int:
+        return 0
+
+
+class _DummyExecutionTaskCompletionJudgeProvider:
+    def __init__(self, session_id: str, turn_id: str) -> None:
+        self.stream_calls: list[dict[str, object]] = []
+        self.judge_calls: list[dict[str, object]] = []
+        self.output_path = f"outputs/chat/{session_id}/{turn_id}/preview.html"
+
+    async def chat(self, messages, tools=None, **kwargs):
+        self.judge_calls.append({"messages": messages, "tools": tools})
+        if len(self.judge_calls) > 1:
+            return ProviderResponse(
+                content=json.dumps(
+                    {
+                        "decision": "final",
+                        "reason": "artifacts_ready",
+                        "instruction": "",
+                        "turn_outcome": "answered",
+                    },
+                    ensure_ascii=False,
+                ),
+                usage=TokenUsage(),
+                model="dummy-model",
+                finish_reason="stop",
+            )
+        return ProviderResponse(
+            content=json.dumps(
+                {
+                    "decision": "continue",
+                    "reason": "candidate_only_describes_next_step",
+                    "instruction": "当前 PPT 更新任务还没完成。不要输出行动说明；直接继续调用完成任务所需的工具，并在拿到可验证结果后再回答用户。",
+                    "turn_outcome": "answered",
+                },
+                ensure_ascii=False,
+            ),
+            usage=TokenUsage(),
+            model="dummy-model",
+            finish_reason="stop",
+        )
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        self.stream_calls.append({"messages": messages, "tools": tools})
+        if len(self.stream_calls) == 1:
+            yield ProviderChunk(type="text", delta="引号嵌套问题，需要转义中文引号。")
+            yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
+            return
+        if len(self.stream_calls) == 2:
+            yield ProviderChunk(
+                type="tool_call",
+                tool_call=ToolCall(
+                    id="tool-1",
+                    name="write_file",
+                    arguments={"path": self.output_path, "content": "<html>ok</html>"},
+                ),
+            )
+            yield ProviderChunk(type="done", finish_reason="tool_calls", usage=TokenUsage())
+            return
+        yield ProviderChunk(type="text", delta="PPT 已更新完成，预览文件和最终文件都已生成。")
         yield ProviderChunk(type="done", finish_reason="stop", usage=TokenUsage())
 
     def estimate_tokens(self, messages) -> int:
@@ -909,7 +1004,7 @@ class WorkflowAwaitingUserRunLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("项目管理员表预览", awaiting["content"])
             self.assertIn("项目管理员表预览", saved.metadata["awaiting_user_input"]["content"])
 
-    async def test_final_answer_requesting_user_input_stays_final_answer(self) -> None:
+    async def test_final_answer_requesting_user_input_is_converted_to_awaiting_user(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session_store = SessionStore(Path(tmp))
             session = session_store.create(title="excel")
@@ -939,6 +1034,15 @@ class WorkflowAwaitingUserRunLoopTests(unittest.IsolatedAsyncioTestCase):
                 approval=_DummyApproval(),
                 runtime=SimpleNamespace(max_tool_depth=30),
             )
+            runtime.router = SimpleNamespace(
+                route=lambda tool_name, arguments: request_tool,
+                static_checks=lambda tool, arguments: [],
+            )
+
+            async def execute_tool(tool, arguments, session_id, emit, **kwargs):
+                return await tool.run(arguments, session_id)
+
+            runtime.orchestrator = SimpleNamespace(execute=execute_tool)
 
             async def fake_maybe_checkpoint(task, emit):
                 return True
@@ -953,15 +1057,18 @@ class WorkflowAwaitingUserRunLoopTests(unittest.IsolatedAsyncioTestCase):
             await runtime.handle_message(session.session_id, "把朱方伟加入 Excel", emit, turn_id="turn-1")
 
             saved = session_store.get(session.session_id)
-            self.assertEqual(provider.calls, 1)
+            self.assertEqual(provider.stream_calls, 2)
+            self.assertEqual(provider.judge_calls, 1)
             self.assertEqual(saved.messages[-1].role, "assistant")
-            self.assertEqual(saved.messages[-1].metadata["turn_outcome"], "answered")
-            self.assertNotIn("awaiting_user_input", saved.metadata)
-            self.assertFalse(any(event == "user_input_requested" for event, _ in events))
+            self.assertEqual(saved.messages[-1].metadata["turn_outcome"], "awaiting_user")
+            self.assertIn("awaiting_user_input", saved.metadata)
+            self.assertTrue(any(event == "user_input_requested" for event, _ in events))
             final_payload = next(data for event, data in events if event == "final_response")
-            self.assertEqual(final_payload["finish_reason"], "stop")
-            self.assertEqual(final_payload["turn_outcome"], "answered")
+            self.assertEqual(final_payload["finish_reason"], "awaiting_user")
+            self.assertEqual(final_payload["turn_outcome"], "awaiting_user")
             self.assertIn("GitHub Personal Access Token", final_payload["content"])
+            completed_payload = next(data for event, data in events if event == "turn_completed")
+            self.assertEqual(completed_payload["turn_outcome"], "awaiting_user")
 
 
 class TurnCompletionGateTests(unittest.IsolatedAsyncioTestCase):
@@ -1135,6 +1242,114 @@ class TurnCompletionGateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(completion_feedback["reason"], "recoverable_failure_recovery:incomplete_action_statement")
             final_response_payload = next(data for event, data in events if event == "final_response")
             self.assertIn("backend_data/run/logs/frontend.log", final_response_payload["content"])
+            completed_payload = next(data for event, data in events if event == "turn_completed")
+            self.assertEqual(completed_payload["turn_outcome"], "answered")
+
+    async def test_execution_task_short_answer_is_routed_back_to_tools_by_completion_judge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+            session_store = SessionStore(root / "sessions")
+            session = session_store.create(title="ppt-update")
+            provider = _DummyExecutionTaskCompletionJudgeProvider(session.session_id, "turn-1")
+
+            runtime = object.__new__(NewmanRuntime)
+            runtime.provider = provider
+            runtime.usage_store = None
+            runtime.session_store = session_store
+            runtime.hook_manager = _DummyHookManager()
+            runtime.skill_registry = SimpleNamespace(sync_snapshot=lambda: None)
+            runtime.reload_ecosystem = lambda: None
+            runtime.memory_extractor = SimpleNamespace(looks_like_explicit_persistence_signal=lambda content: False)
+            runtime._tools_overview = lambda task=None: "tools"
+            runtime._assemble_task_messages = lambda task, **kwargs: [
+                {"role": message.role, "content": message.content}
+                for message in task.session.messages
+            ]
+            runtime._provider_tools_for_turn = lambda task: [{"type": "function", "function": {"name": "write_file"}}]
+            runtime.checkpoints = SimpleNamespace(get=lambda session_id: None)
+            runtime.feedback_writer = SimpleNamespace(build=lambda result: f"tool failed: {result.summary}")
+            runtime.settings = SimpleNamespace(
+                provider=SimpleNamespace(
+                    model="dummy-model",
+                    type="mock",
+                    context_window=None,
+                    effective_context_window=None,
+                ),
+                approval=_DummyApproval(),
+                runtime=SimpleNamespace(max_tool_depth=30),
+                paths=SimpleNamespace(
+                    workspace=workspace,
+                    output_root=workspace / "outputs" / "chat",
+                    skills_dir=root / "skills",
+                    plugins_dir=root / "plugins",
+                ),
+            )
+            runtime.router = SimpleNamespace(
+                route=lambda tool_name, arguments: SimpleNamespace(meta=SimpleNamespace(name=tool_name)),
+                static_checks=lambda tool, arguments: [],
+            )
+
+            output_file = workspace / "outputs" / "chat" / session.session_id / "turn-1" / "preview.html"
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            output_file.write_text("<html>ok</html>", encoding="utf-8")
+
+            async def execute_tool(tool, arguments, session_id, emit, **kwargs):
+                return ToolExecutionResult(
+                    success=True,
+                    tool="write_file",
+                    action="write",
+                    summary="已写入预览文件",
+                    metadata={
+                        "path": str(output_file),
+                        "created": True,
+                        "output_files": [
+                            {
+                                "path": str(output_file),
+                                "summary": "终端命令生成文件 outputs/chat/session-1/turn-1/preview.html",
+                                "created": True,
+                                "content_type": "text/html",
+                            }
+                        ],
+                    },
+                )
+
+            runtime.orchestrator = SimpleNamespace(execute=execute_tool)
+
+            async def fake_maybe_checkpoint(task, emit):
+                return True
+
+            runtime._maybe_checkpoint = fake_maybe_checkpoint
+
+            events: list[tuple[str, dict[str, object]]] = []
+
+            async def emit(event: str, data: dict[str, object]) -> None:
+                events.append((event, data))
+
+            await runtime.handle_message(
+                session.session_id,
+                "根据图中内容，做一页ppt加入到第三章中",
+                emit,
+                turn_id="turn-1",
+                request_id="req-1",
+            )
+
+            saved = session_store.get(session.session_id)
+            assistant_messages = [message.content for message in saved.messages if message.role == "assistant"]
+
+            self.assertEqual(len(provider.judge_calls), 1)
+            self.assertEqual(provider.stream_calls[1]["tools"], [{"type": "function", "function": {"name": "write_file"}}])
+            self.assertFalse(any(content == "老板，让我先看看这张图片的内容。" for content in assistant_messages))
+            self.assertIn("PPT 已更新完成", saved.messages[-1].content)
+            self.assertTrue(
+                any(
+                    message.role == "system"
+                    and message.metadata.get("type") == "completion_gate_feedback"
+                    and message.metadata.get("completion_decision") == "llm_completion_judge:candidate_only_describes_next_step"
+                    for message in saved.messages
+                )
+            )
             completed_payload = next(data for event, data in events if event == "turn_completed")
             self.assertEqual(completed_payload["turn_outcome"], "answered")
 
@@ -2153,6 +2368,74 @@ class CommentaryStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event for event, _ in events], ["commentary_delta", "commentary_complete"])
         self.assertEqual(events[0][1]["content"], response.commentary)
 
+    async def test_tool_argument_brief_includes_previous_tool_result_naturally(self) -> None:
+        runtime = object.__new__(NewmanRuntime)
+        runtime.provider = _DummyBareGoogleSearchProvider()
+        runtime.usage_store = None
+        runtime.settings = SimpleNamespace(
+            provider=SimpleNamespace(
+                model="dummy-model",
+                type="mock",
+                context_window=None,
+                effective_context_window=None,
+            )
+        )
+
+        session = SessionRecord(
+            session_id="session-1",
+            title="Previous Result Brief Test",
+            messages=[
+                SessionMessage(
+                    id="user-1",
+                    role="user",
+                    content="L20显卡有成功部署 mimov2.5 的案例吗",
+                    metadata={"turn_id": "turn-1"},
+                ),
+                SessionMessage(
+                    id="tool-previous",
+                    role="tool",
+                    content="/root/newman/\n  README.md",
+                    metadata={
+                        "turn_id": "turn-1",
+                        "tool": "list_dir",
+                        "success": True,
+                        "summary": "已列出 /root/newman 下的 1 个条目",
+                    },
+                ),
+            ],
+        )
+        task = SessionTask(session=session, permission_context=PermissionContext(), turn_id="turn-1", tool_depth=1)
+
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def emit(event: str, data: dict[str, object]) -> None:
+            events.append((event, data))
+
+        response = await runtime._stream_provider_response(
+            [{"role": "system", "content": "test"}],
+            [{"name": "google_search"}],
+            emit,
+            session_id="session-1",
+            turn_id="turn-1",
+            request_kind="session_turn",
+            counts_toward_context_window=True,
+            group_id="turn-1:group:2",
+        )
+        response = await runtime._ensure_tool_response_commentary(
+            task,
+            response,
+            emit,
+            group_id="turn-1:group:2",
+        )
+
+        self.assertEqual(
+            response.commentary,
+            "刚才 list_dir 已列出 /root/newman 下的 1 个条目，接下来我继续搜索「L20 显卡 MiniCPM-V 2.5 部署案例」相关资料，确认可引用的信息来源。",
+        )
+        self.assertNotIn("已获得信息", response.commentary)
+        self.assertNotIn("下一步", response.commentary)
+        self.assertEqual([event for event, _ in events], ["commentary_delta", "commentary_complete"])
+
     async def test_internal_parsed_artifact_path_uses_readable_brief_target(self) -> None:
         runtime = object.__new__(NewmanRuntime)
         runtime.provider = _DummyBareParsedArtifactReadProvider()
@@ -2581,12 +2864,13 @@ class ToolResultPersistenceTests(unittest.TestCase):
     def test_build_assistant_message_attaches_turn_output_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
-            output_path = turn_output_dir(workspace, "session-1", "turn-1") / "diagram.html"
+            output_root = workspace / "outputs" / "chat"
+            output_path = turn_output_dir(output_root, "session-1", "turn-1") / "diagram.html"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text("<!doctype html><html><body>ok</body></html>", encoding="utf-8")
 
             runtime = object.__new__(NewmanRuntime)
-            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace))
+            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace, output_root=output_root))
             session = SessionRecord(
                 session_id="session-1",
                 title="output file",
@@ -2625,12 +2909,13 @@ class ToolResultPersistenceTests(unittest.TestCase):
     def test_build_assistant_message_attaches_updated_prior_turn_output_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
-            output_path = turn_output_dir(workspace, "session-1", "turn-parent") / "report.xlsx"
+            output_root = workspace / "outputs" / "chat"
+            output_path = turn_output_dir(output_root, "session-1", "turn-parent") / "report.xlsx"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text("updated", encoding="utf-8")
 
             runtime = object.__new__(NewmanRuntime)
-            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace))
+            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace, output_root=output_root))
             session = SessionRecord(
                 session_id="session-1",
                 title="updated output file",
@@ -2674,12 +2959,13 @@ class ToolResultPersistenceTests(unittest.TestCase):
     def test_build_assistant_message_does_not_attach_other_session_output_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
-            output_path = turn_output_dir(workspace, "session-2", "turn-1") / "report.xlsx"
+            output_root = workspace / "outputs" / "chat"
+            output_path = turn_output_dir(output_root, "session-2", "turn-1") / "report.xlsx"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text("updated", encoding="utf-8")
 
             runtime = object.__new__(NewmanRuntime)
-            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace))
+            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace, output_root=output_root))
             session = SessionRecord(
                 session_id="session-1",
                 title="other session output file",
@@ -2717,14 +3003,15 @@ class ToolResultPersistenceTests(unittest.TestCase):
     def test_build_assistant_message_attaches_terminal_output_files_even_after_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
-            output_path = turn_output_dir(workspace, "session-1", "turn-1") / "report.xlsx"
+            output_root = workspace / "outputs" / "chat"
+            output_path = turn_output_dir(output_root, "session-1", "turn-1") / "report.xlsx"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text("ok", encoding="utf-8")
             helper_script = workspace / "modify_excel.py"
             helper_script.write_text("print('helper')", encoding="utf-8")
 
             runtime = object.__new__(NewmanRuntime)
-            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace))
+            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace, output_root=output_root))
             session = SessionRecord(
                 session_id="session-1",
                 title="terminal output",
@@ -2772,12 +3059,13 @@ class ToolResultPersistenceTests(unittest.TestCase):
     def test_build_assistant_message_inherits_awaiting_turn_output_attachments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
-            output_path = turn_output_dir(workspace, "session-1", "turn-parent") / "report.xlsx"
+            output_root = workspace / "outputs" / "chat"
+            output_path = turn_output_dir(output_root, "session-1", "turn-parent") / "report.xlsx"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text("ok", encoding="utf-8")
 
             runtime = object.__new__(NewmanRuntime)
-            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace))
+            runtime.settings = SimpleNamespace(paths=SimpleNamespace(workspace=workspace, output_root=output_root))
             session = SessionRecord(
                 session_id="session-1",
                 title="awaiting output",
@@ -2929,7 +3217,7 @@ class ToolResultPersistenceTests(unittest.TestCase):
         self.assertEqual(message.content, "first line\nwarn line")
         self.assertTrue(message.metadata["content_persisted"])
 
-    def test_tool_event_output_preview_prefers_user_facing_summary(self) -> None:
+    def test_tool_event_output_preview_prefers_raw_output(self) -> None:
         result = ToolExecutionResult(
             success=True,
             tool="read_file",
@@ -2938,7 +3226,7 @@ class ToolResultPersistenceTests(unittest.TestCase):
             stdout='{"content":"README\\n","encoding":"utf-8","binary":false}',
         )
 
-        self.assertEqual(_build_tool_event_output_preview(result), "已读取文件 README.md（10 字节）")
+        self.assertEqual(_build_tool_event_output_preview(result), '{"content":"README\\n","encoding":"utf-8","binary":false}')
 
     def test_tool_event_output_preview_falls_back_to_terminal_output(self) -> None:
         result = ToolExecutionResult(
@@ -2978,7 +3266,8 @@ class CollaborationModeRuntimeTests(unittest.TestCase):
             overview = runtime._tools_overview()
 
             self.assertIn("## Workspace Access", overview)
-            self.assertIn(f"Runtime workspace (primary operation space): {root.resolve()}", overview)
+            self.assertIn(f"Runtime workspace (operation space): {root.resolve()}", overview)
+            self.assertIn(f"Default browse root for relative tool paths: {root.resolve()}", overview)
             self.assertIn(f"Per-turn output root for user deliverables: {root.resolve() / 'outputs' / 'chat'}", overview)
             self.assertIn(
                 f"Current turn output directory pattern for user deliverables: {root.resolve() / 'outputs' / 'chat' / '{session_id}' / '{turn_id}'}",

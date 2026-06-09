@@ -76,6 +76,8 @@ async def get_workspace_roots(request: Request):
     policy = build_path_access_policy(settings)
     return {
         "workspace": str(policy.workspace),
+        "browse_root": str(policy.browse_root),
+        "output_root": str(policy.output_root),
         "readable_roots": [str(path) for path in policy.readable_roots],
         "writable_roots": [str(path) for path in policy.writable_roots],
         "protected_roots": [str(path) for path in policy.protected_roots],
@@ -98,7 +100,7 @@ async def list_workspace_files(request: Request, path: str = "."):
         }
     items = []
     for child in sorted(target.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))[:200]:
-        if should_skip_path(child, settings.paths.workspace, include_hidden=False):
+        if should_skip_path(child, policy.browse_root, include_hidden=False):
             continue
         items.append(
             {

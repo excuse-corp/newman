@@ -95,6 +95,10 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertIn("permissions:", project_config_text)
             self.assertNotIn("models:", project_config_text)
             self.assertEqual(settings.server.port, 8005)
+            self.assertEqual(settings.runtime.provider_max_concurrent_requests, 1)
+            self.assertEqual(settings.runtime.provider_min_interval_seconds, 0.0)
+            self.assertEqual(settings.subagents.max_agents_per_run, 5)
+            self.assertEqual(settings.subagents.max_parallel_agents, 5)
             self.assertEqual(report.sources["server.port"], "newman.yaml")
             self.assertEqual(report.sources["models.primary.model"], "defaults.yaml")
 
@@ -124,6 +128,54 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual(settings.permissions.readable_paths, [root / "docs"])
             self.assertEqual(settings.permissions.writable_paths, [root / "skills"])
             self.assertEqual(settings.permissions.protected_paths, [root / ".env"])
+
+    def test_resolves_browse_and_output_roots_relative_to_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_project(root)
+            (root / "newman.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    paths:
+                      workspace: "runtime"
+                      browse_root: "."
+                      output_root: "runtime/outputs/chat"
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"HOME": str(root / "fake-home")}, clear=True):
+                settings = reload_settings(str(root))
+
+            self.assertEqual(settings.paths.workspace, root / "runtime")
+            self.assertEqual(settings.paths.browse_root, root)
+            self.assertEqual(settings.paths.output_root, root / "runtime" / "outputs" / "chat")
+
+    def test_subagents_config_can_be_overridden_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_project(root)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "HOME": str(root / "fake-home"),
+                    "NEWMAN_SUBAGENTS_MAX_AGENTS_PER_RUN": "2",
+                    "NEWMAN_SUBAGENTS_MAX_PARALLEL_AGENTS": "1",
+                    "NEWMAN_SUBAGENTS_LOCK_WAIT_TIMEOUT_SECONDS": "5",
+                },
+                clear=True,
+            ):
+                settings = reload_settings(str(root))
+                report = get_settings_report(str(root))
+
+            self.assertEqual(settings.subagents.max_agents_per_run, 2)
+            self.assertEqual(settings.subagents.max_parallel_agents, 1)
+            self.assertEqual(settings.subagents.lock_wait_timeout_seconds, 5)
+            self.assertEqual(report.sources["subagents.max_agents_per_run"], "environment")
+            self.assertEqual(report.sources["subagents.max_parallel_agents"], "environment")
 
     def _write_project(self, root: Path) -> None:
         config_dir = root / "backend" / "config"
@@ -162,6 +214,15 @@ class ConfigLoaderTests(unittest.TestCase):
                   tool_retry_backoff_seconds: 1.0
                   provider_retry_attempts: 3
                   provider_retry_backoff_seconds: 1.0
+                  provider_max_concurrent_requests: 1
+                  provider_min_interval_seconds: 0.0
+                subagents:
+                  enabled: true
+                  max_agents_per_run: 5
+                  max_parallel_agents: 5
+                  default_max_turns: 200
+                  lock_wait_timeout_seconds: 30
+                  sequential_context_token_limit: 2000
                 sandbox:
                   enabled: true
                   backend: "linux_bwrap"
@@ -187,6 +248,7 @@ class ConfigLoaderTests(unittest.TestCase):
                   sessions_dir: "backend_data/sessions"
                   memory_dir: "backend_data/memory"
                   audit_dir: "backend_data/audit"
+                  subagents_dir: "backend_data/subagents"
                   plugins_dir: "plugins"
                   skills_dir: "skills"
                   mcp_dir: "backend_data/mcp"

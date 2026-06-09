@@ -9,7 +9,7 @@ from backend.config.schema import AppConfig
 from backend.mcp.path_guard import validate_mcp_argument_paths
 from backend.tools.base import BaseTool
 from backend.tools.registry import ToolRegistry
-from backend.tools.workspace_fs import build_path_access_policy, classify_path, resolve_requested_path
+from backend.tools.workspace_fs import build_path_access_policy, classify_path, resolve_requested_path, resolve_writable_path
 
 
 class ToolRouter:
@@ -43,9 +43,9 @@ class ToolRouter:
         }:
             return checks
 
-        path = resolve_requested_path(self.path_policy, arguments.get("path"))
-        state = classify_path(self.path_policy, path)
         if tool_name in {"write_file", "edit_file"}:
+            path = resolve_writable_path(self.path_policy, arguments.get("path"))
+            state = classify_path(self.path_policy, path)
             if state == "protected":
                 checks.append("write_protected_path")
             elif state != "writable":
@@ -54,6 +54,8 @@ class ToolRouter:
             checks.extend(self._managed_path_reasons(path))
             return _dedupe_reasons(checks)
 
+        path = resolve_requested_path(self.path_policy, arguments.get("path"))
+        state = classify_path(self.path_policy, path)
         if state == "protected":
             checks.append("read_protected_path")
         elif state == "forbidden":
@@ -254,7 +256,7 @@ def analyze_terminal_command(command: str, path_policy) -> TerminalCommandAnalys
     matches: list[TerminalPathMatch] = []
     seen: set[str] = set()
     for raw in candidates:
-        path = resolve_requested_path(path_policy, raw)
+        path = _resolve_terminal_operand_path(path_policy, raw)
         key = str(path)
         if key in seen:
             continue
@@ -271,6 +273,13 @@ def analyze_terminal_command(command: str, path_policy) -> TerminalCommandAnalys
         mutating=mutating,
         path_matches=tuple(matches),
     )
+
+
+def _resolve_terminal_operand_path(path_policy, raw: str) -> Path:
+    # NativeSandbox executes shell commands with cwd=workspace, so relative path
+    # operands must be resolved the same way during static analysis.
+    candidate = Path(raw or ".").expanduser()
+    return (path_policy.workspace / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
 
 
 def _dedupe_reasons(reasons: list[str]) -> list[str]:

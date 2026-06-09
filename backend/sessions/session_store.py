@@ -48,10 +48,12 @@ class SessionStore:
             )
         return items
 
-    def list_records(self) -> list[SessionRecord]:
+    def list_records(self, *, include_subagents: bool = False) -> list[SessionRecord]:
         items_by_session_id: dict[str, SessionRecord] = {}
         for path in self._all_session_paths():
             record = SessionRecord.model_validate_json(path.read_text(encoding="utf-8"))
+            if not include_subagents and record.metadata.get("subagent") is True:
+                continue
             existing = items_by_session_id.get(record.session_id)
             if existing is None or record.updated_at > existing.updated_at:
                 items_by_session_id[record.session_id] = record
@@ -86,6 +88,12 @@ class SessionStore:
         self._cleanup_duplicate_paths(session.session_id, keep=path)
 
     def delete(self, session_id: str) -> None:
+        for child in self._child_sessions_for(session_id):
+            for path in self._matching_paths(child.session_id):
+                path.unlink()
+            child_checkpoint_path = self.sessions_dir / f"{child.session_id}_checkpoint.json"
+            if child_checkpoint_path.exists():
+                child_checkpoint_path.unlink()
         for path in self._matching_paths(session_id):
             path.unlink()
         checkpoint_path = self.sessions_dir / f"{session_id}_checkpoint.json"
@@ -141,6 +149,16 @@ class SessionStore:
         for path in self._matching_paths(session_id):
             if path != keep and path.exists():
                 path.unlink()
+
+    def _child_sessions_for(self, parent_session_id: str) -> list[SessionRecord]:
+        children: list[SessionRecord] = []
+        for session in self.list_records(include_subagents=True):
+            if session.metadata.get("subagent") is not True:
+                continue
+            if session.metadata.get("parent_session_id") != parent_session_id:
+                continue
+            children.append(session)
+        return children
 
     def _path_for(self, session: SessionRecord) -> Path:
         date_prefix = self._date_prefix(session.created_at)

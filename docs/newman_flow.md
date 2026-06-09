@@ -188,7 +188,8 @@ handle_message(session_id, content, emit, ...)
     │  │                                  │
     │  ├─ 5. _stream_provider_response()   │  ← 调用 LLM
     │  │                                  │
-    │  ├─ 6. decide_turn_step()            │  ← 决策：继续/结束/阻塞
+    │  ├─ 6. decide_turn_step()            │  ← 首轮决策：继续/结束/阻塞
+    │  ├─ 6.5 completion judge（可选）     │  ← 执行型任务的 finalize 再校验
     │  │                                  │
     │  ├─── [无工具调用] → finalize → return│
     │  │                                  │
@@ -218,12 +219,14 @@ PromptAssembler.assemble()
         │       ├── SKILLS_SNAPSHOT.md # 可用技能列表
         │       └── tools_overview     # 工具描述 + 路径权限
         │
-        ├── 2. COMMENTARY_SYSTEM_GUARDRAIL  # commentary 规则
-        ├── 3. collaboration_mode_prompt    # 协作模式（default/plan）
-        ├── 4. workflow_state_prompt        # 工作流状态
-        ├── 5. checkpoint summary           # 上下文压缩摘要
+        ├── 2. COMMENTARY_SYSTEM_GUARDRAIL   # 工具/技能前必须有 commentary
+        ├── 3. TOOL_ACTION_SYSTEM_GUARDRAIL  # 需要继续动工具时不能假装 finalize
+        ├── 4. USER_INPUT_SYSTEM_GUARDRAIL   # 需要用户确认时必须走 request_user_input
+        ├── 5. collaboration_mode_prompt     # 协作模式（default/plan）
+        ├── 6. workflow_state_prompt         # 工作流状态
+        ├── 7. checkpoint summary            # 上下文压缩摘要
         │
-        └── 6. 拼装历史消息
+        └── 8. 拼装历史消息
                 ├── system message  ← 上述所有内容合并
                 ├── assistant messages（含 tool_calls）
                 ├── tool messages
@@ -335,11 +338,17 @@ tool_call (from LLM response)
         │       └── terminal 成功 → 检查命令是否修改了上述目录
         │       └── 如果是 → reload_ecosystem()
         │
-        └── 13. 失败处理
+        └── 13. 失败处理 / 进度状态更新
                 ├── recovery_class == "recoverable" → 记录，继续循环
                 ├── recovery_class == "fatal"       → _finalize_fatal_tool_error()
                 └── turn_outcome == "awaiting_user"  → _finalize_awaiting_user_input()
 ```
+
+`TurnProgressState` 现在会区分 3 类“成功”：
+
+- `diagnostic_success`：例如读错误日志、打印出报错行，只说明拿到了诊断信息，不会清除未解决失败状态
+- `progress_success`：例如 `write_file` / `edit_file` 成功，或者 `terminal` 明确写出了路径/文件，只说明任务在推进
+- `resolved_success`：例如产生 `output_files`，或 `request_user_input` 进入 `awaiting_user`，这时才会清除 `has_unresolved_recoverable_failure`
 
 ---
 
@@ -358,16 +367,28 @@ ProviderResponse
                 ├── final_answer_gate_reason()
                 │   ├── 空回答 → "empty_final_answer"
                 │   ├── 看起来像未完成的行动 → "incomplete_action_statement"
-                │   ├── 有未解决的工具失败且无完成信号 → "unresolved_tool_failure"
+                │   ├── 有未解决的工具失败且无完成信号 → "unresolved_tool_failure_without_result"
                 │   └── 通过 → None（有效回答）
                 │
-                ├── gate 通过 → "finalize"（结束本轮）
+                ├── gate 通过 → tentative "finalize"
+                │   │
+                │   └── 若当前用户请求属于执行型任务
+                │       且本轮没有明确产物证据、回答里也没有可解析的本地附件
+                │       → 进入 LLM completion judge
+                │           ├── final    → finalize
+                │           ├── continue → 注入指令继续做，工具保持可用
+                │           ├── blocked  → finalize_blocked
+                │           └── ask_user → 下一轮必须调用 request_user_input
                 │
-                ├── gate 未通过 + 第一次
-                │   └── "continue" + inject_instruction（注入指令要求 LLM 收口）
-                │       └── force_no_tools_next = True（禁止再调用工具）
+                ├── gate 未通过 + 可恢复失败尚未耗尽
+                │   └── "continue" + recovery_instruction
+                │       └── 可以继续调用工具，但不要重复同一个已知失败动作
                 │
-                └── gate 未通过 + 已重试过
+                ├── gate 未通过 + 首次 finalization retry
+                │   └── "continue" + finalization_instruction
+                │       └── 工具仍然可用，不再强制 force_no_tools_next
+                │
+                └── gate 未通过 + 重试额度耗尽
                     └── "finalize_blocked"（强制结束，标记为阻塞）
 ```
 
@@ -383,10 +404,10 @@ RunLoop 结束的 7 种方式：
                                       └── 达到 20 个 user turn 时后台 schedule_evolution("turn_interval")
 
 2. finalize_blocked（收口被拦截）
-   └── LLM 连续返回无效回答 → 输出阻塞信息
+   └── LLM 连续返回无效回答，或 completion judge 判定当前已明确阻塞 → 输出阻塞信息
 
 3. awaiting_user（等待用户输入）
-   └── 工具返回 turn_outcome=awaiting_user → 暂停等待
+   └── 工具返回 turn_outcome=awaiting_user，或 completion judge 要求改走 request_user_input → 暂停等待
 
 4. tool_limit（工具调用上限）
    └── tool_depth >= max_tool_depth → 注入指令要求给出阶段性结论

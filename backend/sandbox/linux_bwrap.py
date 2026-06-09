@@ -12,6 +12,13 @@ FIXED_READ_ROOTS = [
     Path("/lib"),
     Path("/lib64"),
 ]
+NETWORK_READ_MOUNTS = [
+    (Path("/etc/resolv.conf"), Path("/etc/resolv.conf")),
+    (Path("/etc/nsswitch.conf"), Path("/etc/nsswitch.conf")),
+    (Path("/etc/hosts"), Path("/etc/hosts")),
+    (Path("/etc/ssl"), Path("/etc/ssl")),
+    (Path("/etc/pki"), Path("/etc/pki")),
+]
 
 
 def resolve_bwrap_executable() -> str | None:
@@ -41,6 +48,12 @@ def build_bwrap_command(
 
     for root in _resolve_read_roots(readable_roots):
         args.extend(["--ro-bind", str(root), str(root)])
+
+    network_mounts = _resolve_network_read_mounts(readable_roots) if network_access else []
+    if network_mounts:
+        args.extend(["--dir", "/etc"])
+        for source, target in network_mounts:
+            args.extend(["--ro-bind", str(source), str(target)])
 
     args.extend(["--proc", "/proc", "--dev", "/dev"])
 
@@ -103,6 +116,27 @@ def _resolve_protected_roots(protected_roots: list[Path]) -> list[Path]:
         seen.add(key)
         deduped.append(candidate)
     return deduped
+
+
+def _resolve_network_read_mounts(readable_roots: list[Path]) -> list[tuple[Path, Path]]:
+    read_roots = [path.resolve() for path in readable_roots if path.exists()]
+    if any(root == Path("/etc") or _path_is_within(Path("/etc"), root) for root in read_roots):
+        return []
+
+    mounts: list[tuple[Path, Path]] = []
+    seen_targets: set[str] = set()
+    for source, target in NETWORK_READ_MOUNTS:
+        if not source.exists():
+            continue
+        resolved_source = source.resolve()
+        if not resolved_source.exists():
+            continue
+        target_key = str(target)
+        if target_key in seen_targets:
+            continue
+        seen_targets.add(target_key)
+        mounts.append((resolved_source, target))
+    return mounts
 
 
 def _path_is_within(path: Path, root: Path) -> bool:

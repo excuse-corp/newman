@@ -93,11 +93,28 @@ const REQUEST_KIND_LABELS: Record<string, string> = {
   context_compaction: "上下文压缩",
   manual_context_compaction: "手动压缩",
   memory_extraction: "记忆抽取",
-  evolution_analysis: "进化分析",
-  evolution_skill_update: "技能进化",
+  evolution_analysis: "自进化分析",
+  evolution_skill_update: "Skill 自进化",
   multimodal_analysis: "多模态解析",
+  skill_upload_optimization: "Skill 上传优化",
   rag_rerank: "RAG 重排",
   commentary_fallback: "工具前说明",
+};
+
+const REQUEST_KIND_DESCRIPTIONS: Record<string, string> = {
+  session_turn: "用户消息触发的主模型调用，包含普通回复和工具调用前后的模型响应。",
+  session_turn_non_stream_fallback: "主对话流式响应失败后，系统改用非流式方式重试。",
+  context_compaction: "会话上下文接近上限时，后台生成 checkpoint 摘要来压缩历史。",
+  manual_context_compaction: "用户手动触发的会话 checkpoint 摘要生成。",
+  memory_extraction: "后台从会话里抽取稳定用户记忆，合并到 USER.md。",
+  evolution_analysis: "自进化第一步，分析最近会话并判断是否需要更新 MEMORY.md 或 Skill。",
+  evolution_skill_update: "自进化第二步，在确定要更新 Skill 后生成具体文件修改。",
+  multimodal_analysis: "上传图片后，模型做视觉理解、OCR 和附件摘要。",
+  skill_upload_optimization: "上传 Skill 时，模型把材料整理成 Newman 兼容的 SKILL.md。",
+  rag_rerank: "检索到知识候选后，模型重新排序或筛选最相关内容。",
+  commentary_fallback: "模型准备调用工具但缺少可见说明时，补生成一句工具前说明。",
+  tool_limit_finalize: "达到工具调用上限时，模型生成本轮收尾回复。",
+  fatal_tool_finalize: "工具连续失败或不可恢复时，模型生成错误说明和收尾回复。",
 };
 
 const PROVIDER_TYPE_LABELS: Record<string, string> = {
@@ -173,8 +190,16 @@ function requestKindLabel(kind: string) {
   return REQUEST_KIND_LABELS[kind] ?? kind;
 }
 
+function requestKindDescription(kind: string) {
+  return REQUEST_KIND_DESCRIPTIONS[kind] ?? "未配置说明的模型请求类型，通常来自新增后台流程或插件扩展。";
+}
+
 function providerTypeLabel(providerType: string) {
   return PROVIDER_TYPE_LABELS[providerType] ?? providerType;
+}
+
+function isEvolutionRequestKind(kind: string) {
+  return kind.startsWith("evolution_");
 }
 
 function buildDaySeries(summary: UsageSummaryResponse | null): UsageDayBucket[] {
@@ -267,6 +292,22 @@ export default function UsageDashboard({
   };
   const inputRatio = totals.total_tokens > 0 ? Math.round((totals.input_tokens / totals.total_tokens) * 100) : 0;
   const outputRatio = totals.total_tokens > 0 ? 100 - inputRatio : 0;
+  const evolutionTotals = (summary?.by_request_kind ?? [])
+    .filter((bucket) => isEvolutionRequestKind(bucket.request_kind))
+    .reduce(
+      (current, bucket) => ({
+        request_count: current.request_count + bucket.request_count,
+        input_tokens: current.input_tokens + bucket.input_tokens,
+        output_tokens: current.output_tokens + bucket.output_tokens,
+        total_tokens: current.total_tokens + bucket.total_tokens,
+      }),
+      {
+        request_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+      },
+    );
   const topModel = summary?.by_model[0] ?? null;
   const topSession = summary?.by_session[0] ?? null;
   const rangeLabel = summary ? `${summary.range.start_date} 至 ${summary.range.end_date}` : "--";
@@ -339,6 +380,14 @@ export default function UsageDashboard({
           <span className="usage-kpi-label">缺失统计</span>
           <strong>{totals.usage_missing_count}</strong>
           <span>{totals.usage_missing_count ? "未返回消耗数据，不计入汇总" : "全部请求均已返回消耗数据"}</span>
+        </article>
+        <article className="usage-kpi-card evolution">
+          <span className="usage-kpi-label">自进化</span>
+          <strong>{formatTokens(evolutionTotals.total_tokens)}</strong>
+          <span>
+            {evolutionTotals.request_count} 次请求 · 输入 {compactTokens(evolutionTotals.input_tokens)} / 输出{" "}
+            {compactTokens(evolutionTotals.output_tokens)}
+          </span>
         </article>
       </section>
 
@@ -431,22 +480,23 @@ export default function UsageDashboard({
           <div className="usage-panel-head">
             <div>
               <h2>按请求类型</h2>
-              <p>主对话、压缩、RAG 等</p>
+              <p>主对话、压缩、自进化、RAG 等</p>
             </div>
           </div>
           <div className="usage-bar-list">
             {(summary?.by_request_kind ?? []).map((bucket) => (
               <div className="usage-meter-row compact" key={bucket.request_kind}>
-                <div className="usage-meter-topline">
+                <div className="usage-meter-topline usage-kind-topline">
                   <span>{requestKindLabel(bucket.request_kind)}</span>
                   <strong>{formatTokens(bucket.total_tokens)}</strong>
                 </div>
+                <p className="usage-kind-description">{requestKindDescription(bucket.request_kind)}</p>
                 <div className="usage-meter-track secondary">
                   <span style={{ width: `${Math.max(3, (bucket.total_tokens / maxKindTokens) * 100)}%` }} />
                 </div>
-                <div className="usage-meter-meta">
+                <div className="usage-meter-meta usage-kind-meta">
                   <span>{bucket.request_count} 次请求</span>
-                  <span>{bucket.request_kind}</span>
+                  <code>{bucket.request_kind}</code>
                 </div>
               </div>
             ))}
@@ -503,6 +553,7 @@ export default function UsageDashboard({
               <div className={`usage-feed-item ${record.usage_available ? "" : "missing"}`} key={record.request_id}>
                 <div>
                   <strong>{record.model}</strong>
+                  <span>{requestKindLabel(record.request_kind)}</span>
                   <span>{record.session_title ?? "未关联会话"}</span>
                 </div>
                 <div>

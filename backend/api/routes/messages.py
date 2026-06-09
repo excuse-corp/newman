@@ -235,6 +235,15 @@ async def interrupt_message(session_id: str, request: Request):
         approval_mode=active_run.approval_mode,
     )
 
+    subagent_manager = getattr(runtime, "subagent_manager", None)
+    cancel_parent_turn = getattr(subagent_manager, "cancel_parent_turn", None)
+    if turn_id and callable(cancel_parent_turn):
+        cancel_parent_turn(
+            parent_session_id=session_id,
+            parent_turn_id=turn_id,
+            reason="parent_interrupted",
+        )
+
     await _queue_active_run_payload(active_run, payload)
     active_run.worker.cancel()
     with suppress(asyncio.CancelledError):

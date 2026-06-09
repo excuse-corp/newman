@@ -30,6 +30,7 @@ type TurnOutcome = "answered" | "awaiting_user" | "artifact_ready" | "task_compl
 type AwaitingUserInputKind = "confirm" | "choice" | "free_text";
 type UiTheme = "classic" | "coral";
 type StatusTagTone = "blue" | "green" | "orange";
+type WorkspaceNavIconName = "chat" | "automations" | "memory" | "skills" | "evolution";
 
 type SessionPlanPayload = {
   explanation?: string | null;
@@ -115,6 +116,22 @@ type ResolvedLocationResponse = {
   source: string;
   precision: string;
   captured_at_utc: string;
+};
+
+type EnvironmentLocationStatusKind =
+  | "idle"
+  | "manual"
+  | "resolved"
+  | "requesting"
+  | "prompt"
+  | "denied"
+  | "insecure"
+  | "unsupported"
+  | "unresolved";
+
+type EnvironmentLocationStatus = {
+  kind: EnvironmentLocationStatusKind;
+  message: string;
 };
 
 const DEFAULT_CONFIRM_AWAITING_OPTIONS: AwaitingUserInputOption[] = [
@@ -232,6 +249,211 @@ type SessionUsageResponse = {
   records: SessionUsageRecord[];
   available: boolean;
   error?: string;
+};
+
+type MultiAgentRunStatus =
+  | "pending"
+  | "running"
+  | "waiting_file_lock"
+  | "waiting_approval"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
+
+type MultiAgentTaskStatus =
+  | "pending"
+  | "running"
+  | "waiting_file_lock"
+  | "waiting_approval"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "timed_out"
+  | "report_invalid";
+
+type MultiAgentUsageSummary = {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  request_count: number;
+  cost_usd?: number | null;
+};
+
+type MultiAgentFinding = {
+  title: string;
+  detail: string;
+  severity: "info" | "low" | "medium" | "high" | "critical";
+  file?: string | null;
+  line?: number | null;
+};
+
+type MultiAgentFileChange = {
+  path: string;
+  tool: "write_file" | "edit_file" | "terminal";
+  created?: boolean | null;
+  bytes?: number | null;
+  summary?: string | null;
+  at: string;
+};
+
+type MultiAgentTerminalCommand = {
+  command: string;
+  pid?: number | null;
+  exit_code?: number | null;
+  success?: boolean | null;
+  stdout_preview?: string | null;
+  stderr_preview?: string | null;
+  started_at: string;
+  completed_at?: string | null;
+};
+
+type MultiAgentArtifact = {
+  path?: string | null;
+  url?: string | null;
+  title?: string | null;
+  kind?: string | null;
+  metadata: Record<string, unknown>;
+};
+
+type MultiAgentAgentReport = {
+  task_id: string;
+  name: string;
+  status: "completed" | "failed" | "cancelled" | "timed_out" | "report_invalid";
+  summary: string;
+  findings: MultiAgentFinding[];
+  files_changed: MultiAgentFileChange[];
+  commands_run: MultiAgentTerminalCommand[];
+  artifacts: MultiAgentArtifact[];
+  risks: string[];
+  recommended_next_steps: string[];
+  transcript_ref: string;
+  usage_summary: MultiAgentUsageSummary;
+  degraded: boolean;
+  degraded_reason?: string | null;
+};
+
+type MultiAgentFileWriteRecord = {
+  task_id: string;
+  tool: "write_file" | "edit_file" | "terminal";
+  at: string;
+};
+
+type MultiAgentFileOverlap = {
+  path: string;
+  writers: MultiAgentFileWriteRecord[];
+};
+
+type MultiAgentFileConflict = {
+  path: string;
+  blocked_task_id: string;
+  holding_task_id?: string | null;
+  reason: "lock_timeout" | "blocked" | "concurrent_mutation";
+  detected_at: string;
+};
+
+type MultiAgentReportRecord = {
+  run_id: string;
+  status: MultiAgentRunStatus;
+  summary: string;
+  agent_reports: MultiAgentAgentReport[];
+  failed_agents: string[];
+  file_overlaps: MultiAgentFileOverlap[];
+  file_conflicts: MultiAgentFileConflict[];
+  usage_summary: MultiAgentUsageSummary;
+  recommended_next_steps: string[];
+};
+
+type MultiAgentRunRecord = {
+  run_id: string;
+  parent_session_id: string;
+  parent_turn_id: string;
+  mode: "parallel" | "sequential";
+  run_mode: "sync" | "background";
+  return_strategy: "wait_all";
+  context_policy: "fresh" | "fork";
+  status: MultiAgentRunStatus;
+  task_ids: string[];
+  usage_summary: MultiAgentUsageSummary;
+  started_at: string;
+  cancel_requested_at?: string | null;
+  cancel_reason?: string | null;
+  completed_at?: string | null;
+  result?: MultiAgentReportRecord | null;
+  error?: string | null;
+};
+
+type MultiAgentTaskRecord = {
+  task_id: string;
+  run_id: string;
+  parent_session_id: string;
+  parent_turn_id: string;
+  child_session_id: string;
+  name: string;
+  agent_type?: string | null;
+  description: string;
+  assignment_prompt: string;
+  status: MultiAgentTaskStatus;
+  current_activity?: string | null;
+  progress: {
+    completed_turns: number;
+    max_turns: number;
+    tool_call_count: number;
+    last_event_at?: string | null;
+  };
+  file_changes: MultiAgentFileChange[];
+  file_conflicts: MultiAgentFileConflict[];
+  terminal_commands: MultiAgentTerminalCommand[];
+  usage_summary: MultiAgentUsageSummary;
+  result?: MultiAgentAgentReport | null;
+  transcript_ref: string;
+  started_at?: string | null;
+  cancel_requested_at?: string | null;
+  cancel_reason?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
+};
+
+type SessionMultiagentRunsResponse = {
+  session_id: string;
+  turn_id?: string | null;
+  runs: Array<{
+    run: MultiAgentRunRecord;
+    task_count: number;
+    updated_at: string;
+  }>;
+};
+
+type MultiAgentRunDetailResponse = {
+  run: MultiAgentRunRecord;
+  tasks: MultiAgentTaskRecord[];
+  updated_at: string;
+};
+
+type MultiAgentTaskDetailResponse = {
+  task: MultiAgentTaskRecord;
+  run: MultiAgentRunRecord;
+  updated_at: string;
+};
+
+type MultiAgentPendingApproval = {
+  approval_request_id: string;
+  run_id: string;
+  task_id: string;
+  task_name: string;
+  child_session_id: string;
+  turn_id?: string | null;
+  tool: string;
+  arguments: Record<string, unknown>;
+  reason: string;
+  timeout_seconds: number;
+  remaining_seconds: number;
+};
+
+type SessionMultiagentApprovalsResponse = {
+  session_id: string;
+  pending: MultiAgentPendingApproval[];
 };
 
 type SessionAuditResponse = {
@@ -539,12 +761,12 @@ type InterruptTurnResponse = {
   reason?: string | null;
 };
 
-const navItems: Array<{ id: Exclude<WorkspacePage, "settings">; label: string; hint: string }> = [
-  { id: "chat", label: "Chat", hint: "对话" },
-  { id: "automations", label: "Automations", hint: "定时" },
-  { id: "memory", label: "Memory", hint: "记忆" },
-  { id: "skills", label: "Skills", hint: "技能" },
-  { id: "evolution", label: "Evolution", hint: "进化" }
+const navItems: Array<{ id: Exclude<WorkspacePage, "settings">; label: string; hint: string; icon: WorkspaceNavIconName }> = [
+  { id: "chat", label: "Chat", hint: "对话", icon: "chat" },
+  { id: "automations", label: "Automations", hint: "定时", icon: "automations" },
+  { id: "memory", label: "Memory", hint: "记忆", icon: "memory" },
+  { id: "skills", label: "Skills", hint: "技能", icon: "skills" },
+  { id: "evolution", label: "Evolution", hint: "进化", icon: "evolution" }
 ];
 
 const approvalModeMeta: Record<
@@ -670,14 +892,20 @@ const settingsTabOptions: Array<{
 
 const LEFT_MIN = 180;
 const LEFT_MAX = 360;
+const COMPACT_LEFT_RAIL_WIDTH = 74;
 const HANDLE_WIDTH = 8;
 const HTML_PREVIEW_MIN = 360;
 const HTML_PREVIEW_MAX = 920;
 const HTML_PREVIEW_DEFAULT = 760;
 const HTML_PREVIEW_MAIN_MIN = 360;
+const MULTIAGENT_DRAWER_MIN = 320;
+const MULTIAGENT_DRAWER_MAX = 520;
+const MULTIAGENT_DRAWER_DEFAULT = 380;
 const TURN_APPROVAL_MODE_STORAGE_KEY = "newman-turn-approval-mode";
 const ENVIRONMENT_CITY_CACHE_KEY = "newman-environment-city-cache";
 const ENVIRONMENT_CITY_GEOLOCATION_TTL_MS = 6 * 60 * 60 * 1000;
+const ENVIRONMENT_LOCATION_OVERRIDE_KEY = "newman-environment-city-override";
+const CHAT_SESSIONS_REFRESH_INTERVAL_MS = 5000;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -748,6 +976,44 @@ function writeCachedEnvironmentLocation(timezone: string, location: EnvironmentL
       location,
     })
   );
+}
+
+function readManualEnvironmentLocation(): EnvironmentLocationContext | null {
+  const raw = window.localStorage.getItem(ENVIRONMENT_LOCATION_OVERRIDE_KEY);
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { city?: unknown; captured_at_utc?: unknown; timezone_hint?: unknown };
+    if (typeof parsed.city !== "string" || !parsed.city.trim()) {
+      return null;
+    }
+    return {
+      city: parsed.city.trim(),
+      source: "manual_override",
+      precision: "city",
+      captured_at_utc:
+        typeof parsed.captured_at_utc === "string" && parsed.captured_at_utc ? parsed.captured_at_utc : new Date().toISOString(),
+      timezone_hint: typeof parsed.timezone_hint === "string" && parsed.timezone_hint ? parsed.timezone_hint : localTimezone(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeManualEnvironmentLocation(city: string) {
+  const normalizedCity = city.trim();
+  if (!normalizedCity) {
+    window.localStorage.removeItem(ENVIRONMENT_LOCATION_OVERRIDE_KEY);
+    return null;
+  }
+  const payload = {
+    city: normalizedCity,
+    captured_at_utc: new Date().toISOString(),
+    timezone_hint: localTimezone(),
+  };
+  window.localStorage.setItem(ENVIRONMENT_LOCATION_OVERRIDE_KEY, JSON.stringify(payload));
+  return readManualEnvironmentLocation();
 }
 
 function readCachedEnvironmentLocation(timezone: string): EnvironmentLocationContext | null {
@@ -1422,6 +1688,110 @@ function resolveToolSemantic(toolName: string | null | undefined) {
       runningText: "我先获取完成任务需要的信息",
       completedText: "这一步我已经完成了"
     }
+  );
+}
+
+function WorkspaceNavIcon({ name, className }: { name: WorkspaceNavIconName; className?: string }) {
+  const props = {
+    viewBox: "0 0 20 20",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.45,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    className,
+    "aria-hidden": true
+  };
+
+  if (name === "chat") {
+    return (
+      <svg {...props}>
+        <path d="M4.25 5.25h11.5a1.9 1.9 0 0 1 1.9 1.9v5.1a1.9 1.9 0 0 1-1.9 1.9H9.1l-3.35 2.6v-2.6h-1.5a1.9 1.9 0 0 1-1.9-1.9v-5.1a1.9 1.9 0 0 1 1.9-1.9Z" />
+        <path d="M6.25 8.25h7.5" />
+        <path d="M6.25 11.15h4.65" />
+      </svg>
+    );
+  }
+
+  if (name === "automations") {
+    return (
+      <svg {...props}>
+        <rect x="3.15" y="4.15" width="13.7" height="12.2" rx="2.1" />
+        <path d="M6.25 2.75v2.75" />
+        <path d="M13.75 2.75v2.75" />
+        <path d="M3.15 7.7h13.7" />
+        <path d="M7.1 11.55h2.2v2.2H7.1z" />
+        <path d="M11.2 11.55h1.7" />
+      </svg>
+    );
+  }
+
+  if (name === "memory") {
+    return (
+      <svg {...props}>
+        <path d="M4.4 6.3c0-1.35 2.5-2.45 5.6-2.45s5.6 1.1 5.6 2.45-2.5 2.45-5.6 2.45-5.6-1.1-5.6-2.45Z" />
+        <path d="M4.4 6.3v3.7c0 1.35 2.5 2.45 5.6 2.45s5.6-1.1 5.6-2.45V6.3" />
+        <path d="M4.4 10v3.7c0 1.35 2.5 2.45 5.6 2.45s5.6-1.1 5.6-2.45V10" />
+      </svg>
+    );
+  }
+
+  if (name === "skills") {
+    return (
+      <svg {...props}>
+        <rect x="3.4" y="3.4" width="5.2" height="5.2" rx="1.2" />
+        <rect x="11.4" y="3.4" width="5.2" height="5.2" rx="1.2" />
+        <rect x="3.4" y="11.4" width="5.2" height="5.2" rx="1.2" />
+        <rect x="11.4" y="11.4" width="5.2" height="5.2" rx="1.2" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg {...props}>
+      <path d="M10 2.8 11.55 7l4.35-1.1-2.8 3.5 3.65 2.55-4.48.1.34 4.45L10 12.85 7.39 16.5l.34-4.45-4.48-.1L6.9 9.4 4.1 5.9 8.45 7 10 2.8Z" />
+    </svg>
+  );
+}
+
+function SettingsNavIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.45}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M5.25 3.2v13.6" />
+      <path d="M10 3.2v13.6" />
+      <path d="M14.75 3.2v13.6" />
+      <circle cx="5.25" cy="7.2" r="1.65" />
+      <circle cx="10" cy="12.8" r="1.65" />
+      <circle cx="14.75" cy="8.9" r="1.65" />
+    </svg>
+  );
+}
+
+function RailToggleIcon({ collapsed, className }: { collapsed: boolean; className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.45}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <rect x="3.1" y="3.3" width="13.8" height="13.4" rx="2" />
+      <path d="M7.2 3.3v13.4" />
+      {collapsed ? <path d="m10.35 7 3.1 3-3.1 3" /> : <path d="m13.45 7-3.1 3 3.1 3" />}
+    </svg>
   );
 }
 
@@ -2596,6 +2966,233 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   }
 
   return payload as T;
+}
+
+function isMultiagentEventName(event: string) {
+  return event.startsWith("multiagent_");
+}
+
+function readMultiagentParentSessionId(event: SessionEventPayload) {
+  const value = event.data.parent_session_id;
+  return typeof value === "string" && value ? value : null;
+}
+
+function readMultiagentRunId(event: SessionEventPayload) {
+  const value = event.data.run_id;
+  return typeof value === "string" && value ? value : null;
+}
+
+function readMultiagentTaskId(event: SessionEventPayload) {
+  const value = event.data.task_id;
+  return typeof value === "string" && value ? value : null;
+}
+
+function formatSessionMessageRoleLabel(role: SessionMessageRecord["role"]) {
+  switch (role) {
+    case "system":
+      return "System";
+    case "user":
+      return "User";
+    case "assistant":
+      return "Assistant";
+    case "tool":
+      return "Tool";
+    default:
+      return role;
+  }
+}
+
+function truncateTranscriptMessage(content: string, limit = 1600) {
+  const normalized = content.trim();
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+  return `${normalized.slice(0, limit - 3).trimEnd()}...`;
+}
+
+function resolveNextSelectedMultiagentTaskId(tasks: MultiAgentTaskRecord[], currentTaskId: string | null) {
+  if (currentTaskId && tasks.some((task) => task.task_id === currentTaskId)) {
+    return currentTaskId;
+  }
+  const activeTask = tasks.find((task) =>
+    ["running", "waiting_file_lock", "waiting_approval", "pending"].includes(task.status)
+  );
+  return activeTask?.task_id ?? tasks[0]?.task_id ?? null;
+}
+
+function formatMultiagentStatusLabel(status: MultiAgentRunStatus | MultiAgentTaskStatus | MultiAgentAgentReport["status"]) {
+  switch (status) {
+    case "pending":
+      return "待启动";
+    case "running":
+      return "执行中";
+    case "waiting_file_lock":
+      return "等待文件锁";
+    case "waiting_approval":
+      return "等待审批";
+    case "completed":
+      return "已完成";
+    case "partial":
+      return "部分完成";
+    case "failed":
+      return "失败";
+    case "cancelled":
+      return "已取消";
+    case "timed_out":
+      return "超时";
+    case "report_invalid":
+      return "报告无效";
+    default:
+      return status;
+  }
+}
+
+function multiagentStatusTone(status: MultiAgentRunStatus | MultiAgentTaskStatus | MultiAgentAgentReport["status"]) {
+  if (status === "completed") {
+    return "green";
+  }
+  if (status === "running" || status === "pending" || status === "waiting_file_lock" || status === "waiting_approval") {
+    return "blue";
+  }
+  if (status === "partial") {
+    return "orange";
+  }
+  return "red";
+}
+
+function multiagentDisplayStatusTone(
+  status: MultiAgentRunStatus | MultiAgentTaskStatus | MultiAgentAgentReport["status"],
+  stopping = false
+) {
+  return stopping ? "orange" : multiagentStatusTone(status);
+}
+
+function isMultiagentRunActive(status: MultiAgentRunStatus) {
+  return ["pending", "running", "waiting_file_lock", "waiting_approval"].includes(status);
+}
+
+function isMultiagentTaskActive(status: MultiAgentTaskStatus) {
+  return ["pending", "running", "waiting_file_lock", "waiting_approval"].includes(status);
+}
+
+function isMultiagentRunStopping(run: MultiAgentRunRecord) {
+  return Boolean(run.cancel_requested_at) && isMultiagentRunActive(run.status);
+}
+
+function isMultiagentTaskStopping(task: MultiAgentTaskRecord) {
+  return Boolean(task.cancel_requested_at) && isMultiagentTaskActive(task.status);
+}
+
+function formatMultiagentDisplayStatusLabel(
+  status: MultiAgentRunStatus | MultiAgentTaskStatus | MultiAgentAgentReport["status"],
+  stopping = false
+) {
+  return stopping ? "停止中" : formatMultiagentStatusLabel(status);
+}
+
+function MultiagentStatusPill({
+  status,
+  stopping = false,
+}: {
+  status: MultiAgentRunStatus | MultiAgentTaskStatus | MultiAgentAgentReport["status"];
+  stopping?: boolean;
+}) {
+  return (
+    <span
+      className={`multiagent-status-pill tone-${multiagentDisplayStatusTone(status, stopping)} ${
+        stopping ? "is-stopping" : ""
+      }`}
+    >
+      {stopping ? <span className="multiagent-status-spinner" aria-hidden="true" /> : null}
+      {formatMultiagentDisplayStatusLabel(status, stopping)}
+    </span>
+  );
+}
+
+function buildMultiagentTimeline(
+  events: SessionEventPayload[],
+  runId: string | null,
+  taskId: string | null
+) {
+  if (!runId) {
+    return [];
+  }
+  return events
+    .filter((event) => isMultiagentEventName(event.event) && readMultiagentRunId(event) === runId)
+    .filter((event) => {
+      if (!taskId) {
+        return true;
+      }
+      const eventTaskId = readMultiagentTaskId(event);
+      return eventTaskId === null || eventTaskId === taskId;
+    })
+    .slice(-24)
+    .map((event, index) => {
+      const eventTaskId = readMultiagentTaskId(event);
+      const detail = describeMultiagentTimelineEvent(event);
+      return {
+        id: `${event.event}:${event.ts}:${eventTaskId ?? "run"}:${index}`,
+        event: event.event,
+        taskId: eventTaskId,
+        detail,
+        ts: event.ts,
+      };
+    });
+}
+
+function describeMultiagentTimelineEvent(event: SessionEventPayload) {
+  if (event.event === "multiagent_run_started") {
+    return "多代理运行已启动";
+  }
+  if (event.event === "multiagent_run_completed") {
+    const status = typeof event.data.status === "string" ? event.data.status : "completed";
+    return `运行结束，状态 ${formatMultiagentStatusLabel(status as MultiAgentRunStatus)}`;
+  }
+  if (event.event === "multiagent_run_updated") {
+    const status = typeof event.data.status === "string" ? event.data.status : "running";
+    return `运行状态更新为 ${formatMultiagentStatusLabel(status as MultiAgentRunStatus)}`;
+  }
+  if (event.event === "multiagent_task_started") {
+    const name = typeof event.data.name === "string" ? event.data.name : "subagent";
+    return `${name} 已加入执行`;
+  }
+  if (event.event === "multiagent_task_updated") {
+    const name = typeof event.data.name === "string" ? event.data.name : "subagent";
+    const status = typeof event.data.status === "string" ? event.data.status : "running";
+    const activity = typeof event.data.current_activity === "string" ? event.data.current_activity : "";
+    return activity
+      ? `${name} · ${formatMultiagentStatusLabel(status as MultiAgentTaskStatus)} · ${activity}`
+      : `${name} · ${formatMultiagentStatusLabel(status as MultiAgentTaskStatus)}`;
+  }
+  if (event.event === "multiagent_approval_queued") {
+    const nestedEvent = typeof event.data.event === "string" ? event.data.event : "tool_approval_request";
+    return nestedEvent === "tool_approval_request" ? "子代理工具调用进入审批队列" : "子代理审批事件";
+  }
+  if (event.event === "multiagent_tool_event") {
+    const nestedEvent = typeof event.data.event === "string" ? event.data.event : "tool_event";
+    const nestedData = event.data.data;
+    const tool =
+      nestedData && typeof nestedData === "object" && "tool" in nestedData && typeof nestedData.tool === "string"
+        ? nestedData.tool
+        : "tool";
+    if (nestedEvent === "tool_call_started") {
+      return `${tool} 开始执行`;
+    }
+    if (nestedEvent === "tool_call_finished") {
+      const success =
+        nestedData && typeof nestedData === "object" && "success" in nestedData ? Boolean(nestedData.success) : false;
+      const summary =
+        nestedData && typeof nestedData === "object" && "summary" in nestedData && typeof nestedData.summary === "string"
+          ? nestedData.summary
+          : "";
+      return summary ? `${tool} ${success ? "完成" : "失败"} · ${summary}` : `${tool} ${success ? "完成" : "失败"}`;
+    }
+    if (nestedEvent === "tool_approval_request") {
+      return `${tool} 请求审批`;
+    }
+    return `${tool} 事件：${nestedEvent}`;
+  }
+  return event.event;
 }
 
 function isAbortError(error: unknown) {
@@ -5104,6 +5701,7 @@ function App() {
   const [chatError, setChatError] = useState<string | null>(null);
   const [sendingMessage, setSendingMessage] = useState(false);
   const [stoppingMessage, setStoppingMessage] = useState(false);
+  const [sendingSessionId, setSendingSessionId] = useState<string | null>(null);
   const [liveTurn, setLiveTurn] = useState<LiveTurnState | null>(null);
   const [openSessionMenuId, setOpenSessionMenuId] = useState<string | null>(null);
   const [memoryFiles, setMemoryFiles] = useState<Record<MemoryKey, MemoryFile>>({
@@ -5168,12 +5766,30 @@ function App() {
   const [configNotice, setConfigNotice] = useState<string | null>(null);
   const [pluginBusyName, setPluginBusyName] = useState<string | null>(null);
   const [leftWidth, setLeftWidth] = useState(() => readStoredNumber("newman-left-rail-width", 220, LEFT_MIN, LEFT_MAX));
+  const [leftRailCollapsed, setLeftRailCollapsed] = useState(false);
   const [htmlPreviewWidth, setHtmlPreviewWidth] = useState(() =>
     readStoredNumber("newman-html-preview-width", HTML_PREVIEW_DEFAULT, HTML_PREVIEW_MIN, HTML_PREVIEW_MAX)
   );
-  const [dragging, setDragging] = useState<null | "left" | "html-preview">(null);
+  const [multiagentDrawerWidth, setMultiagentDrawerWidth] = useState(() =>
+    readStoredNumber("newman-multiagent-drawer-width", MULTIAGENT_DRAWER_DEFAULT, MULTIAGENT_DRAWER_MIN, MULTIAGENT_DRAWER_MAX)
+  );
+  const [dragging, setDragging] = useState<null | "left" | "html-preview" | "multiagent-drawer">(null);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [expandedTimelineIds, setExpandedTimelineIds] = useState<Record<string, boolean>>({});
+  const [multiagentDrawerOpen, setMultiagentDrawerOpen] = useState(false);
+  const [multiagentRuns, setMultiagentRuns] = useState<SessionMultiagentRunsResponse["runs"]>([]);
+  const [multiagentLoading, setMultiagentLoading] = useState(false);
+  const [multiagentError, setMultiagentError] = useState<string | null>(null);
+  const [selectedMultiagentRunId, setSelectedMultiagentRunId] = useState<string | null>(null);
+  const [selectedMultiagentTaskId, setSelectedMultiagentTaskId] = useState<string | null>(null);
+  const [multiagentRunDetailsById, setMultiagentRunDetailsById] = useState<Record<string, MultiAgentRunDetailResponse>>({});
+  const [multiagentDetailLoading, setMultiagentDetailLoading] = useState(false);
+  const [multiagentApprovals, setMultiagentApprovals] = useState<MultiAgentPendingApproval[]>([]);
+  const [multiagentApprovalActionId, setMultiagentApprovalActionId] = useState<string | null>(null);
+  const [multiagentApprovalError, setMultiagentApprovalError] = useState<string | null>(null);
+  const [multiagentCancelActionId, setMultiagentCancelActionId] = useState<string | null>(null);
+  const [multiagentChildSessionsById, setMultiagentChildSessionsById] = useState<Record<string, SessionRecordDetail>>({});
+  const [multiagentTranscriptLoading, setMultiagentTranscriptLoading] = useState(false);
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [approvalActionLoading, setApprovalActionLoading] = useState<null | "approve" | "reject">(null);
@@ -5188,20 +5804,34 @@ function App() {
     return isTurnApprovalMode(stored) ? stored : "manual";
   });
   const [environmentLocation, setEnvironmentLocation] = useState<EnvironmentLocationContext | null>(() => {
+    const manual = readManualEnvironmentLocation();
+    if (manual) {
+      return manual;
+    }
     const timezone = localTimezone();
     return readCachedEnvironmentLocation(timezone);
   });
+  const [environmentLocationStatus, setEnvironmentLocationStatus] = useState<EnvironmentLocationStatus>(() => {
+    const manual = readManualEnvironmentLocation();
+    if (manual) {
+      return { kind: "manual", message: `当前使用手动设置城市：${manual.city}` };
+    }
+    return { kind: "idle", message: "尚未获取地理位置。" };
+  });
+  const [manualEnvironmentCity, setManualEnvironmentCity] = useState(() => readManualEnvironmentLocation()?.city ?? "");
   const [htmlPreview, setHtmlPreview] = useState<HtmlPreviewState | null>(null);
   const [htmlPreviewView, setHtmlPreviewView] = useState<HtmlPreviewView>("preview");
   const conversationPaneRef = useRef<HTMLElement | null>(null);
   const chatStageRef = useRef<HTMLDivElement | null>(null);
   const htmlPreviewPanelRef = useRef<HTMLElement | null>(null);
+  const multiagentDrawerRef = useRef<HTMLElement | null>(null);
   const composerFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillUploadFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillUploadFolderInputRef = useRef<HTMLInputElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const composerPlanTrayListRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
+  const previousWorkspaceSidePanelOpenRef = useRef(false);
   const activeMessageControllerRef = useRef<AbortController | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const lastComposerPlanFocusRef = useRef<string | null>(null);
@@ -5249,30 +5879,63 @@ function App() {
 
   const refreshEnvironmentLocation = async ({
     allowPrompt,
+    forcePrompt = false,
   }: {
     allowPrompt: boolean;
+    forcePrompt?: boolean;
   }): Promise<EnvironmentLocationContext | null> => {
     if (environmentLocationRefreshRef.current) {
       return environmentLocationRefreshRef.current;
     }
 
     const task = (async () => {
+      const manualLocation = readManualEnvironmentLocation();
+      if (manualLocation) {
+        setEnvironmentLocation(manualLocation);
+        setEnvironmentLocationStatus({ kind: "manual", message: `当前使用手动设置城市：${manualLocation.city}` });
+        return manualLocation;
+      }
+
       const timezone = localTimezone();
       const fallbackLocation =
         readCachedEnvironmentLocation(timezone) ??
         environmentLocationRef.current;
+
+      if (!window.isSecureContext) {
+        setEnvironmentLocationStatus({
+          kind: "insecure",
+          message: "当前页面不是安全上下文，浏览器不会提供定位。请改用 http://127.0.0.1:7775 或 HTTPS 打开。",
+        });
+        return fallbackLocation;
+      }
+
       const permissionState = await readGeolocationPermissionState();
 
       if (!allowPrompt) {
         if (permissionState !== "granted") {
+          setEnvironmentLocationStatus({
+            kind: permissionState === "unsupported" ? "unsupported" : "prompt",
+            message:
+              permissionState === "unsupported"
+                ? "当前浏览器环境不支持定位接口。"
+                : "尚未授予定位权限。点击“获取当前位置”后，浏览器会弹出授权。",
+          });
           return fallbackLocation;
         }
       } else {
         if (permissionState === "denied") {
+          setEnvironmentLocationStatus({
+            kind: "denied",
+            message: "浏览器已拒绝定位权限。请在站点权限里允许位置访问，或手动填写城市。",
+          });
           return fallbackLocation;
         }
         if (permissionState === "prompt") {
-          if (environmentLocationPromptAttemptedRef.current) {
+          if (environmentLocationPromptAttemptedRef.current && !forcePrompt) {
+            setEnvironmentLocationStatus({
+              kind: "prompt",
+              message: "尚未授予定位权限。点击“获取当前位置”可再次触发授权。",
+            });
             return fallbackLocation;
           }
           environmentLocationPromptAttemptedRef.current = true;
@@ -5280,6 +5943,7 @@ function App() {
       }
 
       try {
+        setEnvironmentLocationStatus({ kind: "requesting", message: "正在请求浏览器定位..." });
         const position = await getCurrentGeolocationPosition({
           enableHighAccuracy: false,
           timeout: allowPrompt ? 5000 : 2500,
@@ -5296,6 +5960,10 @@ function App() {
           }),
         });
         if (!resolved.resolved || !resolved.city) {
+          setEnvironmentLocationStatus({
+            kind: "unresolved",
+            message: "已经拿到定位坐标，但城市反查失败。你可以稍后重试，或手动填写城市。",
+          });
           return fallbackLocation;
         }
         const nextLocation: EnvironmentLocationContext = {
@@ -5307,8 +5975,23 @@ function App() {
         };
         writeCachedEnvironmentLocation(timezone, nextLocation, ENVIRONMENT_CITY_GEOLOCATION_TTL_MS);
         setEnvironmentLocation(nextLocation);
+        setEnvironmentLocationStatus({ kind: "resolved", message: `已获取当前位置：${nextLocation.city}` });
         return nextLocation;
-      } catch {
+      } catch (error) {
+        const geolocationCode =
+          error && typeof error === "object" && "code" in error && typeof error.code === "number" ? error.code : null;
+        const errorMessage =
+          geolocationCode === 1
+            ? "浏览器拒绝了定位权限。请在站点权限里允许位置访问。"
+            : geolocationCode === 2
+              ? "浏览器暂时无法确定当前位置。"
+              : geolocationCode === 3
+                ? "定位请求超时，请重试。"
+                : "浏览器当前无法提供地理位置。";
+        setEnvironmentLocationStatus({
+          kind: "unresolved",
+          message: `${errorMessage} 你也可以手动填写城市。`,
+        });
         return fallbackLocation;
       }
     })();
@@ -5320,6 +6003,25 @@ function App() {
     });
     environmentLocationRefreshRef.current = trackedTask;
     return trackedTask;
+  };
+
+  const saveManualEnvironmentCity = () => {
+    const nextLocation = writeManualEnvironmentLocation(manualEnvironmentCity);
+    setEnvironmentLocation(nextLocation);
+    environmentLocationRef.current = nextLocation;
+    if (nextLocation) {
+      setEnvironmentLocationStatus({ kind: "manual", message: `当前使用手动设置城市：${nextLocation.city}` });
+    } else {
+      setEnvironmentLocationStatus({ kind: "idle", message: "已清除手动城市。可以重新请求浏览器定位。" });
+    }
+  };
+
+  const clearManualEnvironmentCity = () => {
+    setManualEnvironmentCity("");
+    window.localStorage.removeItem(ENVIRONMENT_LOCATION_OVERRIDE_KEY);
+    setEnvironmentLocation(null);
+    environmentLocationRef.current = null;
+    setEnvironmentLocationStatus({ kind: "idle", message: "已清除手动城市。可以重新请求浏览器定位。" });
   };
 
   useEffect(() => {
@@ -5609,6 +6311,15 @@ function App() {
 
   useEffect(() => {
     environmentLocationRef.current = environmentLocation;
+    if (environmentLocation && environmentLocationStatus.kind === "idle") {
+      setEnvironmentLocationStatus({
+        kind: environmentLocation.source === "manual_override" ? "manual" : "resolved",
+        message:
+          environmentLocation.source === "manual_override"
+            ? `当前使用手动设置城市：${environmentLocation.city}`
+            : `已获取当前位置：${environmentLocation.city}`,
+      });
+    }
   }, [environmentLocation]);
 
   useEffect(() => {
@@ -5646,6 +6357,10 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem("newman-html-preview-width", `${htmlPreviewWidth}`);
   }, [htmlPreviewWidth]);
+
+  useEffect(() => {
+    window.localStorage.setItem("newman-multiagent-drawer-width", `${multiagentDrawerWidth}`);
+  }, [multiagentDrawerWidth]);
 
   useEffect(() => {
     window.localStorage.setItem(TURN_APPROVAL_MODE_STORAGE_KEY, turnApprovalMode);
@@ -5735,17 +6450,39 @@ function App() {
     if (!dragging) return;
 
     const onPointerMove = (event: PointerEvent) => {
+      const stageRect = chatStageRef.current?.getBoundingClientRect();
+      const htmlPreviewFloating = viewportWidth <= 980;
+      const multiagentDrawerFloating = viewportWidth <= 980;
+
       if (dragging === "left") {
         setLeftWidth(clamp(event.clientX, LEFT_MIN, LEFT_MAX));
         return;
       }
 
-      const stageRect = chatStageRef.current?.getBoundingClientRect();
+      if (dragging === "multiagent-drawer") {
+        const siblingHtmlWidth =
+          htmlPreview && !htmlPreviewFloating
+            ? htmlPreviewPanelRef.current?.getBoundingClientRect().width ?? htmlPreviewWidth
+            : 0;
+        const maxWidth = stageRect
+          ? Math.max(0, Math.min(MULTIAGENT_DRAWER_MAX, stageRect.width - HTML_PREVIEW_MAIN_MIN - siblingHtmlWidth))
+          : MULTIAGENT_DRAWER_MAX;
+        const minWidth = Math.min(MULTIAGENT_DRAWER_MIN, maxWidth);
+        const nextWidth = clamp((stageRect?.right ?? window.innerWidth) - event.clientX, minWidth, maxWidth);
+        setMultiagentDrawerWidth(nextWidth);
+        return;
+      }
+
       const panelRight = htmlPreviewPanelRef.current?.getBoundingClientRect().right ?? stageRect?.right ?? window.innerWidth;
+      const siblingDrawerWidth =
+        multiagentDrawerOpen && !multiagentDrawerFloating
+          ? multiagentDrawerRef.current?.getBoundingClientRect().width ?? multiagentDrawerWidth
+          : 0;
       const maxWidth = stageRect
-        ? Math.min(HTML_PREVIEW_MAX, Math.max(HTML_PREVIEW_MIN, stageRect.width - HTML_PREVIEW_MAIN_MIN))
+        ? Math.max(0, Math.min(HTML_PREVIEW_MAX, stageRect.width - HTML_PREVIEW_MAIN_MIN - siblingDrawerWidth))
         : HTML_PREVIEW_MAX;
-      setHtmlPreviewWidth(clamp(panelRight - event.clientX, HTML_PREVIEW_MIN, maxWidth));
+      const minWidth = Math.min(HTML_PREVIEW_MIN, maxWidth);
+      setHtmlPreviewWidth(clamp(panelRight - event.clientX, minWidth, maxWidth));
     };
 
     const onPointerUp = () => setDragging(null);
@@ -5757,11 +6494,25 @@ function App() {
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
     };
-  }, [dragging]);
+  }, [
+    dragging,
+    htmlPreview,
+    htmlPreviewWidth,
+    multiagentDrawerOpen,
+    multiagentDrawerWidth,
+    viewportWidth,
+  ]);
 
-  async function loadChatSessions(signal?: AbortSignal, preferredId?: string | null) {
-    setSessionsLoading(true);
-    setSessionsError(null);
+  async function loadChatSessions(
+    signal?: AbortSignal,
+    preferredId?: string | null,
+    options?: { silent?: boolean }
+  ) {
+    const silent = options?.silent ?? false;
+    if (!silent) {
+      setSessionsLoading(true);
+      setSessionsError(null);
+    }
 
     try {
       const data = await fetchJson<SessionSummaryRecord[]>(`${apiBase}/api/sessions`, { signal });
@@ -5771,6 +6522,7 @@ function App() {
 
       const nextSessions = data.map(mapSessionSummary);
       setChatSessions(nextSessions);
+      setSessionsError(null);
 
       const storedId = preferredId === undefined ? activeSessionIdRef.current : preferredId;
       if (storedId && nextSessions.some((item) => item.id === storedId)) {
@@ -5786,11 +6538,227 @@ function App() {
       if (signal?.aborted) {
         return;
       }
-      setSessionsError(error instanceof Error ? error.message : "会话列表加载失败");
+      if (!silent) {
+        setSessionsError(error instanceof Error ? error.message : "会话列表加载失败");
+      }
     } finally {
-      if (!signal?.aborted) {
+      if (!silent && !signal?.aborted) {
         setSessionsLoading(false);
       }
+    }
+  }
+
+  async function loadSessionMultiagentRuns(
+    sessionId: string,
+    signal?: AbortSignal,
+    options?: { silent?: boolean; preferredRunId?: string | null }
+  ) {
+    const silent = options?.silent ?? false;
+    if (!silent) {
+      setMultiagentLoading(true);
+      setMultiagentError(null);
+    }
+
+    try {
+      const payload = await fetchJson<SessionMultiagentRunsResponse>(
+        `${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/multiagent-runs`,
+        { signal }
+      );
+      if (signal?.aborted || activeSessionIdRef.current !== sessionId) {
+        return null;
+      }
+
+      setMultiagentRuns(payload.runs);
+      const candidateRunId =
+        (options?.preferredRunId &&
+        payload.runs.some((item) => item.run.run_id === options.preferredRunId)
+          ? options.preferredRunId
+          : null) ??
+        (selectedMultiagentRunId &&
+        payload.runs.some((item) => item.run.run_id === selectedMultiagentRunId)
+          ? selectedMultiagentRunId
+          : null) ??
+        payload.runs[0]?.run.run_id ??
+        null;
+
+      setSelectedMultiagentRunId(candidateRunId);
+      if (!candidateRunId) {
+        setSelectedMultiagentTaskId(null);
+        return payload;
+      }
+      await loadMultiagentRunDetail(candidateRunId, { signal, silent: true });
+      return payload;
+    } catch (error) {
+      if (signal?.aborted) {
+        return null;
+      }
+      setMultiagentError(error instanceof Error ? error.message : "多代理运行记录加载失败");
+      return null;
+    } finally {
+      if (!silent && !signal?.aborted && activeSessionIdRef.current === sessionId) {
+        setMultiagentLoading(false);
+      }
+    }
+  }
+
+  async function loadSessionMultiagentApprovals(
+    sessionId: string,
+    signal?: AbortSignal,
+    options?: { silent?: boolean }
+  ) {
+    const silent = options?.silent ?? false;
+    if (!silent) {
+      setMultiagentApprovalError(null);
+    }
+
+    try {
+      const payload = await fetchJson<SessionMultiagentApprovalsResponse>(
+        `${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/multiagent-approvals`,
+        { signal }
+      );
+      if (signal?.aborted || activeSessionIdRef.current !== sessionId) {
+        return null;
+      }
+      setMultiagentApprovals(payload.pending);
+      if (payload.pending.length > 0) {
+        setMultiagentDrawerOpen(true);
+      }
+      return payload;
+    } catch (error) {
+      if (signal?.aborted) {
+        return null;
+      }
+      setMultiagentApprovalError(error instanceof Error ? error.message : "多代理审批队列加载失败");
+      return null;
+    }
+  }
+
+  async function loadMultiagentRunDetail(
+    runId: string,
+    options?: { signal?: AbortSignal; silent?: boolean }
+  ) {
+    const signal = options?.signal;
+    const silent = options?.silent ?? false;
+    if (!silent) {
+      setMultiagentDetailLoading(true);
+    }
+    try {
+      const payload = await fetchJson<MultiAgentRunDetailResponse>(
+        `${apiBase}/api/multiagent/runs/${encodeURIComponent(runId)}`,
+        { signal }
+      );
+      if (signal?.aborted) {
+        return null;
+      }
+      setMultiagentRunDetailsById((current) => ({
+        ...current,
+        [runId]: payload,
+      }));
+      setSelectedMultiagentTaskId((currentTaskId) =>
+        resolveNextSelectedMultiagentTaskId(payload.tasks, currentTaskId)
+      );
+      return payload;
+    } catch (error) {
+      if (signal?.aborted) {
+        return null;
+      }
+      setMultiagentError(error instanceof Error ? error.message : "多代理运行详情加载失败");
+      return null;
+    } finally {
+      if (!silent && !signal?.aborted) {
+        setMultiagentDetailLoading(false);
+      }
+    }
+  }
+
+  async function loadMultiagentChildSession(
+    sessionId: string,
+    options?: { signal?: AbortSignal; silent?: boolean }
+  ) {
+    const signal = options?.signal;
+    const silent = options?.silent ?? false;
+    if (!silent) {
+      setMultiagentTranscriptLoading(true);
+    }
+    try {
+      const payload = await fetchJson<SessionDetailResponse>(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}`, { signal });
+      if (signal?.aborted) {
+        return null;
+      }
+      setMultiagentChildSessionsById((current) => ({
+        ...current,
+        [sessionId]: payload.session,
+      }));
+      return payload.session;
+    } catch (error) {
+      if (signal?.aborted) {
+        return null;
+      }
+      setMultiagentError(error instanceof Error ? error.message : "子会话 transcript 加载失败");
+      return null;
+    } finally {
+      if (!silent && !signal?.aborted) {
+        setMultiagentTranscriptLoading(false);
+      }
+    }
+  }
+
+  async function cancelMultiagentRun(runId: string) {
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId || multiagentCancelActionId) {
+      return;
+    }
+    setMultiagentCancelActionId(`run:${runId}`);
+    setMultiagentError(null);
+    try {
+      await fetchJson<{
+        accepted: boolean;
+        message: string;
+        run_id: string;
+        status: MultiAgentRunStatus;
+      }>(`${apiBase}/api/multiagent/runs/${encodeURIComponent(runId)}/cancel`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ reason: "user_requested" }),
+      });
+      await loadSessionMultiagentRuns(sessionId, undefined, { silent: true, preferredRunId: runId });
+      await loadSessionMultiagentApprovals(sessionId, undefined, { silent: true });
+    } catch (error) {
+      setMultiagentError(error instanceof Error ? error.message : "停止多代理运行失败");
+    } finally {
+      setMultiagentCancelActionId(null);
+    }
+  }
+
+  async function cancelMultiagentTask(taskId: string, runId: string) {
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId || multiagentCancelActionId) {
+      return;
+    }
+    setMultiagentCancelActionId(`task:${taskId}`);
+    setMultiagentError(null);
+    try {
+      await fetchJson<{
+        accepted: boolean;
+        message: string;
+        task_id: string;
+        status: MultiAgentTaskStatus;
+      }>(`${apiBase}/api/multiagent/tasks/${encodeURIComponent(taskId)}/cancel`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ reason: "user_requested" }),
+      });
+      await loadMultiagentRunDetail(runId, { silent: true });
+      await loadSessionMultiagentRuns(sessionId, undefined, { silent: true, preferredRunId: runId });
+      await loadSessionMultiagentApprovals(sessionId, undefined, { silent: true });
+    } catch (error) {
+      setMultiagentError(error instanceof Error ? error.message : "停止子代理任务失败");
+    } finally {
+      setMultiagentCancelActionId(null);
     }
   }
 
@@ -5840,6 +6808,9 @@ function App() {
         }
         console.warn("Failed to load session usage", { sessionId, usageError });
       }
+
+      await loadSessionMultiagentRuns(sessionId, signal, { silent: true });
+      await loadSessionMultiagentApprovals(sessionId, signal, { silent: true });
 
       if (signal?.aborted || activeSessionIdRef.current !== sessionId) {
         return false;
@@ -6005,30 +6976,84 @@ function App() {
   }, [apiBase]);
 
   useEffect(() => {
+    let cancelled = false;
+    let controller: AbortController | null = null;
+
+    const refreshVisibleSessions = async () => {
+      if (cancelled || document.visibilityState === "hidden" || controller) {
+        return;
+      }
+      controller = new AbortController();
+      try {
+        await loadChatSessions(controller.signal, undefined, { silent: true });
+      } finally {
+        controller = null;
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refreshVisibleSessions();
+      }
+    };
+
+    const timer = window.setInterval(() => {
+      void refreshVisibleSessions();
+    }, CHAT_SESSIONS_REFRESH_INTERVAL_MS);
+
+    window.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      if (controller) {
+        controller.abort();
+      }
+      window.clearInterval(timer);
+      window.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [apiBase]);
+
+  useEffect(() => {
     if (!activeSessionId) {
-      resetLiveAnswerStreaming();
-      resetLiveSessionEventQueue();
       setActiveSessionDetail(null);
       setActivePlan(null);
       setActiveCollaborationMode(null);
       setActiveContextUsage(null);
       setSessionEvents([]);
-      setLiveSessionEvents([]);
-      setLiveTurn(null);
+      setMultiagentRuns([]);
+      setMultiagentRunDetailsById({});
+      setSelectedMultiagentRunId(null);
+      setSelectedMultiagentTaskId(null);
+      setMultiagentApprovals([]);
+      setMultiagentApprovalActionId(null);
+      setMultiagentApprovalError(null);
+      setMultiagentChildSessionsById({});
+      setMultiagentTranscriptLoading(false);
+      setMultiagentError(null);
+      setMultiagentLoading(false);
+      setMultiagentDetailLoading(false);
       setChatLoading(false);
       return;
     }
 
     const controller = new AbortController();
-    resetLiveAnswerStreaming();
-    resetLiveSessionEventQueue();
     setActiveSessionDetail(null);
     setActivePlan(null);
     setActiveCollaborationMode(null);
     setActiveContextUsage(null);
     setSessionEvents([]);
-    setLiveSessionEvents([]);
-    setLiveTurn((currentTurn) => (currentTurn && currentTurn.sessionId !== activeSessionId ? null : currentTurn));
+    setMultiagentRuns([]);
+    setMultiagentRunDetailsById({});
+    setSelectedMultiagentRunId(null);
+    setSelectedMultiagentTaskId(null);
+    setMultiagentApprovals([]);
+    setMultiagentApprovalActionId(null);
+    setMultiagentApprovalError(null);
+    setMultiagentChildSessionsById({});
+    setMultiagentTranscriptLoading(false);
+    setMultiagentError(null);
+    setMultiagentLoading(false);
+    setMultiagentDetailLoading(false);
     void loadChatWorkspace(activeSessionId, controller.signal);
     return () => controller.abort();
   }, [activeSessionId, apiBase]);
@@ -6064,6 +7089,32 @@ function App() {
       window.clearInterval(timer);
     };
   }, [activePage, activeSessionId, apiBase]);
+
+  useEffect(() => {
+    if (activePage !== "chat" || !selectedMultiagentRunId) {
+      return;
+    }
+    if (multiagentRunDetailsById[selectedMultiagentRunId]) {
+      return;
+    }
+    void loadMultiagentRunDetail(selectedMultiagentRunId, { silent: true });
+  }, [activePage, selectedMultiagentRunId, multiagentRunDetailsById]);
+
+  useEffect(() => {
+    if (activePage !== "chat" || !selectedMultiagentRunId) {
+      return;
+    }
+    const detail = multiagentRunDetailsById[selectedMultiagentRunId];
+    const task =
+      detail?.tasks.find((item) => item.task_id === selectedMultiagentTaskId) ??
+      detail?.tasks[0] ??
+      null;
+    const childSessionId = task?.child_session_id ?? null;
+    if (!childSessionId || multiagentChildSessionsById[childSessionId]) {
+      return;
+    }
+    void loadMultiagentChildSession(childSessionId);
+  }, [activePage, selectedMultiagentRunId, selectedMultiagentTaskId, multiagentRunDetailsById, multiagentChildSessionsById]);
 
   useEffect(() => {
     if (!pendingComposerMode) {
@@ -6397,12 +7448,38 @@ function App() {
   }, [activePage, apiBase]);
 
   const isMobile = viewportWidth <= 820;
+  const workspaceSidePanelOpen = activePage === "chat" && (Boolean(htmlPreview) || multiagentDrawerOpen);
+  useEffect(() => {
+    if (!isMobile && workspaceSidePanelOpen && !previousWorkspaceSidePanelOpenRef.current) {
+      setLeftRailCollapsed(true);
+    }
+    previousWorkspaceSidePanelOpenRef.current = workspaceSidePanelOpen;
+  }, [isMobile, workspaceSidePanelOpen]);
+
+  const compactLeftRail = !isMobile && leftRailCollapsed;
+  const effectiveLeftWidth = compactLeftRail ? COMPACT_LEFT_RAIL_WIDTH : leftWidth;
+  const effectiveHandleWidth = compactLeftRail ? 0 : HANDLE_WIDTH;
   const isHtmlPreviewFloating = viewportWidth <= 980;
-  const maxHtmlPreviewWidth = useMemo(() => {
-    const mainStageWidth = viewportWidth - (isMobile ? 0 : leftWidth + HANDLE_WIDTH) - 12;
-    return clamp(mainStageWidth - HTML_PREVIEW_MAIN_MIN, HTML_PREVIEW_MIN, HTML_PREVIEW_MAX);
-  }, [isMobile, leftWidth, viewportWidth]);
-  const effectiveHtmlPreviewWidth = Math.min(htmlPreviewWidth, maxHtmlPreviewWidth);
+  const isMultiagentDrawerFloating = viewportWidth <= 980;
+  const desktopChatStageWidth = Math.max(0, viewportWidth - (isMobile ? 0 : effectiveLeftWidth + effectiveHandleWidth) - 12);
+  const availableDesktopSideWidth = Math.max(0, desktopChatStageWidth - HTML_PREVIEW_MAIN_MIN);
+  const desiredDesktopHtmlPreviewWidth =
+    htmlPreview && !isHtmlPreviewFloating ? clamp(htmlPreviewWidth, HTML_PREVIEW_MIN, HTML_PREVIEW_MAX) : 0;
+  const desiredDesktopMultiagentDrawerWidth =
+    multiagentDrawerOpen && !isMultiagentDrawerFloating
+      ? clamp(multiagentDrawerWidth, MULTIAGENT_DRAWER_MIN, MULTIAGENT_DRAWER_MAX)
+      : 0;
+  const desiredDesktopSideWidth = desiredDesktopHtmlPreviewWidth + desiredDesktopMultiagentDrawerWidth;
+  const desktopSideScale =
+    desiredDesktopSideWidth > 0 ? Math.min(1, availableDesktopSideWidth / desiredDesktopSideWidth) : 1;
+  const effectiveHtmlPreviewWidth =
+    desiredDesktopHtmlPreviewWidth > 0
+      ? Math.max(0, Math.round(desiredDesktopHtmlPreviewWidth * desktopSideScale))
+      : clamp(htmlPreviewWidth, HTML_PREVIEW_MIN, HTML_PREVIEW_MAX);
+  const effectiveMultiagentDrawerWidth =
+    desiredDesktopMultiagentDrawerWidth > 0
+      ? Math.max(0, Math.round(desiredDesktopMultiagentDrawerWidth * desktopSideScale))
+      : clamp(multiagentDrawerWidth, MULTIAGENT_DRAWER_MIN, MULTIAGENT_DRAWER_MAX);
   const htmlPreviewPanelStyle = {
     "--html-preview-width": `${effectiveHtmlPreviewWidth}px`
   } as CSSProperties;
@@ -6471,29 +7548,95 @@ ${markup}
     setHtmlPreview(payload);
     setHtmlPreviewView(payload.initialView ?? "preview");
   };
-  const liveTurnLocalId = liveTurn?.localId ?? null;
-  const liveTurnRequestId = liveTurn?.requestId ?? null;
-  const liveTurnServerTurnId = liveTurn?.serverTurnId ?? null;
+  const multiagentDrawerStyle = useMemo(
+    () =>
+      ({
+        ["--drawer-width" as string]: `${effectiveMultiagentDrawerWidth}px`,
+      }) as CSSProperties,
+    [effectiveMultiagentDrawerWidth]
+  );
+  const activeLiveTurn = liveTurn?.sessionId === activeSessionId ? liveTurn : null;
+  const activeLiveSessionEvents = activeLiveTurn ? liveSessionEvents : [];
+  const liveTurnLocalId = activeLiveTurn?.localId ?? null;
+  const liveTurnRequestId = activeLiveTurn?.requestId ?? null;
+  const liveTurnServerTurnId = activeLiveTurn?.serverTurnId ?? null;
   const persistedTurns = useMemo(
     () => buildChatTurns(activeSessionDetail?.session_id ?? "", activeSessionDetail?.messages ?? [], sessionEvents, activeTurnUsageById),
     [activeSessionDetail?.session_id, activeSessionDetail?.messages, sessionEvents, activeTurnUsageById]
   );
   const visiblePersistedTurns = useMemo(
-    () => persistedTurns.filter((turn) => !turnMatchesLiveTurn(turn, liveTurn)),
+    () => persistedTurns.filter((turn) => !turnMatchesLiveTurn(turn, activeLiveTurn)),
     [persistedTurns, liveTurnLocalId, liveTurnRequestId, liveTurnServerTurnId]
   );
   const liveDisplayTurn = useMemo(
-    () => (liveTurn ? buildLiveTurn(liveTurn, liveSessionEvents) : null),
-    [liveTurn, liveSessionEvents]
+    () => (activeLiveTurn ? buildLiveTurn(activeLiveTurn, activeLiveSessionEvents) : null),
+    [activeLiveTurn, activeLiveSessionEvents]
+  );
+  const mergedSessionEvents = useMemo(
+    () => dedupeSessionEvents([...sessionEvents, ...activeLiveSessionEvents]),
+    [sessionEvents, activeLiveSessionEvents]
   );
   const displayTurns = useMemo(
     () => (liveDisplayTurn ? [...visiblePersistedTurns, liveDisplayTurn] : visiblePersistedTurns),
     [visiblePersistedTurns, liveDisplayTurn]
   );
+  useEffect(() => {
+    if (!activeLiveTurn) {
+      return;
+    }
+    const persistedMatch = persistedTurns.find((turn) => turnMatchesLiveTurn(turn, activeLiveTurn));
+    if (!persistedMatch || (persistedMatch.status !== "completed" && persistedMatch.status !== "failed")) {
+      return;
+    }
+    resetLiveAnswerStreaming();
+    resetLiveSessionEventQueue();
+    setLiveSessionEvents((currentEvents) => currentEvents.filter((event) => !matchLiveTurnEvent(event, activeLiveTurn)));
+    setLiveTurn((currentTurn) =>
+      currentTurn && turnMatchesLiveTurn(persistedMatch, currentTurn) ? null : currentTurn
+    );
+  }, [activeLiveTurn, persistedTurns]);
+  const selectedMultiagentRunDetail = selectedMultiagentRunId ? multiagentRunDetailsById[selectedMultiagentRunId] ?? null : null;
+  const selectedMultiagentTask =
+    selectedMultiagentRunDetail?.tasks.find((task) => task.task_id === selectedMultiagentTaskId) ??
+    selectedMultiagentRunDetail?.tasks[0] ??
+    null;
+  const selectedMultiagentChildSession = selectedMultiagentTask
+    ? multiagentChildSessionsById[selectedMultiagentTask.child_session_id] ?? null
+    : null;
+  const selectedMultiagentRunStopping = selectedMultiagentRunDetail
+    ? isMultiagentRunStopping(selectedMultiagentRunDetail.run)
+    : false;
+  const selectedMultiagentTaskStopping = selectedMultiagentTask
+    ? isMultiagentTaskStopping(selectedMultiagentTask)
+    : false;
+  const selectedMultiagentTimeline = useMemo(
+    () =>
+      buildMultiagentTimeline(
+        mergedSessionEvents,
+        selectedMultiagentRunId,
+        selectedMultiagentTask?.task_id ?? null
+      ),
+    [mergedSessionEvents, selectedMultiagentRunId, selectedMultiagentTask?.task_id]
+  );
+  const multiagentRunningCount = multiagentRuns.filter((item) =>
+    ["pending", "running", "waiting_file_lock", "waiting_approval"].includes(item.run.status)
+  ).length;
+  const multiagentNeedsRefresh =
+    multiagentRuns.some((item) => isMultiagentRunActive(item.run.status) || isMultiagentRunStopping(item.run)) ||
+    Boolean(
+      selectedMultiagentRunDetail &&
+        (isMultiagentRunActive(selectedMultiagentRunDetail.run.status) ||
+          isMultiagentRunStopping(selectedMultiagentRunDetail.run) ||
+          selectedMultiagentRunDetail.tasks.some(
+            (task) => isMultiagentTaskActive(task.status) || isMultiagentTaskStopping(task)
+          ))
+    );
+  const isSendingInActiveSession = Boolean(activeSessionId) && sendingMessage && sendingSessionId === activeSessionId;
+  const isSendingInOtherSession = sendingMessage && Boolean(sendingSessionId) && sendingSessionId !== activeSessionId;
+  const isStoppingInActiveSession = Boolean(activeSessionId) && stoppingMessage && sendingSessionId === activeSessionId;
   const showEmptyChatState =
     activePage === "chat" &&
     !chatLoading &&
-    !sendingMessage &&
     displayTurns.length === 0;
   const contextPressure =
     activeContextUsage?.budget_pressure ??
@@ -6562,6 +7705,35 @@ ${markup}
       : buildComposerSlashCommands().filter((command) =>
           slashCommandQuery === null ? false : !slashCommandQuery || command.keyword.includes(slashCommandQuery)
         );
+
+  useEffect(() => {
+    if (activePage !== "chat" || !activeSessionId || !multiagentNeedsRefresh) {
+      return;
+    }
+
+    const controller = new AbortController();
+    let cancelled = false;
+
+    async function refreshMultiagentState() {
+      await loadSessionMultiagentRuns(activeSessionId, controller.signal, {
+        silent: true,
+        preferredRunId: selectedMultiagentRunId,
+      });
+      if (!cancelled && !controller.signal.aborted) {
+        await loadSessionMultiagentApprovals(activeSessionId, controller.signal, { silent: true });
+      }
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshMultiagentState();
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [activePage, activeSessionId, multiagentNeedsRefresh, selectedMultiagentRunId]);
 
   useLayoutEffect(() => {
     if (!showComposerPlanTray) {
@@ -6712,7 +7884,7 @@ ${markup}
 
   useLayoutEffect(() => {
     if (activePage !== "chat") return;
-    if (!activeSessionDetail && !liveTurn) return;
+    if (!activeSessionDetail && !activeLiveTurn) return;
 
     const pane = conversationPaneRef.current;
     if (!pane) return;
@@ -6721,7 +7893,7 @@ ${markup}
     }
 
     scrollConversationToBottom();
-  }, [activePage, activeSessionId, activeSessionDetail, liveTurn, sessionEvents.length]);
+  }, [activePage, activeSessionId, activeSessionDetail, activeLiveTurn, sessionEvents.length]);
 
   const switchPage = (nextPage: WorkspacePage) => {
     setActivePage(nextPage);
@@ -6975,7 +8147,7 @@ ${markup}
       return;
     }
 
-    const sessionId = liveTurn?.sessionId ?? activeSessionIdRef.current;
+    const sessionId = sendingSessionId;
     if (!sessionId) {
       return;
     }
@@ -7031,6 +8203,7 @@ ${markup}
 
     setChatError(null);
     setSendingMessage(true);
+    setSendingSessionId(null);
     const controller = new AbortController();
     activeMessageControllerRef.current = controller;
 
@@ -7039,6 +8212,7 @@ ${markup}
         activeMessageControllerRef.current = null;
       }
       setSendingMessage(false);
+      setSendingSessionId(null);
     };
 
     try {
@@ -7046,6 +8220,7 @@ ${markup}
       if (controller.signal.aborted) {
         return;
       }
+      setSendingSessionId(sessionId);
 
       if (desiredCollaborationMode !== currentCollaborationMode) {
         const synced = await updateSessionCollaborationMode(desiredCollaborationMode, {
@@ -7160,10 +8335,7 @@ ${markup}
       );
 
       await consumeSseStream(response, (payload) => {
-        if (activeSessionIdRef.current !== sessionId) {
-          return;
-        }
-
+        const isViewingStreamSession = activeSessionIdRef.current === sessionId;
         const payloadTurnId = readTurnId(payload.data);
         if (shouldPersistLiveSessionEvent(payload)) {
           enqueueLiveSessionEvent(payload);
@@ -7171,58 +8343,86 @@ ${markup}
         if (payload.event === "assistant_delta" || payload.event === "final_response") {
           enqueueLiveAnswerEvent(liveTurnLocalId, payload);
         }
-        applyHtmlPreviewStreamEvent(payload);
         if (payload.event === "error") {
           resetLiveAnswerStreaming();
         }
-        if (payload.event === "collaboration_mode_changed") {
-          const modePayload =
-            "collaboration_mode" in payload.data && payload.data.collaboration_mode && typeof payload.data.collaboration_mode === "object"
-              ? (payload.data.collaboration_mode as NonNullable<SessionDetailResponse["collaboration_mode"]>)
-              : null;
-          if (modePayload) {
-            setActiveCollaborationMode(modePayload);
+        if (isViewingStreamSession) {
+          applyHtmlPreviewStreamEvent(payload);
+          if (payload.event === "collaboration_mode_changed") {
+            const modePayload =
+              "collaboration_mode" in payload.data && payload.data.collaboration_mode && typeof payload.data.collaboration_mode === "object"
+                ? (payload.data.collaboration_mode as NonNullable<SessionDetailResponse["collaboration_mode"]>)
+                : null;
+            if (modePayload) {
+              setActiveCollaborationMode(modePayload);
+            }
           }
-        }
-        if (payload.event === "plan_updated") {
-          const planPayload =
-            "plan" in payload.data && payload.data.plan && typeof payload.data.plan === "object"
-              ? (payload.data.plan as NonNullable<SessionPlanPayload>)
-              : null;
-          setActivePlan(planPayload);
-        }
-        if (payload.event === "user_input_requested" || payload.event === "final_response") {
-          const awaiting = readAwaitingUserInput(payload.data);
-          if (awaiting) {
-            setActiveAwaitingUserInput(awaiting);
-          } else if (payload.event === "final_response" && readTurnOutcome(payload.data) !== "awaiting_user") {
+          if (payload.event === "plan_updated") {
+            const planPayload =
+              "plan" in payload.data && payload.data.plan && typeof payload.data.plan === "object"
+                ? (payload.data.plan as NonNullable<SessionPlanPayload>)
+                : null;
+            setActivePlan(planPayload);
+          }
+          if (payload.event === "user_input_requested" || payload.event === "final_response") {
+            const awaiting = readAwaitingUserInput(payload.data);
+            if (awaiting) {
+              setActiveAwaitingUserInput(awaiting);
+            } else if (payload.event === "final_response" && readTurnOutcome(payload.data) !== "awaiting_user") {
+              setActiveAwaitingUserInput(null);
+            }
+          }
+          if (payload.event === "turn_completed" && readTurnOutcome(payload.data) !== "awaiting_user") {
             setActiveAwaitingUserInput(null);
           }
-        }
-        if (payload.event === "turn_completed" && readTurnOutcome(payload.data) !== "awaiting_user") {
-          setActiveAwaitingUserInput(null);
-        }
-        if (eventMarksTurnFinalized(payload)) {
-          setActivePlan((currentPlan) =>
-            shouldClosePlanFromEvent(currentPlan, payload) ? closePlanSteps(currentPlan) : currentPlan
-          );
-        }
-        if (payload.event === "tool_approval_request") {
-          const approval = buildPendingApprovalFromEvent(payload);
-          if (approval) {
-            setPendingApproval(approval);
-            setApprovalError(null);
-          }
-        }
-        if (payload.event === "tool_approval_resolved") {
-          const approvalRequestId =
-            typeof payload.data.approval_request_id === "string" && payload.data.approval_request_id
-              ? payload.data.approval_request_id
-              : null;
-          if (approvalRequestId) {
-            setPendingApproval((current) =>
-              current?.approval_request_id === approvalRequestId ? null : current
+          if (eventMarksTurnFinalized(payload)) {
+            setActivePlan((currentPlan) =>
+              shouldClosePlanFromEvent(currentPlan, payload) ? closePlanSteps(currentPlan) : currentPlan
             );
+          }
+          if (payload.event === "tool_approval_request") {
+            const approval = buildPendingApprovalFromEvent(payload);
+            if (approval) {
+              setPendingApproval(approval);
+              setApprovalError(null);
+            }
+          }
+          if (payload.event === "tool_approval_resolved") {
+            const approvalRequestId =
+              typeof payload.data.approval_request_id === "string" && payload.data.approval_request_id
+                ? payload.data.approval_request_id
+                : null;
+            if (approvalRequestId) {
+              setPendingApproval((current) =>
+                current?.approval_request_id === approvalRequestId ? null : current
+              );
+            }
+          }
+          if (isMultiagentEventName(payload.event)) {
+            const payloadSessionId = readMultiagentParentSessionId(payload);
+            if (!payloadSessionId || payloadSessionId === sessionId) {
+              const runId = readMultiagentRunId(payload);
+              if (payload.event === "multiagent_run_started") {
+                setMultiagentDrawerOpen(true);
+                if (runId) {
+                  setSelectedMultiagentRunId(runId);
+                }
+              }
+              if (payload.event === "multiagent_approval_queued") {
+                setMultiagentDrawerOpen(true);
+                void loadSessionMultiagentApprovals(sessionId, undefined, { silent: true });
+              }
+              if (
+                payload.event === "multiagent_tool_event" &&
+                typeof payload.data.event === "string" &&
+                payload.data.event === "tool_approval_resolved"
+              ) {
+                void loadSessionMultiagentApprovals(sessionId, undefined, { silent: true });
+              }
+              if (payload.event !== "multiagent_tool_event" && payload.event !== "multiagent_approval_queued") {
+                void loadSessionMultiagentRuns(sessionId, undefined, { silent: true, preferredRunId: runId });
+              }
+            }
           }
         }
         setLiveTurn((currentTurn) => {
@@ -7376,6 +8576,36 @@ ${markup}
     }
   };
 
+  const resolveMultiagentApproval = async (
+    action: "approve" | "reject",
+    approval: MultiAgentPendingApproval
+  ) => {
+    if (!activeSessionId) {
+      return;
+    }
+
+    setMultiagentApprovalActionId(approval.approval_request_id);
+    setMultiagentApprovalError(null);
+
+    try {
+      await fetchJson<{ approved: boolean }>(
+        `${apiBase}/api/sessions/${encodeURIComponent(activeSessionId)}/multiagent-approvals/${encodeURIComponent(
+          approval.approval_request_id
+        )}/${action}`,
+        {
+          method: "POST",
+        }
+      );
+      setMultiagentApprovals((current) =>
+        current.filter((item) => item.approval_request_id !== approval.approval_request_id)
+      );
+    } catch (error) {
+      setMultiagentApprovalError(error instanceof Error ? error.message : "多代理审批操作失败");
+    } finally {
+      setMultiagentApprovalActionId(null);
+    }
+  };
+
   const focusComposerWithAwaitingDraft = (draft = "") => {
     setComposerValue((currentValue) => (currentValue.trim() ? currentValue : draft));
     requestAnimationFrame(() => {
@@ -7465,7 +8695,6 @@ ${markup}
     const replyPlaceholder =
       requestOptions.length > 0 ? "没有合适选项时，在这里补充具体说明" : "在这里输入你的回复";
     const replyInputId = `awaiting-input-${request.requestId}-${options?.compact ? "compact" : "full"}`;
-    const manualReplyHint = showInlineReply ? "你也可以直接输入你所想的。" : "你也可以直接在底部输入你所想的。";
 
     return (
       <article className={`awaiting-input-card kind-${request.kind} ${options?.compact ? "compact" : ""} ${
@@ -7523,16 +8752,12 @@ ${markup}
           </div>
         ) : null}
 
-        <p className="awaiting-input-manual-hint">{manualReplyHint}</p>
-
         {showInlineReply ? (
           <div className={`awaiting-input-reply ${requestOptions.length > 0 ? "with-options" : ""}`}>
-            <label className="awaiting-input-reply-label" htmlFor={replyInputId}>
-              {requestOptions.length > 0 ? "或者输入具体回复" : "输入回复"}
-            </label>
             <textarea
               id={replyInputId}
               className="awaiting-input-reply-textarea"
+              aria-label={requestOptions.length > 0 ? "输入具体回复" : "输入回复"}
               value={freeTextDraft}
               onChange={(event) => updateAwaitingInputDraft(request, event.target.value)}
               onKeyDown={(event) => {
@@ -7546,18 +8771,15 @@ ${markup}
               rows={3}
               disabled={isActionDisabled}
             />
-            <div className="awaiting-input-reply-footer">
-              <span className="awaiting-input-reply-hint">Enter 发送，Shift + Enter 换行</span>
-              <button
-                type="button"
-                className={`awaiting-input-reply-submit ${submittedSelection?.value === "free_text" ? "selected" : ""}`}
-                onClick={() => void submitAwaitingFreeText(request)}
-                disabled={isActionDisabled || !freeTextDraft.trim()}
-                aria-pressed={submittedSelection?.value === "free_text"}
-              >
-                发送回复
-              </button>
-            </div>
+            <button
+              type="button"
+              className={`awaiting-input-reply-submit ${submittedSelection?.value === "free_text" ? "selected" : ""}`}
+              onClick={() => void submitAwaitingFreeText(request)}
+              disabled={isActionDisabled || !freeTextDraft.trim()}
+              aria-pressed={submittedSelection?.value === "free_text"}
+            >
+              发送回复
+            </button>
           </div>
         ) : requestOptions.length === 0 ? (
           <div className="awaiting-input-reply-fallback">
@@ -7620,10 +8842,7 @@ ${markup}
     if (typeof manual === "boolean") {
       return manual;
     }
-    if (node.secondaryItems.some((item) => item.toolName === "request_user_input")) {
-      return true;
-    }
-    return false;
+    return node.secondaryItems.some((item) => item.toolName === "request_user_input" || item.awaitingUserInput);
   };
 
   const toggleTimelineNode = (node: TimelineNode) => {
@@ -8072,6 +9291,15 @@ ${markup}
     const inputClassName = variant === "hero" ? "composer-input composer-input-hero" : "composer-input";
     const isComposerEmpty = !composerValue.trim() && composerAttachments.length === 0;
     const showContextMeter = !isHero;
+    const showStopTrigger = isSendingInActiveSession;
+    const composerInputDisabled = sendingMessage || stoppingMessage;
+    const composerPlaceholder = isStoppingInActiveSession
+      ? "正在停止当前任务，请稍候…"
+      : isSendingInActiveSession
+        ? "当前正在执行，点击右侧按钮可立即停止…"
+        : isSendingInOtherSession
+          ? "另一个会话正在执行，当前会话暂时不能发送"
+          : "输入你的任务，可附附件；按 Enter 发送，Shift + Enter 换行";
 
     return (
       <div className={`composer-main ${variant === "hero" ? "composer-main-hero" : ""}`}>
@@ -8121,15 +9349,9 @@ ${markup}
                 onFocus={() => setComposerFocused(true)}
                 onBlur={() => setComposerFocused(false)}
                 aria-label="message composer"
-                placeholder={
-                  stoppingMessage
-                    ? "正在停止当前任务，请稍候…"
-                    : sendingMessage
-                      ? "当前正在执行，点击右侧按钮可立即停止…"
-                      : "输入你的任务，可附附件；按 Enter 发送，Shift + Enter 换行"
-                }
+                placeholder={composerPlaceholder}
                 rows={3}
-                disabled={sendingMessage || stoppingMessage}
+                disabled={composerInputDisabled}
               />
 
               {showComposerSlashMenu ? (
@@ -8244,6 +9466,32 @@ ${markup}
                       ) : null}
                     </div>
                   ) : null}
+
+                  {!isHero ? (
+                    <button
+                      type="button"
+                      className={`composer-action-button multiagent-trigger ${multiagentDrawerOpen ? "active" : ""}`}
+                      aria-label="查看多代理运行面板"
+                      title="查看多代理运行面板"
+                      onClick={() => setMultiagentDrawerOpen((current) => !current)}
+                    >
+                      <svg viewBox="0 0 20 20" aria-hidden="true" className="multiagent-trigger-icon">
+                        <path
+                          d="M10 3.25a2.25 2.25 0 1 1 0 4.5 2.25 2.25 0 0 1 0-4.5Zm-5 7.5a2.25 2.25 0 1 1 0 4.5 2.25 2.25 0 0 1 0-4.5Zm10 0a2.25 2.25 0 1 1 0 4.5 2.25 2.25 0 0 1 0-4.5ZM7.05 8.3l1.55 1.55m2.8 0 1.55-1.55m-5.1 3.4h4.3"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.5"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                      {multiagentRuns.length > 0 ? (
+                        <span className="multiagent-trigger-badge" aria-hidden="true">
+                          {multiagentRunningCount > 0 ? multiagentRunningCount : multiagentRuns.length}
+                        </span>
+                      ) : null}
+                    </button>
+                  ) : null}
                 </div>
 
                 <div className="composer-subbar-right">
@@ -8262,19 +9510,19 @@ ${markup}
 
                   <button
                     type="button"
-                    className={`send-trigger send-trigger-inline ${sendingMessage ? "is-running" : ""}`}
+                    className={`send-trigger send-trigger-inline ${showStopTrigger ? "is-running" : ""}`}
                     onClick={() => {
-                      if (sendingMessage) {
+                      if (showStopTrigger) {
                         void stopActiveComposerRun();
                         return;
                       }
                       void submitComposer();
                     }}
-                    disabled={stoppingMessage || planModeUpdating || (!sendingMessage && isComposerEmpty)}
-                    aria-label={sendingMessage ? (stoppingMessage ? "正在停止当前任务" : "停止当前任务") : "发送"}
-                    title={sendingMessage ? (stoppingMessage ? "正在停止当前任务" : "点击立即停止当前任务") : "发送"}
+                    disabled={stoppingMessage || planModeUpdating || isSendingInOtherSession || (!showStopTrigger && isComposerEmpty)}
+                    aria-label={showStopTrigger ? (stoppingMessage ? "正在停止当前任务" : "停止当前任务") : "发送"}
+                    title={showStopTrigger ? (stoppingMessage ? "正在停止当前任务" : "点击立即停止当前任务") : "发送"}
                   >
-                    {sendingMessage ? (
+                    {showStopTrigger ? (
                       <svg viewBox="0 0 20 20" aria-hidden="true">
                         <rect x="5.25" y="5.25" width="9.5" height="9.5" rx="2.4" fill="currentColor" />
                       </svg>
@@ -8302,15 +9550,424 @@ ${markup}
     );
   };
 
+  const renderMultiagentDrawer = () => (
+    <aside
+      ref={multiagentDrawerRef}
+      className={`right-drawer ${multiagentDrawerOpen ? "open" : ""}`}
+      style={multiagentDrawerStyle}
+      aria-label="多代理运行面板"
+    >
+      {multiagentDrawerOpen && !isMultiagentDrawerFloating ? (
+        <div
+          className="drawer-resize-handle"
+          onPointerDown={() => setDragging("multiagent-drawer")}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整多代理面板宽度"
+        />
+      ) : null}
+      <div className="drawer-inner multiagent-drawer-inner">
+        <div className="drawer-head">
+          <div>
+            <h3>Subagents</h3>
+            <p className="multiagent-drawer-kicker">
+              {multiagentRuns.length > 0 ? `${multiagentRuns.length} runs` : "当前会话还没有多代理运行"}
+            </p>
+          </div>
+          <button
+            type="button"
+            className="drawer-close"
+            aria-label="关闭多代理面板"
+            onClick={() => setMultiagentDrawerOpen(false)}
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="multiagent-drawer-strip">
+          <div className="multiagent-strip-metric">
+            <span className="multiagent-strip-label">运行中</span>
+            <strong>{multiagentRunningCount}</strong>
+          </div>
+          <div className="multiagent-strip-metric">
+            <span className="multiagent-strip-label">最近会话</span>
+            <strong>{activeSessionDetail ? formatDateTime(activeSessionDetail.updated_at) : "--"}</strong>
+          </div>
+        </div>
+
+        {multiagentError ? <div className="workspace-alert error">{multiagentError}</div> : null}
+        {multiagentApprovalError ? <div className="workspace-alert error">{multiagentApprovalError}</div> : null}
+
+        <div className="drawer-card">
+          <div className="multiagent-section-head">
+            <span className="drawer-label">审批队列</span>
+            <span className="workspace-tiny-note">{multiagentApprovals.length} pending</span>
+          </div>
+          {multiagentApprovals.length === 0 ? (
+            <p className="multiagent-empty-copy">当前没有等待处理的子代理审批请求。</p>
+          ) : (
+            <div className="multiagent-approval-list">
+              {multiagentApprovals.map((approval) => {
+                const isBusy = multiagentApprovalActionId === approval.approval_request_id;
+                return (
+                  <div key={approval.approval_request_id} className="multiagent-approval-item">
+                    <div className="multiagent-approval-head">
+                      <strong>{approval.task_name}</strong>
+                      <span className="multiagent-status-pill tone-orange">待审批</span>
+                    </div>
+                    <p className="multiagent-summary-copy">{buildApprovalPrompt(approval)}</p>
+                    <div className="multiagent-run-item-meta">
+                      <span>{approval.task_id}</span>
+                      <span>{approval.remaining_seconds}s</span>
+                    </div>
+                    <p className="multiagent-task-activity">{buildApprovalSupportCopy(approval)}</p>
+                    <div className="multiagent-command-item">
+                      <code>{buildApprovalPayloadPreview(approval)}</code>
+                      <span>{buildApprovalPayloadLabel(approval)}</span>
+                    </div>
+                    <div className="multiagent-approval-actions">
+                      <button
+                        type="button"
+                        className="timeline-approval-button ghost"
+                        disabled={multiagentApprovalActionId !== null}
+                        onClick={() => void resolveMultiagentApproval("reject", approval)}
+                      >
+                        {isBusy ? "处理中..." : "拒绝"}
+                      </button>
+                      <button
+                        type="button"
+                        className="timeline-approval-button solid"
+                        disabled={multiagentApprovalActionId !== null}
+                        onClick={() => void resolveMultiagentApproval("approve", approval)}
+                      >
+                        {isBusy ? "处理中..." : "允许继续"}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="drawer-card multiagent-run-browser">
+          <div className="multiagent-section-head">
+            <span className="drawer-label">运行列表</span>
+            {multiagentLoading ? <span className="workspace-tiny-note">同步中...</span> : null}
+          </div>
+          {multiagentRuns.length === 0 ? (
+            <p className="multiagent-empty-copy">这个会话里还没有记录到 `multiagent` 运行。</p>
+          ) : (
+            <div className="multiagent-run-list">
+              {multiagentRuns.map((item) => {
+                const isActive = item.run.run_id === selectedMultiagentRunId;
+                const isStopping = isMultiagentRunStopping(item.run);
+                return (
+                  <button
+                    key={item.run.run_id}
+                    type="button"
+                    className={`multiagent-run-item ${isActive ? "active" : ""}`}
+                    onClick={() => {
+                      setSelectedMultiagentRunId(item.run.run_id);
+                      setSelectedMultiagentTaskId(null);
+                      void loadMultiagentRunDetail(item.run.run_id, { silent: true });
+                    }}
+                  >
+                    <div className="multiagent-run-item-head">
+                      <strong>{item.run.mode === "parallel" ? "Parallel" : "Sequential"}</strong>
+                      <MultiagentStatusPill status={item.run.status} stopping={isStopping} />
+                    </div>
+                    <div className="multiagent-run-item-meta">
+                      <span>{item.task_count} tasks</span>
+                      <span>{item.run.usage_summary.total_tokens.toLocaleString("zh-CN")} tok</span>
+                    </div>
+                    <div className="multiagent-run-item-foot">
+                      <span>{item.run.parent_turn_id}</span>
+                      <span>{formatDateTime(item.updated_at)}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {selectedMultiagentRunDetail ? (
+          <>
+            <div className="drawer-card">
+              <div className="multiagent-section-head">
+                <span className="drawer-label">运行摘要</span>
+                <MultiagentStatusPill
+                  status={selectedMultiagentRunDetail.run.status}
+                  stopping={selectedMultiagentRunStopping}
+                />
+              </div>
+              {isMultiagentRunActive(selectedMultiagentRunDetail.run.status) ? (
+                <div className="multiagent-approval-actions">
+                  <button
+                    type="button"
+                    className={`workspace-danger-button ${selectedMultiagentRunStopping ? "is-stopping" : ""}`}
+                    disabled={multiagentCancelActionId !== null || selectedMultiagentRunStopping}
+                    onClick={() => void cancelMultiagentRun(selectedMultiagentRunDetail.run.run_id)}
+                  >
+                    {multiagentCancelActionId === `run:${selectedMultiagentRunDetail.run.run_id}` ||
+                    selectedMultiagentRunStopping ? (
+                      <>
+                        <span className="workspace-button-spinner" aria-hidden="true" />
+                        停止中...
+                      </>
+                    ) : (
+                      "停止运行"
+                    )}
+                  </button>
+                </div>
+              ) : null}
+              <p className="multiagent-summary-copy">
+                {selectedMultiagentRunDetail.run.result?.summary ?? "运行仍在进行，等待更多子代理结果。"}
+              </p>
+              <div className="multiagent-stat-grid">
+                <div className="multiagent-stat-cell">
+                  <span className="multiagent-stat-label">总 token</span>
+                  <strong>{selectedMultiagentRunDetail.run.usage_summary.total_tokens.toLocaleString("zh-CN")}</strong>
+                </div>
+                <div className="multiagent-stat-cell">
+                  <span className="multiagent-stat-label">文件重叠</span>
+                  <strong>{selectedMultiagentRunDetail.run.result?.file_overlaps.length ?? 0}</strong>
+                </div>
+                <div className="multiagent-stat-cell">
+                  <span className="multiagent-stat-label">文件冲突</span>
+                  <strong>{selectedMultiagentRunDetail.run.result?.file_conflicts.length ?? 0}</strong>
+                </div>
+                <div className="multiagent-stat-cell">
+                  <span className="multiagent-stat-label">失败代理</span>
+                  <strong>{selectedMultiagentRunDetail.run.result?.failed_agents.length ?? 0}</strong>
+                </div>
+              </div>
+            </div>
+
+            <div className="drawer-card">
+              <div className="multiagent-section-head">
+                <span className="drawer-label">任务</span>
+                {multiagentDetailLoading ? <span className="workspace-tiny-note">详情刷新中...</span> : null}
+              </div>
+              <div className="multiagent-task-list">
+                {selectedMultiagentRunDetail.tasks.map((task) => {
+                  const isStopping = isMultiagentTaskStopping(task);
+                  return (
+                    <button
+                      key={task.task_id}
+                      type="button"
+                      className={`multiagent-task-item ${selectedMultiagentTask?.task_id === task.task_id ? "active" : ""}`}
+                      onClick={() => setSelectedMultiagentTaskId(task.task_id)}
+                    >
+                      <div className="multiagent-task-item-head">
+                        <strong>{task.name}</strong>
+                        <MultiagentStatusPill status={task.status} stopping={isStopping} />
+                      </div>
+                      <div className="multiagent-task-item-meta">
+                        <span>{task.progress.completed_turns}/{task.progress.max_turns} turns</span>
+                        <span>{task.usage_summary.total_tokens.toLocaleString("zh-CN")} tok</span>
+                      </div>
+                      {task.current_activity ? <p className="multiagent-task-activity">{task.current_activity}</p> : null}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {selectedMultiagentTask ? (
+              <>
+                <div className="drawer-card">
+                  <div className="multiagent-section-head">
+                    <span className="drawer-label">当前任务</span>
+                    <span className="workspace-tiny-note">{selectedMultiagentTask.transcript_ref}</span>
+                  </div>
+                  {isMultiagentTaskActive(selectedMultiagentTask.status) ? (
+                    <div className="multiagent-approval-actions">
+                      <button
+                        type="button"
+                        className={`workspace-danger-button ${selectedMultiagentTaskStopping ? "is-stopping" : ""}`}
+                        disabled={multiagentCancelActionId !== null || selectedMultiagentTaskStopping}
+                        onClick={() =>
+                          void cancelMultiagentTask(
+                            selectedMultiagentTask.task_id,
+                            selectedMultiagentTask.run_id
+                          )
+                        }
+                      >
+                        {multiagentCancelActionId === `task:${selectedMultiagentTask.task_id}` ||
+                        selectedMultiagentTaskStopping ? (
+                          <>
+                            <span className="workspace-button-spinner" aria-hidden="true" />
+                            停止中...
+                          </>
+                        ) : (
+                          "停止任务"
+                        )}
+                      </button>
+                    </div>
+                  ) : null}
+                  <p className="multiagent-summary-copy">
+                    {selectedMultiagentTask.result?.summary ?? selectedMultiagentTask.current_activity ?? "任务正在等待更多执行进展。"}
+                  </p>
+                  {selectedMultiagentTask.result?.degraded ? (
+                    <p className="multiagent-degraded-copy">
+                      degraded: {selectedMultiagentTask.result.degraded_reason ?? "degraded"}
+                    </p>
+                  ) : null}
+                  <div className="multiagent-stat-grid compact">
+                    <div className="multiagent-stat-cell">
+                      <span className="multiagent-stat-label">工具调用</span>
+                      <strong>{selectedMultiagentTask.progress.tool_call_count}</strong>
+                    </div>
+                    <div className="multiagent-stat-cell">
+                      <span className="multiagent-stat-label">文件改动</span>
+                      <strong>{selectedMultiagentTask.file_changes.length}</strong>
+                    </div>
+                    <div className="multiagent-stat-cell">
+                      <span className="multiagent-stat-label">终端命令</span>
+                      <strong>{selectedMultiagentTask.terminal_commands.length}</strong>
+                    </div>
+                    <div className="multiagent-stat-cell">
+                      <span className="multiagent-stat-label">发现</span>
+                      <strong>{selectedMultiagentTask.result?.findings.length ?? 0}</strong>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="drawer-card">
+                  <div className="multiagent-section-head">
+                    <span className="drawer-label">Child Transcript</span>
+                    {multiagentTranscriptLoading && !selectedMultiagentChildSession ? (
+                      <span className="workspace-tiny-note">加载中...</span>
+                    ) : selectedMultiagentChildSession ? (
+                      <span className="workspace-tiny-note">{selectedMultiagentChildSession.messages.length} messages</span>
+                    ) : null}
+                  </div>
+                  {selectedMultiagentChildSession ? (
+                    <div className="multiagent-transcript-list">
+                      {selectedMultiagentChildSession.messages.slice(-10).map((message) => (
+                        <div
+                          key={message.id}
+                          className={`multiagent-transcript-message role-${message.role}`}
+                        >
+                          <div className="multiagent-transcript-head">
+                            <strong>{formatSessionMessageRoleLabel(message.role)}</strong>
+                            <span>{formatDateTime(message.created_at)}</span>
+                          </div>
+                          <div className="multiagent-transcript-body">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                              {truncateTranscriptMessage(message.content)}
+                            </ReactMarkdown>
+                          </div>
+                        </div>
+                      ))}
+                      {selectedMultiagentChildSession.messages.length > 10 ? (
+                        <p className="multiagent-empty-copy">仅显示最近 10 条 transcript 消息。</p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <p className="multiagent-empty-copy">
+                      {multiagentTranscriptLoading ? "正在加载 child transcript..." : "这个子会话还没有可展示的 transcript。"}
+                    </p>
+                  )}
+                </div>
+
+                {selectedMultiagentTask.result?.findings.length ? (
+                  <div className="drawer-card">
+                    <div className="multiagent-section-head">
+                      <span className="drawer-label">Findings</span>
+                    </div>
+                    <div className="multiagent-findings-list">
+                      {selectedMultiagentTask.result.findings.slice(0, 6).map((finding, index) => (
+                        <div key={`${finding.title}:${index}`} className="multiagent-finding-item">
+                          <div className="multiagent-finding-head">
+                            <strong>{finding.title}</strong>
+                            <span
+                              className={`multiagent-status-pill tone-${
+                                finding.severity === "info" ? "blue" : finding.severity === "low" ? "green" : "orange"
+                              }`}
+                            >
+                              {finding.severity}
+                            </span>
+                          </div>
+                          {finding.detail ? <p>{finding.detail}</p> : null}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedMultiagentTask.file_changes.length ? (
+                  <div className="drawer-card">
+                    <div className="multiagent-section-head">
+                      <span className="drawer-label">文件改动</span>
+                    </div>
+                    <div className="multiagent-file-list">
+                      {selectedMultiagentTask.file_changes.slice(0, 8).map((change, index) => (
+                        <div key={`${change.path}:${index}`} className="multiagent-file-item">
+                          <strong>{change.path}</strong>
+                          <span>{change.tool}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedMultiagentTask.terminal_commands.length ? (
+                  <div className="drawer-card">
+                    <div className="multiagent-section-head">
+                      <span className="drawer-label">终端命令</span>
+                    </div>
+                    <div className="multiagent-command-list">
+                      {selectedMultiagentTask.terminal_commands.slice(0, 6).map((command, index) => (
+                        <div key={`${command.command}:${index}`} className="multiagent-command-item">
+                          <code>{command.command}</code>
+                          <span>{typeof command.exit_code === "number" ? `exit ${command.exit_code}` : "running"}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+
+            <div className="drawer-card">
+              <div className="multiagent-section-head">
+                <span className="drawer-label">最近事件</span>
+              </div>
+              {selectedMultiagentTimeline.length === 0 ? (
+                <p className="multiagent-empty-copy">当前还没有可展示的多代理事件。</p>
+              ) : (
+                <div className="multiagent-timeline">
+                  {selectedMultiagentTimeline.map((item) => (
+                    <div key={item.id} className="multiagent-timeline-item">
+                      <span className="multiagent-timeline-time">{formatDateTime(new Date(item.ts).toISOString())}</span>
+                      <p>{item.detail}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </>
+        ) : null}
+      </div>
+    </aside>
+  );
+
   return (
     <div
-      className={`screen-shell ${dragging ? "is-resizing" : ""}`}
+      className={`screen-shell ${dragging ? "is-resizing" : ""} ${compactLeftRail ? "with-compact-rail" : ""}`}
       data-theme={uiTheme}
       style={{
-        gridTemplateColumns: isMobile ? "1fr" : `${leftWidth}px ${HANDLE_WIDTH}px minmax(0, 1fr)`
+        gridTemplateColumns: isMobile
+          ? "1fr"
+          : compactLeftRail
+            ? `${COMPACT_LEFT_RAIL_WIDTH}px minmax(0, 1fr)`
+            : `${leftWidth}px ${HANDLE_WIDTH}px minmax(0, 1fr)`
       }}
     >
-      <aside className="left-rail">
+      <aside className={`left-rail ${compactLeftRail ? "compact" : ""}`}>
         <div className="brand">
           <div className="brand-logo">
             <img src={logo} alt="NewMan logo" className="brand-logo-image" />
@@ -8318,6 +9975,19 @@ ${markup}
           <div className="brand-copy">
             <h1>NewMan</h1>
           </div>
+          {!isMobile && !compactLeftRail ? (
+            <button
+              type="button"
+              className="rail-collapse-toggle rail-collapse-toggle-brand"
+              onClick={() => setLeftRailCollapsed(true)}
+              aria-label="收缩左侧导航栏"
+              aria-pressed={false}
+              title="收缩导航栏"
+            >
+              <RailToggleIcon collapsed={false} className="rail-collapse-toggle-icon" />
+              <span className="rail-collapse-toggle-label">收缩导航</span>
+            </button>
+          ) : null}
         </div>
 
         <nav className="rail-nav" aria-label="workspace nav">
@@ -8328,146 +9998,167 @@ ${markup}
               className={`rail-nav-item ${activePage === item.id ? "active" : ""}`}
               onClick={() => switchPage(item.id)}
               aria-current={activePage === item.id ? "page" : undefined}
+              aria-label={`${item.label} ${item.hint}`}
+              title={`${item.label} ${item.hint}`}
             >
-              <span>{item.label}</span>
+              <WorkspaceNavIcon name={item.icon} className="rail-nav-item-icon" />
+              <span className="rail-nav-item-label">{item.label}</span>
               <small>{item.hint}</small>
             </button>
           ))}
         </nav>
 
-        <section className="rail-section">
-          <div className="rail-section-head">
-            <span>会话</span>
-            <button
-              type="button"
-              className="session-create-button"
-              aria-label="新建会话"
-              onClick={() => void createDraftSession()}
-            >
-              <span className="session-create-button-mark" aria-hidden="true" />
-            </button>
-          </div>
+        {!compactLeftRail ? (
+          <section className="rail-section">
+            <div className="rail-section-head">
+              <span>会话</span>
+              <button
+                type="button"
+                className="session-create-button"
+                aria-label="新建会话"
+                onClick={() => void createDraftSession()}
+              >
+                <span className="session-create-button-mark" aria-hidden="true" />
+              </button>
+            </div>
 
-          {sessionsError ? <div className="workspace-alert error">{sessionsError}</div> : null}
-          {sessionsLoading && chatSessions.length === 0 ? <div className="workspace-empty">正在加载会话...</div> : null}
+            {sessionsError ? <div className="workspace-alert error">{sessionsError}</div> : null}
+            {sessionsLoading && chatSessions.length === 0 ? <div className="workspace-empty">正在加载会话...</div> : null}
 
-          <div className="session-list">
-            {!sessionsLoading && chatSessions.length === 0 ? <div className="workspace-empty">当前还没有会话，点击右上角开始。</div> : null}
-            {chatSessions.map((session) => {
-              const displayTitle = session.scheduled ? scheduledSessionTitle(session.title) : session.title;
-              return (
-                <div
-                  key={session.id}
-                  className={`session-row ${activeSessionId === session.id ? "active" : ""} ${
-                    openSessionMenuId === session.id ? "menu-open" : ""
-                  }`}
-                >
-                  <button
-                    type="button"
-                    className="session-main"
-                    onClick={() => {
-                      setActiveSessionId(session.id);
-                      setOpenSessionMenuId(null);
-                      switchPage("chat");
-                    }}
-                    aria-current={activeSessionId === session.id && activePage === "chat" ? "page" : undefined}
+            <div className="session-list">
+              {!sessionsLoading && chatSessions.length === 0 ? <div className="workspace-empty">当前还没有会话，点击右上角开始。</div> : null}
+              {chatSessions.map((session) => {
+                const displayTitle = session.scheduled ? scheduledSessionTitle(session.title) : session.title;
+                return (
+                  <div
+                    key={session.id}
+                    className={`session-row ${activeSessionId === session.id ? "active" : ""} ${
+                      openSessionMenuId === session.id ? "menu-open" : ""
+                    }`}
                   >
-                    <span className={`session-title ${session.scheduled ? "scheduled" : ""}`}>
-                      {session.scheduled ? <ScheduledSessionIcon className="session-scheduled-icon" /> : null}
-                      <span className="session-title-text">{displayTitle}</span>
-                    </span>
-                    {!session.scheduled && session.background ? (
-                      <span className="session-meta-line">
-                        <span className="session-tag muted">后台</span>
+                    <button
+                      type="button"
+                      className="session-main"
+                      onClick={() => {
+                        setActiveSessionId(session.id);
+                        setOpenSessionMenuId(null);
+                        switchPage("chat");
+                      }}
+                      aria-current={activeSessionId === session.id && activePage === "chat" ? "page" : undefined}
+                    >
+                      <span className={`session-title ${session.scheduled ? "scheduled" : ""}`}>
+                        {session.scheduled ? <ScheduledSessionIcon className="session-scheduled-icon" /> : null}
+                        <span className="session-title-text">{displayTitle}</span>
                       </span>
-                    ) : null}
-                  </button>
+                      {!session.scheduled && session.background ? (
+                        <span className="session-meta-line">
+                          <span className="session-tag muted">后台</span>
+                        </span>
+                      ) : null}
+                    </button>
 
-                  <div className="session-actions">
-                  <button
-                    type="button"
-                    className="session-more"
-                    aria-label={`${session.title} 更多操作`}
-                    aria-expanded={openSessionMenuId === session.id}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      toggleSessionMenu(session.id);
-                    }}
-                  >
-                    <span />
-                    <span />
-                    <span />
-                  </button>
-
-                  {openSessionMenuId === session.id ? (
-                    <div className="session-menu" role="menu" onClick={(event) => event.stopPropagation()}>
+                    <div className="session-actions">
                       <button
                         type="button"
-                        className="session-menu-item"
-                        role="menuitem"
-                        onClick={() => {
-                          setActiveSessionId(session.id);
-                          setOpenSessionMenuId(null);
-                          switchPage("automations");
+                        className="session-more"
+                        aria-label={`${session.title} 更多操作`}
+                        aria-expanded={openSessionMenuId === session.id}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          toggleSessionMenu(session.id);
                         }}
                       >
-                        <svg viewBox="0 0 24 24" aria-hidden="true">
-                          <path
-                            d="M7 2v3M17 2v3M4 7h16M6 4h12a2 2 0 0 1 2 2v11a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3V6a2 2 0 0 1 2-2Zm2 6h3v3H8v-3Zm5 0h3v3h-3v-3Zm-5 5h3v2H8v-2Zm5 0h3v2h-3v-2Z"
-                            fill="currentColor"
-                          />
-                        </svg>
-                        <span>定时任务</span>
+                        <span />
+                        <span />
+                        <span />
                       </button>
-                      <button
-                        type="button"
-                        className="session-menu-item"
-                        role="menuitem"
-                        onClick={() => void renameSession(session.id)}
-                      >
-                        <svg viewBox="0 0 24 24" aria-hidden="true">
-                          <path
-                            d="M4 20h4.5L19 9.5 14.5 5 4 15.5V20Zm2-2v-1.67l8.5-8.5 1.67 1.67-8.5 8.5H6ZM18.71 7.79l-2.5-2.5 1.09-1.08a1.5 1.5 0 0 1 2.12 0l1.37 1.37a1.5 1.5 0 0 1 0 2.12l-1.08 1.09Z"
-                            fill="currentColor"
-                          />
-                        </svg>
-                        <span>重命名</span>
-                      </button>
-                      <button
-                        type="button"
-                        className="session-menu-item danger"
-                        role="menuitem"
-                        onClick={() => void deleteSession(session.id)}
-                      >
-                        <svg viewBox="0 0 24 24" aria-hidden="true">
-                          <path
-                            d="M9 3h6l1 2h4v2H4V5h4l1-2Zm1 6h2v8h-2V9Zm4 0h2v8h-2V9ZM7 9h2v8H7V9Zm-1 12a2 2 0 0 1-2-2V8h16v11a2 2 0 0 1-2 2H6Z"
-                            fill="currentColor"
-                          />
-                        </svg>
-                        <span>删除</span>
-                      </button>
+
+                      {openSessionMenuId === session.id ? (
+                        <div className="session-menu" role="menu" onClick={(event) => event.stopPropagation()}>
+                          <button
+                            type="button"
+                            className="session-menu-item"
+                            role="menuitem"
+                            onClick={() => {
+                              setActiveSessionId(session.id);
+                              setOpenSessionMenuId(null);
+                              switchPage("automations");
+                            }}
+                          >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path
+                                d="M7 2v3M17 2v3M4 7h16M6 4h12a2 2 0 0 1 2 2v11a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3V6a2 2 0 0 1 2-2Zm2 6h3v3H8v-3Zm5 0h3v3h-3v-3Zm-5 5h3v2H8v-2Zm5 0h3v2h-3v-2Z"
+                                fill="currentColor"
+                              />
+                            </svg>
+                            <span>定时任务</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="session-menu-item"
+                            role="menuitem"
+                            onClick={() => void renameSession(session.id)}
+                          >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path
+                                d="M4 20h4.5L19 9.5 14.5 5 4 15.5V20Zm2-2v-1.67l8.5-8.5 1.67 1.67-8.5 8.5H6ZM18.71 7.79l-2.5-2.5 1.09-1.08a1.5 1.5 0 0 1 2.12 0l1.37 1.37a1.5 1.5 0 0 1 0 2.12l-1.08 1.09Z"
+                                fill="currentColor"
+                              />
+                            </svg>
+                            <span>重命名</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="session-menu-item danger"
+                            role="menuitem"
+                            onClick={() => void deleteSession(session.id)}
+                          >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path
+                                d="M9 3h6l1 2h4v2H4V5h4l1-2Zm1 6h2v8h-2V9Zm4 0h2v8h-2V9ZM7 9h2v8H7V9Zm-1 12a2 2 0 0 1-2-2V8h16v11a2 2 0 0 1-2 2H6Z"
+                                fill="currentColor"
+                              />
+                            </svg>
+                            <span>删除</span>
+                          </button>
+                        </div>
+                      ) : null}
                     </div>
-                  ) : null}
                   </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
+                );
+              })}
+            </div>
+          </section>
+        ) : null}
 
         <footer className="rail-footer">
+          {!isMobile && compactLeftRail ? (
+            <button
+              type="button"
+              className="rail-collapse-toggle rail-collapse-toggle-footer"
+              onClick={() => setLeftRailCollapsed(false)}
+              aria-label="展开左侧导航栏"
+              aria-pressed={true}
+              title="展开导航栏"
+            >
+              <RailToggleIcon collapsed={true} className="rail-collapse-toggle-icon" />
+              <span className="rail-collapse-toggle-label">展开导航</span>
+            </button>
+          ) : null}
           <button
             type="button"
             className={`settings-trigger ${activePage === "settings" ? "active" : ""}`}
             onClick={() => switchPage("settings")}
+            aria-label="Settings & Plugins"
+            title="Settings & Plugins"
           >
-            Settings &amp; Plugins
+            <SettingsNavIcon className="settings-trigger-icon" />
+            <span className="settings-trigger-label">Settings &amp; Plugins</span>
           </button>
         </footer>
       </aside>
 
-      {!isMobile ? (
+      {!isMobile && !compactLeftRail ? (
         <div
           className="resize-handle"
           onPointerDown={() => setDragging("left")}
@@ -8541,130 +10232,230 @@ ${markup}
         ) : null}
 
         {activePage === "chat" ? (
-          showEmptyChatState ? (
-            <section
-              ref={conversationPaneRef}
-              className="conversation-pane conversation-pane-empty"
-            >
-              <div className="chat-empty-state">
-                <div className="chat-empty-brand">
-                  <div className="chat-empty-brand-mark">
-                    <img src={logo} alt="NewMan logo" className="chat-empty-brand-image" />
-                  </div>
-                  <div className="chat-empty-brand-copy">
-                    <h2>
-                      <span className="chat-empty-brand-name">NewMan</span>
-                      <span className="chat-empty-brand-for">for</span>
-                      <span className="chat-empty-brand-cn">牛马</span>
-                    </h2>
-                  </div>
-                </div>
-
-                {renderChatComposer("hero")}
-              </div>
-            </section>
-          ) : (
-            <div
-              ref={chatStageRef}
-              className={`chat-stage ${htmlPreview ? "with-html-preview" : ""}`}
-              style={htmlPreviewPanelStyle}
-            >
-              <div className="chat-stage-main">
+          <div
+            ref={chatStageRef}
+            className={`chat-stage ${htmlPreview ? "with-html-preview" : ""} ${
+              multiagentDrawerOpen ? "with-multiagent-drawer" : ""
+            } ${showEmptyChatState ? "is-empty" : ""}`}
+            style={htmlPreviewPanelStyle}
+          >
+            <div className="chat-stage-main">
+              {showEmptyChatState ? (
                 <section
                   ref={conversationPaneRef}
-                  className="conversation-pane conversation-pane-floating"
+                  className="conversation-pane conversation-pane-empty"
                 >
-                  {chatError ? <div className="workspace-alert error">{chatError}</div> : null}
-                  {chatLoading ? (
-                    <div
-                      className="chat-session-loading"
-                      role="status"
-                      aria-live="polite"
-                      aria-label="正在加载会话内容"
-                    >
-                      <span className="chat-session-loading-spinner" aria-hidden="true" />
+                  <div className="chat-empty-state">
+                    <div className="chat-empty-brand">
+                      <div className="chat-empty-brand-mark">
+                        <img src={logo} alt="NewMan logo" className="chat-empty-brand-image" />
+                      </div>
+                      <div className="chat-empty-brand-copy">
+                        <h2>
+                          <span className="chat-empty-brand-name">NewMan</span>
+                          <span className="chat-empty-brand-for">for</span>
+                          <span className="chat-empty-brand-cn">牛马</span>
+                        </h2>
+                      </div>
                     </div>
-                  ) : null}
 
-                  {!chatLoading ? (
-                    <>
-                      {displayTurns.length === 0 ? <div className="workspace-empty">这个会话还没有内容，直接开始提需求就行。</div> : null}
+                    {renderChatComposer("hero")}
+                  </div>
+                </section>
+              ) : (
+                <>
+                  <section
+                    ref={conversationPaneRef}
+                    className="conversation-pane conversation-pane-floating"
+                  >
+                    {chatError ? <div className="workspace-alert error">{chatError}</div> : null}
+                    {chatLoading ? (
+                      <div
+                        className="chat-session-loading"
+                        role="status"
+                        aria-live="polite"
+                        aria-label="正在加载会话内容"
+                      >
+                        <span className="chat-session-loading-spinner" aria-hidden="true" />
+                      </div>
+                    ) : null}
 
-                      {displayTurns.map((turn) => {
-                        const answerCopy = resolveAnswerCopy(turn.answer, turn.status);
-                        const showAssistantMessageMeta = shouldRenderAssistantMessageMeta(turn);
-                        const awaitingInput = turn.answer?.awaitingUserInput ?? null;
-                        const showAwaitingInputInAnswer = Boolean(awaitingInput && !hasAwaitingInputTimelineCard(turn, awaitingInput));
-                        const showAnswerBubble = shouldRenderAnswerBubble(turn) && (!awaitingInput || showAwaitingInputInAnswer);
-                        const assistantCopyValue =
-                          turn.answer?.content.trim() ? turn.answer.content : turn.answer?.phase === "failed" ? answerCopy : null;
-                        const visibleThinkingNode = turn.timeline.find(
-                          (node) => node.kind === "thinking" && node.state === "running" && turn.isLive
-                        );
-                        const hasVisibleThinkingNode = Boolean(visibleThinkingNode);
-                        const visibleTimelineNodes = turn.timeline.filter((node) => node.kind !== "thinking");
-                        const shouldShowTimelineStack = visibleTimelineNodes.length > 0 || hasVisibleThinkingNode;
-                        return (
-                          <div key={turn.id} className={`turn-block ${turn.isLive ? "live" : ""}`}>
-                            <div className="user-row">
-                              <div className="turn-user-stack">
-                                <MessageHoverShell
-                                  shellClassName="user"
-                                  align="end"
-                                  timestamp={turn.userMessage.createdAt}
-                                  copyValue={turn.userMessage.content}
-                                  copyLabel="用户输入"
-                                >
-                                  <div className={`user-bubble ${turn.userMessage.attachments.length > 0 ? "has-attachments" : ""}`}>
-                                    <MessageContent
-                                      apiBase={apiBase}
-                                      variant="user"
-                                      content={turn.userMessage.content}
-                                      attachments={turn.userMessage.attachments}
-                                    />
-                                  </div>
-                                </MessageHoverShell>
+                    {!chatLoading ? (
+                      <>
+                        {displayTurns.length === 0 ? <div className="workspace-empty">这个会话还没有内容，直接开始提需求就行。</div> : null}
+
+                        {displayTurns.map((turn) => {
+                          const answerCopy = resolveAnswerCopy(turn.answer, turn.status);
+                          const showAssistantMessageMeta = shouldRenderAssistantMessageMeta(turn);
+                          const awaitingInput = turn.answer?.awaitingUserInput ?? null;
+                          const showAwaitingInputInAnswer = Boolean(awaitingInput && !hasAwaitingInputTimelineCard(turn, awaitingInput));
+                          const showAnswerBubble = shouldRenderAnswerBubble(turn) && (!awaitingInput || showAwaitingInputInAnswer);
+                          const assistantCopyValue =
+                            turn.answer?.content.trim() ? turn.answer.content : turn.answer?.phase === "failed" ? answerCopy : null;
+                          const visibleThinkingNode = turn.timeline.find(
+                            (node) => node.kind === "thinking" && node.state === "running" && turn.isLive
+                          );
+                          const hasVisibleThinkingNode = Boolean(visibleThinkingNode);
+                          const visibleTimelineNodes = turn.timeline.filter((node) => node.kind !== "thinking");
+                          const shouldShowTimelineStack = visibleTimelineNodes.length > 0 || hasVisibleThinkingNode;
+                          return (
+                            <div key={turn.id} className={`turn-block ${turn.isLive ? "live" : ""}`}>
+                              <div className="user-row">
+                                <div className="turn-user-stack">
+                                  <MessageHoverShell
+                                    shellClassName="user"
+                                    align="end"
+                                    timestamp={turn.userMessage.createdAt}
+                                    copyValue={turn.userMessage.content}
+                                    copyLabel="用户输入"
+                                  >
+                                    <div className={`user-bubble ${turn.userMessage.attachments.length > 0 ? "has-attachments" : ""}`}>
+                                      <MessageContent
+                                        apiBase={apiBase}
+                                        variant="user"
+                                        content={turn.userMessage.content}
+                                        attachments={turn.userMessage.attachments}
+                                      />
+                                    </div>
+                                  </MessageHoverShell>
+                                </div>
                               </div>
-                            </div>
 
-                            {shouldShowTimelineStack ? (
-                              <div className="timeline-stack trace-turn-column">
-                                {visibleTimelineNodes.map((node, index) => {
-                                  if (node.kind === "system_meta") {
-                                    const systemHasHead = index > 0;
-                                    const systemHasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
-                                    return (
-                                      <div key={node.id} className="timeline-system-row">
-                                        <div
-                                          className={`timeline-primary-marker rail-only ${systemHasHead ? "has-head" : ""} ${
-                                            systemHasTail ? "has-tail" : ""
-                                          }`}
-                                        />
-                                        <div className="timeline-system-meta" role="status" aria-live="polite">
-                                          <span className="timeline-system-meta-text">{node.primaryText}</span>
+                              {shouldShowTimelineStack ? (
+                                <div className="timeline-stack trace-turn-column">
+                                  {visibleTimelineNodes.map((node, index) => {
+                                    if (node.kind === "system_meta") {
+                                      const systemHasHead = index > 0;
+                                      const systemHasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
+                                      return (
+                                        <div key={node.id} className="timeline-system-row">
+                                          <div
+                                            className={`timeline-primary-marker rail-only ${systemHasHead ? "has-head" : ""} ${
+                                              systemHasTail ? "has-tail" : ""
+                                            }`}
+                                          />
+                                          <div className="timeline-system-meta" role="status" aria-live="polite">
+                                            <span className="timeline-system-meta-text">{node.primaryText}</span>
+                                          </div>
                                         </div>
-                                      </div>
-                                    );
-                                  }
+                                      );
+                                    }
 
-                                  if (node.kind === "approval" && node.approval) {
+                                    if (node.kind === "approval" && node.approval) {
+                                      const expanded = isTimelineExpanded(node);
+                                      const markerIcon = resolveTimelineNodeIcon(node);
+                                      const hasHead = index > 0;
+                                      const hasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
+                                      const payloadPreview = buildApprovalPayloadPreview(node.approval);
+                                      const payloadCodePreview = buildTimelineCodePreview(
+                                        node.approval.tool,
+                                        payloadPreview,
+                                        node.approval.arguments
+                                      );
+                                      const payloadLabel = buildApprovalPayloadLabel(node.approval);
+                                      const isActivePendingApproval =
+                                        pendingApproval?.approval_request_id === node.approval.approvalRequestId;
+                                      const showPendingActions = node.state === "pending";
+                                      const showResolvedDetail = !showPendingActions && Boolean(payloadPreview);
+                                      const detailCardClass = node.approval.tool === "terminal" ? "terminal" : "generic";
+
+                                      return (
+                                        <article
+                                          key={node.id}
+                                          className={`timeline-node ${expanded ? "expanded" : ""} state-${node.state} kind-${node.kind}`}
+                                        >
+                                          <div className={`timeline-primary-marker ${hasHead ? "has-head" : ""} ${hasTail ? "has-tail" : ""}`}>
+                                            <span className="timeline-marker-icon-wrap" aria-hidden="true">
+                                              <TimelineMarkerIcon name={markerIcon} className="timeline-marker-icon" />
+                                            </span>
+                                          </div>
+
+                                          <div className="timeline-primary-copy">
+                                            <div className="timeline-approval-primary">
+                                              <p className="timeline-primary-text">{node.primaryText}</p>
+                                              {!showPendingActions ? (
+                                                <span className={`timeline-approval-status-tag state-${node.state}`}>
+                                                  {buildApprovalStateLabel(node.state)}
+                                                </span>
+                                              ) : null}
+                                            </div>
+
+                                            {showPendingActions ? (
+                                              <div className="timeline-approval-action-row">
+                                                <button
+                                                  type="button"
+                                                  className="timeline-approval-button ghost"
+                                                  onClick={() => void resolveApproval("reject", node.approval?.approvalRequestId ?? null)}
+                                                  disabled={approvalActionLoading !== null || !isActivePendingApproval}
+                                                >
+                                                  {approvalActionLoading === "reject" && isActivePendingApproval ? "拒绝中..." : "拒绝"}
+                                                </button>
+                                                <button
+                                                  type="button"
+                                                  className="timeline-approval-button solid"
+                                                  onClick={() => void resolveApproval("approve", node.approval?.approvalRequestId ?? null)}
+                                                  disabled={approvalActionLoading !== null || !isActivePendingApproval}
+                                                >
+                                                  {approvalActionLoading === "approve" && isActivePendingApproval ? "允许中..." : "允许继续"}
+                                                </button>
+                                              </div>
+                                            ) : null}
+
+                                            {approvalError && showPendingActions && isActivePendingApproval ? (
+                                              <div className="workspace-alert error timeline-approval-error">{approvalError}</div>
+                                            ) : null}
+
+                                            {showResolvedDetail ? (
+                                              <button
+                                                type="button"
+                                                className={`timeline-tool-toggle ${expanded ? "expanded" : ""}`}
+                                                onClick={() => toggleTimelineNode(node)}
+                                                aria-expanded={expanded}
+                                                aria-controls={`timeline-panel-${node.id}`}
+                                              >
+                                                <span className="timeline-tool-toggle-label">查看参数</span>
+                                              </button>
+                                            ) : null}
+
+                                            {showResolvedDetail ? (
+                                              <div
+                                                id={`timeline-panel-${node.id}`}
+                                                className={`timeline-secondary-region ${expanded ? "expanded" : ""}`}
+                                                aria-hidden={!expanded}
+                                              >
+                                                <div className="timeline-secondary-region-inner">
+                                                  <div className="timeline-secondary-list">
+                                                    <article className={`timeline-secondary-card ${detailCardClass}`}>
+                                                      <div className="timeline-secondary-head">
+                                                        <div className="timeline-secondary-head-main">
+                                                          <div className="timeline-secondary-label-row">
+                                                            <span className="timeline-secondary-label">{payloadLabel}</span>
+                                                            <span className="timeline-secondary-time-inline">{node.time}</span>
+                                                          </div>
+                                                        </div>
+                                                      </div>
+                                                      <div className="timeline-secondary-result-wrap timeline-code-block">
+                                                        <pre className={`timeline-secondary-result timeline-code-block-pre ${detailCardClass === "terminal" ? "terminal" : ""}`}>
+                                                          <code
+                                                            className={payloadCodePreview.language ? `language-${payloadCodePreview.language}` : undefined}
+                                                            dangerouslySetInnerHTML={{ __html: payloadCodePreview.html }}
+                                                          />
+                                                        </pre>
+                                                      </div>
+                                                    </article>
+                                                  </div>
+                                                </div>
+                                              </div>
+                                            ) : null}
+                                          </div>
+                                        </article>
+                                      );
+                                    }
+
                                     const expanded = isTimelineExpanded(node);
                                     const markerIcon = resolveTimelineNodeIcon(node);
                                     const hasHead = index > 0;
                                     const hasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
-                                    const payloadPreview = buildApprovalPayloadPreview(node.approval);
-                                    const payloadCodePreview = buildTimelineCodePreview(
-                                      node.approval.tool,
-                                      payloadPreview,
-                                      node.approval.arguments
-                                    );
-                                    const payloadLabel = buildApprovalPayloadLabel(node.approval);
-                                    const isActivePendingApproval =
-                                      pendingApproval?.approval_request_id === node.approval.approvalRequestId;
-                                    const showPendingActions = node.state === "pending";
-                                    const showResolvedDetail = !showPendingActions && Boolean(payloadPreview);
-                                    const detailCardClass = node.approval.tool === "terminal" ? "terminal" : "generic";
-
                                     return (
                                       <article
                                         key={node.id}
@@ -8677,41 +10468,9 @@ ${markup}
                                         </div>
 
                                         <div className="timeline-primary-copy">
-                                          <div className="timeline-approval-primary">
-                                            <p className="timeline-primary-text">{node.primaryText}</p>
-                                            {!showPendingActions ? (
-                                              <span className={`timeline-approval-status-tag state-${node.state}`}>
-                                                {buildApprovalStateLabel(node.state)}
-                                              </span>
-                                            ) : null}
-                                          </div>
+                                          <p className="timeline-primary-text">{node.primaryText}</p>
 
-                                          {showPendingActions ? (
-                                            <div className="timeline-approval-action-row">
-                                              <button
-                                                type="button"
-                                                className="timeline-approval-button ghost"
-                                                onClick={() => void resolveApproval("reject", node.approval?.approvalRequestId ?? null)}
-                                                disabled={approvalActionLoading !== null || !isActivePendingApproval}
-                                              >
-                                                {approvalActionLoading === "reject" && isActivePendingApproval ? "拒绝中..." : "拒绝"}
-                                              </button>
-                                              <button
-                                                type="button"
-                                                className="timeline-approval-button solid"
-                                                onClick={() => void resolveApproval("approve", node.approval?.approvalRequestId ?? null)}
-                                                disabled={approvalActionLoading !== null || !isActivePendingApproval}
-                                              >
-                                                {approvalActionLoading === "approve" && isActivePendingApproval ? "允许中..." : "允许继续"}
-                                              </button>
-                                            </div>
-                                          ) : null}
-
-                                          {approvalError && showPendingActions && isActivePendingApproval ? (
-                                            <div className="workspace-alert error timeline-approval-error">{approvalError}</div>
-                                          ) : null}
-
-                                          {showResolvedDetail ? (
+                                          {node.secondaryItems.length > 0 ? (
                                             <button
                                               type="button"
                                               className={`timeline-tool-toggle ${expanded ? "expanded" : ""}`}
@@ -8719,11 +10478,11 @@ ${markup}
                                               aria-expanded={expanded}
                                               aria-controls={`timeline-panel-${node.id}`}
                                             >
-                                              <span className="timeline-tool-toggle-label">查看参数</span>
+                                              <span className="timeline-tool-toggle-label">{buildTimelineToolSummary(node)}</span>
                                             </button>
                                           ) : null}
 
-                                          {showResolvedDetail ? (
+                                          {node.secondaryItems.length > 0 ? (
                                             <div
                                               id={`timeline-panel-${node.id}`}
                                               className={`timeline-secondary-region ${expanded ? "expanded" : ""}`}
@@ -8731,24 +10490,59 @@ ${markup}
                                             >
                                               <div className="timeline-secondary-region-inner">
                                                 <div className="timeline-secondary-list">
-                                                  <article className={`timeline-secondary-card ${detailCardClass}`}>
-                                                    <div className="timeline-secondary-head">
-                                                      <div className="timeline-secondary-head-main">
-                                                        <div className="timeline-secondary-label-row">
-                                                          <span className="timeline-secondary-label">{payloadLabel}</span>
-                                                          <span className="timeline-secondary-time-inline">{node.time}</span>
-                                                        </div>
-                                                      </div>
-                                                    </div>
-                                                    <div className="timeline-secondary-result-wrap timeline-code-block">
-                                                      <pre className={`timeline-secondary-result timeline-code-block-pre ${detailCardClass === "terminal" ? "terminal" : ""}`}>
-                                                        <code
-                                                          className={payloadCodePreview.language ? `language-${payloadCodePreview.language}` : undefined}
-                                                          dangerouslySetInnerHTML={{ __html: payloadCodePreview.html }}
-                                                        />
-                                                      </pre>
-                                                    </div>
-                                                  </article>
+                                                  {node.secondaryItems.map((item) => {
+                                                    const resultText = buildTimelineSecondaryResultText(item, {
+                                                      isTurnRunning: turn.isLive && turn.status === "running",
+                                                    });
+                                                    const resultCodePreview = buildTimelineCodePreview(
+                                                      item.toolName,
+                                                      resultText,
+                                                      item.argumentsPayload
+                                                    );
+                                                    return (
+                                                      <article
+                                                        key={item.id}
+                                                        className={`timeline-secondary-card ${item.cardType} ${
+                                                          item.awaitingUserInput ? "awaiting-input-secondary-card" : ""
+                                                        }`}
+                                                      >
+                                                        {item.awaitingUserInput ? (
+                                                          renderAwaitingUserInputCard(item.awaitingUserInput, turn, { compact: true })
+                                                        ) : (
+                                                          <>
+                                                            <div className="timeline-secondary-head">
+                                                              <div className="timeline-secondary-head-main">
+                                                                <div className="timeline-secondary-label-row">
+                                                                  <div className="timeline-secondary-title-row">
+                                                                    <span className="timeline-secondary-label">{item.label}</span>
+                                                                    <span className={`timeline-secondary-status-tag tone-${item.statusTone}`}>
+                                                                      {item.statusLabel}
+                                                                    </span>
+                                                                  </div>
+                                                                  <span className="timeline-secondary-time-inline">{item.detail.time}</span>
+                                                                </div>
+                                                              </div>
+                                                            </div>
+                                                            <div className="timeline-secondary-result-wrap timeline-code-block">
+                                                              {item.cardType === "terminal" && item.command ? (
+                                                                <pre className="timeline-terminal-command">{`$ ${item.command}`}</pre>
+                                                              ) : null}
+                                                              <pre
+                                                                className={`timeline-secondary-result timeline-code-block-pre ${
+                                                                  item.cardType === "terminal" ? "terminal" : ""
+                                                                }`}
+                                                              >
+                                                                <code
+                                                                  className={resultCodePreview.language ? `language-${resultCodePreview.language}` : undefined}
+                                                                  dangerouslySetInnerHTML={{ __html: resultCodePreview.html }}
+                                                                />
+                                                              </pre>
+                                                            </div>
+                                                          </>
+                                                        )}
+                                                      </article>
+                                                    );
+                                                  })}
                                                 </div>
                                               </div>
                                             </div>
@@ -8756,260 +10550,163 @@ ${markup}
                                         </div>
                                       </article>
                                     );
-                                  }
+                                  })}
 
-                                  const expanded = isTimelineExpanded(node);
-                                  const markerIcon = resolveTimelineNodeIcon(node);
-                                  const hasHead = index > 0;
-                                  const hasTail = index < visibleTimelineNodes.length - 1 || hasVisibleThinkingNode;
-                                  return (
-                                    <article
-                                      key={node.id}
-                                      className={`timeline-node ${expanded ? "expanded" : ""} state-${node.state} kind-${node.kind}`}
-                                    >
-                                      <div className={`timeline-primary-marker ${hasHead ? "has-head" : ""} ${hasTail ? "has-tail" : ""}`}>
-                                        <span className="timeline-marker-icon-wrap" aria-hidden="true">
-                                          <TimelineMarkerIcon name={markerIcon} className="timeline-marker-icon" />
-                                        </span>
-                                      </div>
+                                  {visibleThinkingNode ? (
+                                    <article className="timeline-node timeline-thinking-node" aria-label="Thinking">
+                                      <div
+                                        className={`timeline-primary-marker rail-only ${
+                                          visibleTimelineNodes.length > 0 ? "has-head" : ""
+                                        }`}
+                                      />
 
-                                      <div className="timeline-primary-copy">
-                                        <p className="timeline-primary-text">{node.primaryText}</p>
-
-                                        {node.secondaryItems.length > 0 ? (
-                                          <button
-                                            type="button"
-                                            className={`timeline-tool-toggle ${expanded ? "expanded" : ""}`}
-                                            onClick={() => toggleTimelineNode(node)}
-                                            aria-expanded={expanded}
-                                            aria-controls={`timeline-panel-${node.id}`}
-                                          >
-                                            <span className="timeline-tool-toggle-label">{buildTimelineToolSummary(node)}</span>
-                                          </button>
-                                        ) : null}
-
-                                        {node.secondaryItems.length > 0 ? (
-                                          <div
-                                            id={`timeline-panel-${node.id}`}
-                                            className={`timeline-secondary-region ${expanded ? "expanded" : ""}`}
-                                            aria-hidden={!expanded}
-                                          >
-                                            <div className="timeline-secondary-region-inner">
-                                              <div className="timeline-secondary-list">
-                                                {node.secondaryItems.map((item) => {
-                                                  const resultText = buildTimelineSecondaryResultText(item, {
-                                                    isTurnRunning: turn.isLive && turn.status === "running",
-                                                  });
-                                                  const resultCodePreview = buildTimelineCodePreview(
-                                                    item.toolName,
-                                                    resultText,
-                                                    item.argumentsPayload
-                                                  );
-                                                  return (
-                                                    <article
-                                                      key={item.id}
-                                                      className={`timeline-secondary-card ${item.cardType} ${
-                                                        item.awaitingUserInput ? "awaiting-input-secondary-card" : ""
-                                                      }`}
-                                                    >
-                                                      {item.awaitingUserInput ? (
-                                                        renderAwaitingUserInputCard(item.awaitingUserInput, turn, { compact: true })
-                                                      ) : (
-                                                        <>
-                                                          <div className="timeline-secondary-head">
-                                                            <div className="timeline-secondary-head-main">
-                                                              <div className="timeline-secondary-label-row">
-                                                                <div className="timeline-secondary-title-row">
-                                                                  <span className="timeline-secondary-label">{item.label}</span>
-                                                                  <span className={`timeline-secondary-status-tag tone-${item.statusTone}`}>
-                                                                    {item.statusLabel}
-                                                                  </span>
-                                                                </div>
-                                                                <span className="timeline-secondary-time-inline">{item.detail.time}</span>
-                                                              </div>
-                                                            </div>
-                                                          </div>
-                                                          <div className="timeline-secondary-result-wrap timeline-code-block">
-                                                            {item.cardType === "terminal" && item.command ? (
-                                                              <pre className="timeline-terminal-command">{`$ ${item.command}`}</pre>
-                                                            ) : null}
-                                                            <pre
-                                                              className={`timeline-secondary-result timeline-code-block-pre ${
-                                                                item.cardType === "terminal" ? "terminal" : ""
-                                                              }`}
-                                                            >
-                                                              <code
-                                                                className={resultCodePreview.language ? `language-${resultCodePreview.language}` : undefined}
-                                                                dangerouslySetInnerHTML={{ __html: resultCodePreview.html }}
-                                                              />
-                                                            </pre>
-                                                          </div>
-                                                        </>
-                                                      )}
-                                                    </article>
-                                                  );
-                                                })}
-                                              </div>
-                                            </div>
+                                      <div className="timeline-primary-copy timeline-thinking-copy">
+                                        <div className="thinking-logo-row">
+                                          <img src={logo} alt="" className="thinking-inline-logo" />
+                                          <div className="thinking-inline-copy">
+                                            <span className="thinking-inline-word">thinking</span>
+                                            <span className="thinking-inline-dots" aria-hidden="true">
+                                              <span className="thinking-inline-dot dot-one">.</span>
+                                              <span className="thinking-inline-dot dot-two">.</span>
+                                              <span className="thinking-inline-dot dot-three">.</span>
+                                            </span>
                                           </div>
-                                        ) : null}
-                                      </div>
-                                    </article>
-                                  );
-                                })}
-
-                                {visibleThinkingNode ? (
-                                  <article className="timeline-node timeline-thinking-node" aria-label="Thinking">
-                                    <div
-                                      className={`timeline-primary-marker rail-only ${
-                                        visibleTimelineNodes.length > 0 ? "has-head" : ""
-                                      }`}
-                                    />
-
-                                    <div className="timeline-primary-copy timeline-thinking-copy">
-                                      <div className="thinking-logo-row">
-                                        <img src={logo} alt="" className="thinking-inline-logo" />
-                                        <div className="thinking-inline-copy">
-                                          <span className="thinking-inline-word">thinking</span>
-                                          <span className="thinking-inline-dots" aria-hidden="true">
-                                            <span className="thinking-inline-dot dot-one">.</span>
-                                            <span className="thinking-inline-dot dot-two">.</span>
-                                            <span className="thinking-inline-dot dot-three">.</span>
-                                          </span>
                                         </div>
                                       </div>
+                                    </article>
+                                  ) : null}
+                                </div>
+                              ) : null}
+
+                              {showAnswerBubble ? (
+                                <div className="trace-row">
+                                  <MessageHoverShell
+                                    shellClassName="assistant"
+                                    align="start"
+                                    timestamp={turn.answer?.createdAt ?? turn.userMessage.createdAt}
+                                    copyValue={showAssistantMessageMeta ? assistantCopyValue : null}
+                                    copyLabel="回复"
+                                    showMeta={showAssistantMessageMeta && Boolean(turn.answer)}
+                                    turnUsage={turn.usage}
+                                    durationMs={turn.durationMs}
+                                  >
+                                    <div className="trace-bubble wide final answer-bubble">
+                                      {awaitingInput ? (
+                                        renderAwaitingUserInputCard(awaitingInput, turn)
+                                      ) : (
+                                        <MessageContent
+                                          apiBase={apiBase}
+                                          variant="assistant"
+                                          content={answerCopy}
+                                          attachments={turn.answer?.attachments ?? []}
+                                          className="trace-copy"
+                                          onOpenHtmlPreview={openHtmlPreview}
+                                          deferCodeBlocksUntilComplete={turn.isLive && turn.status === "running"}
+                                        />
+                                      )}
                                     </div>
-                                  </article>
-                                ) : null}
-                              </div>
-                            ) : null}
+                                  </MessageHoverShell>
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })}
+                      </>
+                    ) : null}
+                  </section>
 
-                            {showAnswerBubble ? (
-                              <div className="trace-row">
-                                <MessageHoverShell
-                                  shellClassName="assistant"
-                                  align="start"
-                                  timestamp={turn.answer?.createdAt ?? turn.userMessage.createdAt}
-                                  copyValue={showAssistantMessageMeta ? assistantCopyValue : null}
-                                  copyLabel="回复"
-                                  showMeta={showAssistantMessageMeta && Boolean(turn.answer)}
-                                  turnUsage={turn.usage}
-                                  durationMs={turn.durationMs}
-                                >
-                                  <div className="trace-bubble wide final answer-bubble">
-                                    {awaitingInput ? (
-                                      renderAwaitingUserInputCard(awaitingInput, turn)
-                                    ) : (
-                                      <MessageContent
-                                        apiBase={apiBase}
-                                        variant="assistant"
-                                        content={answerCopy}
-                                        attachments={turn.answer?.attachments ?? []}
-                                        className="trace-copy"
-                                        onOpenHtmlPreview={openHtmlPreview}
-                                        deferCodeBlocksUntilComplete={turn.isLive && turn.status === "running"}
-                                      />
-                                    )}
-                                  </div>
-                                </MessageHoverShell>
-                              </div>
-                            ) : null}
-                          </div>
-                        );
-                      })}
-                    </>
-                  ) : null}
-                </section>
+                  <footer className="composer-bar composer-bar-floating">{renderChatComposer("footer")}</footer>
+                </>
+              )}
+            </div>
 
-                <footer className="composer-bar composer-bar-floating">{renderChatComposer("footer")}</footer>
-              </div>
-
-              <aside
-                ref={htmlPreviewPanelRef}
-                className={`html-preview-panel ${htmlPreview ? "open" : ""}`}
-                aria-label="HTML 预览面板"
-              >
-                {htmlPreview && !isHtmlPreviewFloating ? (
-                  <div
-                    className="html-preview-resize-handle"
-                    onPointerDown={(event) => {
-                      event.preventDefault();
-                      setDragging("html-preview");
-                    }}
-                    role="separator"
-                    aria-orientation="vertical"
-                    aria-label="调整 HTML 预览宽度"
-                  />
-                ) : null}
-                <div className="html-preview-panel-inner">
-                  <div className="html-preview-frame-topbar">
-                    <div className="html-preview-frame-topbar-main">
-                      <span className="html-preview-frame-badge">{htmlPreviewBadge}</span>
-                      <span className="html-preview-frame-title">
-                        {htmlPreview?.streaming ? "生成中 · " : htmlPreview?.saveStatus === "failed" ? "写入失败 · " : ""}
-                        {htmlPreview?.title ?? "HTML 实时预览"}
-                      </span>
-                    </div>
-                    <div className="html-preview-frame-actions">
-                      <div className="html-preview-view-toggle" role="group" aria-label="HTML 查看模式">
-                        <button
-                          type="button"
-                          className={htmlPreviewView === "preview" ? "active" : ""}
-                          onClick={() => setHtmlPreviewView("preview")}
-                          aria-pressed={htmlPreviewView === "preview"}
-                          title="预览模式"
-                        >
-                          <EyePanelIcon className="html-preview-view-toggle-icon" />
-                          <span>预览</span>
-                        </button>
-                        <button
-                          type="button"
-                          className={htmlPreviewView === "code" ? "active" : ""}
-                          onClick={() => setHtmlPreviewView("code")}
-                          aria-pressed={htmlPreviewView === "code"}
-                          title="代码模式"
-                        >
-                          <CodePanelIcon className="html-preview-view-toggle-icon" />
-                          <span>代码</span>
-                        </button>
-                      </div>
+            <aside
+              ref={htmlPreviewPanelRef}
+              className={`html-preview-panel ${htmlPreview ? "open" : ""}`}
+              aria-label="HTML 预览面板"
+            >
+              {htmlPreview && !isHtmlPreviewFloating ? (
+                <div
+                  className="html-preview-resize-handle"
+                  onPointerDown={(event) => {
+                    event.preventDefault();
+                    setDragging("html-preview");
+                  }}
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="调整 HTML 预览宽度"
+                />
+              ) : null}
+              <div className="html-preview-panel-inner">
+                <div className="html-preview-frame-topbar">
+                  <div className="html-preview-frame-topbar-main">
+                    <span className="html-preview-frame-badge">{htmlPreviewBadge}</span>
+                    <span className="html-preview-frame-title">
+                      {htmlPreview?.streaming ? "生成中 · " : htmlPreview?.saveStatus === "failed" ? "写入失败 · " : ""}
+                      {htmlPreview?.title ?? "HTML 实时预览"}
+                    </span>
+                  </div>
+                  <div className="html-preview-frame-actions">
+                    <div className="html-preview-view-toggle" role="group" aria-label="HTML 查看模式">
                       <button
                         type="button"
-                        className="html-preview-panel-close"
-                        onClick={() => {
-                          setHtmlPreview(null);
-                          setHtmlPreviewView("preview");
-                        }}
-                        aria-label="关闭 HTML 预览"
+                        className={htmlPreviewView === "preview" ? "active" : ""}
+                        onClick={() => setHtmlPreviewView("preview")}
+                        aria-pressed={htmlPreviewView === "preview"}
+                        title="预览模式"
                       >
-                        <ClosePanelIcon className="html-preview-panel-close-icon" />
+                        <EyePanelIcon className="html-preview-view-toggle-icon" />
+                        <span>预览</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={htmlPreviewView === "code" ? "active" : ""}
+                        onClick={() => setHtmlPreviewView("code")}
+                        aria-pressed={htmlPreviewView === "code"}
+                        title="代码模式"
+                      >
+                        <CodePanelIcon className="html-preview-view-toggle-icon" />
+                        <span>代码</span>
                       </button>
                     </div>
-                  </div>
-                  <div className={`html-preview-frame-stage ${htmlPreviewView === "code" ? "code-mode" : "preview-mode"}`}>
-                    {htmlPreview && htmlPreviewView === "preview" ? (
-                      <iframe
-                        key={`${htmlPreview.path ?? htmlPreview.title}:${htmlPreview.streaming ? "streaming" : "complete"}`}
-                        className="html-preview-iframe"
-                        title={htmlPreview.title}
-                        srcDoc={normalizedHtmlPreviewContent}
-                        sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
-                        referrerPolicy="no-referrer"
-                      />
-                    ) : null}
-                    {htmlPreview && htmlPreviewView === "code" ? (
-                      <pre className="chat-code-block-pre html-preview-code">
-                        <code
-                          className={htmlPreviewCodeHighlight.language ? `language-${htmlPreviewCodeHighlight.language}` : undefined}
-                          dangerouslySetInnerHTML={{ __html: htmlPreviewCodeHighlight.html || "&nbsp;" }}
-                        />
-                      </pre>
-                    ) : null}
+                    <button
+                      type="button"
+                      className="html-preview-panel-close"
+                      onClick={() => {
+                        setHtmlPreview(null);
+                        setHtmlPreviewView("preview");
+                      }}
+                      aria-label="关闭 HTML 预览"
+                    >
+                      <ClosePanelIcon className="html-preview-panel-close-icon" />
+                    </button>
                   </div>
                 </div>
-              </aside>
-            </div>
-          )
+                <div className={`html-preview-frame-stage ${htmlPreviewView === "code" ? "code-mode" : "preview-mode"}`}>
+                  {htmlPreview && htmlPreviewView === "preview" ? (
+                    <iframe
+                      key={`${htmlPreview.path ?? htmlPreview.title}:${htmlPreview.streaming ? "streaming" : "complete"}`}
+                      className="html-preview-iframe"
+                      title={htmlPreview.title}
+                      srcDoc={normalizedHtmlPreviewContent}
+                      sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
+                      referrerPolicy="no-referrer"
+                    />
+                  ) : null}
+                  {htmlPreview && htmlPreviewView === "code" ? (
+                    <pre className="chat-code-block-pre html-preview-code">
+                      <code
+                        className={htmlPreviewCodeHighlight.language ? `language-${htmlPreviewCodeHighlight.language}` : undefined}
+                        dangerouslySetInnerHTML={{ __html: htmlPreviewCodeHighlight.html || "&nbsp;" }}
+                      />
+                    </pre>
+                  ) : null}
+                </div>
+              </div>
+            </aside>
+
+            {renderMultiagentDrawer()}
+          </div>
         ) : null}
 
         {activePage === "automations" ? (
@@ -9483,6 +11180,80 @@ ${markup}
             {pluginsNotice ? <div className="workspace-alert success">{pluginsNotice}</div> : null}
 
             <div className="workspace-stack">
+              <article className="workspace-card">
+                <div className="workspace-card-head">
+                  <div>
+                    <h3>地理位置</h3>
+                    <p>优先使用浏览器定位；如果浏览器不给权限，可以手动填写城市作为上下文。</p>
+                  </div>
+                  <div className="workspace-inline-actions">
+                    <button
+                      type="button"
+                      className="workspace-secondary-button"
+                      onClick={() => void refreshEnvironmentLocation({ allowPrompt: true, forcePrompt: true })}
+                    >
+                      获取当前位置
+                    </button>
+                  </div>
+                </div>
+
+                <div className="workspace-card-body">
+                  <div className="workspace-info-grid">
+                    <div className="workspace-mini-card">
+                      <span className="workspace-mini-label">当前状态</span>
+                      <strong>{environmentLocationStatus.message}</strong>
+                    </div>
+                    <div className="workspace-mini-card">
+                      <span className="workspace-mini-label">当前城市</span>
+                      <strong>{environmentLocation?.city ?? "未获取"}</strong>
+                    </div>
+                    <div className="workspace-mini-card">
+                      <span className="workspace-mini-label">访问地址</span>
+                      <strong>{window.location.origin}</strong>
+                    </div>
+                    <div className="workspace-mini-card">
+                      <span className="workspace-mini-label">安全上下文</span>
+                      <strong>{window.isSecureContext ? "是" : "否"}</strong>
+                    </div>
+                  </div>
+
+                  <div className="workspace-detail-block">
+                    <span className="workspace-field-label">手动城市</span>
+                    <div className="location-settings-row">
+                      <input
+                        className="workspace-text-input"
+                        value={manualEnvironmentCity}
+                        onChange={(event) => setManualEnvironmentCity(event.target.value)}
+                        placeholder="例如：武汉"
+                      />
+                      <button
+                        type="button"
+                        className="workspace-secondary-button"
+                        onClick={saveManualEnvironmentCity}
+                        disabled={!manualEnvironmentCity.trim()}
+                      >
+                        保存城市
+                      </button>
+                      <button
+                        type="button"
+                        className="workspace-secondary-button"
+                        onClick={clearManualEnvironmentCity}
+                      >
+                        清除
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="workspace-detail-block">
+                    <span className="workspace-field-label">说明</span>
+                    <p className="workspace-copy">
+                      如果你是从 <code>http://局域网 IP:7775</code> 打开的，很多浏览器不会开放定位能力。优先改用{" "}
+                      <code>http://127.0.0.1:7775</code> 或 <code>http://localhost:7775</code>。
+                    </p>
+                  </div>
+                </div>
+              </article>
+
               {activeSettingsTab === "theme" ? (
                 <article className="workspace-card">
                   <div className="workspace-card-head">

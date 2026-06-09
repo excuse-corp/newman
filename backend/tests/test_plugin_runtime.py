@@ -5,9 +5,12 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from backend.config.schema import ModelConfig
 from backend.hooks.hook_manager import HookManager
+from backend.plugin_runtime.skill_loader import SkillImportLoader, UploadedSkillFile
 from backend.plugin_runtime.plugin_loader import PluginLoader
 from backend.plugin_runtime.service import PluginService
+from backend.providers.base import BaseProvider, ProviderChunk, ProviderResponse, TokenUsage
 
 
 def _write_plugin(root: Path, name: str, manifest: str, *, skill_body: str | None = None, hook_body: str | None = None) -> None:
@@ -112,6 +115,57 @@ class PluginServiceTests(unittest.TestCase):
             self.assertEqual(configs[0]["args"], [str(script_path.resolve())])
             self.assertEqual(configs[0]["env"]["NEWMAN_PLUGIN_ROOT"], str(plugin_dir.resolve()))
             self.assertEqual(configs[0]["env"]["NEWMAN_PLUGIN_NAME"], "tool-plugin")
+
+
+class _SkillOptimizeProvider(BaseProvider):
+    async def chat(self, messages, tools=None, **kwargs):
+        return ProviderResponse(
+            content=(
+                '{"description":"Imported reporting workflow",'
+                '"when_to_use":"Use for reporting tasks",'
+                '"body_markdown":"# Reporting\\n\\n## Workflow\\n\\n1. Read the source material."}'
+            ),
+            usage=TokenUsage(input_tokens=70, output_tokens=20, total_tokens=90),
+            model="test-model",
+        )
+
+    async def chat_stream(self, messages, tools=None, **kwargs):
+        yield ProviderChunk(type="done", finish_reason="stop")
+
+    def estimate_tokens(self, messages) -> int:
+        return 70
+
+
+class _UsageStore:
+    def __init__(self) -> None:
+        self.records = []
+
+    def record(self, record) -> None:
+        self.records.append(record)
+
+
+class SkillImportLoaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_llm_optimizer_records_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            usage_store = _UsageStore()
+            loader = SkillImportLoader(
+                provider=_SkillOptimizeProvider(),
+                provider_config=ModelConfig(type="openai_compatible", model="test-model", context_window=100000),
+                usage_store=usage_store,
+            )
+
+            await loader.prepare_upload(
+                [UploadedSkillFile(filename="guide.md", content=b"# Reporting\n\nMake a report.\n")],
+                Path(tmp),
+                requested_name="reporting",
+                optimize_with_llm=True,
+            )
+
+            self.assertEqual(len(usage_store.records), 1)
+            record = usage_store.records[0]
+            self.assertEqual(record.request_kind, "skill_upload_optimization")
+            self.assertEqual(record.total_tokens, 90)
+            self.assertFalse(record.counts_toward_context_window)
 
 
 class HookManagerTests(unittest.IsolatedAsyncioTestCase):

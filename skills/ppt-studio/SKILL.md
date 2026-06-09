@@ -126,6 +126,61 @@ For requests that expand the original deck: insert new pages, or replace specifi
 
 ---
 
+## plan.json Editing Best Practices
+
+plan.json is the central data file that drives the entire rendering pipeline. Editing it correctly is critical.
+
+### Rule 1: Prefer Python over text replacement tools
+
+When editing plan.json, **always use Python json.load → modify → json.dump** instead of `edit_file` or `sed`:
+
+```python
+import json
+
+with open('plan.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+# Modify the data structure in memory
+for i, slide in enumerate(data['slides']):
+    if slide.get('data', {}).get('title', '') == 'target_title':
+        data['slides'][i] = new_slide_data
+        break
+
+with open('plan.json', 'w', encoding='utf-8') as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+```
+
+**Why:** `edit_file` and `sed` work on raw text, which causes JSON corruption when content contains Unicode escape sequences (e.g., `\u201c`/`\u201d` for Chinese curly quotes) or nested quotes. The text-level replacement cannot distinguish between JSON structure quotes and content quotes.
+
+### Rule 2: Use ensure_ascii=False
+
+When writing plan.json, always use `json.dump(data, f, ensure_ascii=False, indent=2)`. This preserves Chinese characters as-is rather than converting them to `\uXXXX` escape sequences, which prevents encoding-related parse errors.
+
+### Rule 3: Avoid mixing edit_file with Unicode-heavy content
+
+`edit_file` matches raw text byte-for-byte. If plan.json contains Chinese curly quotes (\u201c " and \u201d "), the tool may:
+- Fail to match because of encoding differences between the search string and file content
+- Introduce quote nesting conflicts that break JSON parsing
+
+**Instead:** Find the target slide by title/property matching in Python, then replace the entire slide dict.
+
+### Rule 4: Validate after every edit
+
+After modifying plan.json, always validate it before rendering:
+
+```python
+import json
+with open('plan.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)  # Will throw if JSON is invalid
+print(f"Valid JSON: {len(data['slides'])} slides")
+```
+
+### Rule 5: For large structural changes, regenerate instead of patching
+
+When adding 3+ new slides or renumbering chapters, it's safer to build the complete slides list in Python and write it fresh rather than doing multiple `edit_file` calls that can accumulate encoding errors.
+
+---
+
 ## After-task hygiene (all paths)
 
 1. Save the final `.pptx` to `/mnt/user-data/outputs/`
@@ -145,6 +200,7 @@ For requests that expand the original deck: insert new pages, or replace specifi
 - **Silently producing visual mismatches in G'** — always disclose that newly inserted pages may differ stylistically.
 - **Hand-writing HTML for preview (Path G)** — never use `show_widget` or write HTML by hand as a preview. The ONLY valid preview is the file from `render.py --preview`, delivered via `present_files`. A widget or hand-written HTML looks different from the PPTX and misleads the user into approving something they won't actually get.
 - **Running QA after PPTX export** — QA belongs in Phase 4b on the HTML-rasterized images, not Phase 5. If QA runs post-export, fixes require a full re-export.
+- **Editing plan.json with edit_file/sed** — when the JSON contains Chinese characters or Unicode escape sequences, text-level editing tools produce corrupted JSON. Always use Python's json.load → modify → json.dump pipeline (see "plan.json Editing Best Practices" section above).
 
 ## Goal
 

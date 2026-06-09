@@ -48,6 +48,17 @@ class RuntimeConfig(BaseModel):
     tool_retry_backoff_seconds: float = 1.0
     provider_retry_attempts: int = 3
     provider_retry_backoff_seconds: float = 1.0
+    provider_max_concurrent_requests: int = 1
+    provider_min_interval_seconds: float = 0.0
+
+
+class SubagentsConfig(BaseModel):
+    enabled: bool = True
+    max_agents_per_run: int = 5
+    max_parallel_agents: int = 5
+    default_max_turns: int = 200
+    lock_wait_timeout_seconds: int = 30
+    sequential_context_token_limit: int = 2000
 
 
 class EvolutionConfig(BaseModel):
@@ -56,7 +67,8 @@ class EvolutionConfig(BaseModel):
     overlap_user_turns: int = 6
     max_context_messages: int = 120
     max_tool_output_chars: int = 2_000
-    max_memory_updates_per_run: int = 8
+    max_memory_updates_per_run: int = 1
+    max_memory_item_chars: int = 80
     max_skill_updates_per_run: int = 3
     max_skill_file_bytes: int = 200_000
     max_skill_total_bytes: int = 700_000
@@ -97,10 +109,13 @@ class PermissionsConfig(BaseModel):
 
 class PathsConfig(BaseModel):
     workspace: Path = Path.cwd()
+    browse_root: Path | None = None
+    output_root: Path | None = None
     data_dir: Path = Path("backend_data")
     sessions_dir: Path = Path("backend_data/sessions")
     memory_dir: Path = Path("backend_data/memory")
     audit_dir: Path = Path("backend_data/audit")
+    subagents_dir: Path = Path("backend_data/subagents")
     plugins_dir: Path = Path("plugins")
     skills_dir: Path = Path("skills")
     mcp_dir: Path = Path("backend_data/mcp")
@@ -123,6 +138,7 @@ class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
     postgres_dsn: str = "postgresql://postgres@127.0.0.1:65437/newman"
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)

@@ -143,6 +143,14 @@ TOOL_ERROR_MAP = {
         "recoverable",
         "Retry the request; if it keeps returning no content, inspect the gateway and streaming response path.",
     ),
+    "lock_timeout": ErrorDescriptor(
+        "NEWMAN-TOOL-016",
+        "warning",
+        "medium",
+        "文件写锁等待超时",
+        "recoverable",
+        "Retry after the holding task finishes, or ask the main agent to split the write target.",
+    ),
 }
 
 DEFAULT_TOOL_ERROR = ErrorDescriptor(

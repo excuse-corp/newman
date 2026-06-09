@@ -84,18 +84,25 @@ class TerminalPermissionTests(unittest.TestCase):
             self.assertEqual(len(reasons), 1)
             self.assertTrue(reasons[0].startswith("terminal_write_readonly_path:"))
 
-    def test_terminal_static_checks_allow_writes_to_runtime_workspace(self) -> None:
+    def test_terminal_static_checks_allow_writes_to_configured_writable_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
+            writable = root / "writable"
             workspace.mkdir()
+            writable.mkdir()
 
-            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace)}})
+            settings = AppConfig.model_validate(
+                {
+                    "paths": {"workspace": str(workspace), "browse_root": str(workspace)},
+                    "permissions": {"writable_paths": [str(writable)]},
+                }
+            )
             router = ToolRouter(ToolRegistry(), settings)
 
             reasons = router.static_checks(
                 _FakeTerminalTool(),
-                {"command": "touch ./notes.txt"},
+                {"command": f"touch {writable / 'notes.txt'}"},
             )
 
             self.assertEqual(reasons, [])
@@ -168,7 +175,30 @@ class TerminalPermissionTests(unittest.TestCase):
 
             self.assertIn("maintain_plugin", reasons)
 
-    def test_mcp_static_checks_deny_paths_outside_workspace(self) -> None:
+    def test_mcp_static_checks_allow_paths_in_additional_readable_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            readable = root / "shared"
+            workspace.mkdir()
+            readable.mkdir()
+
+            settings = AppConfig.model_validate(
+                {
+                    "paths": {"workspace": str(workspace)},
+                    "permissions": {"readable_paths": [str(readable)]},
+                }
+            )
+            router = ToolRouter(ToolRegistry(), settings)
+
+            reasons = router.static_checks(
+                _FakeMCPTool(),
+                {"path": str(readable / "demo.txt")},
+            )
+
+            self.assertEqual(reasons, [])
+
+    def test_mcp_static_checks_deny_reads_outside_allowed_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
@@ -185,7 +215,7 @@ class TerminalPermissionTests(unittest.TestCase):
             )
 
             self.assertEqual(len(reasons), 1)
-            self.assertTrue(reasons[0].startswith("mcp_path_outside_workspace:"))
+            self.assertTrue(reasons[0].startswith("mcp_read_outside_readable_paths:"))
 
     def test_mcp_static_checks_can_skip_api_path_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -226,6 +256,76 @@ class TerminalPermissionTests(unittest.TestCase):
             self.assertEqual(len(reasons), 1)
             self.assertTrue(reasons[0].startswith("mcp_path_protected:"))
 
+    def test_mcp_static_checks_deny_writes_to_readonly_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            readonly = root / "readonly"
+            workspace.mkdir()
+            readonly.mkdir()
+
+            settings = AppConfig.model_validate(
+                {
+                    "paths": {"workspace": str(workspace)},
+                    "permissions": {"readable_paths": [str(readonly)]},
+                }
+            )
+            router = ToolRouter(ToolRegistry(), settings)
+
+            reasons = router.static_checks(
+                _FakeMCPTool(),
+                {"outputFile": str(readonly / "result.txt")},
+            )
+
+            self.assertEqual(len(reasons), 1)
+            self.assertTrue(reasons[0].startswith("mcp_write_readonly_path:"))
+
+    def test_mcp_static_checks_allow_writes_to_additional_writable_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            writable = root / "managed"
+            workspace.mkdir()
+            writable.mkdir()
+
+            settings = AppConfig.model_validate(
+                {
+                    "paths": {"workspace": str(workspace)},
+                    "permissions": {"writable_paths": [str(writable)]},
+                }
+            )
+            router = ToolRouter(ToolRegistry(), settings)
+
+            reasons = router.static_checks(
+                _FakeMCPTool(),
+                {"outputFile": str(writable / "result.txt")},
+            )
+
+            self.assertEqual(reasons, [])
+
+    def test_terminal_static_checks_resolve_relative_paths_from_workspace_not_browse_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            browse_root = root / "browse"
+            workspace.mkdir()
+            browse_root.mkdir()
+
+            settings = AppConfig.model_validate(
+                {
+                    "paths": {"workspace": str(workspace), "browse_root": str(browse_root)},
+                    "permissions": {"writable_paths": [str(workspace)]},
+                }
+            )
+            router = ToolRouter(ToolRegistry(), settings)
+
+            reasons = router.static_checks(
+                _FakeTerminalTool(),
+                {"command": "touch note.txt"},
+            )
+
+            self.assertEqual(reasons, [])
+
     def test_bwrap_command_mounts_readable_writable_and_protected_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -257,6 +357,28 @@ class TerminalPermissionTests(unittest.TestCase):
             self.assertIn(str(protected_dir), argv)
             self.assertIn("/dev/null", argv)
             self.assertIn(str(protected_file), argv)
+
+    def test_bwrap_command_mounts_dns_and_ca_files_when_network_is_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+
+            argv = build_bwrap_command(
+                bwrap_executable="bwrap",
+                workspace=workspace,
+                readable_roots=[workspace],
+                writable_roots=[workspace],
+                protected_roots=[],
+                mode="workspace-write",
+                network_access=True,
+                command="getent hosts example.com",
+            )
+
+            self.assertIn("--dir", argv)
+            self.assertIn("/etc", argv)
+            self.assertIn("/etc/resolv.conf", argv)
+            if Path("/etc/ssl").exists():
+                self.assertIn("/etc/ssl", argv)
 
 
 class NativeSandboxEscalationTests(unittest.IsolatedAsyncioTestCase):
@@ -316,10 +438,12 @@ class TerminalOutputReportingTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
+            output_root = workspace / "outputs" / "chat"
             workspace.mkdir()
-            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace)}})
+            output_root.mkdir(parents=True)
+            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace), "output_root": str(output_root)}})
             policy = build_path_access_policy(settings)
-            target = workspace / "report.xlsx"
+            target = output_root / "report.xlsx"
 
             class _FakeSandbox:
                 limits = SimpleNamespace(timeout_seconds=30)
@@ -342,13 +466,19 @@ class TerminalOutputReportingTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
+            output_root = workspace / "outputs" / "chat"
             workspace.mkdir()
-            outputs_dir = turn_output_dir(workspace, "session-1", "turn-1")
+            outputs_dir = turn_output_dir(output_root, "session-1", "turn-1")
             outputs_dir.mkdir(parents=True)
             helper_script = workspace / "modify_excel.py"
             helper_script.write_text("print('helper')", encoding="utf-8")
             target = outputs_dir / "report.xlsx"
-            settings = AppConfig.model_validate({"paths": {"workspace": str(workspace)}})
+            settings = AppConfig.model_validate(
+                {
+                    "paths": {"workspace": str(workspace), "output_root": str(output_root)},
+                    "permissions": {"writable_paths": [str(workspace)]},
+                }
+            )
             policy = build_path_access_policy(settings)
 
             class _FakeSandbox:

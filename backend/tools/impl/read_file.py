@@ -26,7 +26,7 @@ class ReadFileTool(BaseTool):
         self.meta = ToolMeta(
             name="read_file",
             description=(
-                "Read a small workspace file. UTF-8 text files are returned as plain text in content; "
+                "Read a small file from the allowed readable paths. UTF-8 text files are returned as plain text in content; "
                 "binary or non-UTF-8 files are returned as base64 in dataBase64. "
                 "If the file may be large or you only need part of a text file, use read_file_range instead."
             ),
@@ -35,7 +35,7 @@ class ReadFileTool(BaseTool):
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative or absolute file path. Must point to a file, not a directory.",
+                        "description": "Browse-root-relative or absolute file path. Must point to a file, not a directory.",
                     },
                 },
                 "required": ["path"],
@@ -119,7 +119,7 @@ class ReadFileRangeTool(BaseTool):
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative or absolute path to a UTF-8 text file.",
+                        "description": "Browse-root-relative or absolute path to a UTF-8 text file.",
                     },
                     "offset": {
                         "type": "integer",

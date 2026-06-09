@@ -205,7 +205,7 @@ body,
 }
 
 .usage-kpi-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(178px, 1fr));
 }
 
 .usage-hero-grid {
@@ -245,6 +245,11 @@ body,
 .usage-kpi-card.warning {
   border-color: #efd5c8;
   background: #fff7f2;
+}
+
+.usage-kpi-card.evolution {
+  border-color: #d0ddd6;
+  background: linear-gradient(180deg, #fbfffd 0%, #edf6f1 100%);
 }
 
 .usage-kpi-label {
@@ -493,6 +498,17 @@ body,
   font-variant-numeric: tabular-nums;
 }
 
+.usage-kind-topline {
+  align-items: flex-start;
+}
+
+.usage-kind-description {
+  margin: -1px 0 1px;
+  color: #71685f;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
 .usage-meter-track {
   overflow: hidden;
   height: 10px;
@@ -515,6 +531,25 @@ body,
   color: #8d8378;
   font-size: 0.75rem;
   font-weight: 650;
+}
+
+.usage-kind-meta {
+  align-items: center;
+}
+
+.usage-kind-meta code {
+  overflow: hidden;
+  max-width: 58%;
+  padding: 2px 6px;
+  border: 1px solid #e9dfd3;
+  border-radius: 7px;
+  background: #f8f4ef;
+  color: #8a8076;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .usage-table-wrap {

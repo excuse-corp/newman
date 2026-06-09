@@ -523,17 +523,25 @@ class EvolutionService:
             return []
         updates: list[dict[str, str]] = []
         seen: set[str] = set()
-        for item in raw_updates[: self.config.max_memory_updates_per_run]:
+        max_updates = max(self.config.max_memory_updates_per_run, 0)
+        max_chars = max(self.config.max_memory_item_chars, 0)
+        if max_updates == 0 or max_chars == 0:
+            return []
+        for item in raw_updates:
             if not isinstance(item, dict):
                 continue
             text = _clean_memory_text(str(item.get("text") or ""))
             if not text or len(text) < 6:
+                continue
+            if len(text) > max_chars:
                 continue
             normalized = _normalize_memory_item(text)
             if normalized in seen:
                 continue
             seen.add(normalized)
             updates.append({"text": text, "reason": str(item.get("reason") or "").strip()})
+            if len(updates) >= max_updates:
+                break
         return updates
 
     def _normalize_skill_requests(self, raw_requests: Any) -> list[dict[str, str]]:
@@ -859,4 +867,3 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 def _is_text_skill_file(path: Path) -> bool:
     return path.name in TEXT_SKILL_FILENAMES or path.suffix.lower() in TEXT_SKILL_SUFFIXES
-

@@ -15,6 +15,7 @@ from backend.tools.approval_policy import (
 )
 from backend.tools.base import BaseTool
 from backend.tools.result import ToolExecutionResult
+from backend.tools.workspace_fs import build_path_access_policy
 
 
 EventEmitter = Callable[[str, dict], Awaitable[None]]
@@ -100,6 +101,8 @@ class ToolOrchestrator:
             arguments,
             session_id=session_id,
             turn_id=turn_id,
+            turn_approval_mode=turn_approval_mode,
+            emit=emit,
         )
         attempt = 1
         while True:
@@ -153,10 +156,21 @@ class ToolOrchestrator:
         *,
         session_id: str,
         turn_id: str | None,
+        turn_approval_mode: TurnApprovalMode = DEFAULT_TURN_APPROVAL_MODE,
+        emit: EventEmitter | None = None,
     ) -> dict:
+        if tool.meta.name == "multiagent":
+            prepared = dict(arguments)
+            if turn_id:
+                prepared["__parent_turn_id"] = turn_id
+            prepared["__turn_approval_mode"] = turn_approval_mode
+            if emit is not None:
+                prepared["__multiagent_event_emitter"] = emit
+            return prepared
         if tool.meta.name != "terminal" or not turn_id:
             return arguments
-        output_dir = turn_output_dir(self.settings.paths.workspace, session_id, turn_id)
+        policy = build_path_access_policy(self.settings)
+        output_dir = turn_output_dir(policy.output_root, session_id, turn_id)
         prepared = dict(arguments)
         prepared["__turn_output_dir"] = str(output_dir)
         return prepared
@@ -192,7 +206,7 @@ class ToolOrchestrator:
             },
         )
         if scheduler_run_mode == "unattended":
-            self.approvals.discard(approval_request.approval_request_id)
+            self.approvals.discard(approval_request.approval_request_id, resolved_approved=False)
             await emit(
                 "tool_approval_resolved",
                 {
@@ -209,7 +223,7 @@ class ToolOrchestrator:
         except asyncio.CancelledError:
             self.approvals.discard(approval_request.approval_request_id)
             raise
-        self.approvals.discard(approval_request.approval_request_id)
+        self.approvals.discard(approval_request.approval_request_id, resolved_approved=approved)
         await emit(
             "tool_approval_resolved",
             {
@@ -252,14 +266,15 @@ class ToolOrchestrator:
                     },
                 )
 
-            result = await asyncio.wait_for(
-                tool.run_streaming(
-                    arguments,
-                    session_id=session_id,
-                    emit_output=emit_tool_output if tool_call_id else None,
-                ),
-                timeout=tool.meta.timeout_seconds,
+            run = tool.run_streaming(
+                arguments,
+                session_id=session_id,
+                emit_output=emit_tool_output if tool_call_id else None,
             )
+            if tool.meta.timeout_seconds is None:
+                result = await run
+            else:
+                result = await asyncio.wait_for(run, timeout=tool.meta.timeout_seconds)
         except asyncio.TimeoutError:
             result = ToolExecutionResult(
                 success=False,
@@ -355,7 +370,7 @@ class ToolOrchestrator:
             except asyncio.CancelledError:
                 self.approvals.discard(approval_request.approval_request_id)
                 raise
-            self.approvals.discard(approval_request.approval_request_id)
+            self.approvals.discard(approval_request.approval_request_id, resolved_approved=approved)
             await emit(
                 "tool_approval_resolved",
                 {
@@ -448,14 +463,15 @@ class ToolOrchestrator:
                     },
                 )
 
-            result = await asyncio.wait_for(
-                tool.run_streaming_escalated(
-                    arguments,
-                    session_id=session_id,
-                    emit_output=emit_tool_output if tool_call_id else None,
-                ),
-                timeout=tool.meta.timeout_seconds,
+            run = tool.run_streaming_escalated(
+                arguments,
+                session_id=session_id,
+                emit_output=emit_tool_output if tool_call_id else None,
             )
+            if tool.meta.timeout_seconds is None:
+                result = await run
+            else:
+                result = await asyncio.wait_for(run, timeout=tool.meta.timeout_seconds)
         except asyncio.TimeoutError:
             result = ToolExecutionResult(
                 success=False,

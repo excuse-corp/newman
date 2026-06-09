@@ -31,6 +31,8 @@ class TextFilePayload:
 @dataclass(frozen=True)
 class PathAccessPolicy:
     workspace: Path
+    browse_root: Path
+    output_root: Path
     readable_roots: tuple[Path, ...]
     writable_roots: tuple[Path, ...]
     protected_roots: tuple[Path, ...]
@@ -38,15 +40,21 @@ class PathAccessPolicy:
 
 def build_path_access_policy(settings: AppConfig) -> PathAccessPolicy:
     workspace = settings.paths.workspace.resolve()
+    browse_root_setting = getattr(settings.paths, "browse_root", None)
+    output_root_setting = getattr(settings.paths, "output_root", None)
+    browse_root = (browse_root_setting or settings.paths.workspace).resolve()
+    output_root = (output_root_setting or (settings.paths.workspace / "outputs" / "chat")).resolve()
     permissions = getattr(settings, "permissions", None)
     readable_paths = list(getattr(permissions, "readable_paths", []))
     writable_paths = list(getattr(permissions, "writable_paths", []))
     protected_paths = list(getattr(permissions, "protected_paths", []))
-    writable_roots = _dedupe_roots([workspace, *writable_paths])
-    readable_roots = _dedupe_roots([workspace, *writable_roots, *readable_paths])
+    writable_roots = _dedupe_roots([output_root, *writable_paths])
+    readable_roots = _dedupe_roots([workspace, browse_root, output_root, *writable_roots, *readable_paths])
     protected_roots = _dedupe_roots(protected_paths)
     return PathAccessPolicy(
         workspace=workspace,
+        browse_root=browse_root,
+        output_root=output_root,
         readable_roots=tuple(readable_roots),
         writable_roots=tuple(writable_roots),
         protected_roots=tuple(protected_roots),
@@ -59,6 +67,8 @@ def coerce_path_access_policy(policy_or_workspace: PathAccessPolicy | Path) -> P
     workspace = policy_or_workspace.resolve()
     return PathAccessPolicy(
         workspace=workspace,
+        browse_root=workspace,
+        output_root=workspace / "outputs" / "chat",
         readable_roots=(workspace,),
         writable_roots=(workspace,),
         protected_roots=(),
@@ -75,6 +85,11 @@ def resolve_workspace_path(workspace: Path, raw_path: str | None = None) -> Path
 
 
 def resolve_requested_path(policy: PathAccessPolicy, raw_path: str | None = None) -> Path:
+    candidate = Path(raw_path or ".")
+    return (policy.browse_root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
+
+def resolve_writable_path(policy: PathAccessPolicy, raw_path: str | None = None) -> Path:
     candidate = Path(raw_path or ".")
     return (policy.workspace / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
 
@@ -101,7 +116,7 @@ def ensure_readable_path(policy: PathAccessPolicy, raw_path: str | None = None) 
 
 
 def ensure_writable_path(policy: PathAccessPolicy, raw_path: str | None = None) -> Path:
-    target = resolve_requested_path(policy, raw_path)
+    target = resolve_writable_path(policy, raw_path)
     state = classify_path(policy, target)
     if state == "protected":
         raise ValueError("path 位于受保护目录内")
@@ -113,7 +128,7 @@ def ensure_writable_path(policy: PathAccessPolicy, raw_path: str | None = None) 
 def display_path(policy: PathAccessPolicy, path: Path) -> str:
     resolved = path.resolve()
     try:
-        return str(resolved.relative_to(policy.workspace))
+        return str(resolved.relative_to(policy.browse_root))
     except ValueError:
         return str(resolved)
 

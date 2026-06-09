@@ -56,7 +56,11 @@ async def upload_skill(
         UploadedSkillFile(filename=file.filename or "", content=await file.read())
         for file in files
     ]
-    loader = SkillImportLoader(provider=provider, provider_config=provider_config)
+    loader = SkillImportLoader(
+        provider=provider,
+        provider_config=provider_config,
+        usage_store=getattr(runtime, "usage_store", None),
+    )
     with tempfile.TemporaryDirectory(prefix="newman-skill-upload-") as tmp:
         prepared_dir, report = await loader.prepare_upload(
             uploaded_files,

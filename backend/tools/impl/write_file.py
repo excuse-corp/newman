@@ -23,7 +23,7 @@ class WriteFileTool(BaseTool):
         self.workspace = self.policy.workspace
         self.meta = ToolMeta(
             name="write_file",
-            description="Create or overwrite a text file inside the workspace.",
+            description="Create or overwrite a text file inside the allowed writable paths.",
             input_schema={
                 "type": "object",
                 "properties": {

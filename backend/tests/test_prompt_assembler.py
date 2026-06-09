@@ -5,7 +5,12 @@ import unittest
 from pathlib import Path
 
 from backend.memory.stable_context import StableContextLoader
-from backend.runtime.prompt_assembler import COMMENTARY_SYSTEM_GUARDRAIL, USER_INPUT_SYSTEM_GUARDRAIL, PromptAssembler
+from backend.runtime.prompt_assembler import (
+    COMMENTARY_SYSTEM_GUARDRAIL,
+    TOOL_ACTION_SYSTEM_GUARDRAIL,
+    USER_INPUT_SYSTEM_GUARDRAIL,
+    PromptAssembler,
+)
 from backend.sessions.models import CheckpointRecord, SessionMessage, SessionRecord
 
 
@@ -24,6 +29,7 @@ class PromptAssemblerTests(unittest.TestCase):
 
             self.assertEqual(assembled[0]["role"], "system")
             self.assertTrue(assembled[0]["content"].startswith(COMMENTARY_SYSTEM_GUARDRAIL))
+            self.assertIn(TOOL_ACTION_SYSTEM_GUARDRAIL, assembled[0]["content"])
             self.assertIn(USER_INPUT_SYSTEM_GUARDRAIL, assembled[0]["content"])
             self.assertIn("# Newman", assembled[0]["content"])
             self.assertIn("当前处于 Default mode", assembled[0]["content"])

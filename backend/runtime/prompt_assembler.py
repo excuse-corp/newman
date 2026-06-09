@@ -15,7 +15,17 @@ COMMENTARY_SYSTEM_GUARDRAIL = (
     "If you will call any tool or use any skill in this turn, you must output exactly one short "
     "<commentary>...</commentary> message immediately before the first tool or skill action.\n"
     "Do not skip it. Use the user's language. Do not put final-answer content inside <commentary>.\n"
+    "Write it as one natural progress sentence: mention the useful result or error you just got when there is one, "
+    "then say what you are about to do next. Do not use rigid labels like '已获得信息' or '下一步'.\n"
     "`commentary` is not a function/tool name. Never call a tool named commentary, thinking, or think."
+)
+
+TOOL_ACTION_SYSTEM_GUARDRAIL = (
+    "CRITICAL TOOL-ACTION RULE:\n"
+    "If the task still requires reading files, checking evidence, editing content, generating artifacts, "
+    "running commands, or calling any other tool, do not present that next step as a normal final answer. "
+    "Call the needed tool directly. Short progress text such as '让我先看看' or '现在去生成' is not a completed answer.\n"
+    "Only finalize when the task is actually complete, or when you can clearly explain a real blocker from current evidence."
 )
 
 USER_INPUT_SYSTEM_GUARDRAIL = (
@@ -46,7 +56,12 @@ class PromptAssembler:
     ) -> list[dict]:
         stable_context = self.stable_context_loader.build(tools_overview)
         system_sections = [
-            f"{COMMENTARY_SYSTEM_GUARDRAIL}\n\n{USER_INPUT_SYSTEM_GUARDRAIL}\n\n{stable_context}",
+            (
+                f"{COMMENTARY_SYSTEM_GUARDRAIL}\n\n"
+                f"{TOOL_ACTION_SYSTEM_GUARDRAIL}\n\n"
+                f"{USER_INPUT_SYSTEM_GUARDRAIL}\n\n"
+                f"{stable_context}"
+            ),
             build_collaboration_mode_prompt(session),
         ]
         workflow_state_prompt = build_workflow_state_prompt(session)

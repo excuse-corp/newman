@@ -24,7 +24,7 @@ class SearchFilesTool(BaseTool):
         self.workspace = self.policy.workspace
         self.meta = ToolMeta(
             name=name,
-            description=description or "Search file contents in the workspace and return matching lines.",
+            description=description or "Search file contents in the allowed readable paths and return matching lines.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -129,6 +129,6 @@ def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
         SearchFilesTool(
             context.path_policy,
             name="grep",
-            description="Alias of search_files. Search file contents in the workspace and return matching lines.",
+            description="Alias of search_files. Search file contents in the allowed readable paths and return matching lines.",
         ),
     ]

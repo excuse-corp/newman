@@ -7,6 +7,7 @@ from typing import Literal
 from backend.providers.base import ProviderResponse
 from backend.runtime.workflow_state import (
     TURN_OUTCOME_ANSWERED,
+    TURN_OUTCOME_AWAITING_USER,
     TURN_OUTCOME_BLOCKED,
 )
 from backend.tools.result import ToolExecutionResult
@@ -18,10 +19,14 @@ MAX_RECOVERY_ATTEMPTS = 2
 MAX_FINALIZATION_ATTEMPTS = 1
 
 INCOMPLETE_ACTION_PATTERNS = (
+    re.compile(r"^\s*(?:老板|好的老板|收到|明白了)?[，,:：\s]*(?:让我|我先|我来|我继续|我会|我将).*(?:看看|查查|检查|确认|修复|处理|生成|制作|创建|执行|运行|调用)", re.I),
+    re.compile(r"(?:让我|我先|我来).*(?:重新生成|直接用|修复|处理|生成|制作|创建|执行|运行|调用)", re.I),
     re.compile(r"^\s*我(?:先|来|再|继续|会|将)?\s*.*(?:试试|看看|找找|查找|查询|确认|定位|检查|处理)", re.I),
     re.compile(r"^\s*(?:先|继续|接下来).*(?:试试|看看|找找|查找|查询|确认|定位|检查|处理)", re.I),
+    re.compile(r"(?:这次|现在|接下来|下一步).*?(?:我|我们)?.*?(?:重试|再试|执行|运行|调用|生成|传入|处理)", re.I),
+    re.compile(r"(?:我|我们)(?:会|将|准备|打算|需要).*?(?:重试|再试|执行|运行|调用|生成|传入|处理)", re.I),
     re.compile(r"允许的路径范围内.*(?:找|查|确认|定位)", re.I),
-    re.compile(r"^(?:I'?ll|I will|Let me|I can|I am going to)\s+.*(?:check|look|search|try|inspect|find)", re.I),
+    re.compile(r"^(?:I'?ll|I will|Let me|I can|I am going to)\s+.*(?:check|look|search|try|retry|run|execute|call|generate|inspect|find)", re.I),
 )
 
 COMPLETION_SIGNAL_PATTERNS = (
@@ -55,12 +60,16 @@ class TurnProgressState:
     def record_tool_result(self, result: ToolExecutionResult) -> None:
         self.tool_call_count += 1
         if result.success:
-            self.last_failure_tool = None
-            self.last_failure_summary = None
-            self.last_failure_frontend_message = None
-            self.has_unresolved_recoverable_failure = False
-            self.recoverable_recovery_attempts = 0
             self.finalization_attempts = 0
+            success_kind = _successful_result_kind(result)
+            if success_kind == "resolved":
+                self.last_failure_tool = None
+                self.last_failure_summary = None
+                self.last_failure_frontend_message = None
+                self.has_unresolved_recoverable_failure = False
+                self.recoverable_recovery_attempts = 0
+            elif success_kind == "progress":
+                self.recoverable_recovery_attempts = 0
             return
 
         self.last_failure_tool = result.tool
@@ -123,14 +132,13 @@ def decide_turn_step(response: ProviderResponse, progress: TurnProgressState) ->
 
     if progress.finalization_attempts < MAX_FINALIZATION_ATTEMPTS:
         progress.finalization_attempts += 1
-        progress.force_no_tools_next = True
         return TurnStepDecision(
             action="continue",
             reason=gate_reason,
             finish_reason=response.finish_reason,
             inject_instruction=build_finalization_instruction(progress, candidate),
             reset_visible_answer=True,
-            disable_tools_next=True,
+            disable_tools_next=False,
         )
 
     return TurnStepDecision(
@@ -198,12 +206,13 @@ def build_finalization_instruction(progress: TurnProgressState, rejected_answer:
     preface = "最近一次可恢复失败在多次恢复尝试后仍未形成结果。\n\n" if exhausted_recovery else ""
     return (
         f"{preface}你刚才的回复只是行动计划或未完成说明，不能作为最终回答。\n\n"
-        "不要再调用任何工具。请只基于当前上下文给用户一个明确收口：\n"
+        "如果还需要执行工具、修改文件、重新生成结果或补验证，请直接继续推进，不要把下一步计划当成最终回答。\n"
+        "如果现有上下文已经足够收口，请明确写出：\n"
         "1. 已经知道的结果是什么；\n"
         "2. 哪些工具或路径失败了；\n"
         "3. 是否因为权限、路径或上下文限制而无法继续；\n"
         "4. 用户下一步可以怎么做。\n\n"
-        "如果已知信息足以回答用户问题，直接回答；如果不足以完成任务，明确标为阻塞，不要说“我继续查找”。\n\n"
+        "如果仍未完成，就继续执行；如果确实无法继续，再明确标为阻塞，不要只说“我继续查找”。\n\n"
         f"被拦截的回复：{rejected}\n\n"
         f"最近一次工具失败：\n{failure_block}"
     )
@@ -231,3 +240,15 @@ def _has_completion_signal(text: str) -> bool:
     if len(text) >= 80:
         return True
     return any(pattern.search(text) for pattern in COMPLETION_SIGNAL_PATTERNS)
+
+
+def _successful_result_kind(result: ToolExecutionResult) -> Literal["diagnostic", "progress", "resolved"]:
+    if str(result.metadata.get("turn_outcome") or "").strip() == TURN_OUTCOME_AWAITING_USER:
+        return "resolved"
+    if result.metadata.get("output_files"):
+        return "resolved"
+    if result.tool in {"write_file", "edit_file"}:
+        return "progress"
+    if result.tool == "terminal" and any(result.metadata.get(key) is not None for key in ("path", "created", "bytes", "content_type")):
+        return "progress"
+    return "diagnostic"

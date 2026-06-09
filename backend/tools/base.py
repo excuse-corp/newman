@@ -17,7 +17,7 @@ class ToolMeta:
     description: str
     input_schema: dict[str, Any]
     risk_level: Literal["low", "medium", "high", "critical"]
-    timeout_seconds: int
+    timeout_seconds: int | None
     approval_behavior: ApprovalBehavior = "safe"
     force_user_confirmation: bool = False
     requires_approval: bool | None = None

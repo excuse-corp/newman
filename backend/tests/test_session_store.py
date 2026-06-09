@@ -64,6 +64,41 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(renamed.title, "new title")
             self.assertEqual(store.get(session.session_id).title, "new title")
 
+    def test_list_hides_subagent_sessions_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            parent = store.create(title="parent")
+            child = SessionRecord(
+                session_id="child-session",
+                title="child",
+                metadata={"subagent": True, "parent_session_id": parent.session_id},
+            )
+            store.save(child)
+
+            summaries = store.list()
+            all_records = store.list_records(include_subagents=True)
+
+            self.assertEqual([item.session_id for item in summaries], [parent.session_id])
+            self.assertEqual({item.session_id for item in all_records}, {parent.session_id, child.session_id})
+
+    def test_delete_parent_deletes_child_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            parent = store.create(title="parent")
+            child = SessionRecord(
+                session_id="child-session",
+                title="child",
+                metadata={"subagent": True, "parent_session_id": parent.session_id},
+            )
+            store.save(child)
+
+            store.delete(parent.session_id)
+
+            with self.assertRaises(FileNotFoundError):
+                store.get(parent.session_id)
+            with self.assertRaises(FileNotFoundError):
+                store.get(child.session_id)
+
 
 if __name__ == "__main__":
     unittest.main()

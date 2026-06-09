@@ -251,13 +251,32 @@ def _http_error(provider: str, exc: httpx.HTTPStatusError) -> ProviderError:
 
 
 def _response_error_details(response: httpx.Response) -> dict[str, Any]:
+    details = _rate_limit_header_details(response.headers)
     try:
         text = response.text.strip()
     except httpx.ResponseNotRead:
-        return {}
-    if not text:
-        return {}
-    return {"response_text": text[:2_000]}
+        return details
+    if text:
+        details["response_text"] = text[:2_000]
+    return details
+
+
+def _rate_limit_header_details(headers: httpx.Headers) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    rate_limit_headers: dict[str, str] = {}
+    for key, value in headers.items():
+        normalized = key.lower()
+        if normalized == "retry-after":
+            details["retry_after"] = value
+            try:
+                details["retry_after_seconds"] = max(0.0, float(value.strip()))
+            except ValueError:
+                pass
+        if normalized.startswith("x-ratelimit-"):
+            rate_limit_headers[normalized] = value
+    if rate_limit_headers:
+        details["rate_limit_headers"] = rate_limit_headers
+    return details
 
 
 async def _consume_error_response(response: httpx.Response) -> None:

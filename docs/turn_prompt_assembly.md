@@ -116,17 +116,24 @@ tools = registry.tools_for_provider(permission_context)
 
 ## 3. 第一大块：System Block 0
 
-这是每次请求一定会出现的第一条 `system` message。它的内容不是单一文件，而是两层内容拼在一起：
+这是每次请求一定会出现的第一条 `system` message。它的内容不是单一文件，而是四层内容拼在一起：
 
 1. Commentary guardrail
-2. Stable Context
+2. Tool-action guardrail
+3. User-input guardrail
+4. Stable Context
 
 代码上是：
 
 ```python
 messages = [{
   "role": "system",
-  "content": f"{COMMENTARY_SYSTEM_GUARDRAIL}\\n\\n{stable_context}"
+  "content": (
+    f"{COMMENTARY_SYSTEM_GUARDRAIL}\\n\\n"
+    f"{TOOL_ACTION_SYSTEM_GUARDRAIL}\\n\\n"
+    f"{USER_INPUT_SYSTEM_GUARDRAIL}\\n\\n"
+    f"{stable_context}"
+  )
 }]
 ```
 
@@ -144,7 +151,28 @@ Do not skip it. Use the user's language. Do not put final-answer content inside 
 
 这段 guardrail 会被直接放在 system prompt 最前面。
 
-### 3.2 Stable Context
+### 3.2 Tool-action guardrail
+
+这是一段固定英文规则，用来防止模型把“下一步准备做什么”误写成最终回答。
+
+核心约束是：
+
+- 只要任务还需要读文件、查证据、改内容、生成产物、跑命令或继续调用工具，就不要把这一步写成普通最终回答
+- `让我先看看`、`现在去生成` 这类短句不是完成态
+- 只有任务真的完成，或者已经能基于现有证据明确说明真实阻塞点时，才允许 finalize
+
+这段 guardrail 是运行时直接注入的，不依赖 `backend_data/memory/Newman.md` 是否已经同步到最新模板。
+
+### 3.3 User-input guardrail
+
+这段固定英文规则约束模型：凡是后续必须等待用户确认、选择、审批、补信息，必须调用 `request_user_input`，不能用普通最终回答来提问。
+
+它还补充了两个具体要求：
+
+- 已知选项要尽量放进结构化 `options`
+- 让用户审批或修改某个预览时，预览正文要放进工具参数里的 `content`
+
+### 3.4 Stable Context
 
 `stable_context` 由下面内容按顺序拼起来，中间用两个换行分隔：
 
@@ -172,9 +200,9 @@ Do not skip it. Use the user's language. Do not put final-answer content inside 
 {tools_overview}
 ```
 
-### 3.3 这些稳定上下文段分别是什么
+### 3.5 这些稳定上下文段分别是什么
 
-#### 3.3.1 `Newman.md`
+#### 3.5.1 `Newman.md`
 
 这里注入的是整个 [backend_data/memory/Newman.md](/root/newman/backend_data/memory/Newman.md) 文件全文，不是摘要。
 
@@ -191,7 +219,7 @@ Do not skip it. Use the user's language. Do not put final-answer content inside 
 
 也就是说，模型每次开局都会重新看到这些平台级规则。
 
-#### 3.3.2 `USER.md`
+#### 3.5.2 `USER.md`
 
 这里注入的是整个 [backend_data/memory/USER.md](/root/newman/backend_data/memory/USER.md) 文件全文。
 
@@ -208,13 +236,13 @@ Do not skip it. Use the user's language. Do not put final-answer content inside 
 <!-- END AUTO USER MEMORY -->
 ```
 
-#### 3.3.3 `MEMORY.md`
+#### 3.5.3 `MEMORY.md`
 
 这里注入的是整个 [backend_data/memory/MEMORY.md](/root/newman/backend_data/memory/MEMORY.md) 文件全文。
 
 它用于保存 Newman 通过自进化自动沉淀的跨 session 经验，例如工作流经验、错误恢复经验、工具使用经验和完成标准。它不是 session 流水账，也不存放一次性项目事实。
 
-#### 3.3.4 `SKILLS_SNAPSHOT.md`
+#### 3.5.4 `SKILLS_SNAPSHOT.md`
 
 这里注入的是整个 [backend_data/memory/SKILLS_SNAPSHOT.md](/root/newman/backend_data/memory/SKILLS_SNAPSHOT.md) 文件全文。
 
@@ -233,11 +261,11 @@ A skill is a set of local instructions stored in a `SKILL.md` file. Below is the
 - Do not read multiple skills up front unless the user explicitly asks for a comparison.
 ```
 
-#### 3.3.5 `TOOLS_SNAPSHOT.md`
+#### 3.5.5 `TOOLS_SNAPSHOT.md`
 
 这里注入的是当前工具快照文件，用于让模型看到工具清单的稳定摘要。具体路径和权限仍以运行时工具 schema 与工具规格为准。
 
-#### 3.3.6 `Tooling Overview`
+#### 3.5.6 `Tooling Overview`
 
 这是一个纯文本工具总览，不是工具 schema 本体。作用是让模型在 system prompt 里知道“有哪些工具、它们大致做什么”。
 

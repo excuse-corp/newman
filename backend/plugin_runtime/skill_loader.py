@@ -14,6 +14,8 @@ import yaml
 
 from backend.config.schema import ModelConfig
 from backend.providers.base import BaseProvider
+from backend.usage.recorder import ModelRequestContext, record_model_usage
+from backend.usage.store import PostgresModelUsageStore
 
 
 ALLOWED_UPLOAD_SUFFIXES = {".md", ".py", ".jpg", ".jpeg", ".png"}
@@ -71,9 +73,15 @@ class SkillImportReport:
 class SkillImportLoader:
     """Normalize uploaded files into a Newman-compatible skill directory."""
 
-    def __init__(self, provider: BaseProvider | None = None, provider_config: ModelConfig | None = None):
+    def __init__(
+        self,
+        provider: BaseProvider | None = None,
+        provider_config: ModelConfig | None = None,
+        usage_store: PostgresModelUsageStore | None = None,
+    ):
         self.provider = provider
         self.provider_config = provider_config
+        self.usage_store = usage_store
 
     async def prepare_upload(
         self,
@@ -168,6 +176,21 @@ class SkillImportLoader:
                 tools=[],
                 temperature=0.1,
                 max_tokens=2200,
+            )
+            record_model_usage(
+                self.usage_store,
+                ModelRequestContext(
+                    request_kind="skill_upload_optimization",
+                    model_config=self.provider_config,
+                    provider_type=self.provider_config.type,
+                    streaming=False,
+                    counts_toward_context_window=False,
+                    metadata={
+                        "resource_count": len(inventory),
+                        "current_skill_chars": len(content),
+                    },
+                ),
+                response,
             )
             payload = _parse_llm_json_object(response.content)
             frontmatter, body = _split_frontmatter(content)

@@ -34,6 +34,16 @@ runtime:
   tool_retry_backoff_seconds: 1.0
   provider_retry_attempts: 3
   provider_retry_backoff_seconds: 1.0
+  provider_max_concurrent_requests: 1
+  provider_min_interval_seconds: 0.0
+
+subagents:
+  enabled: true
+  max_agents_per_run: 5
+  max_parallel_agents: 5
+  default_max_turns: 200
+  lock_wait_timeout_seconds: 30
+  sequential_context_token_limit: 2000
 
 evolution:
   enabled: true
@@ -97,10 +107,13 @@ channels:
 
 paths:
   workspace: "."
+  browse_root: "."
+  output_root: "outputs/chat"
   data_dir: "backend_data"
   sessions_dir: "backend_data/sessions"
   memory_dir: "backend_data/memory"
   audit_dir: "backend_data/audit"
+  subagents_dir: "backend_data/subagents"
   knowledge_dir: "backend_data/knowledge"
   chroma_dir: "backend_data/chroma"
   plugins_dir: "plugins"
@@ -301,6 +314,8 @@ def _resolve_paths(config: AppConfig, project_root: Path) -> AppConfig:
     data = config.model_dump()
     paths = data["paths"]
     for name, raw_path in list(paths.items()):
+        if raw_path is None:
+            continue
         path = Path(raw_path)
         if not path.is_absolute():
             paths[name] = str((project_root / path).resolve())
@@ -373,6 +388,7 @@ def get_settings(project_root: str | None = None) -> AppConfig:
         settings.paths.sessions_dir,
         settings.paths.memory_dir,
         settings.paths.audit_dir,
+        settings.paths.subagents_dir,
         settings.paths.plugins_dir,
         settings.paths.skills_dir,
         settings.paths.mcp_dir,

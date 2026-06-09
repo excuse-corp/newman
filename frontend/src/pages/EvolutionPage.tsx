@@ -239,7 +239,7 @@ export default function EvolutionPage({ apiBase }: EvolutionPageProps) {
           ) : null}
 
           {!detailLoading && selectedRun ? (
-            <>
+            <div className="evolution-detail-body">
               <div className="evolution-detail-summary">
                 <div>
                   <span>状态</span>
@@ -260,7 +260,7 @@ export default function EvolutionPage({ apiBase }: EvolutionPageProps) {
               </div>
 
               <div className="evolution-detail-actions">
-                <span>来源 session：{selectedRun.source_session_id ?? "暂无"}</span>
+                <span className="evolution-detail-source">来源 session：{selectedRun.source_session_id ?? "暂无"}</span>
                 <button
                   type="button"
                   className="evolution-button danger"
@@ -279,7 +279,7 @@ export default function EvolutionPage({ apiBase }: EvolutionPageProps) {
                 </div>
               ) : null}
 
-              <div className="evolution-change-list">
+              <div className={`evolution-change-list ${selectedRun.changes.length === 0 ? "empty-state" : ""}`}>
                 {selectedRun.changes.length === 0 ? <div className="evolution-empty">这次运行没有产生文件变更。</div> : null}
                 {selectedRun.changes.map((change) => (
                   <article className="evolution-change" key={change.change_id}>
@@ -304,11 +304,10 @@ export default function EvolutionPage({ apiBase }: EvolutionPageProps) {
                   </article>
                 ))}
               </div>
-            </>
+            </div>
           ) : null}
         </section>
       </div>
     </section>
   )
 }
-

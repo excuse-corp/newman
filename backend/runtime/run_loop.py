@@ -29,6 +29,7 @@ from backend.plugin_runtime.service import PluginService
 from backend.providers.base import ProviderError, ProviderResponse, TokenUsage, ToolCall, ToolCallDelta
 from backend.providers.multimodal import MultimodalAnalyzer
 from backend.providers.factory import build_provider
+from backend.providers.limited import LimitedProvider
 from backend.runtime.collaboration_mode import (
     PLAN_COLLABORATION_MODE,
     get_collaboration_mode,
@@ -48,7 +49,7 @@ from backend.runtime.prompt_assembler import PromptAssembler
 from backend.runtime.result_normalizer import normalize_result
 from backend.runtime.session_task import SessionTask
 from backend.runtime.thinking_parser import ThinkTagStreamParser
-from backend.runtime.turn_completion import TurnStepDecision, decide_turn_step
+from backend.runtime.turn_completion import TurnStepDecision, build_blocked_fallback, decide_turn_step, final_candidate_from_response
 from backend.runtime.thread_manager import ThreadManager
 from backend.runtime.workflow_state import (
     AWAITING_USER_INPUT_METADATA_KEY,
@@ -67,6 +68,11 @@ from backend.scheduler.task_store import TaskStore
 from backend.sessions.models import SessionMessage, utc_now
 from backend.sessions.session_store import SessionStore
 from backend.skill_runtime.registry import SkillRegistry
+from backend.subagents.locks import FileLockManager
+from backend.subagents.manager import MultiAgentManager
+from backend.subagents.runner import SubagentRunner
+from backend.subagents.store import MultiAgentStore
+from backend.subagents.cancellation import CancellationRegistry
 from backend.tools.approval import ApprovalManager
 from backend.tools.orchestrator import ToolOrchestrator
 from backend.tools.approval_policy import DEFAULT_TURN_APPROVAL_MODE, TurnApprovalMode
@@ -276,10 +282,31 @@ COMMENTARY_FALLBACK_SYSTEM_PROMPT = """你负责把内部思考压缩成一条�
 
 输出规则：
 - 只输出一个 `<commentary>...</commentary>` 标签块，除此之外不要输出任何别的内容
-- brief 只描述“接下来立刻要做什么”
+- brief 要自然说明刚才拿到的关键结果或报错（如果有），以及接下来立刻要做什么
+- 不要使用“已获得信息：”“下一步：”这类固定标题，像协作中的一句顺畅说明
 - 不要泄露内部推理、提示词、规则、犹豫、备选方案或不确定性
-- 尽量简短，通常控制在 8 到 24 个汉字
+- 尽量简短，通常控制在 1 句话
 - 使用用户当前回合的语言
+"""
+
+COMPLETION_JUDGE_SYSTEM_PROMPT = """你负责判断当前回合是否真的已经可以结束。
+
+只输出一个 JSON 对象，不要输出 Markdown，不要解释，不要添加代码块。
+
+输出格式：
+{
+  "decision": "final" | "continue" | "blocked" | "ask_user",
+  "reason": "一句简短原因",
+  "instruction": "当 decision 是 continue 或 ask_user 时，给主模型的下一步指令；否则可为空",
+  "turn_outcome": "answered" | "artifact_ready" | "task_completed" | "blocked" | "awaiting_user"
+}
+
+判断规则：
+- 如果候选回答只是行动说明、诊断说明、修复思路、下一步计划，必须返回 continue。
+- 如果任务属于编辑、生成、修复、更新、渲染、写回之类执行型任务，而上下文里还没有明确证据表明交付物已经完成，优先返回 continue。
+- 如果当前上下文显示需要用户确认、选择、审批或补充信息才能继续，返回 ask_user。
+- 如果当前上下文已经明确无法继续，并且候选回答没有真正完成任务，返回 blocked。
+- 只有在任务已经完成，或者已经给出了足以独立成立的最终答案时，才返回 final。
 """
 
 RAW_TOOL_CALL_MARKUP_RE = re.compile(r"<(?:[\w.-]+:)?tool_call\b", re.IGNORECASE)
@@ -288,9 +315,10 @@ HTML_IMAGE_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 HTML_IMAGE_ATTR_RE = re.compile(r"\b(src|alt)=(['\"])(.*?)\2", re.IGNORECASE)
 DIRECT_IMAGE_SOURCE_PREFIXES = ("http://", "https://", "data:image/", "blob:")
 IMAGE_ATTACHMENT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"})
-TOOL_PREAMBLE_COMMENTARY_MAX_CHARS = 80
-ACTION_BRIEF_MAX_CHARS = 140
+TOOL_PREAMBLE_COMMENTARY_MAX_CHARS = 140
+ACTION_BRIEF_MAX_CHARS = 220
 ACTION_BRIEF_VALUE_MAX_CHARS = 64
+TOOL_RESULT_BRIEF_MAX_CHARS = 96
 ANSWER_DEFER_RELEASE_CHARS = 96
 STRUCTURED_ANSWER_DEFER_RELEASE_CHARS = 360
 TOOL_ARGUMENT_PROGRESS_EMIT_BYTES = 2_048
@@ -301,6 +329,24 @@ PSEUDO_TOOL_NAMES = frozenset({"commentary", "thinking", "think"})
 PLAN_TOOL_NAMES = frozenset({"enter_plan_mode", "update_plan"})
 MAX_INVALID_TOOL_CALL_RECOVERY_ATTEMPTS = 1
 PLAN_TOOL_INVALID_CALL_RECOVERY_ATTEMPTS = 2
+COMPLETION_JUDGE_DECISIONS = frozenset({"final", "continue", "blocked", "ask_user"})
+COMPLETION_JUDGE_OUTCOMES = frozenset(
+    {
+        TURN_OUTCOME_ANSWERED,
+        TURN_OUTCOME_ARTIFACT_READY,
+        TURN_OUTCOME_TASK_COMPLETED,
+        TURN_OUTCOME_BLOCKED,
+        TURN_OUTCOME_AWAITING_USER,
+    }
+)
+EXECUTION_TASK_ACTION_RE = re.compile(
+    r"(?:修改|更新|编辑|生成|创建|制作|渲染|写回|导出|插入|新增|添加|追加|替换|修复|继续完成|加入|实现|输出|产出|做一页|做个|做一个|build|generate|render|create|update|edit|fix|insert|append|export|write back|produce|implement|complete)",
+    re.I,
+)
+EXECUTION_TASK_TARGET_RE = re.compile(
+    r"(?:pptx?|excel|xlsx|csv|word|docx|html|json|md|png|jpg|jpeg|gif|svg|pdf|网页|页面|图片|图像|图|文件|脚本|幻灯片|表格|图表|架构图|第三章|附件)",
+    re.I,
+)
 ATTACHMENT_FIRST_REPLY_BLOCKED_TOOLS = frozenset(
     {
         "read_file",
@@ -332,10 +378,14 @@ def _compact_tool_event_output_preview(value: str) -> str:
 
 
 def _build_tool_event_output_preview(result: ToolExecutionResult) -> str:
+    output = _build_tool_message_output(result)
+    if output.strip():
+        return _compact_tool_event_output_preview(output)
+
     for candidate in (result.frontend_message, result.summary):
         if candidate and candidate.strip():
             return _compact_tool_event_output_preview(candidate)
-    return _compact_tool_event_output_preview(_build_tool_message_output(result))
+    return ""
 
 
 def _format_compact_bytes(value: int) -> str:
@@ -365,6 +415,10 @@ def _compact_action_value(value: object, max_chars: int = ACTION_BRIEF_VALUE_MAX
     if len(normalized) <= max_chars:
         return normalized
     return f"{normalized[: max_chars - 1]}…"
+
+
+def _compact_tool_result_brief(value: object) -> str:
+    return _compact_action_value(value, TOOL_RESULT_BRIEF_MAX_CHARS)
 
 
 def _read_action_argument(arguments: dict[str, object], *keys: str) -> str | None:
@@ -473,6 +527,34 @@ def _format_action_url(raw_url: str | None) -> str | None:
 
 def _brief_prefix_for_task(task: SessionTask) -> str:
     return "我继续" if task.tool_depth > 0 else "我先"
+
+
+def _last_tool_result_brief_for_task(task: SessionTask) -> str:
+    for message in reversed(task.session.messages):
+        if message.role != "tool":
+            continue
+        if task.turn_id and message.metadata.get("turn_id") != task.turn_id:
+            continue
+        tool = str(message.metadata.get("tool") or "工具")
+        success = message.metadata.get("success")
+        frontend_message = message.metadata.get("frontend_message")
+        summary = message.metadata.get("summary")
+        raw_detail = frontend_message or summary or message.content
+        detail = _compact_tool_result_brief(raw_detail)
+        if success is False:
+            return f"刚才 {tool} 没成功" + (f"：{detail}" if detail else "")
+        if detail:
+            return f"刚才 {tool} {detail}"
+        return f"刚才 {tool} 已执行完成"
+    return ""
+
+
+def _compose_action_brief(task: SessionTask, next_action: str) -> str:
+    previous = _last_tool_result_brief_for_task(task)
+    next_action = next_action.strip()
+    if not previous:
+        return next_action
+    return f"{previous}，接下来{next_action}"
 
 
 def _build_single_tool_action_brief(tool_call: ToolCall, prefix: str, task: SessionTask) -> str:
@@ -696,7 +778,11 @@ def _schema_placeholder(schema: object) -> object:
 class NewmanRuntime:
     def __init__(self, settings: AppConfig):
         self.settings = settings
-        self.provider = build_provider(settings.provider)
+        self.provider = LimitedProvider(
+            build_provider(settings.provider),
+            max_concurrent_requests=settings.runtime.provider_max_concurrent_requests,
+            min_interval_seconds=settings.runtime.provider_min_interval_seconds,
+        )
         self.usage_store = PostgresModelUsageStore(settings.postgres_dsn)
         self.multimodal_analyzer = MultimodalAnalyzer(settings.models.multimodal, self.usage_store)
         self.session_store = SessionStore(settings.paths.sessions_dir)
@@ -728,6 +814,29 @@ class NewmanRuntime:
         self.hook_manager = HookManager(self.plugin_service)
         self.mcp_registry = MCPRegistry(settings.paths.mcp_dir / "servers.yaml", workspace=settings.paths.workspace)
         self.scheduler_store = TaskStore(settings.paths.scheduler_dir / "tasks.json")
+        self.subagent_store = MultiAgentStore(settings.paths.subagents_dir)
+        self.subagent_file_locks = FileLockManager()
+        self.subagent_cancellations = CancellationRegistry()
+        self.subagent_runner = SubagentRunner(
+            settings,
+            self.provider,
+            self.session_store,
+            self.subagent_store,
+            usage_store=self.usage_store,
+            registry_provider=lambda: self.registry,
+            router_provider=lambda: self.router,
+            orchestrator_provider=lambda: self.orchestrator,
+            lock_manager=self.subagent_file_locks,
+            cancellation_registry=self.subagent_cancellations,
+        )
+        self.subagent_manager = MultiAgentManager(
+            settings,
+            self.subagent_store,
+            tool_names_provider=self._registered_tool_names,
+            skill_names_provider=self._registered_skill_names,
+            runner=self.subagent_runner,
+            cancellation_registry=self.subagent_cancellations,
+        )
         self.registry = ToolRegistry()
         self.router = ToolRouter(self.registry, settings)
         self.orchestrator = ToolOrchestrator(settings, self.approvals)
@@ -818,7 +927,7 @@ class NewmanRuntime:
 
     def _workspace_access_overview(self, task: SessionTask | None = None) -> str:
         policy = build_path_access_policy(self.settings)
-        output_root = output_root_dir(policy.workspace)
+        output_root = output_root_dir(policy.output_root)
         current_output_dir = self._current_turn_output_dir(task) if task is not None else None
         paths = getattr(self.settings, "paths", None)
         raw_data_dir = getattr(paths, "data_dir", policy.workspace.parent / "backend_data")
@@ -836,7 +945,8 @@ class NewmanRuntime:
         return "\n".join(
             [
                 "## Workspace Access",
-                f"Runtime workspace (primary operation space): {policy.workspace}",
+                f"Runtime workspace (operation space): {policy.workspace}",
+                f"Default browse root for relative tool paths: {policy.browse_root}",
                 *output_lines,
                 "",
                 "Runtime logs (read-only when permitted by configuration):",
@@ -865,7 +975,8 @@ class NewmanRuntime:
     def _current_turn_output_dir(self, task: SessionTask | None) -> Path | None:
         if task is None or not task.turn_id:
             return None
-        return turn_output_dir(self.settings.paths.workspace, task.session.session_id, task.turn_id)
+        policy = build_path_access_policy(self.settings)
+        return turn_output_dir(policy.output_root, task.session.session_id, task.turn_id)
 
     def schedule_previous_session_extraction(self, exclude_session_id: str) -> dict[str, object]:
         return self.schedule_previous_session_evolution(exclude_session_id)
@@ -993,6 +1104,7 @@ class NewmanRuntime:
             multimodal_analyzer=self.multimodal_analyzer,
             scheduler_store=self.scheduler_store,
             mcp_registry=self.mcp_registry,
+            subagent_manager=self.subagent_manager,
         )
         tool_context = self.tool_context
         registry = ToolRegistry()
@@ -1001,6 +1113,28 @@ class NewmanRuntime:
         for tool in self.mcp_registry.build_tools(self.plugin_service.mcp_server_configs()):
             registry.register(tool)
         return registry
+
+    def _registered_tool_names(self) -> set[str]:
+        registry = getattr(self, "registry", None)
+        if registry is None:
+            return set()
+        return {tool.meta.name for tool in registry.list_tools()}
+
+    def _registered_skill_names(self) -> set[str]:
+        skill_registry = getattr(self, "skill_registry", None)
+        list_skills = getattr(skill_registry, "list_skills", None)
+        if not callable(list_skills):
+            return set()
+        try:
+            skills = list_skills()
+        except Exception:
+            return set()
+        names: set[str] = set()
+        for skill in skills:
+            name = getattr(skill, "name", None)
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+        return names
 
     async def handle_message(
         self,
@@ -1107,6 +1241,13 @@ class NewmanRuntime:
             )
 
             decision = decide_turn_step(response, task.progress)
+            if not response.tool_calls and decision.action == "finalize":
+                decision = await self._apply_completion_judge(
+                    task,
+                    response,
+                    decision,
+                    provider_tools=provider_tools,
+                )
 
             if decision.action == "continue" and not response.tool_calls:
                 await self._handle_completion_gate_continue(
@@ -2039,8 +2180,10 @@ class NewmanRuntime:
             return ""
         prefix = _brief_prefix_for_task(task)
         if len(response.tool_calls) == 1:
-            return _compact_action_brief(_build_single_tool_action_brief(response.tool_calls[0], prefix, task))
-        return _compact_action_brief(_build_multi_tool_action_brief(response.tool_calls, prefix))
+            next_action = _build_single_tool_action_brief(response.tool_calls[0], prefix, task)
+        else:
+            next_action = _build_multi_tool_action_brief(response.tool_calls, prefix)
+        return _compact_action_brief(_compose_action_brief(task, next_action))
 
     async def _handle_completion_gate_continue(
         self,
@@ -2272,6 +2415,7 @@ class NewmanRuntime:
 
         user_content = self._current_turn_user_content(task.session, task.turn_id)
         tool_names = ", ".join(tool_call.name for tool_call in response.tool_calls) or "无"
+        previous_tool_result = _last_tool_result_brief_for_task(task) or "（无）"
         messages = [
             {"role": "system", "content": COMMENTARY_FALLBACK_SYSTEM_PROMPT},
             {
@@ -2279,6 +2423,7 @@ class NewmanRuntime:
                 "content": (
                     "请基于下面的信息生成一句工具调用前的 brief。\n\n"
                     f"用户请求：\n{user_content or '（未找到）'}\n\n"
+                    f"上一工具结果：\n{previous_tool_result}\n\n"
                     f"即将执行的工具：\n{tool_names}\n\n"
                     f"内部思考：\n{thinking_excerpt}"
                 ),
@@ -2311,6 +2456,273 @@ class NewmanRuntime:
         commentary, answer = self._parse_response_text(fallback.content)
         brief = commentary.strip() or answer.strip()
         return self._sanitize_commentary_brief(brief)
+
+    def _looks_like_execution_task_request(self, text: str) -> bool:
+        normalized = (text or "").strip()
+        if not normalized:
+            return False
+        return bool(
+            EXECUTION_TASK_ACTION_RE.search(normalized)
+            and EXECUTION_TASK_TARGET_RE.search(normalized)
+        )
+
+    def _candidate_has_resolved_attachment_reference(self, candidate: str) -> bool:
+        for source, _alt_text in _extract_assistant_image_references(candidate):
+            if self._resolve_assistant_image_path(source) is not None:
+                return True
+        return False
+
+    def _should_run_completion_judge(
+        self,
+        task: SessionTask,
+        response: ProviderResponse,
+        decision: TurnStepDecision,
+    ) -> bool:
+        if decision.action != "finalize" or response.tool_calls:
+            return False
+        user_content = self._current_turn_user_content(task.session, task.turn_id)
+        if not self._looks_like_execution_task_request(user_content):
+            return False
+        candidate = (decision.final_content or final_candidate_from_response(response)).strip()
+        if self._current_turn_output_artifacts(task, limit=1):
+            return False
+        if self._candidate_has_resolved_attachment_reference(candidate):
+            return False
+        return True
+
+    def _current_turn_tool_result_summaries(self, task: SessionTask, *, limit: int = 8) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        for message in reversed(task.session.messages):
+            if message.role != "tool":
+                continue
+            metadata = message.metadata if isinstance(message.metadata, dict) else {}
+            if metadata.get("turn_id") != task.turn_id:
+                continue
+            entry: dict[str, object] = {
+                "tool": metadata.get("tool"),
+                "success": metadata.get("success"),
+                "category": metadata.get("category"),
+                "summary": metadata.get("summary"),
+                "frontend_message": metadata.get("frontend_message"),
+                "recovery_class": metadata.get("recovery_class"),
+            }
+            output_files = metadata.get("output_files")
+            if isinstance(output_files, list) and output_files:
+                entry["output_files"] = [
+                    {
+                        "path": item.get("path"),
+                        "summary": item.get("summary"),
+                        "created": item.get("created"),
+                    }
+                    for item in output_files[:3]
+                    if isinstance(item, dict)
+                ]
+            items.append(entry)
+            if len(items) >= limit:
+                break
+        items.reverse()
+        return items
+
+    def _current_turn_output_artifacts(self, task: SessionTask, *, limit: int = 6) -> list[dict[str, object]]:
+        artifacts: list[dict[str, object]] = []
+        for message in reversed(task.session.messages):
+            if message.role != "tool":
+                continue
+            metadata = message.metadata if isinstance(message.metadata, dict) else {}
+            if metadata.get("turn_id") != task.turn_id:
+                continue
+            output_files = metadata.get("output_files")
+            if not isinstance(output_files, list):
+                continue
+            for item in output_files:
+                if not isinstance(item, dict):
+                    continue
+                artifacts.append(
+                    {
+                        "tool": metadata.get("tool"),
+                        "path": item.get("path"),
+                        "summary": item.get("summary"),
+                        "created": item.get("created"),
+                        "content_type": item.get("content_type"),
+                    }
+                )
+                if len(artifacts) >= limit:
+                    artifacts.reverse()
+                    return artifacts
+        artifacts.reverse()
+        return artifacts
+
+    def _completion_judge_fallback_instruction(self, candidate: str) -> str:
+        rejected = candidate.strip() or "（空）"
+        return (
+            "当前任务还没有可靠收口，不要把诊断说明或下一步计划当成最终回答。\n\n"
+            "如果任务尚未完成，请继续调用完成任务所需的工具，并在得到可验证结果后再回答用户；"
+            "如果确实无法继续，请明确说明真实阻塞点。\n\n"
+            f"刚才被拦下的候选回答：{rejected}"
+        )
+
+    def _parse_completion_judge_payload(self, text: str) -> dict[str, object] | None:
+        candidate = text.strip()
+        if not candidate:
+            return None
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate, count=1, flags=re.I)
+            candidate = re.sub(r"\s*```$", "", candidate, count=1)
+        try:
+            parsed = json.loads(candidate)
+        except JSONDecodeError:
+            match = re.search(r"\{.*\}", candidate, re.S)
+            if match is None:
+                return None
+            try:
+                parsed = json.loads(match.group(0))
+            except JSONDecodeError:
+                return None
+        if not isinstance(parsed, dict):
+            return None
+        return parsed
+
+    async def _run_completion_judge(
+        self,
+        task: SessionTask,
+        response: ProviderResponse,
+        decision: TurnStepDecision,
+        *,
+        provider_tools: list[dict[str, object]],
+    ) -> dict[str, object] | None:
+        candidate = (decision.final_content or final_candidate_from_response(response)).strip()
+        available_tools = sorted(_provider_tool_schema_names(provider_tools))
+        payload = {
+            "user_request": self._current_turn_user_content(task.session, task.turn_id),
+            "candidate_answer": candidate,
+            "tool_call_count_this_turn": task.progress.tool_call_count,
+            "has_unresolved_recoverable_failure": task.progress.has_unresolved_recoverable_failure,
+            "tool_results": self._current_turn_tool_result_summaries(task),
+            "artifacts": self._current_turn_output_artifacts(task),
+            "available_tools": available_tools,
+        }
+        messages = [
+            {"role": "system", "content": COMPLETION_JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
+        ]
+        try:
+            judge_response = await self.provider.chat(messages, tools=[])
+        except ProviderError:
+            return None
+
+        record_model_usage(
+            self.usage_store,
+            ModelRequestContext(
+                request_kind="completion_judge",
+                model_config=self.settings.provider,
+                provider_type=self.settings.provider.type,
+                streaming=False,
+                counts_toward_context_window=False,
+                session_id=task.session.session_id,
+                turn_id=task.turn_id,
+                metadata={
+                    "candidate_length": len(candidate),
+                    "tool_call_count_this_turn": task.progress.tool_call_count,
+                    "has_unresolved_recoverable_failure": task.progress.has_unresolved_recoverable_failure,
+                    "available_tool_count": len(available_tools),
+                },
+            ),
+            judge_response,
+        )
+
+        commentary, answer = self._parse_response_text(judge_response.content)
+        parsed = self._parse_completion_judge_payload(answer or commentary or judge_response.content)
+        if parsed is None:
+            return None
+        return parsed
+
+    async def _apply_completion_judge(
+        self,
+        task: SessionTask,
+        response: ProviderResponse,
+        decision: TurnStepDecision,
+        *,
+        provider_tools: list[dict[str, object]],
+    ) -> TurnStepDecision:
+        if not self._should_run_completion_judge(task, response, decision):
+            return decision
+
+        candidate = (decision.final_content or final_candidate_from_response(response)).strip()
+        parsed = await self._run_completion_judge(
+            task,
+            response,
+            decision,
+            provider_tools=provider_tools,
+        )
+        if parsed is None:
+            return TurnStepDecision(
+                action="continue",
+                reason="llm_completion_judge_unavailable",
+                finish_reason=response.finish_reason,
+                inject_instruction=self._completion_judge_fallback_instruction(candidate),
+                reset_visible_answer=True,
+                disable_tools_next=False,
+            )
+
+        raw_decision = str(parsed.get("decision") or "").strip().lower()
+        reason = str(parsed.get("reason") or "").strip() or "llm_completion_judge"
+        instruction = str(parsed.get("instruction") or "").strip()
+        raw_outcome = str(parsed.get("turn_outcome") or "").strip()
+        turn_outcome = raw_outcome if raw_outcome in COMPLETION_JUDGE_OUTCOMES else decision.turn_outcome
+
+        if raw_decision not in COMPLETION_JUDGE_DECISIONS:
+            return TurnStepDecision(
+                action="continue",
+                reason="llm_completion_judge_invalid",
+                finish_reason=response.finish_reason,
+                inject_instruction=self._completion_judge_fallback_instruction(candidate),
+                reset_visible_answer=True,
+                disable_tools_next=False,
+            )
+
+        if raw_decision == "final":
+            return TurnStepDecision(
+                action="finalize",
+                reason=f"llm_completion_judge:{reason}",
+                final_content=candidate,
+                finish_reason=decision.finish_reason,
+                turn_outcome=turn_outcome,
+            )
+
+        if raw_decision == "blocked":
+            final_content = build_blocked_fallback(task.progress, candidate)
+            if reason and reason not in final_content:
+                final_content = f"{final_content}\n判断原因：{reason}"
+            return TurnStepDecision(
+                action="finalize_blocked",
+                reason=f"llm_completion_judge:{reason}",
+                final_content=final_content,
+                finish_reason="completion_judge_blocked",
+                turn_outcome=TURN_OUTCOME_BLOCKED,
+            )
+
+        if raw_decision == "ask_user":
+            prompt_instruction = instruction or (
+                "当前任务继续依赖用户确认、选择、审批或补充信息。不要输出普通最终回答；下一步必须调用 request_user_input。"
+            )
+            return TurnStepDecision(
+                action="continue",
+                reason=f"llm_completion_judge:{reason}",
+                finish_reason=response.finish_reason,
+                inject_instruction=prompt_instruction,
+                reset_visible_answer=True,
+                disable_tools_next=False,
+            )
+
+        continue_instruction = instruction or self._completion_judge_fallback_instruction(candidate)
+        return TurnStepDecision(
+            action="continue",
+            reason=f"llm_completion_judge:{reason}",
+            finish_reason=response.finish_reason,
+            inject_instruction=continue_instruction,
+            reset_visible_answer=True,
+            disable_tools_next=False,
+        )
 
     async def _record_failure_feedback(
         self,
@@ -3812,9 +4224,10 @@ class NewmanRuntime:
                 if not isinstance(raw_path, str) or not raw_path.strip():
                     continue
                 path = Path(raw_path)
+                policy = build_path_access_policy(self.settings)
                 if not is_within_turn_output_dir(
                     path,
-                    self.settings.paths.workspace,
+                    policy.output_root,
                     task.session.session_id,
                     parent_turn_id,
                 ):
@@ -3854,9 +4267,10 @@ class NewmanRuntime:
         return attachments
 
     def _is_session_output_file(self, task: SessionTask, path: Path) -> bool:
+        policy = build_path_access_policy(self.settings)
         return is_within_session_output_dir(
             path,
-            self.settings.paths.workspace,
+            policy.output_root,
             task.session.session_id,
         )
 

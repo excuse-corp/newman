@@ -316,8 +316,15 @@ def structured_content(data, theme):
     els = [rect(0, 0, CANVAS_W, CANVAS_H, theme["bg_light"])]
     els += _title_bar(theme, data.get("title", ""))
     # bordered card
-    card_x, card_y = MARGIN, 100
-    card_w = CANVAS_W - MARGIN * 2
+    has_image = data.get("image_placeholder", False)
+    if has_image:
+        card_x, card_y = MARGIN, 100
+        card_w = (CANVAS_W - MARGIN * 2) * 0.55
+        img_x = card_x + card_w + 16
+        img_w = CANVAS_W - MARGIN - img_x
+    else:
+        card_x, card_y = MARGIN, 100
+        card_w = CANVAS_W - MARGIN * 2
     bottom = data.get("bottom_bar")
     card_h = (CANVAS_H - card_y - (90 if bottom else 50))
     els.append(rect(card_x, card_y, card_w, card_h, "FFFFFF"))
@@ -355,6 +362,20 @@ def structured_content(data, theme):
         els.append(text(MARGIN + 200, bb_y, card_w - 220, 44, bottom.get("text", ""),
                         size=11, color=theme["secondary"], font=theme["fontBody"],
                         valign="middle"))
+    # image placeholder area
+    if has_image:
+        img_h = CANVAS_H - card_y - (90 if bottom else 50)
+        els.append(rect(img_x, card_y, img_w, img_h, "F0F2F5", radius=6))
+        els.append(line(img_x, card_y, img_w, 3, theme["secondary"]))
+        # placeholder icon and text
+        center_x = img_x + img_w / 2
+        center_y = card_y + img_h / 2
+        els.append(text(center_x - 60, center_y - 30, 120, 24, "[图片占位]",
+                        size=14, color=theme["secondary"], font=theme["fontBody"],
+                        align="center", valign="middle"))
+        els.append(text(center_x - 60, center_y + 6, 120, 20, "请插入截图",
+                        size=11, color=theme["secondary"], font=theme["fontBody"],
+                        align="center", valign="middle"))
     els += _page_badge(theme, data.get("page"))
     return els
 

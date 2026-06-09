@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from backend.tools.workspace_fs import PathAccessPolicy, classify_path, resolve_requested_path
+from backend.tools.workspace_fs import PathAccessPolicy, classify_path, resolve_requested_path, resolve_writable_path
 
 
 _CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
@@ -51,21 +51,22 @@ _PATH_FIELD_SUFFIXES = {
 def validate_mcp_argument_paths(policy: PathAccessPolicy, arguments: dict) -> list[str]:
     reasons: list[str] = []
     seen: set[str] = set()
-    for raw_value in _iter_mcp_path_values(arguments):
+    for raw_value, writable_hint in _iter_mcp_path_values(arguments):
         candidate = _normalize_candidate_path(raw_value)
         if candidate is None:
             continue
-        path = _resolve_candidate_path(policy, candidate)
+        path = _resolve_candidate_path(policy, candidate, writable_hint=writable_hint)
         state = classify_path(policy, path)
         if state == "protected":
             reason = f"mcp_path_protected:{path}"
+        elif state == "forbidden":
+            reason = (
+                f"{'mcp_write_outside_writable_paths' if writable_hint else 'mcp_read_outside_readable_paths'}:{path}"
+            )
+        elif writable_hint and state != "writable":
+            reason = f"mcp_write_readonly_path:{path}"
         else:
-            try:
-                path.relative_to(policy.workspace.resolve())
-            except ValueError:
-                reason = f"mcp_path_outside_workspace:{path}"
-            else:
-                continue
+            continue
         if reason in seen:
             continue
         seen.add(reason)
@@ -73,8 +74,8 @@ def validate_mcp_argument_paths(policy: PathAccessPolicy, arguments: dict) -> li
     return reasons
 
 
-def _iter_mcp_path_values(value: object, current_key: str | None = None) -> list[str]:
-    matches: list[str] = []
+def _iter_mcp_path_values(value: object, current_key: str | None = None) -> list[tuple[str, bool]]:
+    matches: list[tuple[str, bool]] = []
     if isinstance(value, dict):
         if current_key and _is_path_field_name(current_key):
             for nested in value.values():
@@ -89,7 +90,7 @@ def _iter_mcp_path_values(value: object, current_key: str | None = None) -> list
             matches.extend(_iter_mcp_path_values(nested, current_key))
         return matches
     if isinstance(value, str) and current_key and _is_path_field_name(current_key):
-        matches.append(value)
+        matches.append((value, _looks_like_writable_path_field_name(current_key)))
     return matches
 
 
@@ -103,6 +104,32 @@ def _is_path_field_name(raw_name: str) -> bool:
     if tokens[-1] in _PATH_FIELD_SUFFIXES:
         return True
     return any(token in {"path", "paths", "cwd", "dir", "dirs", "directory", "directories", "root", "roots"} for token in tokens)
+
+
+def _looks_like_writable_path_field_name(raw_name: str) -> bool:
+    normalized = _normalize_field_name(raw_name)
+    tokens = [token for token in normalized.split("_") if token]
+    if not tokens:
+        return False
+    writable_markers = {
+        "output",
+        "outputs",
+        "dest",
+        "destination",
+        "target",
+        "targets",
+        "write",
+        "writes",
+        "save",
+        "saved",
+        "export",
+        "exports",
+        "result",
+        "results",
+        "generated",
+        "generateds",
+    }
+    return any(token in writable_markers for token in tokens)
 
 
 def _normalize_field_name(raw_name: str) -> str:
@@ -127,6 +154,7 @@ def _normalize_candidate_path(raw_value: str) -> str | None:
     return candidate
 
 
-def _resolve_candidate_path(policy: PathAccessPolicy, candidate: str) -> Path:
+def _resolve_candidate_path(policy: PathAccessPolicy, candidate: str, *, writable_hint: bool) -> Path:
     expanded = Path(candidate).expanduser()
-    return resolve_requested_path(policy, str(expanded))
+    resolver = resolve_writable_path if writable_hint else resolve_requested_path
+    return resolver(policy, str(expanded))

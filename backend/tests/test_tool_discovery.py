@@ -13,6 +13,30 @@ from backend.tools.workspace_fs import PathAccessPolicy
 
 
 class ToolDiscoveryTests(unittest.TestCase):
+    def test_multiagent_tool_ignores_legacy_context_without_subagent_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            policy = PathAccessPolicy(
+                workspace=workspace,
+                browse_root=workspace,
+                output_root=workspace / "outputs" / "chat",
+                readable_roots=(workspace,),
+                writable_roots=(workspace,),
+                protected_roots=(),
+            )
+            legacy_context = SimpleNamespace(
+                path_policy=policy,
+                sandbox=SimpleNamespace(limits=SimpleNamespace(timeout_seconds=30), execute_shell=None),
+                session_store=None,
+                multimodal_analyzer=None,
+            )
+
+            tools = load_builtin_tools(legacy_context)
+
+        self.assertNotIn("multiagent", [tool.meta.name for tool in tools])
+
     def test_load_builtin_tools_discovers_new_module(self) -> None:
         impl_dir = Path(__file__).resolve().parents[1] / "tools" / "impl"
         module_path = impl_dir / "zz_dynamic_test_tool.py"
@@ -63,6 +87,8 @@ class ToolDiscoveryTests(unittest.TestCase):
                 workspace.mkdir()
                 policy = PathAccessPolicy(
                     workspace=workspace,
+                    browse_root=workspace,
+                    output_root=workspace / "outputs" / "chat",
                     readable_roots=(workspace,),
                     writable_roots=(workspace,),
                     protected_roots=(),

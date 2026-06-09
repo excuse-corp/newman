@@ -28,6 +28,23 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
         self.assertEqual(error.status_code, 400)
         self.assertEqual(error.details["response_text"], '{"error":"bad request"}')
 
+    def test_http_error_keeps_rate_limit_headers(self) -> None:
+        request = httpx.Request("POST", "https://example.com/chat/completions")
+        response = httpx.Response(
+            429,
+            text='{"error":"slow down"}',
+            headers={"Retry-After": "2", "x-ratelimit-remaining-requests": "0"},
+            request=request,
+        )
+        exc = httpx.HTTPStatusError("too many requests", request=request, response=response)
+
+        error = _http_error("openai_compatible", exc)
+
+        self.assertEqual(error.kind, "rate_limit_error")
+        self.assertEqual(error.details["retry_after"], "2")
+        self.assertEqual(error.details["retry_after_seconds"], 2.0)
+        self.assertEqual(error.details["rate_limit_headers"]["x-ratelimit-remaining-requests"], "0")
+
     def test_http_error_handles_unread_streaming_response(self) -> None:
         request = httpx.Request("POST", "https://example.com/chat/completions")
         response = httpx.Response(400, request=request, stream=httpx.ByteStream(b'{"error":"bad request"}'))

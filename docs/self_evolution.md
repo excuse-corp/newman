@@ -134,7 +134,8 @@ Memory 验证：
 
 - 自动区块存在时只替换自动区块
 - 新经验去重
-- 单次新增数量受配置限制
+- 单次新增数量受配置限制，默认每次最多 1 条
+- 单条经验长度受配置限制，默认最多 80 个字符
 
 Skill 验证：
 
@@ -198,7 +199,8 @@ evolution:
   overlap_user_turns: 6
   max_context_messages: 120
   max_tool_output_chars: 2000
-  max_memory_updates_per_run: 8
+  max_memory_updates_per_run: 1
+  max_memory_item_chars: 80
   max_skill_updates_per_run: 3
   max_skill_file_bytes: 200000
   max_skill_total_bytes: 700000

@@ -194,8 +194,10 @@
 - `write_outside_writable_paths`
 - `read_protected_path`
 - `write_protected_path`
-- `mcp_path_outside_workspace`
 - `mcp_path_protected`
+- `mcp_read_outside_readable_paths`
+- `mcp_write_outside_writable_paths`
+- `mcp_write_readonly_path`
 - `terminal_read_outside_readable_paths`
 - `terminal_write_outside_writable_paths`
 - `terminal_read_protected_path`

@@ -49,7 +49,7 @@ def _render_tool_spec(tool: BaseTool) -> list[str]:
         "## Security",
         f"- Risk level: {tool.meta.risk_level}",
         f"- Approval: {tool.meta.approval_behavior}",
-        f"- Timeout: {tool.meta.timeout_seconds}s",
+        f"- Timeout: {tool.meta.timeout_seconds}s" if tool.meta.timeout_seconds is not None else "- Timeout: none",
     ])
 
     return lines

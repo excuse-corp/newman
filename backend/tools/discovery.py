@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from backend.scheduler.scheduler_engine import SchedulerEngine
     from backend.scheduler.task_store import TaskStore
     from backend.sessions.session_store import SessionStore
+    from backend.subagents.manager import MultiAgentManager
     from backend.tools.workspace_fs import PathAccessPolicy
 
 
@@ -26,6 +27,7 @@ class BuiltinToolContext:
     scheduler_store: "TaskStore | None" = None
     scheduler_engine: "SchedulerEngine | None" = None
     mcp_registry: "MCPRegistry | None" = None
+    subagent_manager: "MultiAgentManager | None" = None
 
 
 def load_builtin_tools(context: BuiltinToolContext) -> list[BaseTool]:

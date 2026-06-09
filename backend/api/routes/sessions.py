@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from uuid import uuid4
 
+from backend.api.routes.subagents import list_multiagent_runs_payload
 from backend.api.sse.event_emitter import format_sse
 from backend.memory.compressor import (
     build_context_usage_snapshot,
@@ -147,6 +148,21 @@ async def get_session_usage(session_id: str, request: Request, limit: int = 100)
         "session_id": session_id,
         "records": [record.model_dump(mode="json") for record in records],
         "available": True,
+    }
+
+
+@router.get("/{session_id}/multiagent-runs")
+async def list_session_multiagent_runs(session_id: str, request: Request, turn_id: str | None = None):
+    runtime = request.app.state.runtime
+    runtime.session_store.get(session_id)
+    records = runtime.subagent_manager.list_runs(
+        parent_session_id=session_id,
+        parent_turn_id=turn_id,
+    )
+    return {
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "runs": list_multiagent_runs_payload(records),
     }
 
 
