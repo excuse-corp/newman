@@ -113,6 +113,38 @@ class PostgresModelUsageStore:
             rows = cur.fetchall()
         return [self._record_from_row(row) for row in rows]
 
+    def list_session_records_for_sessions(
+        self,
+        session_ids: Iterable[str],
+        limit: int = 100,
+    ) -> list[ModelUsageRecord]:
+        unique_session_ids = list(dict.fromkeys(session_id for session_id in session_ids if session_id))
+        if not unique_session_ids:
+            return []
+        if len(unique_session_ids) == 1:
+            return self.list_session_records(unique_session_ids[0], limit=limit)
+
+        self.ensure_schema()
+        placeholders = ", ".join(["%s"] * len(unique_session_ids))
+        with self._connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    request_id, session_id, turn_id, request_kind,
+                    counts_toward_context_window, streaming,
+                    provider_type, model, context_window, effective_context_window,
+                    usage_available, input_tokens, output_tokens, total_tokens,
+                    finish_reason, created_at, metadata
+                FROM model_usage_records
+                WHERE session_id IN ({placeholders})
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (*unique_session_ids, limit),
+            )
+            rows = cur.fetchall()
+        return [self._record_from_row(row) for row in rows]
+
     def list_records_window(
         self,
         *,

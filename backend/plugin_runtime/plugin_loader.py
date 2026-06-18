@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
 
 from backend.plugin_runtime.models import LoadedPlugin, PluginLoadError, PluginManifest, SkillDescriptor
 from backend.plugin_runtime.skill_parser import parse_skill_file
+
+
+PLUGIN_TOOL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{1,63}$")
 
 
 class PluginLoader:
@@ -74,6 +78,7 @@ class PluginLoader:
         return skills
 
     def _validate_manifest_paths(self, plugin_path: Path, manifest: PluginManifest) -> None:
+        seen_tool_names: set[str] = set()
         for skill in manifest.skills:
             skill_path = (plugin_path / skill.path).resolve()
             if not skill_path.exists():
@@ -88,3 +93,9 @@ class PluginLoader:
             ui_entry = (plugin_path / manifest.ui.entry).resolve()
             if not ui_entry.exists():
                 raise ValueError(f"UI entry not found: {manifest.ui.entry}")
+        for command in manifest.commands:
+            if not PLUGIN_TOOL_NAME_RE.fullmatch(command.tool_name):
+                raise ValueError(f"Invalid plugin tool_name: {command.tool_name}")
+            if command.tool_name in seen_tool_names:
+                raise ValueError(f"Duplicate plugin tool_name: {command.tool_name}")
+            seen_tool_names.add(command.tool_name)

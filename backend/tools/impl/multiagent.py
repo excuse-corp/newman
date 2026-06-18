@@ -48,7 +48,7 @@ class MultiAgentTool(BaseTool):
                                 "approval_mode": {
                                     "type": "string",
                                     "enum": ["inherit", "auto_allow", "manual"],
-                                    "default": "inherit",
+                                    "default": "auto_allow",
                                 },
                                 "model": {"type": "string"},
                                 "max_turns": {"type": "integer", "default": 200},

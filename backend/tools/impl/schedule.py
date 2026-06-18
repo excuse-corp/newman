@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from backend.scheduler.cron_parser import next_run
 from backend.scheduler.models import ScheduledTask, TaskAction
+from backend.tools.approval_policy import normalize_turn_approval_mode
 from backend.tools.base import BaseTool, ToolMeta
 from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
@@ -73,6 +74,11 @@ class SchedulerTool(BaseTool):
                     "max_retries": {
                         "type": "integer",
                         "description": "Max retry count on failure, 0-5 (default 5).",
+                    },
+                    "approval_mode": {
+                        "type": "string",
+                        "enum": ["auto_allow", "manual"],
+                        "description": "Approval mode for unattended runs. auto_allow is the default.",
                     },
                 },
                 "required": ["action"],
@@ -150,6 +156,7 @@ class SchedulerTool(BaseTool):
             max_retries = max(0, min(5, int(max_retries)))
         else:
             max_retries = 5
+        approval_mode = normalize_turn_approval_mode(args.get("approval_mode", "auto_allow"))
 
         task = ScheduledTask(
             task_id=uuid4().hex,
@@ -158,6 +165,7 @@ class SchedulerTool(BaseTool):
             action=action,
             timezone=timezone_name,
             description=_optional_str(args.get("description")),
+            approval_mode=approval_mode,
             enabled=args.get("enabled", True),
             max_retries=max_retries,
             source="chat",
@@ -203,6 +211,8 @@ class SchedulerTool(BaseTool):
             updates["enabled"] = bool(args["enabled"])
         if "max_retries" in args and args["max_retries"] is not None:
             updates["max_retries"] = max(0, min(5, int(args["max_retries"])))
+        if "approval_mode" in args and args["approval_mode"] is not None:
+            updates["approval_mode"] = normalize_turn_approval_mode(args["approval_mode"])
         if "prompt" in args and args["prompt"] is not None:
             action = task.action.model_copy(update={"prompt": str(args["prompt"]).strip()})
             updates["action"] = action
@@ -381,6 +391,7 @@ def _format_task_detail(task: ScheduledTask) -> str:
         f"Cron: {task.cron} [{task.timezone}]",
         f"状态: {task.status}",
         f"启用: {'是' if task.enabled else '否'}",
+        f"审批: {_approval_mode_label(task.approval_mode)}",
         f"提示词: {task.action.prompt}",
         f"类型: {task.action.type}",
     ]
@@ -395,6 +406,12 @@ def _format_task_detail(task: ScheduledTask) -> str:
     lines.append(f"执行次数: {task.run_count}")
     lines.append(f"失败次数: {task.failure_count}")
     return "\n".join(lines)
+
+
+def _approval_mode_label(mode: str) -> str:
+    if mode == "manual":
+        return "逐个手动确认"
+    return "默认全部通过"
 
 
 def build_tools(context: BuiltinToolContext) -> list[BaseTool]:

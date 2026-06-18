@@ -76,6 +76,7 @@ approval:
     - "write_file_outside_workspace"
     - "process_spawn"
     - "terminal_mutation_or_unknown"
+    - "plugin_cli_mutating"
     - "danger_full_access_terminal"
   timeout_seconds: 120
 
@@ -102,6 +103,18 @@ permissions:
 channels:
   feishu:
     enabled: true
+    # Use channel_sdk for Feishu -> Newman long-connection inbound.
+    # Put app_id/app_secret in .env:
+    #   NEWMAN_CHANNELS__FEISHU__APP_ID=cli_xxx
+    #   NEWMAN_CHANNELS__FEISHU__APP_SECRET=xxx
+    transport: "channel_sdk"
+    domain: "https://open.feishu.cn"
+    default_turn_approval_mode: "auto_allow"
+    require_mention_in_group: true
+    allowed_chat_ids: []
+    allowed_user_open_ids: []
+    reply_timeout_seconds: 20
+    dedup_ttl_seconds: 600
   wecom:
     enabled: true
 
@@ -140,6 +153,10 @@ def get_project_config_path(project_root: str | None = None) -> Path:
     return resolve_project_root(project_root) / "newman.yaml"
 
 
+def get_project_dotenv_path(project_root: str | None = None) -> Path:
+    return resolve_project_root(project_root) / ".env"
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -170,7 +187,26 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return result
 
 
-def _coerce_env_value(value: str) -> Any:
+def _get_nested_default(data: dict[str, Any], path: tuple[str, ...]) -> Any:
+    cursor: Any = data
+    for part in path:
+        if not isinstance(cursor, dict) or part not in cursor:
+            return None
+        cursor = cursor[part]
+    return cursor
+
+
+def _coerce_env_value(value: str, expected: Any = None) -> Any:
+    if isinstance(expected, list):
+        if not value.strip():
+            return []
+        stripped = value.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            loaded = yaml.safe_load(stripped)
+            if isinstance(loaded, list):
+                return loaded
+        return [item.strip() for item in value.split(",") if item.strip()]
+
     lowered = value.lower()
     if lowered in {"true", "false"}:
         return lowered == "true"
@@ -188,8 +224,12 @@ def _coerce_env_value(value: str) -> Any:
 def _read_dotenv(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
+    return parse_dotenv_content(path.read_text(encoding="utf-8"))
+
+
+def parse_dotenv_content(content: str) -> dict[str, str]:
     values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -306,7 +346,8 @@ def _env_to_nested(defaults: dict[str, Any], dotenv_values: dict[str, str] | Non
             path = tuple(part for part in raw_path.split("__") if part)
         if path is None:
             continue
-        _assign_nested(nested, path, _coerce_env_value(raw_value))
+        expected = _get_nested_default(defaults, path)
+        _assign_nested(nested, path, _coerce_env_value(raw_value, expected))
     return nested
 
 
@@ -333,7 +374,12 @@ def _resolve_paths(config: AppConfig, project_root: Path) -> AppConfig:
     return AppConfig.model_validate(data)
 
 
-def _load_settings_uncached(root: Path, *, project_payload: dict[str, Any] | None = None) -> tuple[AppConfig, ConfigLoadReport]:
+def _load_settings_uncached(
+    root: Path,
+    *,
+    project_payload: dict[str, Any] | None = None,
+    project_dotenv_values: dict[str, str] | None = None,
+) -> tuple[AppConfig, ConfigLoadReport]:
     defaults_path = root / "backend" / "config" / "defaults.yaml"
     project_config_path = root / "newman.yaml"
     user_config_path = Path.home() / ".newman" / "config.yaml"
@@ -344,7 +390,7 @@ def _load_settings_uncached(root: Path, *, project_payload: dict[str, Any] | Non
     _ensure_project_config(project_config_path)
     project = project_payload if project_payload is not None else _read_yaml(project_config_path)
     user = _read_yaml(user_config_path)
-    dotenv_values = _read_dotenv(project_dotenv_path)
+    dotenv_values = dict(project_dotenv_values) if project_dotenv_values is not None else _read_dotenv(project_dotenv_path)
     dotenv_values.update(_read_dotenv(user_dotenv_path))
     merged = defaults
     source_map: dict[str, str] = {}
@@ -369,10 +415,24 @@ def read_project_config_text(project_root: str | None = None) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def read_project_dotenv_text(project_root: str | None = None) -> str:
+    path = get_project_dotenv_path(project_root)
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
 def validate_project_config_content(content: str, project_root: str | None = None) -> AppConfig:
     root = resolve_project_root(project_root)
     project_payload = parse_project_config_content(content)
     settings, _ = _load_settings_uncached(root, project_payload=project_payload)
+    return settings
+
+
+def validate_project_dotenv_content(content: str, project_root: str | None = None) -> AppConfig:
+    root = resolve_project_root(project_root)
+    dotenv_values = parse_dotenv_content(content)
+    settings, _ = _load_settings_uncached(root, project_dotenv_values=dotenv_values)
     return settings
 
 

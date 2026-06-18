@@ -23,6 +23,7 @@ from backend.api.routes.subagents import router as subagents_router
 from backend.api.routes.tools import router as tools_router
 from backend.api.routes.usage import router as usage_router
 from backend.api.routes.workspace import router as workspace_router
+from backend.api.sse.channel_event_broker import ChannelEventBroker
 from backend.channels.service import ChannelService
 from backend.config.loader import get_settings, log_settings_report
 from backend.runtime.run_loop import NewmanRuntime
@@ -38,10 +39,11 @@ def create_app() -> FastAPI:
     app.state.settings = settings
     app.state.runtime = NewmanRuntime(settings)
     app.state.scheduler = SchedulerEngine(app.state.runtime.scheduler_store, app.state.runtime)
+    app.state.channel_events = ChannelEventBroker()
     app.state.runtime.tool_context.scheduler_engine = app.state.scheduler
     if hasattr(app.state.scheduler, "set_session_busy_checker"):
         app.state.scheduler.set_session_busy_checker(lambda session_id: session_id in app.state.active_message_runs)
-    app.state.channels = ChannelService(settings, app.state.runtime)
+    app.state.channels = ChannelService(settings, app.state.runtime, event_broker=app.state.channel_events)
 
     app.middleware("http")(request_id_middleware)
     app.add_middleware(
@@ -75,9 +77,13 @@ def create_app() -> FastAPI:
         app.state.runtime.reload_ecosystem()
         app.state.scheduler.refresh_schedule()
         await app.state.scheduler.start()
+        if hasattr(app.state.channels, "start"):
+            await app.state.channels.start()
 
     @app.on_event("shutdown")
     async def stop_scheduler() -> None:
+        if hasattr(app.state.channels, "stop"):
+            await app.state.channels.stop()
         await app.state.scheduler.stop()
         app.state.runtime.close()
 

@@ -25,6 +25,72 @@ class PluginUIConfig(BaseModel):
     entry: str | None = None
 
 
+class PluginSandboxConfig(BaseModel):
+    readable_roots: list[str] = Field(default_factory=list)
+    writable_roots: list[str] = Field(default_factory=list)
+
+
+class PluginPreflightConfig(BaseModel):
+    bins: list[str] = Field(default_factory=list)
+    readable_paths: list[str] = Field(default_factory=list)
+
+
+class PluginPreflightCheckResult(BaseModel):
+    kind: Literal["bin", "readable_path"]
+    target: str
+    resolved: str | None = None
+    ok: bool
+    message: str
+
+
+class PluginPreflightReport(BaseModel):
+    ok: bool = True
+    issue_count: int = 0
+    checks: list[PluginPreflightCheckResult] = Field(default_factory=list)
+
+
+class PluginCLIConfirmationProtocolConfig(BaseModel):
+    exit_code: int = Field(default=10, ge=1, le=255)
+    error_type: str = Field(default="confirmation_required", min_length=1)
+
+
+class PluginCLICommandConfig(BaseModel):
+    tool_name: str = Field(min_length=2)
+    executable: str = Field(min_length=1)
+    description: str = ""
+    default_args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    approval_behavior: Literal["safe", "confirmable"] = "safe"
+    timeout_seconds: int = Field(default=30, ge=1, le=300)
+    confirmation_flag: str | None = None
+    confirmation_protocol: PluginCLIConfirmationProtocolConfig = Field(
+        default_factory=PluginCLIConfirmationProtocolConfig
+    )
+    readonly_prefixes: list[list[str]] = Field(default_factory=list)
+    sandbox: PluginSandboxConfig | None = None
+    allow_stdin: bool = True
+
+
+class ResolvedPluginCLICommand(BaseModel):
+    plugin_name: str
+    plugin_root: str
+    tool_name: str
+    executable: str
+    description: str = ""
+    default_args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    approval_behavior: Literal["safe", "confirmable"] = "safe"
+    timeout_seconds: int = 30
+    confirmation_flag: str | None = None
+    confirmation_protocol: PluginCLIConfirmationProtocolConfig = Field(
+        default_factory=PluginCLIConfirmationProtocolConfig
+    )
+    readonly_prefixes: list[list[str]] = Field(default_factory=list)
+    allow_stdin: bool = True
+    readable_roots: list[str] = Field(default_factory=list)
+    writable_roots: list[str] = Field(default_factory=list)
+
+
 class PluginManifest(BaseModel):
     name: str
     version: str
@@ -34,6 +100,9 @@ class PluginManifest(BaseModel):
     hooks: list[PluginHook] = Field(default_factory=list)
     mcp_servers: list[dict] = Field(default_factory=list)
     required_permissions: list[str] = Field(default_factory=list)
+    sandbox: PluginSandboxConfig | None = None
+    preflight: PluginPreflightConfig | None = None
+    commands: list[PluginCLICommandConfig] = Field(default_factory=list)
     ui: PluginUIConfig | None = None
 
 
@@ -46,6 +115,8 @@ class PluginRecord(BaseModel):
     skill_count: int = 0
     hook_count: int = 0
     mcp_server_count: int = 0
+    cli_command_count: int = 0
+    preflight: PluginPreflightReport = Field(default_factory=PluginPreflightReport)
 
 
 class SkillDescriptor(BaseModel):

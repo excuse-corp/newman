@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Literal
 
 from backend.config.schema import AppConfig
@@ -83,8 +84,8 @@ PROCESS_SPAWN_MARKERS = (
     "python -m http.server",
     "npm run dev",
     "pnpm dev",
-    " &",
 )
+PROCESS_SPAWN_BACKGROUND_RE = re.compile(r"(?:^|\s)&(?:\s|$)")
 
 SHELL_META_MARKERS = ("|", "&&", "||", ";", "$(", "`")
 PATH_DENY_REASONS = {
@@ -218,7 +219,9 @@ class ApprovalPolicy:
 
     def _looks_like_process_spawn(self, command: str) -> bool:
         normalized = self._normalize(command)
-        return any(marker in normalized for marker in PROCESS_SPAWN_MARKERS)
+        return any(marker in normalized for marker in PROCESS_SPAWN_MARKERS) or bool(
+            PROCESS_SPAWN_BACKGROUND_RE.search(normalized)
+        )
 
     @staticmethod
     def _normalize(command: str) -> str:

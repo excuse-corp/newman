@@ -16,6 +16,7 @@ class TaskAction(BaseModel):
     session_id: str | None = None
 
 
+SchedulerApprovalMode = Literal["manual", "auto_allow"]
 TaskStatus = Literal["pending", "running", "completed", "failed", "disabled"]
 TaskOutcome = Literal[
     "success",
@@ -33,6 +34,7 @@ class ScheduledTask(BaseModel):
     action: TaskAction
     timezone: str = "UTC"
     description: str | None = None
+    approval_mode: SchedulerApprovalMode = "auto_allow"
     enabled: bool = True
     max_retries: int = 5
     status: TaskStatus = "pending"

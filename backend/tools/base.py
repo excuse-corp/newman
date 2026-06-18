@@ -37,6 +37,9 @@ class BaseTool(ABC):
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:
         raise NotImplementedError
 
+    def static_checks(self, arguments: dict[str, Any]) -> list[str]:
+        return []
+
     def validate_arguments(self, arguments: Any) -> str | None:
         return _validate_schema_value(arguments, self.meta.input_schema, "参数")
 

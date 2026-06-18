@@ -2172,6 +2172,7 @@ multipart/form-data
       "task_id": "daily-report",
       "name": "日报生成",
       "cron": "0 18 * * 1-5",
+      "approval_mode": "auto_allow",
       "action": {
         "type": "session_message",
         "prompt": "请根据今天的工作记录生成日报",
@@ -2223,6 +2224,7 @@ multipart/form-data
 {
   "name": "phase4-check",
   "cron": "*/30 * * * *",
+  "approval_mode": "auto_allow",
   "action": {
     "type": "background_task",
     "prompt": "请总结今天的变更"
@@ -2231,6 +2233,13 @@ multipart/form-data
   "max_retries": 5
 }
 ```
+
+说明：
+
+- `approval_mode` 可选，支持：
+  - `auto_allow`：无人值守任务命中 Level 2 / confirmable 审批时默认放行；仍会保留 Level 1、路径权限、protected path 等硬拒绝
+  - `manual`：无人值守任务命中审批时会快速失败，并记录 `approval_blocked`
+- Scheduler 任务未显式设置 `approval_mode` 时，默认按 `auto_allow` 执行
 
 ## 11.4 启用任务
 
@@ -2278,7 +2287,14 @@ multipart/form-data
     {
       "platform": "feishu",
       "enabled": true,
-      "webhook_token_configured": false
+      "transport": "channel_sdk",
+      "webhook_token_configured": false,
+      "app_configured": true,
+      "dependency_available": true,
+      "running": true,
+      "connected": true,
+      "connection_state": "connected",
+      "dedup_cache_size": 0
     },
     {
       "platform": "wecom",
@@ -2289,9 +2305,42 @@ multipart/form-data
 }
 ```
 
-## 12.2 飞书 Webhook
+## 12.2 飞书 Channel SDK 自检
+
+`GET /api/channels/feishu/setup/status`
+
+返回飞书入站配置、SDK 长连接状态和最近错误。`ok=true` 表示 Newman 后端已经通过 Channel SDK 连上飞书。
+
+`POST /api/channels/feishu/setup/validate`
+
+请求体可选：
+
+```json
+{
+  "timeout_seconds": 10
+}
+```
+
+触发一次连接探测，用于确认 `app_id` / `app_secret`、SDK 依赖和出站网络是否可用。
+
+`POST /api/channels/feishu/setup/test`
+
+请求体可选：
+
+```json
+{
+  "timeout_seconds": 45,
+  "validate_first": true
+}
+```
+
+用于引导用户在飞书端发送一条测试消息，并等待 Newman 确认收到事件。
+
+## 12.3 飞书 Webhook（legacy）
 
 `POST /api/channels/feishu/webhook`
+
+这是早期 webhook 基线接口；当前推荐飞书入站使用 `channels.feishu.transport=channel_sdk`。
 
 请求体示例：
 
@@ -2320,7 +2369,7 @@ multipart/form-data
 }
 ```
 
-## 12.3 企业微信 Webhook
+## 12.4 企业微信 Webhook
 
 `POST /api/channels/wecom/webhook`
 

@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Iterable
 
 import yaml
 
-from backend.plugin_runtime.models import LoadedPlugin, PluginLoadError, PluginManifest, PluginRecord, SkillDescriptor
+from backend.plugin_runtime.models import (
+    LoadedPlugin,
+    PluginCLICommandConfig,
+    PluginLoadError,
+    PluginManifest,
+    PluginPreflightCheckResult,
+    PluginPreflightReport,
+    PluginRecord,
+    ResolvedPluginCLICommand,
+    SkillDescriptor,
+)
 from backend.plugin_runtime.plugin_loader import PluginLoader
 from backend.plugin_runtime.plugin_registry import PluginRegistry
 from backend.plugin_runtime.skill_parser import parse_skill_file
@@ -37,7 +48,7 @@ class PluginService:
         state = self.registry.load_state()
         items: list[PluginRecord] = []
         for plugin in self._plugins:
-            enabled = state.get(plugin.manifest.name, plugin.manifest.enabled_by_default)
+            enabled = self._plugin_enabled(plugin, state)
             items.append(
                 PluginRecord(
                     name=plugin.manifest.name,
@@ -48,6 +59,8 @@ class PluginService:
                     skill_count=len(plugin.skills),
                     hook_count=len(plugin.manifest.hooks),
                     mcp_server_count=len(plugin.manifest.mcp_servers),
+                    cli_command_count=len(plugin.manifest.commands),
+                    preflight=self._build_plugin_preflight(plugin),
                 )
             )
         return items
@@ -133,8 +146,35 @@ class PluginService:
 
     def enabled_plugins(self) -> list[LoadedPlugin]:
         self.ensure_fresh()
-        enabled_names = {item.name for item in self.list_plugins() if item.enabled}
-        return [plugin for plugin in self._plugins if plugin.manifest.name in enabled_names]
+        state = self.registry.load_state()
+        return [plugin for plugin in self._plugins if self._plugin_enabled(plugin, state)]
+
+    def enabled_sandbox_readable_roots(self) -> list[Path]:
+        self.ensure_fresh()
+        roots: list[Path] = []
+        for plugin in self.enabled_plugins():
+            roots.extend(self._resolve_plugin_readable_roots(plugin))
+        return _dedupe_paths(roots)
+
+    def resolved_sandbox_readable_roots(self, plugin_name: str) -> list[str]:
+        plugin = self.get_plugin(plugin_name)
+        return [str(path) for path in self._resolve_plugin_readable_roots(plugin)]
+
+    def plugin_preflight(self, plugin_name: str) -> PluginPreflightReport:
+        plugin = self.get_plugin(plugin_name)
+        return self._build_plugin_preflight(plugin)
+
+    def enabled_cli_commands(self) -> list[ResolvedPluginCLICommand]:
+        self.ensure_fresh()
+        commands: list[ResolvedPluginCLICommand] = []
+        seen_tool_names: set[str] = set()
+        for plugin in self.enabled_plugins():
+            for command in self._resolve_plugin_cli_commands(plugin):
+                if command.tool_name in seen_tool_names:
+                    continue
+                seen_tool_names.add(command.tool_name)
+                commands.append(command)
+        return commands
 
     def list_skills(self) -> list[SkillDescriptor]:
         self.ensure_fresh()
@@ -274,6 +314,147 @@ class PluginService:
         payload["env"] = env
         return payload
 
+    def _plugin_enabled(self, plugin: LoadedPlugin, state: dict[str, bool]) -> bool:
+        return state.get(plugin.manifest.name, plugin.manifest.enabled_by_default)
+
+    def _resolve_plugin_readable_roots(self, plugin: LoadedPlugin) -> list[Path]:
+        sandbox = plugin.manifest.sandbox
+        if sandbox is None:
+            return []
+        roots = [
+            self._resolve_plugin_path_spec(plugin.root_path, raw_root)
+            for raw_root in sandbox.readable_roots
+            if str(raw_root or "").strip()
+        ]
+        return [path for path in _dedupe_paths(roots) if path.exists()]
+
+    def _resolve_plugin_writable_roots(self, plugin: LoadedPlugin) -> list[Path]:
+        sandbox = plugin.manifest.sandbox
+        if sandbox is None:
+            return []
+        roots = [
+            self._resolve_plugin_path_spec(plugin.root_path, raw_root)
+            for raw_root in sandbox.writable_roots
+            if str(raw_root or "").strip()
+        ]
+        return [path for path in _dedupe_paths(roots) if path.exists()]
+
+    def _resolve_plugin_cli_commands(self, plugin: LoadedPlugin) -> list[ResolvedPluginCLICommand]:
+        commands: list[ResolvedPluginCLICommand] = []
+        for command in plugin.manifest.commands:
+            commands.append(self._resolve_plugin_cli_command(plugin, command))
+        return commands
+
+    def _resolve_plugin_cli_command(
+        self,
+        plugin: LoadedPlugin,
+        command: PluginCLICommandConfig,
+    ) -> ResolvedPluginCLICommand:
+        readable_roots = self._resolve_plugin_readable_roots(plugin)
+        writable_roots = self._resolve_plugin_writable_roots(plugin)
+        command_sandbox = command.sandbox
+        if command_sandbox is not None:
+            readable_roots = _dedupe_paths(
+                [
+                    *readable_roots,
+                    *(
+                        self._resolve_plugin_path_spec(plugin.root_path, raw_root)
+                        for raw_root in command_sandbox.readable_roots
+                        if str(raw_root or "").strip()
+                    ),
+                ]
+            )
+            writable_roots = _dedupe_paths(
+                [
+                    *writable_roots,
+                    *(
+                        self._resolve_plugin_path_spec(plugin.root_path, raw_root)
+                        for raw_root in command_sandbox.writable_roots
+                        if str(raw_root or "").strip()
+                    ),
+                ]
+            )
+        env = {
+            key: os.path.expandvars(str(value))
+            for key, value in (command.env or {}).items()
+            if str(key).strip()
+        }
+        env.setdefault("NEWMAN_PLUGIN_ROOT", str(plugin.root_path.resolve()))
+        env.setdefault("NEWMAN_PLUGIN_NAME", plugin.manifest.name)
+        return ResolvedPluginCLICommand(
+            plugin_name=plugin.manifest.name,
+            plugin_root=str(plugin.root_path.resolve()),
+            tool_name=command.tool_name,
+            executable=self._resolve_plugin_command_executable(plugin.root_path, command.executable),
+            description=command.description,
+            default_args=list(command.default_args),
+            env=env,
+            approval_behavior=command.approval_behavior,
+            timeout_seconds=command.timeout_seconds,
+            confirmation_flag=command.confirmation_flag,
+            confirmation_protocol=command.confirmation_protocol,
+            readonly_prefixes=[list(prefix) for prefix in command.readonly_prefixes if prefix],
+            allow_stdin=command.allow_stdin,
+            readable_roots=[str(path) for path in readable_roots if path.exists()],
+            writable_roots=[str(path) for path in writable_roots if path.exists()],
+        )
+
+    def _build_plugin_preflight(self, plugin: LoadedPlugin) -> PluginPreflightReport:
+        config = plugin.manifest.preflight
+        if config is None:
+            return PluginPreflightReport()
+
+        checks: list[PluginPreflightCheckResult] = []
+        for raw_bin in config.bins:
+            binary = str(raw_bin or "").strip()
+            if not binary:
+                continue
+            resolved = shutil.which(binary)
+            checks.append(
+                PluginPreflightCheckResult(
+                    kind="bin",
+                    target=binary,
+                    resolved=resolved,
+                    ok=resolved is not None,
+                    message="binary available" if resolved else "binary not found in PATH",
+                )
+            )
+
+        for raw_path in config.readable_paths:
+            target = str(raw_path or "").strip()
+            if not target:
+                continue
+            resolved_path = self._resolve_plugin_path_spec(plugin.root_path, target)
+            ok, message = _check_readable_path(resolved_path)
+            checks.append(
+                PluginPreflightCheckResult(
+                    kind="readable_path",
+                    target=target,
+                    resolved=str(resolved_path),
+                    ok=ok,
+                    message=message,
+                )
+            )
+
+        issue_count = sum(1 for check in checks if not check.ok)
+        return PluginPreflightReport(ok=issue_count == 0, issue_count=issue_count, checks=checks)
+
+    def _resolve_plugin_path_spec(self, plugin_root: Path, raw_path: str) -> Path:
+        expanded = os.path.expandvars(str(raw_path).strip())
+        candidate = Path(expanded).expanduser()
+        if candidate.is_absolute():
+            return candidate.resolve()
+        return (plugin_root / candidate).resolve()
+
+    def _resolve_plugin_command_executable(self, plugin_root: Path, executable: str) -> str:
+        candidate = Path(str(executable).strip()).expanduser()
+        if candidate.is_absolute():
+            return str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if "/" not in str(executable) and "\\" not in str(executable):
+            return str(executable)
+        resolved = (plugin_root / candidate).resolve()
+        return str(resolved) if resolved.exists() else str(executable)
+
     def _resolve_stdio_path_values(self, plugin_root: Path, value: object) -> object:
         if isinstance(value, list):
             return [self._resolve_stdio_path_values(plugin_root, item) for item in value]
@@ -325,6 +506,27 @@ class PluginService:
             except FileNotFoundError:
                 continue
         return collected or [f"{root}:empty"]
+
+
+def _check_readable_path(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, "path missing"
+    if os.access(path, os.R_OK):
+        return True, "path readable"
+    return False, "path is not readable"
+
+
+def _dedupe_paths(paths: Iterable[Path]) -> list[Path]:
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for raw in paths:
+        path = raw.resolve()
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
 
 
 def _render_skills_snapshot(skills: list[SkillDescriptor]) -> list[str]:

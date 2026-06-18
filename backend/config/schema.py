@@ -91,6 +91,7 @@ class ApprovalConfig(BaseModel):
             "write_file_outside_workspace",
             "process_spawn",
             "terminal_mutation_or_unknown",
+            "plugin_cli_mutating",
             "danger_full_access_terminal",
             "maintain_memory",
             "maintain_skill",
@@ -129,8 +130,21 @@ class ChannelPlatformConfig(BaseModel):
     webhook_token: str | None = None
 
 
+class FeishuChannelConfig(ChannelPlatformConfig):
+    transport: Literal["webhook", "channel_sdk"] = "webhook"
+    app_id: str | None = None
+    app_secret: str | None = None
+    domain: str = "https://open.feishu.cn"
+    default_turn_approval_mode: Literal["manual", "auto_allow"] = "auto_allow"
+    require_mention_in_group: bool = True
+    allowed_chat_ids: list[str] = Field(default_factory=list)
+    allowed_user_open_ids: list[str] = Field(default_factory=list)
+    reply_timeout_seconds: int = 20
+    dedup_ttl_seconds: int = 600
+
+
 class ChannelsConfig(BaseModel):
-    feishu: ChannelPlatformConfig = Field(default_factory=ChannelPlatformConfig)
+    feishu: FeishuChannelConfig = Field(default_factory=FeishuChannelConfig)
     wecom: ChannelPlatformConfig = Field(default_factory=ChannelPlatformConfig)
 
 

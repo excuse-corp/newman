@@ -41,7 +41,7 @@ class UpdateSessionRequest(BaseModel):
 
 
 class UpdateCollaborationModeRequest(BaseModel):
-    mode: Literal["default", "plan"]
+    mode: Literal["default", "plan", "subagent"]
 
 
 class UpdatePlanDraftRequest(BaseModel):
@@ -136,7 +136,16 @@ async def get_session_usage(session_id: str, request: Request, limit: int = 100)
         return {"session_id": session_id, "records": [], "available": False}
 
     try:
-        records = usage_store.list_session_records(session_id, limit=min(limit, 500))
+        resolved_limit = min(limit, 500)
+        related_session_ids = _session_usage_session_ids(runtime, session_id)
+        if hasattr(usage_store, "list_session_records_for_sessions"):
+            records = usage_store.list_session_records_for_sessions(related_session_ids, limit=resolved_limit)
+        else:
+            records = []
+            for related_session_id in related_session_ids:
+                records.extend(usage_store.list_session_records(related_session_id, limit=resolved_limit))
+            records.sort(key=lambda record: record.created_at, reverse=True)
+            records = records[:resolved_limit]
     except Exception as exc:
         return {
             "session_id": session_id,
@@ -361,6 +370,37 @@ def _build_context_usage(runtime, session, checkpoint) -> dict[str, object]:
         checkpoint,
         latest_record=latest_record,
     ).to_dict()
+
+
+def _session_usage_session_ids(runtime, session_id: str) -> list[str]:
+    session_ids = [session_id]
+    subagent_manager = getattr(runtime, "subagent_manager", None)
+    if subagent_manager is not None and hasattr(subagent_manager, "list_runs"):
+        try:
+            run_records = subagent_manager.list_runs(parent_session_id=session_id)
+        except Exception:
+            run_records = []
+        for record in run_records:
+            tasks = getattr(record, "tasks", {}) or {}
+            task_values = tasks.values() if isinstance(tasks, dict) else tasks
+            for task in task_values:
+                child_session_id = getattr(task, "child_session_id", None)
+                if isinstance(child_session_id, str) and child_session_id:
+                    session_ids.append(child_session_id)
+
+    session_store = getattr(runtime, "session_store", None)
+    if session_store is not None and hasattr(session_store, "list_records"):
+        try:
+            for child in session_store.list_records(include_subagents=True):
+                if child.metadata.get("subagent") is not True:
+                    continue
+                if child.metadata.get("parent_session_id") != session_id:
+                    continue
+                session_ids.append(child.session_id)
+        except Exception:
+            pass
+
+    return list(dict.fromkeys(session_ids))
 
 
 def _microcompact_artifact_dir(runtime, session_id: str):

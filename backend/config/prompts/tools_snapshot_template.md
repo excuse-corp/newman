@@ -4,7 +4,7 @@ Use the provider tool definitions as the source of truth for available tool name
 
 ### Tool specs
 Generated tool spec files contain path permissions, risk level, approval behavior, timeout, and parameter details.
-- Spec path pattern: `backend_data/tool_specs/{tool_name}.md`
+- Spec path pattern: the runtime snapshot renders the absolute spec directory path; by default it is under `backend_data/tool_specs/{tool_name}.md`
 - Read a spec file only when parameters, path permissions, or risk details are unclear.
 
 ### How to use tools
@@ -12,6 +12,6 @@ Generated tool spec files contain path permissions, risk level, approval behavio
 - Do not invent tool names or call tools that are absent from the current provider tool list.
 
 ## MCP Servers
-When MCP servers are configured, this file includes server summaries and tool snapshot paths.
 MCP tools are grouped by server and are not exposed to the provider by default.
 Read the server tool snapshot first, then call `activate_mcp_tool` to expose one specific MCP tool schema.
+- Actual server summary entries and snapshot paths are injected into the runtime `TOOLS_SNAPSHOT.md` when MCP servers are available.

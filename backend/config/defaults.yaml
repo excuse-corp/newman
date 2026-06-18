@@ -85,6 +85,7 @@ approval:
     - "write_file_outside_workspace"
     - "process_spawn"
     - "terminal_mutation_or_unknown"
+    - "plugin_cli_mutating"
     - "danger_full_access_terminal"
     - "maintain_memory"
     - "maintain_skill"
@@ -115,7 +116,17 @@ permissions:
 channels:
   feishu:
     enabled: true
+    transport: "channel_sdk"
+    app_id: null
+    app_secret: null
+    domain: "https://open.feishu.cn"
     webhook_token: null
+    default_turn_approval_mode: "auto_allow"
+    require_mention_in_group: true
+    allowed_chat_ids: []
+    allowed_user_open_ids: []
+    reply_timeout_seconds: 20
+    dedup_ttl_seconds: 600
   wecom:
     enabled: true
     webhook_token: null

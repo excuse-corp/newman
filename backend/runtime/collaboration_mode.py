@@ -5,10 +5,11 @@ from typing import Literal
 from backend.sessions.models import ApprovedPlan, SessionCollaborationMode, SessionPlan, SessionPlanDraft, SessionRecord
 
 
-CollaborationModeName = Literal["default", "plan"]
+CollaborationModeName = Literal["default", "plan", "subagent"]
 
 DEFAULT_COLLABORATION_MODE: CollaborationModeName = "default"
 PLAN_COLLABORATION_MODE: CollaborationModeName = "plan"
+SUBAGENT_COLLABORATION_MODE: CollaborationModeName = "subagent"
 
 PLAN_MODE_BLOCKED_TOOLS = frozenset({"enter_plan_mode"})
 
@@ -33,6 +34,16 @@ COLLABORATION_MODE_PLAN_PROMPT = """## Collaboration Mode
 - 完成一步后，立刻调用 `update_plan` 将该项标记为 `completed`，并把下一项推进为 `in_progress`。
 - 如果暂时无法继续，调用 `update_plan` 将当前步骤标记为 `blocked`，并在 `explanation` 中写清阻塞原因。
 - 如果目标变化，可以重排或改写未完成步骤；除非用户明确取消，否则保留已完成项。
+"""
+
+COLLABORATION_MODE_SUBAGENT_PROMPT = """## Collaboration Mode
+当前处于 Subagent mode。
+
+- 这个模式用于优先把边界清晰、可并行或可独立推进的子任务委派给 `multiagent`。
+- 如果任务能自然拆成 1 个或多个明确子任务，优先考虑调用 `multiagent`，而不是全部由主 Agent 串行完成。
+- 在发起 `multiagent` 前，把背景、目标、范围、约束和预期输出写进每个 subagent 的 prompt。
+- `multiagent` 适合执行明确子任务，不负责维护 checklist；如果需要显式计划管理，改用 `enter_plan_mode` / `update_plan`。
+- 如果任务很小、强依赖当前主线程上下文，或拆分成本高于收益，则直接处理，不要为了使用 subagent 而强行拆分。
 """
 
 
@@ -111,7 +122,12 @@ def build_current_plan_section(plan: SessionPlan) -> str:
 
 def build_collaboration_mode_prompt(session: SessionRecord) -> str:
     mode = get_collaboration_mode(session)
-    sections = [COLLABORATION_MODE_DEFAULT_PROMPT if mode.mode == DEFAULT_COLLABORATION_MODE else COLLABORATION_MODE_PLAN_PROMPT]
+    if mode.mode == PLAN_COLLABORATION_MODE:
+        sections = [COLLABORATION_MODE_PLAN_PROMPT]
+    elif mode.mode == SUBAGENT_COLLABORATION_MODE:
+        sections = [COLLABORATION_MODE_SUBAGENT_PROMPT]
+    else:
+        sections = [COLLABORATION_MODE_DEFAULT_PROMPT]
     plan = get_session_plan(session)
 
     if mode.mode == PLAN_COLLABORATION_MODE:

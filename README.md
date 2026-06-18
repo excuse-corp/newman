@@ -1,354 +1,276 @@
+<p align="center">
+  <img src="docs/assets/newman-banner.svg" alt="Newman pixel banner" width="100%" />
+</p>
+
+<p align="center">
+  <strong>Newman</strong> 是一个给牛马干活的本地优先 AI Agent 运行时与工作台。
+  它不只负责聊天，而是围绕本地工作区、长任务推进、Skill / Plugin 生态和可审计数据目录，把能持续交付和自进化的 Agent 基线做出来。
+</p>
+
 # Newman
 
-本仓库包含 Newman 的本地优先后端、前端工作台，以及运行期数据目录。
+## Newman for 牛马 Agent
 
-## 目录说明
+Newman 面向真实工作流：读文件、跑工具、拆长任务、调用子 Agent、沉淀记忆、自我进化、更新技能、接入插件。仓库里包含 FastAPI 后端、React 工作台，以及围绕 `skills/`、`plugins/`、`backend_data/` 组织的本地优先运行时。
 
-- `backend/`：FastAPI 后端与运行时逻辑
-- `frontend/`：前端工作台
-- `backend_data/`：运行期数据，默认不提交
-- `plugins/`：插件目录
-- `skills/`：工作区级技能目录
-- `docs/`：PRD 与 API 文档
+它适合这几类场景：
 
-## 环境准备
+- 任务不是一句话解决，而是需要连续推进、持续补充上下文。
+- 数据和配置更希望留在本机或当前工作区，不想全部托管到远端黑盒。
+- 希望 Agent 的经验、技能和插件能力可以逐步沉淀，而不是每轮会话都从零开始。
 
-### Conda 环境
+## 功能亮点
 
-推荐直接按下面两条命令创建并进入环境：
+| 能力 | 说明 |
+| --- | --- |
+| 长任务 | 支持多阶段推进、上下文压缩、checkpoint 延续和 `multiagent` 子代理协作，适合持续跑任务而不是一次性问答。 |
+| 自进化 | 把每次真实任务中的有效经验自动沉淀为下次可用的记忆和 skill，让 Newman 越用越贴近你的工作方式，同时保留 diff、快照和回滚记录。 |
+| Skill 隔离 | 每个 skill 都是独立目录，能带 `SKILL.md`、脚本、模板、参考资料，Python 依赖还能走 skill-local `.venv`。 |
+| 插件能力 | `plugins/` 支持 `plugin.yaml`、hooks、内嵌 MCP server、启停、重扫和插件内 skill 自动发现。 |
+| 本地化数据 | 会话、记忆、审计、自进化日志、知识库、调度和渠道状态默认都落在 `backend_data/`，数据位置清晰、方便备份。 |
+| 可治理 | 支持 Linux 原生沙箱、路径权限、审批策略和运行时配置热重载，适合需要边界和可追踪性的场景。 |
+
+## 自进化：越干活，越懂活
+
+Newman 的自进化不是简单的“记住聊天记录”，而是把一次次任务里的可复用经验沉淀进本地运行时。它会在会话结束或长会话累计到一定轮次后，后台复盘刚刚发生的任务，提取稳定经验，并判断是否需要更新对应 skill。
+
+这套机制重点解决一个问题：Agent 不应该每次都像新人一样重新摸索你的项目、工具链和偏好。Newman 会把“这次踩过的坑”“这类任务的正确流程”“某个 skill 应该补充的执行约束”变成下次能直接使用的能力。
+
+| 自进化能力 | 说明 |
+| --- | --- |
+| 自动复盘 | 新 session 创建时总结上一个非空 session；长会话每累计一定 user turn 后做增量总结。 |
+| 经验沉淀 | 将高价值、可复用的经验写入 `backend_data/memory/MEMORY.md`，避免重复解释同一类问题。 |
+| Skill 变强 | 在允许范围内更新 `skills/**` 或插件内 skill 的 `SKILL.md`、脚本、模板和参考资料。 |
+| 证据驱动 | 自进化输入包含消息范围、checkpoint、当前 memory、skill 列表和近期 evolution 摘要，减少凭空改写。 |
+| 可审计 | 每次 evolution run 都记录触发来源、变更摘要、diff、验证结果和错误信息。 |
+| 可回滚 | 文件变更前保存快照；skill 验证失败会自动回滚，前端 Evolution Log 也支持事后回滚。 |
+| 有边界 | 默认不会自动改权限、系统 prompt、后端/前端代码、沙箱策略或安装高权限插件。 |
+
+最终效果是：Newman 会从“能调用工具的 Agent”，逐步变成“知道这台机器、这个项目、这些工作流该怎么干活的 Agent”。
+
+## 项目结构
+
+| 路径 | 作用 |
+| --- | --- |
+| `backend/` | FastAPI 后端、运行时、工具、沙箱、自进化、plugin / skill runtime。 |
+| `frontend/` | React + Vite 工作台。 |
+| `backend_data/` | 本地运行期数据目录，默认不提交版本库。 |
+| `plugins/` | 插件目录，支持插件内 skills、hooks 和 MCP 配置。 |
+| `skills/` | 工作区级 skill 目录。 |
+| `scripts/dev/` | 本地开发启动、停止、状态检查脚本。 |
+| `docs/` | API、设计文档、机制说明。 |
+
+### 本地数据默认落盘
+
+`backend_data/` 下默认会看到这些目录：
+
+- `sessions/`：会话和消息记录
+- `memory/`：`Newman.md`、`USER.md`、`MEMORY.md`、`SKILLS_SNAPSHOT.md`
+- `audit/`：审计信息
+- `evolution/`：自进化 run、快照、diff
+- `knowledge/`、`chroma/`：知识文档、解析产物和向量索引
+- `scheduler/`：定时任务与告警
+- `channels/`：渠道 webhook 相关状态
+
+## 部署指导
+
+> 新机器或稳定运行优先走 Docker；需要改代码、联调或看运行日志时优先走本地开发。
+
+### 方案一：Docker 部署
+
+1. 准备容器环境变量。
 
 ```bash
-cd /root/newman
+cd /path/to/newman
+cp .env.docker.example .env.docker
+```
+
+至少补齐这些配置：
+
+- `NEWMAN_MODELS_PRIMARY_ENDPOINT`
+- `NEWMAN_MODELS_PRIMARY_API_KEY`
+- `NEWMAN_MODELS_MULTIMODAL_ENDPOINT`
+- `NEWMAN_MODELS_MULTIMODAL_API_KEY`
+
+2. 构建并启动。
+
+```bash
+cd /path/to/newman
+docker compose build
+docker compose up -d
+```
+
+3. 默认访问地址。
+
+- Frontend: `http://127.0.0.1:17775`
+- Backend API: `http://127.0.0.1:18005`
+- Backend Docs: `http://127.0.0.1:18005/docs`
+
+4. 常用运维命令。
+
+```bash
+cd /path/to/newman
+docker compose ps
+docker compose logs -f backend
+docker compose logs -f frontend
+docker compose logs -f postgres
+docker compose down
+docker compose up -d --build
+```
+
+5. 自定义外部端口时可以直接覆盖环境变量。
+
+```bash
+cd /path/to/newman
+NEWMAN_FRONTEND_PORT=7775 NEWMAN_BACKEND_PORT=8005 docker compose up -d --build
+```
+
+Docker 模式注意事项：
+
+- 容器内访问宿主机服务时，不要写 `127.0.0.1`，应改用 `host.docker.internal`。
+- 后端会挂载 `backend_data/`、`plugins/`、`skills/`、`outputs/` 和 `backend/tools/`，便于保留本地数据和扩展能力。
+- Docker 默认对外暴露的是 `17775 -> 80` 和 `18005 -> 8005`。
+
+### 方案二：本地开发部署
+
+1. 创建并进入 Conda 环境。
+
+```bash
+cd /path/to/newman
 conda env create -f environment.yml
 conda activate newman
 ```
 
-说明：
-
-- `environment.yml` 会创建名为 `newman` 的 Conda 环境
-- 其中已经包含 `-e ./backend`，所以会自动按开发模式安装 `backend/pyproject.toml` 中声明的后端依赖
-- 一般情况下，不需要再额外手动执行一次 `pip install -e ./backend`
-- 如需增量安装依赖，统一在 `newman` 环境中执行
-
-如果前端依赖还没安装，再执行一次：
+2. 安装前端依赖。
 
 ```bash
-cd /root/newman/frontend
+cd /path/to/newman/frontend
 npm install
 ```
 
-### 最推荐启动方式
-
-本项目最省事的启动命令是：
+3. 准备运行时环境变量。
 
 ```bash
-cd /root/newman
+cd /path/to/newman
+cp .env.example .env
+```
+
+4. 启动整套服务。
+
+```bash
+cd /path/to/newman
 conda activate newman
 ./scripts/dev/start_services.sh
 ```
 
-它会在后台常驻启动：
+默认端口：
 
-- PostgreSQL
-- 后端 API
-- 前端工作台
+- Frontend: `http://127.0.0.1:7775`
+- Backend API: `http://127.0.0.1:8005`
+- Backend Docs: `http://127.0.0.1:8005/docs`
+- PostgreSQL: `127.0.0.1:65437`
 
-常用配套命令：
+常用脚本：
 
 ```bash
+cd /path/to/newman
 ./scripts/dev/status_services.sh
 ./scripts/dev/restart_services.sh
 ./scripts/dev/stop_services.sh
+./scripts/dev/start_postgres.sh
+./scripts/dev/stop_postgres.sh
 ```
 
 说明：
 
-- 这些脚本会按端口监听和健康检查确认状态，不再只依赖 PID 文件
-- `backend_data/run/*.pid` 会尽量记录真实监听进程 PID，而不是仅记录启动壳进程
-- 这些脚本应在主机 shell 中运行；如果在 `bwrap` / Codex 这类 PID namespace 沙箱里执行，会直接报错并退出，避免误导性的“已启动 / 已停止”提示
+- `environment.yml` 会创建名为 `newman` 的环境，并按开发模式安装 `backend/`。
+- 这些脚本应在宿主机 shell 里运行，不适合在 PID namespace 沙箱里直接控制主机服务。
 
-### 本地 PostgreSQL
+### 配置约定
 
-```bash
-./scripts/dev/start_postgres.sh
-```
-
-默认会在本机启动：
-
-- PostgreSQL: `127.0.0.1:65437`
-- Database: `newman`
-- Username: `postgres`
-- Auth: 本地开发默认为 `trust`
-
-停止命令：
-
-```bash
-./scripts/dev/stop_postgres.sh
-```
-
-### 前端
-
-```bash
-cd frontend
-npm install
-```
-
-## 配置
-
-Newman 按以下优先级加载配置：
+Newman 的配置优先级如下：
 
 1. 环境变量
 2. `~/.newman/config.yaml`
 3. 项目根目录 `newman.yaml`
 4. `backend/config/defaults.yaml`
 
-可以把这三层理解为：
+部署时通常这样分工：
 
-- `backend/config/defaults.yaml`：内置默认模板 / fallback 基线
-- 项目根目录 `newman.yaml`：当前项目的实际部署配置
-- `.env`：环境级动态覆盖，优先处理模型、密钥、endpoint、连接串等易变或敏感值
+- `newman.yaml`：项目级部署配置
+- `.env` / `.env.docker`：模型、密钥、DSN、endpoint 这类敏感或易变配置
+- `backend/config/defaults.yaml`：代码内置基线，不直接按环境改
 
-这里要特别说明两点：
+一个最常见的启动前检查清单：
 
-- `~/.newman/config.yaml` 默认不存在；只有你想给“这台机器上的所有 Newman 项目”做全局配置时，才需要自己创建
-- 项目根目录 `newman.yaml` 是项目级配置入口；仓库中应保留该文件，且系统初始化时如果发现缺失，会自动创建一个项目部署模板
-- 模型配置可以放进 `newman.yaml`，但通常更推荐通过 `.env` 中的 `NEWMAN_*` 变量覆盖模型相关值，尤其是 `api_key`、endpoint、不同环境下会变化的模型参数
+- `newman.yaml` 是否存在并符合当前环境
+- `.env` 或 `.env.docker` 是否填入真实模型配置
+- PostgreSQL 或 Docker 容器是否正常
+- `GET /healthz` 是否返回 `ok: true`
 
-部署约定：
+### 飞书接入
 
-1. `backend/config/defaults.yaml` 作为代码仓库内的默认基线，不直接按环境修改
-2. 项目根目录 `newman.yaml` 作为部署必备文件，保存当前项目的实际配置
-3. 首次初始化时如果缺少 `newman.yaml`，Newman 会自动生成一份项目部署模板；部署时应主动检查并修改为目标环境配置
-4. `~/.newman/config.yaml` 只用于机器级全局覆盖，不作为项目部署依赖
+Newman 的飞书接入分两条能力线：
 
-项目根目录 `.env` 和 `~/.newman/.env` 中以 `NEWMAN_` 开头的变量也会自动加载。可先复制：
+- 飞书给 Newman 发消息：走官方 Python Channel SDK，适合内网部署，只需要 Newman 主动出站连接飞书。
+- Newman 主动操作飞书：走 `feishu-cli` 插件复用官方 `lark-cli` Agent Skills。
 
-```bash
-cp .env.example .env
-```
-
-如果你要使用基于 SerpApi 的 Google 联网搜索工具，还可以在 `.env` 里补充：
-
-```env
-SERPAPI_API_KEY=your_serpapi_api_key_here
-```
-
-`google_search` 工具固定调用的接口是 `https://serpapi.com/search?engine=google_light`，并兼容读取 `SERPAPI_API_KEY`、`SERPAPI_KEY` 或 `NEWMAN_SERPAPI_API_KEY`。
-
-常见变量示例：
-
-- `NEWMAN_MODELS_PRIMARY_TYPE`
-- `NEWMAN_MODELS_PRIMARY_MODEL`
-- `NEWMAN_MODELS_MULTIMODAL_MODEL`
-- `NEWMAN_MODELS_EMBEDDING_MODEL`
-- `NEWMAN_MODELS_RERANKER_MODEL`
-- `NEWMAN_RAG_POSTGRES_DSN`
-- `NEWMAN_RAG_CHROMA_COLLECTION`
-- `NEWMAN_PATHS_CHROMA_DIR`
-- `NEWMAN_SERVER_PORT`
-- `NEWMAN_SANDBOX_ENABLED`
-- `NEWMAN_SANDBOX_MODE`
-- `NEWMAN_PATHS_WORKSPACE`
-
-最常见的本地开发做法是：
-
-1. 先保持 `backend/config/defaults.yaml` 不动
-2. 检查项目根目录 `newman.yaml` 是否存在，并将它视为当前项目的实际配置文件
-3. 把模型、密钥、连接串这类更适合按环境切换的值放到项目根目录 `.env`
-
-例如：
+飞书 -> Newman 的最小配置：
 
 ```yaml
-server:
-  host: "0.0.0.0"
-  port: 8005
-
-sandbox:
-  enabled: true
-  mode: "workspace-write"
-
-permissions:
-  writable_paths:
-    - "skills"
-    - "plugins"
-    - "backend/tools"
-
-paths:
-  workspace: "backend_data/runtime_workspace"
+# newman.yaml
+channels:
+  feishu:
+    enabled: true
+    transport: "channel_sdk"
+    domain: "https://open.feishu.cn"
+    default_turn_approval_mode: "auto_allow"
+    require_mention_in_group: true
+    allowed_chat_ids: []
+    allowed_user_open_ids: []
+    reply_timeout_seconds: 20
+    dedup_ttl_seconds: 600
 ```
 
-如果你希望把更多稳定配置固化到项目里，也可以继续写在 `newman.yaml`，例如：
+敏感值放 `.env` 或 `.env.docker`：
 
-```yaml
-runtime:
-  max_tool_depth: 30
-
-rag:
-  chroma_collection: "knowledge_chunks"
-
-sandbox:
-  network_access: false
+```dotenv
+NEWMAN_CHANNELS__FEISHU__APP_ID=cli_xxx
+NEWMAN_CHANNELS__FEISHU__APP_SECRET=your_feishu_app_secret
 ```
 
-```env
-NEWMAN_MODELS_PRIMARY_TYPE=openai_compatible
-NEWMAN_MODELS_PRIMARY_MODEL=gpt-5
-NEWMAN_MODELS_PRIMARY_ENDPOINT=http://127.0.0.1:4000/v1
-NEWMAN_MODELS_PRIMARY_API_KEY=your-api-key
-NEWMAN_SERVER_PORT=8005
-NEWMAN_RAG_POSTGRES_DSN=postgresql://postgres@127.0.0.1:65437/newman
-```
+飞书开放平台侧需要准备：
 
-建议把 `newman.yaml` 纳入项目部署流程：
+- 创建自建应用并启用机器人能力。
+- 事件订阅选择“使用长连接接收事件”。
+- 订阅 `im.message.receive_v1`。
+- 开通接收消息、发送消息所需权限，并发布/安装应用到目标企业或测试范围。
 
-1. 部署代码后先确认项目根目录存在 `newman.yaml`
-2. 如文件是系统自动生成的模板，按目标环境补全和修改项目实际配置
-3. 再补充 `.env` 中的敏感信息或临时环境变量
-4. 最后启动 Newman 服务
-
-后端启动时会在日志里打印一份“最终生效配置 + 来源摘要”：
-
-- 会显示每个叶子配置项最终取值
-- 会标明来源是 `defaults.yaml`、`newman.yaml`、`~/.newman/config.yaml` 还是 `environment`
-- `api_key` / `token` / `secret` / `password` 这类敏感值会自动脱敏为 `***`
-
-注意：
-
-- 如果某个值同时出现在 `newman.yaml` 和 `.env`，最终以 `.env` 为准
-- 如果你没有在 `newman.yaml` 里写某个配置项，运行时会继续使用 `defaults.yaml` 里的默认值，或再被 `.env` 覆盖
-
-模型配置现已拆为 4 个槽位：
-
-- `models.primary`：主 LLM，负责文本输出、工具调用等主链路
-- `models.multimodal`：多模态模型，预留给图片理解等能力
-- `models.embedding`：Embedding 模型，预留给向量化
-- `models.reranker`：Reranker 模型，预留给 RAG 重排序
-
-兼容说明：
-
-- 历史配置里的 `provider.*` 仍会自动映射到 `models.primary.*`
-- 历史环境变量 `NEWMAN_PROVIDER_*` 也仍兼容，但新配置建议统一改为 `NEWMAN_MODELS_PRIMARY_*`
-
-RAG 当前按 PRD 目标落地为：
-
-- File System：原始文档与解析产物
-- PostgreSQL：文档元数据、chunk 映射、检索统计、引用记录
-- Chroma：向量索引与向量检索
-
-Linux 原生沙箱默认配置示例：
-
-```yaml
-sandbox:
-  enabled: true
-  backend: "linux_bwrap"
-  mode: "workspace-write"
-  network_access: false
-  writable_roots: []
-
-permissions:
-  # paths.workspace 是主要操作空间，默认可读写；这里列出额外可写的维护目录。
-  writable_paths:
-    - "backend_data/memory"
-    - "skills"
-    - "plugins"
-    - "backend/tools"
-```
-
-## 启动
-
-### 一键后台启动
+验证接口：
 
 ```bash
-cd /root/newman
-conda activate newman
-./scripts/dev/start_services.sh
+curl http://127.0.0.1:8005/api/channels/feishu/setup/status
+curl -X POST http://127.0.0.1:8005/api/channels/feishu/setup/validate
 ```
 
-启动后访问：
-
-- Frontend bind: `http://0.0.0.0:7775`
-- Frontend LAN: `http://<服务器局域网IP>:7775`
-- Backend API: `http://127.0.0.1:8005`
-- Backend Docs: `http://127.0.0.1:8005/docs`
-- OpenAPI JSON: `http://127.0.0.1:8005/openapi.json`
-- PostgreSQL: `127.0.0.1:65437`
-
-日志与 PID 文件位置：
-
-- 日志目录：`backend_data/run/logs/`
-- PID 文件：`backend_data/run/backend.pid`、`backend_data/run/frontend.pid`
-
-状态与重启：
+Newman -> 飞书的最小准备：
 
 ```bash
-cd /root/newman
-./scripts/dev/status_services.sh
-./scripts/dev/restart_services.sh
+npx @larksuite/cli@latest install
+lark-cli config init --new
+lark-cli auth login --recommend
+lark-cli auth status
 ```
 
-停止命令：
+Docker 部署已挂载宿主机 `~/.lark-cli` 和 `~/.local/share/lark-cli`；如果要让 Newman 默认给固定飞书用户发 IM，可在 `.env` / `.env.docker` 设置 `NEWMAN_LARK_DEFAULT_IM_USER_ID`。
 
-```bash
-cd /root/newman
-./scripts/dev/stop_services.sh
-```
+## 相关文档
 
-### 手动分开启动
-
-先启动 PostgreSQL：
-
-```bash
-cd /root/newman
-conda activate newman
-./scripts/dev/start_postgres.sh
-```
-
-再启动后端：
-
-```bash
-cd /root/newman
-conda activate newman
-uvicorn backend.main:app --reload --host 0.0.0.0 --port 8005
-```
-
-最后启动前端：
-
-```bash
-cd /root/newman/frontend
-npm run dev -- --host 0.0.0.0 --port 7775 --strictPort
-```
-
-### 启动排错
-
-如果 PostgreSQL 相关脚本报错，优先按下面顺序重试：
-
-```bash
-cd /root/newman
-./scripts/dev/restart_services.sh
-```
-
-如果仍有问题，再单独看 PostgreSQL：
-
-```bash
-cd /root/newman
-./scripts/dev/start_postgres.sh
-```
-
-## 常用文件
-
-- 后端依赖：`backend/pyproject.toml`
-- 默认配置：`backend/config/defaults.yaml`
-- API 文档：`docs/Newman_API_v1.md`
-- 自进化机制：`docs/self_evolution.md`
-- 稳定记忆：`backend_data/memory/`
-- 自进化日志与快照：`backend_data/evolution/`
-
-## 说明
-
-- `requirements.txt` 当前未单独维护，因为后端依赖已由 `backend/pyproject.toml` 管理。
-- `backend_data/` 属于运行时数据目录，默认通过 `.gitignore` 忽略。
-
-## 当前待办
-
-- `anthropic_compatible` Provider 目前未把工具调用结果解析回 `tool_calls`，切到该 Provider 时工具链路未完全生效。
-- 飞书/企微 Channel 的 `send_response` 目前还是占位实现，Webhook 入站可用，但平台回发消息未真正落地。
+- [API 文档](docs/Newman_API_v1.md)
+- [自进化机制](docs/self_evolution.md)
+- [多代理设计](docs/newman_multiagent_design.md)
+- [飞书接入配置清单](docs/feishu_setup.md)
+- [飞书入站 Channel 设计](docs/feishu_inbound_channel_design.md)
+- [飞书 CLI Channel 接入设计](docs/feishu_cli_channel_design.md)
+- [Plugin Runtime](backend/plugin_runtime/README.md)
+- [Skill Runtime](backend/skill_runtime/README.md)

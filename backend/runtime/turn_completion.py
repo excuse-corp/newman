@@ -23,11 +23,24 @@ INCOMPLETE_ACTION_PATTERNS = (
     re.compile(r"(?:让我|我先|我来).*(?:重新生成|直接用|修复|处理|生成|制作|创建|执行|运行|调用)", re.I),
     re.compile(r"^\s*我(?:先|来|再|继续|会|将)?\s*.*(?:试试|看看|找找|查找|查询|确认|定位|检查|处理)", re.I),
     re.compile(r"^\s*(?:先|继续|接下来).*(?:试试|看看|找找|查找|查询|确认|定位|检查|处理)", re.I),
-    re.compile(r"(?:这次|现在|接下来|下一步).*?(?:我|我们)?.*?(?:重试|再试|执行|运行|调用|生成|传入|处理)", re.I),
+    re.compile(r"(?:这次|现在|接下来|下一步).*?(?:我|我们).*?(?:重试|再试|执行|运行|调用|生成|传入|处理)", re.I),
+    re.compile(r"(?:这次|现在|接下来|下一步)[，,:：\s]*(?:重试|再试|执行|运行|调用|生成|传入|处理)", re.I),
     re.compile(r"(?:我|我们)(?:会|将|准备|打算|需要).*?(?:重试|再试|执行|运行|调用|生成|传入|处理)", re.I),
     re.compile(r"允许的路径范围内.*(?:找|查|确认|定位)", re.I),
     re.compile(r"^(?:I'?ll|I will|Let me|I can|I am going to)\s+.*(?:check|look|search|try|retry|run|execute|call|generate|inspect|find)", re.I),
 )
+INCOMPLETE_FOLLOWUP_ACTION_PATTERNS = (
+    re.compile(
+        r"(?:^|[。！？.!?\n，,；;]\s*)"
+        r"(?:现在|接下来|下一步|这次)?[，,:：\s]*"
+        r"(?:让我|我(?:先|来|再|继续|会|将|准备|打算|需要|要)|我们(?:先|来|再|继续|会|将|准备|打算|需要|要))"
+        r"[^。！？.!?\n]{0,180}"
+        r"(?:尝试|试试|重试|再试|测试|验证|执行|运行|调用|读取|检查|确认|定位|排查|处理|生成|创建|修改|修复)",
+        re.I,
+    ),
+)
+INCOMPLETE_ACTION_MAX_CHARS = 120
+INCOMPLETE_FOLLOWUP_ACTION_MAX_CHARS = 700
 
 COMPLETION_SIGNAL_PATTERNS = (
     re.compile(r"(?:位置|路径|目录|文件|日志|原因|失败|受限|权限|阻塞|无法|不能|已经|已|完成|保存在|生成|结果)"),
@@ -231,9 +244,15 @@ def build_blocked_fallback(progress: TurnProgressState, rejected_answer: str) ->
 
 
 def _looks_like_incomplete_action(text: str) -> bool:
-    if len(text) > 120:
-        return False
-    return any(pattern.search(text) for pattern in INCOMPLETE_ACTION_PATTERNS)
+    if len(text) <= INCOMPLETE_ACTION_MAX_CHARS and any(
+        pattern.search(text) for pattern in INCOMPLETE_ACTION_PATTERNS
+    ):
+        return True
+    if len(text) <= INCOMPLETE_FOLLOWUP_ACTION_MAX_CHARS and any(
+        pattern.search(text) for pattern in INCOMPLETE_FOLLOWUP_ACTION_PATTERNS
+    ):
+        return True
+    return False
 
 
 def _has_completion_signal(text: str) -> bool:

@@ -8,11 +8,14 @@ from pydantic import BaseModel, Field
 from backend.channels.service import ChannelService
 from backend.config.loader import (
     get_project_config_path,
+    get_project_dotenv_path,
     log_settings_report,
     read_project_config_text,
+    read_project_dotenv_text,
     reload_settings,
     resolve_project_root,
     validate_project_config_content,
+    validate_project_dotenv_content,
 )
 from backend.runtime.run_loop import NewmanRuntime
 from backend.scheduler.scheduler_engine import SchedulerEngine
@@ -32,6 +35,10 @@ class UpdateProjectConfigRequest(BaseModel):
     content: str = Field(..., min_length=0, description="newman.yaml 的完整内容")
 
 
+class UpdateProjectDotenvRequest(BaseModel):
+    content: str = Field(..., min_length=0, description=".env 的完整内容")
+
+
 @router.get("/project")
 async def get_project_config(request: Request):
     root = _project_root(request)
@@ -47,11 +54,42 @@ async def get_project_config(request: Request):
     }
 
 
+@router.get("/env")
+async def get_project_dotenv(request: Request):
+    root = _project_root(request)
+    path = get_project_dotenv_path(str(root))
+    content = read_project_dotenv_text(str(root))
+    settings = request.app.state.settings
+    return {
+        "path": str(path),
+        "content": content,
+        "effective_workspace": str(settings.paths.workspace),
+        "reload_supported": True,
+    }
+
+
 @router.put("/project")
 async def update_project_config(payload: UpdateProjectConfigRequest, request: Request):
     root = _project_root(request)
     next_settings = validate_project_config_content(payload.content, str(root))
     path = get_project_config_path(str(root))
+    path.write_text(payload.content, encoding="utf-8")
+    warnings = _build_reload_warnings(request.app.state.settings, next_settings)
+    return {
+        "saved": True,
+        "path": str(path),
+        "content": payload.content,
+        "effective_workspace": str(next_settings.paths.workspace),
+        "requires_reload": True,
+        "warnings": warnings,
+    }
+
+
+@router.put("/env")
+async def update_project_dotenv(payload: UpdateProjectDotenvRequest, request: Request):
+    root = _project_root(request)
+    next_settings = validate_project_dotenv_content(payload.content, str(root))
+    path = get_project_dotenv_path(str(root))
     path.write_text(payload.content, encoding="utf-8")
     warnings = _build_reload_warnings(request.app.state.settings, next_settings)
     return {
@@ -84,18 +122,24 @@ async def reload_project_config(request: Request):
     next_scheduler.refresh_schedule()
 
     await previous_scheduler.stop()
+    if hasattr(previous_channels, "stop"):
+        await previous_channels.stop()
     try:
         app.state.settings = next_settings
         app.state.runtime = next_runtime
         app.state.scheduler = next_scheduler
         app.state.channels = next_channels
         await next_scheduler.start()
+        if hasattr(next_channels, "start"):
+            await next_channels.start()
     except Exception:
         app.state.settings = previous_settings
         app.state.runtime = previous_runtime
         app.state.scheduler = previous_scheduler
         app.state.channels = previous_channels
         next_runtime.close()
+        if hasattr(previous_channels, "start"):
+            await previous_channels.start()
         await previous_scheduler.start()
         raise
 

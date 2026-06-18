@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable, Mapping
 
 from backend.config.schema import SandboxConfig
-from backend.sandbox.linux_bwrap import build_bwrap_command, resolve_bwrap_executable
+from backend.sandbox.linux_bwrap import build_bwrap_argv, build_bwrap_command, resolve_bwrap_executable
 from backend.sandbox.resource_limits import ResourceLimits
 from backend.sandbox.workspace_mount import resolve_workspace
 from backend.tools.base import ToolOutputEmitter
@@ -93,11 +95,13 @@ class NativeSandbox:
         limits: ResourceLimits,
         config: SandboxConfig,
         path_policy: PathAccessPolicy | Path | None = None,
+        extra_readable_roots: list[Path] | tuple[Path, ...] | None = None,
     ):
         self.workspace = resolve_workspace(workspace)
         self.limits = limits
         self.config = config
         self.path_policy = coerce_path_access_policy(path_policy or workspace)
+        self.extra_readable_roots = tuple(Path(path).resolve() for path in (extra_readable_roots or ()))
         self.platform = sys.platform
         self._bwrap_executable = resolve_bwrap_executable() if self.platform == "linux" else None
 
@@ -197,6 +201,103 @@ class NativeSandbox:
             )
         return result
 
+    async def execute_argv(
+        self,
+        argv: list[str],
+        emit_output: ToolOutputEmitter | None = None,
+        *,
+        force_unsandboxed: bool = False,
+        env: Mapping[str, str] | None = None,
+        stdin_text: str | None = None,
+        extra_readable_roots: Iterable[Path] | None = None,
+        extra_writable_roots: Iterable[Path] | None = None,
+    ) -> ToolExecutionResult:
+        if not argv:
+            return ToolExecutionResult(
+                success=False,
+                tool="sandbox",
+                action="execute",
+                category="validation_error",
+                summary="缺少可执行命令",
+                retryable=False,
+            )
+
+        normalized_env = {**os.environ, **dict(env)} if env is not None else None
+        stdin_bytes = stdin_text.encode("utf-8") if stdin_text is not None else None
+
+        if force_unsandboxed or not self.config.enabled or self.config.mode == "danger-full-access":
+            result = await self._execute_direct_argv(argv, emit_output=emit_output, env=normalized_env, stdin_bytes=stdin_bytes)
+            result.metadata.update(
+                {
+                    "sandboxed": False,
+                    "sandbox_backend": self.config.backend,
+                    "sandbox_mode": "unsandboxed-retry" if force_unsandboxed else self.config.mode,
+                }
+            )
+            if force_unsandboxed:
+                result.metadata["sandbox_escalated"] = True
+            return result
+
+        if self.platform != "linux":
+            result = ToolExecutionResult(
+                success=False,
+                tool="sandbox",
+                action="execute",
+                category="runtime_exception",
+                summary=f"当前平台暂未实现原生沙箱: {self.platform}",
+                metadata={
+                    "sandboxed": False,
+                    "sandbox_backend": self.config.backend,
+                    "sandbox_mode": self.config.mode,
+                },
+            )
+            return _mark_sandbox_escalation(
+                result,
+                reason="sandbox_unavailable",
+                summary="当前原生沙箱不可用，是否允许无沙箱重试一次？",
+            )
+        if self._bwrap_executable is None:
+            result = ToolExecutionResult(
+                success=False,
+                tool="sandbox",
+                action="execute",
+                category="runtime_exception",
+                summary="未找到 bwrap，无法启用 Linux 原生沙箱",
+                metadata={
+                    "sandboxed": False,
+                    "sandbox_backend": self.config.backend,
+                    "sandbox_mode": self.config.mode,
+                },
+            )
+            return _mark_sandbox_escalation(
+                result,
+                reason="sandbox_unavailable",
+                summary="当前原生沙箱不可用，是否允许无沙箱重试一次？",
+            )
+
+        result = await self._execute_bwrap_argv(
+            argv,
+            emit_output=emit_output,
+            env=normalized_env,
+            stdin_bytes=stdin_bytes,
+            extra_readable_roots=extra_readable_roots,
+            extra_writable_roots=extra_writable_roots,
+        )
+        result.metadata.update(
+            {
+                "sandboxed": True,
+                "sandbox_backend": self.config.backend,
+                "sandbox_mode": self.config.mode,
+            }
+        )
+        if _looks_like_sandbox_permission_denial(result):
+            _mark_sandbox_escalation(
+                result,
+                reason="sandbox_permission_denied",
+                summary="Linux 原生沙箱阻止了本次执行，是否允许无沙箱重试一次？",
+            )
+        return result
+
     async def _execute_direct(
         self,
         command: str,
@@ -225,6 +326,49 @@ class NativeSandbox:
                 action="execute",
                 category="timeout_error",
                 summary="终端执行超时",
+                retryable=True,
+            )
+        except asyncio.CancelledError:
+            await _cleanup_process(proc)
+            raise
+
+        return _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
+
+    async def _execute_direct_argv(
+        self,
+        argv: list[str],
+        *,
+        emit_output: ToolOutputEmitter | None = None,
+        env: Mapping[str, str] | None = None,
+        stdin_bytes: bytes | None = None,
+    ) -> ToolExecutionResult:
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(self.workspace),
+                env=dict(env) if env is not None else None,
+                stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            if emit_output is not None:
+                stdin_task = _start_stdin_pump(proc, stdin_bytes)
+                return await self._stream_process_output(
+                    proc,
+                    emit_output=emit_output,
+                    timeout_summary="命令执行超时",
+                    stdin_task=stdin_task,
+                )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(stdin_bytes), timeout=self.limits.timeout_seconds)
+        except asyncio.TimeoutError:
+            await _cleanup_process(proc)
+            return ToolExecutionResult(
+                success=False,
+                tool="sandbox",
+                action="execute",
+                category="timeout_error",
+                summary="命令执行超时",
                 retryable=True,
             )
         except asyncio.CancelledError:
@@ -282,12 +426,71 @@ class NativeSandbox:
 
         return _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
 
+    async def _execute_bwrap_argv(
+        self,
+        command_argv: list[str],
+        *,
+        emit_output: ToolOutputEmitter | None = None,
+        env: Mapping[str, str] | None = None,
+        stdin_bytes: bytes | None = None,
+        extra_readable_roots: Iterable[Path] | None = None,
+        extra_writable_roots: Iterable[Path] | None = None,
+    ) -> ToolExecutionResult:
+        readable_roots = self._resolve_readable_roots(extra_readable_roots)
+        writable_roots = self._resolve_writable_roots(extra_writable_roots)
+        protected_roots = self._resolve_protected_roots()
+        argv = build_bwrap_argv(
+            bwrap_executable=self._bwrap_executable or "bwrap",
+            workspace=self.workspace,
+            readable_roots=readable_roots,
+            writable_roots=writable_roots,
+            protected_roots=protected_roots,
+            mode=self.config.mode,
+            network_access=self.config.network_access,
+            argv=command_argv,
+        )
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(self.workspace),
+                env=dict(env) if env is not None else None,
+                stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            if emit_output is not None:
+                stdin_task = _start_stdin_pump(proc, stdin_bytes)
+                return await self._stream_process_output(
+                    proc,
+                    emit_output=emit_output,
+                    timeout_summary="Linux 原生沙箱执行超时",
+                    stdin_task=stdin_task,
+                )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(stdin_bytes), timeout=self.limits.timeout_seconds)
+        except asyncio.TimeoutError:
+            await _cleanup_process(proc)
+            return ToolExecutionResult(
+                success=False,
+                tool="sandbox",
+                action="execute",
+                category="timeout_error",
+                summary="Linux 原生沙箱执行超时",
+                retryable=True,
+            )
+        except asyncio.CancelledError:
+            await _cleanup_process(proc)
+            raise
+
+        return _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
+
     async def _stream_process_output(
         self,
         proc: asyncio.subprocess.Process,
         *,
         emit_output: ToolOutputEmitter,
         timeout_summary: str,
+        stdin_task: asyncio.Task[None] | None = None,
     ) -> ToolExecutionResult:
         stdout_capture = _StreamCapture(self.limits.output_limit_bytes)
         stderr_capture = _StreamCapture(self.limits.output_limit_bytes)
@@ -300,10 +503,11 @@ class NativeSandbox:
 
         try:
             return_code = await asyncio.wait_for(proc.wait(), timeout=self.limits.timeout_seconds)
-            await asyncio.gather(stdout_task, stderr_task)
+            await asyncio.gather(*(task for task in (stdin_task, stdout_task, stderr_task) if task is not None))
         except asyncio.TimeoutError:
             await _terminate_streaming_process(proc)
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            tasks = [task for task in (stdin_task, stdout_task, stderr_task) if task is not None]
+            await asyncio.gather(*tasks, return_exceptions=True)
             return ToolExecutionResult(
                 success=False,
                 tool="sandbox",
@@ -314,17 +518,32 @@ class NativeSandbox:
             )
         except asyncio.CancelledError:
             await _terminate_streaming_process(proc)
+            if stdin_task is not None:
+                stdin_task.cancel()
             stdout_task.cancel()
             stderr_task.cancel()
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            tasks = [task for task in (stdin_task, stdout_task, stderr_task) if task is not None]
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
         return _result_from_stream_captures(return_code, stdout_capture, stderr_capture)
 
-    def _resolve_readable_roots(self) -> list[Path]:
-        return list(self.path_policy.readable_roots)
+    def _resolve_readable_roots(self, extra_roots: Iterable[Path] | None = None) -> list[Path]:
+        roots = list(self.path_policy.readable_roots)
+        roots.extend(path for path in self.extra_readable_roots if path.exists())
+        if extra_roots is not None:
+            roots.extend(Path(path).resolve() for path in extra_roots if Path(path).exists())
+        deduped: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            key = str(root.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(root.resolve())
+        return deduped
 
-    def _resolve_writable_roots(self) -> list[Path]:
+    def _resolve_writable_roots(self, extra_roots: Iterable[Path] | None = None) -> list[Path]:
         if self.config.mode != "workspace-write":
             return []
         roots: list[Path] = []
@@ -337,6 +556,8 @@ class NativeSandbox:
                 candidate = candidate.resolve()
             if candidate.exists():
                 roots.append(candidate)
+        if extra_roots is not None:
+            roots.extend(Path(path).resolve() for path in extra_roots if Path(path).exists())
         deduped: list[Path] = []
         seen: set[str] = set()
         for root in roots:
@@ -445,6 +666,33 @@ async def _pump_output_stream(
         if capture.should_emit_notice():
             capture.truncate_notice_emitted = True
             await emit_output(stream_name, STREAM_TRUNCATED_NOTICE)
+
+
+def _start_stdin_pump(
+    proc: asyncio.subprocess.Process,
+    stdin_bytes: bytes | None,
+) -> asyncio.Task[None] | None:
+    if stdin_bytes is None or proc.stdin is None:
+        return None
+    return asyncio.create_task(_write_process_input(proc.stdin, stdin_bytes))
+
+
+async def _write_process_input(
+    stream: asyncio.StreamWriter | None,
+    stdin_bytes: bytes,
+) -> None:
+    if stream is None:
+        return
+    try:
+        stream.write(stdin_bytes)
+        await stream.drain()
+    finally:
+        with suppress(Exception):
+            stream.close()
+        wait_closed = getattr(stream, "wait_closed", None)
+        if callable(wait_closed):
+            with suppress(Exception):
+                await wait_closed()
 
 
 def _clip(text: str, limit: int) -> str:

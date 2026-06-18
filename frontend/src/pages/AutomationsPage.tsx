@@ -19,6 +19,8 @@ type SchedulerTaskAction = {
   session_id?: string | null
 }
 
+type SchedulerApprovalMode = "manual" | "auto_allow"
+
 type SchedulerTaskRecord = {
   task_id: string
   name: string
@@ -26,6 +28,7 @@ type SchedulerTaskRecord = {
   timezone: string
   description?: string | null
   action: SchedulerTaskAction
+  approval_mode: SchedulerApprovalMode
   enabled: boolean
   max_retries: number
   status: "pending" | "running" | "completed" | "failed" | "disabled"
@@ -92,6 +95,7 @@ type SchedulerDraft = {
   timezone: string
   actionType: SchedulerTaskAction["type"]
   sessionId: string
+  approvalMode: SchedulerApprovalMode
   maxRetries: number
   enabled: boolean
   source: "chat" | "automation_page" | "api"
@@ -166,10 +170,15 @@ function buildDefaultDraft(activeSession: SessionOption | null): SchedulerDraft 
     timezone: localTimezone(),
     actionType: activeSession ? "session_message" : "background_task",
     sessionId: activeSession?.id ?? "",
+    approvalMode: "auto_allow",
     maxRetries: 1,
     enabled: true,
     source: activeSession ? "chat" : "automation_page"
   }
+}
+
+function approvalModeLabel(mode: SchedulerApprovalMode) {
+  return mode === "manual" ? "逐个手动确认" : "默认全部通过"
 }
 
 function extractErrorMessage(payload: unknown, fallback: string) {
@@ -226,6 +235,7 @@ export default function AutomationsPage({ apiBase, sessions, activeSession, onOp
   const [alerts, setAlerts] = useState<SchedulerAlert[]>([])
   const [runs, setRuns] = useState<SchedulerRunRecord[]>([])
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const [alertsDrawerOpen, setAlertsDrawerOpen] = useState(false)
   const [editorTaskId, setEditorTaskId] = useState<string | null>(null)
   const [editorOpen, setEditorOpen] = useState(false)
   const [draft, setDraft] = useState<SchedulerDraft>(() => buildDefaultDraft(activeSession))
@@ -245,6 +255,7 @@ export default function AutomationsPage({ apiBase, sessions, activeSession, onOp
   const sessionTaskCount = useMemo(() => tasks.filter((task) => task.action.type === "session_message").length, [tasks])
   const backgroundTaskCount = tasks.length - sessionTaskCount
   const runCount = useMemo(() => tasks.reduce((total, task) => total + task.run_count, 0), [tasks])
+  const activeAlertCount = useMemo(() => alerts.filter((alert) => !alert.acknowledged).length, [alerts])
   const selectedTask = tasks.find((task) => task.task_id === selectedTaskId) ?? null
   const selectedStatus = selectedTask ? statusMeta[selectedTask.status] : null
   const selectedOutcome = selectedTask?.last_run_outcome ? outcomeMeta[selectedTask.last_run_outcome] : null
@@ -277,6 +288,7 @@ export default function AutomationsPage({ apiBase, sessions, activeSession, onOp
   }
 
   function openCreateTask(targetSession: SessionOption | null = activeSession) {
+    setAlertsDrawerOpen(false)
     resetDraft(targetSession)
     setEditorOpen(true)
   }
@@ -320,6 +332,7 @@ export default function AutomationsPage({ apiBase, sessions, activeSession, onOp
   }
 
   function populateDraftFromTask(task: SchedulerTaskRecord) {
+    setAlertsDrawerOpen(false)
     setEditorTaskId(task.task_id)
     setEditorOpen(true)
     setDraft({
@@ -330,6 +343,7 @@ export default function AutomationsPage({ apiBase, sessions, activeSession, onOp
       timezone: task.timezone,
       actionType: task.action.type,
       sessionId: task.action.session_id ?? "",
+      approvalMode: task.approval_mode,
       maxRetries: task.max_retries,
       enabled: task.enabled,
       source: task.source
@@ -356,6 +370,7 @@ export default function AutomationsPage({ apiBase, sessions, activeSession, onOp
         description: draft.description.trim() || null,
         cron: draft.cron.trim(),
         timezone: draft.timezone.trim(),
+        approval_mode: draft.approvalMode,
         enabled: draft.enabled,
         max_retries: draft.maxRetries,
         source: draft.source,
@@ -443,16 +458,31 @@ export default function AutomationsPage({ apiBase, sessions, activeSession, onOp
     }
   }
 
+  function focusTaskFromAlert(taskId: string) {
+    setSelectedTaskId(taskId)
+    setAlertsDrawerOpen(false)
+  }
+
   return (
     <section className={`workspace-page automations-page ${editorOpen ? "editor-open" : ""}`}>
       <div className="automations-toolbar">
         <div className="automations-toolbar-main">
           <h2>Automations</h2>
           <span>{enabledTaskCount} 启用</span>
-          <span>{alerts.length} 告警</span>
+          <span>{activeAlertCount} 告警</span>
           <span>{runCount} 次运行</span>
         </div>
         <div className="automations-toolbar-actions">
+          <button
+            type="button"
+            className={`workspace-secondary-button automation-alert-button ${alertsDrawerOpen ? "active" : ""}`}
+            onClick={() => setAlertsDrawerOpen((current) => !current)}
+            aria-expanded={alertsDrawerOpen}
+            aria-controls="automations-alert-drawer"
+          >
+            <span>告警中心</span>
+            <span className={`automation-alert-pill ${activeAlertCount > 0 ? "has-alerts" : ""}`}>{activeAlertCount}</span>
+          </button>
           <button type="button" className="workspace-secondary-button" onClick={() => void refreshDashboard(selectedTaskId)} disabled={loading}>
             {loading ? "刷新中" : "刷新"}
           </button>
@@ -584,6 +614,10 @@ export default function AutomationsPage({ apiBase, sessions, activeSession, onOp
                     <dd>{selectedTask.max_retries} 次</dd>
                   </div>
                   <div>
+                    <dt>审批</dt>
+                    <dd>{approvalModeLabel(selectedTask.approval_mode)}</dd>
+                  </div>
+                  <div>
                     <dt>来源</dt>
                     <dd>{taskSourceLabel(selectedTask)}</dd>
                   </div>
@@ -624,27 +658,51 @@ export default function AutomationsPage({ apiBase, sessions, activeSession, onOp
                 </div>
               </section>
 
-              {alerts.length > 0 ? (
-                <section className="automations-alert-strip">
-                  <div className="automations-panel-head">
-                    <h3>最近告警</h3>
-                    <span>{alerts.length} 条</span>
-                  </div>
-                  <div className="automations-alert-list">
-                    {alerts.slice(0, 4).map((alert) => (
-                      <article key={alert.alert_id} className={`automation-alert-row ${alert.severity === "warning" ? "warning" : "error"}`}>
-                        <strong>{alert.task_name}</strong>
-                        <p>{compactText(alert.message, 98)}</p>
-                        <span>{formatDateTime(alert.created_at)}</span>
-                      </article>
-                    ))}
-                  </div>
-                </section>
-              ) : null}
             </>
           )}
         </main>
       </div>
+
+      {alertsDrawerOpen ? (
+        <>
+          <button type="button" className="automations-alert-scrim" aria-label="关闭告警中心" onClick={() => setAlertsDrawerOpen(false)} />
+          <aside id="automations-alert-drawer" className="automations-alert-drawer" aria-label="全局告警">
+            <div className="automations-alert-drawer-head">
+              <div>
+                <span className="automations-section-kicker">Global Alerts</span>
+                <h3>全局告警</h3>
+              </div>
+              <button type="button" className="workspace-secondary-button" onClick={() => setAlertsDrawerOpen(false)}>
+                关闭
+              </button>
+            </div>
+
+            <div className="automations-alert-drawer-body">
+              {alerts.length === 0 ? (
+                <div className="workspace-empty automations-alerts-empty">当前没有全局告警。</div>
+              ) : (
+                <div className="automations-alert-drawer-list">
+                  {alerts.map((alert) => (
+                    <button
+                      key={alert.alert_id}
+                      type="button"
+                      className={`automation-alert-card ${alert.severity === "warning" ? "warning" : "error"}`}
+                      onClick={() => focusTaskFromAlert(alert.task_id)}
+                    >
+                      <div className="automation-alert-card-head">
+                        <strong>{alert.task_name}</strong>
+                        <span>{formatDateTime(alert.created_at)}</span>
+                      </div>
+                      <p>{alert.message}</p>
+                      <span className="automation-alert-card-meta">点击定位到任务详情</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </aside>
+        </>
+      ) : null}
 
       {editorOpen ? (
         <>
@@ -795,6 +853,31 @@ export default function AutomationsPage({ apiBase, sessions, activeSession, onOp
                     </label>
 
                     <div className="automations-settings-stack">
+                      <div className="automations-field">
+                        <span className="workspace-field-label">审批策略</span>
+                        <div className="automations-target-toggle">
+                          <button
+                            type="button"
+                            className={`automation-toggle-chip ${draft.approvalMode === "auto_allow" ? "active" : ""}`}
+                            onClick={() => setDraft((current) => ({ ...current, approvalMode: "auto_allow" }))}
+                          >
+                            默认全部通过
+                          </button>
+                          <button
+                            type="button"
+                            className={`automation-toggle-chip ${draft.approvalMode === "manual" ? "active" : ""}`}
+                            onClick={() => setDraft((current) => ({ ...current, approvalMode: "manual" }))}
+                          >
+                            逐个手动确认
+                          </button>
+                        </div>
+                        <small>
+                          {draft.approvalMode === "manual"
+                            ? "无人值守任务命中审批时会直接快速失败。"
+                            : "适合无人值守任务；仍会保留硬拒绝和路径权限限制。"}
+                        </small>
+                      </div>
+
                       <label className="automations-field">
                         <span className="workspace-field-label">失败重试</span>
                         <input

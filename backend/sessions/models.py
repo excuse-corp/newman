@@ -65,7 +65,7 @@ class SessionPlan(BaseModel):
 
 
 class SessionCollaborationMode(BaseModel):
-    mode: Literal["default", "plan"] = "default"
+    mode: Literal["default", "plan", "subagent"] = "default"
     source: Literal["manual", "tool"] = "manual"
     updated_at: str = Field(default_factory=utc_now)
 

@@ -97,6 +97,12 @@ def _build_plugin_detail(runtime, plugin_name: str) -> dict:
     plugin = runtime.plugin_service.get_plugin(plugin_name)
     record = runtime.plugin_service.plugin_record(plugin_name)
     manifest_content = runtime.plugin_service.read_plugin_manifest_content(plugin_name)
+    sandbox_readable_roots = runtime.plugin_service.resolved_sandbox_readable_roots(plugin_name)
+    cli_tool_names = [
+        command.tool_name
+        for command in runtime.plugin_service.enabled_cli_commands()
+        if command.plugin_name == plugin_name
+    ]
     tool_names = _plugin_mcp_tool_names(runtime, plugin.manifest.mcp_servers, enabled=record.enabled)
     hook_handlers = [
         {
@@ -115,6 +121,8 @@ def _build_plugin_detail(runtime, plugin_name: str) -> dict:
         "manifest": plugin.manifest.model_dump(mode="json"),
         "manifest_content": manifest_content,
         "skill_paths": [str(Path(skill.path).parent) for skill in plugin.skills],
+        "sandbox_readable_roots": sandbox_readable_roots,
+        "cli_tool_names": cli_tool_names,
         "hook_handlers": hook_handlers,
         "tool_names": tool_names,
         "available": True,

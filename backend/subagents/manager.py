@@ -498,7 +498,7 @@ class MultiAgentManager:
         if allowed_tool_names and not effective_allowed_tools:
             errors.append(f"{prefix}.allowed_tools has no executable tools after global denylist")
 
-        approval_mode = _string_value(raw_agent.get("approval_mode"), default="inherit")
+        approval_mode = _string_value(raw_agent.get("approval_mode"), default="auto_allow")
         if approval_mode not in VALID_APPROVAL_MODES:
             errors.append(f"{prefix}.approval_mode must be inherit, auto_allow, or manual")
         effective_approval_mode = turn_approval_mode if approval_mode == "inherit" else approval_mode

@@ -66,7 +66,7 @@ body,
 }
 
 .usage-demo-subtitle {
-  margin: 7px 0 0;
+  margin: 4px 0 0;
   max-width: 760px;
   color: #8d8378;
   font-size: 0.84rem;
@@ -270,9 +270,13 @@ body,
 }
 
 .usage-kpi-card span:last-child {
+  display: block;
+  overflow: hidden;
   color: #8d8378;
   font-size: 0.8rem;
   line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .usage-panel {

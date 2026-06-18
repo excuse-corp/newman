@@ -17,6 +17,16 @@ FRONTEND_PORT="${NEWMAN_FRONTEND_PORT:-7775}"
 PG_PORT="${NEWMAN_PG_PORT:-65437}"
 STARTUP_TIMEOUT_SECONDS="${NEWMAN_STARTUP_TIMEOUT_SECONDS:-30}"
 STOP_TIMEOUT_SECONDS="${NEWMAN_STOP_TIMEOUT_SECONDS:-10}"
+FEISHU_CLI_CHANNEL_ENABLED="${NEWMAN_FEISHU_CLI_CHANNEL_ENABLED:-false}"
+FEISHU_CLI_BIN="${NEWMAN_FEISHU_CLI_BIN:-lark-cli}"
+FEISHU_CLI_IDENTITY="${NEWMAN_FEISHU_CLI_IDENTITY:-bot}"
+FEISHU_CLI_EVENT_KEY="${NEWMAN_FEISHU_CLI_EVENT_KEY:-im.message.receive_v1}"
+FEISHU_CLI_READY_TIMEOUT_SECONDS="${NEWMAN_FEISHU_CLI_READY_TIMEOUT_SECONDS:-20}"
+FEISHU_CLI_CHANNEL_PID_FILE="${RUN_DIR}/feishu_cli_channel.pid"
+FEISHU_CLI_CHANNEL_READY_FILE="${RUN_DIR}/feishu_cli_channel.ready"
+FEISHU_CLI_CHANNEL_LOG_FILE="${LOG_DIR}/feishu_cli_channel.log"
+FEISHU_CLI_CHANNEL_DATA_DIR="${ROOT_DIR}/backend_data/channels/feishu_cli"
+FEISHU_CLI_CHANNEL_EVENTS_FILE="${FEISHU_CLI_CHANNEL_DATA_DIR}/events.ndjson"
 
 primary_ipv4_address() {
   if command -v hostname >/dev/null 2>&1; then
@@ -44,6 +54,13 @@ ensure_conda() {
 is_pid_running() {
   local pid="${1:-}"
   [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1
+}
+
+is_enabled() {
+  case "${1:-}" in
+    true|TRUE|True|1|yes|YES|Yes|on|ON|On) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 find_listener_pids_by_port() {

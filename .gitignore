@@ -1,8 +1,12 @@
 .codex
+.claude/
 .env
+.env.docker
 .env.local
 .venv/
 venv/
+.cache/
+.tmp/
 __pycache__/
 *.pyc
 *.pyo
@@ -10,8 +14,11 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.pid
 
 backend_data/
+outputs/
+backend/tests/
 plugins/*
 !plugins/.gitkeep
 frontend/node_modules/
@@ -19,7 +26,18 @@ frontend/dist/
 frontend/.vite/
 *.tsbuildinfo
 
+# Temporary Docker ignores
+.dockerignore
+.env.docker*
+docker-compose*.yml
+docker/
+backend/sandbox/Dockerfile
+ecology_data_dictionary.csv
+ecology_data_dictionary.md
+ecology_query_semantic_layer.md
+
 *.log
 ref/
 test_runtimespace/
 skills/AOG-ai-daily-news/
+skills/newman-image-responses/

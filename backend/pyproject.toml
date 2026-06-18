@@ -7,6 +7,7 @@ dependencies = [
   "fastapi>=0.115.0",
   "httpx>=0.27.0",
   "jinja2>=3.1.4",
+  "lark-channel-sdk",
   "openpyxl>=3.1.5",
   "pdfplumber>=0.11.0",
   "psycopg[binary]>=3.2.0",
@@ -37,6 +38,7 @@ packages = [
   "backend.attachments",
   "backend.channels",
   "backend.config",
+  "backend.evolution",
   "backend.hooks",
   "backend.memory",
   "backend.mcp",
@@ -50,6 +52,7 @@ packages = [
   "backend.sessions",
   "backend.tools",
   "backend.tools.impl",
+  "backend.usage",
 ]
 
 [tool.setuptools.package-dir]

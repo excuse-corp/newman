@@ -21,10 +21,10 @@ import UsageDashboard from "./pages/UsageDashboard";
 import "./styles.css";
 
 type WorkspacePage = "chat" | "automations" | "memory" | "skills" | "evolution" | "settings";
-type SettingsTab = "theme" | "config" | "plugins" | "usage";
+type SettingsTab = "system" | "config" | "usage";
 type MemoryKey = "memory" | "user";
 type TurnApprovalMode = "manual" | "auto_allow";
-type CollaborationModeName = "default" | "plan";
+type CollaborationModeName = "default" | "plan" | "subagent";
 type PlanStepStatus = "pending" | "in_progress" | "completed" | "blocked" | "cancelled";
 type TurnOutcome = "answered" | "awaiting_user" | "artifact_ready" | "task_completed" | "blocked" | "failed";
 type AwaitingUserInputKind = "confirm" | "choice" | "free_text";
@@ -242,6 +242,7 @@ type SessionUsageRecord = {
   output_tokens: number;
   total_tokens: number;
   created_at: string;
+  metadata?: Record<string, unknown>;
 };
 
 type SessionUsageResponse = {
@@ -715,6 +716,7 @@ type PluginRecord = {
   skill_count: number;
   hook_count: number;
   mcp_server_count: number;
+  cli_command_count: number;
 };
 
 type PluginLoadError = {
@@ -737,6 +739,22 @@ type ProjectConfigResponse = {
 };
 
 type UpdateProjectConfigResponse = {
+  saved: boolean;
+  path: string;
+  content: string;
+  effective_workspace: string;
+  requires_reload: boolean;
+  warnings: string[];
+};
+
+type ProjectEnvResponse = {
+  path: string;
+  content: string;
+  effective_workspace: string;
+  reload_supported: boolean;
+};
+
+type UpdateProjectEnvResponse = {
   saved: boolean;
   path: string;
   content: string;
@@ -869,23 +887,18 @@ const settingsTabOptions: Array<{
   description: string;
 }> = [
   {
-    id: "theme",
-    label: "界面主题",
-    description: "切换当前工作台主题。"
+    id: "system",
+    label: "系统设置",
+    description: "地理位置、插件状态和主题切换。"
   },
   {
     id: "config",
     label: "项目配置",
-    description: "编辑并重载 newman.yaml。"
-  },
-  {
-    id: "plugins",
-    label: "插件与异常",
-    description: "管理插件启停并查看加载问题。"
+    description: "编辑 newman.yaml 与 .env，并 reload 生效。"
   },
   {
     id: "usage",
-    label: "Token 消耗",
+    label: "Token Dashboard",
     description: "查看真实模型 usage 聚合。"
   }
 ];
@@ -905,7 +918,6 @@ const TURN_APPROVAL_MODE_STORAGE_KEY = "newman-turn-approval-mode";
 const ENVIRONMENT_CITY_CACHE_KEY = "newman-environment-city-cache";
 const ENVIRONMENT_CITY_GEOLOCATION_TTL_MS = 6 * 60 * 60 * 1000;
 const ENVIRONMENT_LOCATION_OVERRIDE_KEY = "newman-environment-city-override";
-const CHAT_SESSIONS_REFRESH_INTERVAL_MS = 5000;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -940,7 +952,7 @@ function isTurnApprovalMode(value: string | null): value is TurnApprovalMode {
 }
 
 function isSettingsTab(value: string | null): value is SettingsTab {
-  return value === "theme" || value === "config" || value === "plugins" || value === "usage";
+  return value === "system" || value === "config" || value === "usage";
 }
 
 function localTimezone() {
@@ -1182,14 +1194,25 @@ function readUsageTokenCount(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
 }
 
+function readUsageTurnId(record: SessionUsageRecord) {
+  if (record.request_kind === "subagent_turn") {
+    const parentTurnId = record.metadata?.parent_turn_id;
+    if (typeof parentTurnId === "string" && parentTurnId.trim()) {
+      return parentTurnId;
+    }
+  }
+  return record.turn_id;
+}
+
 function buildTurnUsageSummaries(records: SessionUsageRecord[]) {
   const summaries: Record<string, TurnUsageSummary> = {};
   records.forEach((record) => {
-    if (!record.turn_id) {
+    const turnId = readUsageTurnId(record);
+    if (!turnId) {
       return;
     }
     const current =
-      summaries[record.turn_id] ??
+      summaries[turnId] ??
       {
         requestCount: 0,
         missingCount: 0,
@@ -1207,7 +1230,7 @@ function buildTurnUsageSummaries(records: SessionUsageRecord[]) {
     if (!record.usage_available || totalTokens <= 0) {
       current.missingCount += 1;
     }
-    summaries[record.turn_id] = current;
+    summaries[turnId] = current;
   });
   return summaries;
 }
@@ -2105,6 +2128,23 @@ function ApprovalSmallIcon({ className }: { className?: string }) {
   );
 }
 
+function MultiagentSmallIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M10 3.25a2.25 2.25 0 1 1 0 4.5 2.25 2.25 0 0 1 0-4.5Zm-5 7.5a2.25 2.25 0 1 1 0 4.5 2.25 2.25 0 0 1 0-4.5Zm10 0a2.25 2.25 0 1 1 0 4.5 2.25 2.25 0 0 1 0-4.5ZM7.05 8.3l1.55 1.55m2.8 0 1.55-1.55m-5.1 3.4h4.3" />
+    </svg>
+  );
+}
+
 function PlanChecklistStatusIcon({ status, className }: { status: PlanStepStatus; className?: string }) {
   if (status === "completed") {
     return (
@@ -2987,29 +3027,6 @@ function readMultiagentTaskId(event: SessionEventPayload) {
   return typeof value === "string" && value ? value : null;
 }
 
-function formatSessionMessageRoleLabel(role: SessionMessageRecord["role"]) {
-  switch (role) {
-    case "system":
-      return "System";
-    case "user":
-      return "User";
-    case "assistant":
-      return "Assistant";
-    case "tool":
-      return "Tool";
-    default:
-      return role;
-  }
-}
-
-function truncateTranscriptMessage(content: string, limit = 1600) {
-  const normalized = content.trim();
-  if (normalized.length <= limit) {
-    return normalized;
-  }
-  return `${normalized.slice(0, limit - 3).trimEnd()}...`;
-}
-
 function resolveNextSelectedMultiagentTaskId(tasks: MultiAgentTaskRecord[], currentTaskId: string | null) {
   if (currentTaskId && tasks.some((task) => task.task_id === currentTaskId)) {
     return currentTaskId;
@@ -3018,6 +3035,22 @@ function resolveNextSelectedMultiagentTaskId(tasks: MultiAgentTaskRecord[], curr
     ["running", "waiting_file_lock", "waiting_approval", "pending"].includes(task.status)
   );
   return activeTask?.task_id ?? tasks[0]?.task_id ?? null;
+}
+
+function buildMultiagentRunTitle(
+  run: MultiAgentRunRecord,
+  taskCount: number,
+  detail?: MultiAgentRunDetailResponse | null
+) {
+  const names =
+    detail?.tasks.map((task) => task.name.trim()).filter(Boolean) ??
+    run.result?.agent_reports.map((report) => report.name.trim()).filter(Boolean) ??
+    [];
+  const firstName = names[0] ?? (run.mode === "parallel" ? "并行任务" : "串行任务");
+  if (taskCount <= 1) {
+    return firstName;
+  }
+  return `${firstName} 等 ${taskCount} 个子任务`;
 }
 
 function formatMultiagentStatusLabel(status: MultiAgentRunStatus | MultiAgentTaskStatus | MultiAgentAgentReport["status"]) {
@@ -3199,10 +3232,64 @@ function isAbortError(error: unknown) {
   return error instanceof Error && error.name === "AbortError";
 }
 
+function readSessionEventText(event: SessionEventPayload, key: string) {
+  const value = event.data[key];
+  return typeof value === "string" ? value : "";
+}
+
+function readSessionEventRequestId(event: SessionEventPayload) {
+  return event.request_id || readSessionEventText(event, "request_id");
+}
+
+function isScopedSingletonSessionEvent(event: SessionEventPayload) {
+  return event.event === "turn_interrupted";
+}
+
+function isSameScopedSingletonSessionEvent(left: SessionEventPayload, right: SessionEventPayload) {
+  if (left.event !== right.event || !isScopedSingletonSessionEvent(left) || !isScopedSingletonSessionEvent(right)) {
+    return false;
+  }
+
+  const leftTurnId = readSessionEventText(left, "turn_id");
+  const rightTurnId = readSessionEventText(right, "turn_id");
+  if (leftTurnId && rightTurnId) {
+    return leftTurnId === rightTurnId;
+  }
+
+  const leftRequestId = readSessionEventRequestId(left);
+  const rightRequestId = readSessionEventRequestId(right);
+  if (leftRequestId && rightRequestId) {
+    return leftRequestId === rightRequestId;
+  }
+
+  return false;
+}
+
+function mergeScopedSingletonSessionEvent(previous: SessionEventPayload, next: SessionEventPayload) {
+  const requestId = readSessionEventRequestId(previous) || readSessionEventRequestId(next);
+  const merged: SessionEventPayload = {
+    event: next.event,
+    data: {
+      ...previous.data,
+      ...next.data
+    },
+    ts: Math.min(previous.ts, next.ts)
+  };
+  if (requestId) {
+    merged.request_id = requestId;
+  }
+  return merged;
+}
+
 function dedupeSessionEvents(events: SessionEventPayload[]) {
   const seen = new Set<string>();
   const deduped: SessionEventPayload[] = [];
   events.forEach((event) => {
+    const scopedDuplicateIndex = deduped.findIndex((candidate) => isSameScopedSingletonSessionEvent(candidate, event));
+    if (scopedDuplicateIndex >= 0) {
+      deduped[scopedDuplicateIndex] = mergeScopedSingletonSessionEvent(deduped[scopedDuplicateIndex], event);
+      return;
+    }
     const key = `${event.ts}:${event.request_id ?? ""}:${event.event}:${JSON.stringify(event.data)}`;
     if (seen.has(key)) {
       return;
@@ -3274,6 +3361,12 @@ function mergeLiveSessionEvent(previous: SessionEventPayload, next: SessionEvent
 function coalesceLiveSessionEvents(events: SessionEventPayload[]) {
   const coalesced: SessionEventPayload[] = [];
   events.forEach((event) => {
+    const scopedDuplicateIndex = coalesced.findIndex((candidate) => isSameScopedSingletonSessionEvent(candidate, event));
+    if (scopedDuplicateIndex >= 0) {
+      coalesced[scopedDuplicateIndex] = mergeScopedSingletonSessionEvent(coalesced[scopedDuplicateIndex], event);
+      return;
+    }
+
     const previous = coalesced[coalesced.length - 1];
     const merged = previous ? mergeLiveSessionEvent(previous, event) : null;
     if (merged) {
@@ -3296,6 +3389,20 @@ function mapSessionSummary(record: SessionSummaryRecord): ChatSession {
     scheduled: record.scheduled === true,
     triggerType: typeof record.trigger_type === "string" ? record.trigger_type : null,
     sourceTaskId: typeof record.source_task_id === "string" ? record.source_task_id : null
+  };
+}
+
+function buildOptimisticEmptySession(record: Pick<CreateSessionResponse, "session_id" | "title">): ChatSession {
+  return {
+    id: record.session_id,
+    title: record.title,
+    updatedAt: new Date().toISOString(),
+    messageCount: 0,
+    hasConversation: false,
+    background: false,
+    scheduled: false,
+    triggerType: null,
+    sourceTaskId: null
   };
 }
 
@@ -4451,8 +4558,12 @@ function buildTimelineNodes(
         "collaboration_mode" in eventData && eventData.collaboration_mode && typeof eventData.collaboration_mode === "object"
           ? (eventData.collaboration_mode as Record<string, unknown>)
           : null;
-      const mode = modePayload && modePayload.mode === "plan" ? "plan" : "default";
-      const fallback = mode === "plan" ? "已进入计划模式" : "已回到默认执行模式";
+      const mode =
+        modePayload && typeof modePayload.mode === "string" && ["plan", "subagent"].includes(modePayload.mode)
+          ? (modePayload.mode as "plan" | "subagent")
+          : "default";
+      const fallback =
+        mode === "plan" ? "已进入计划模式" : mode === "subagent" ? "已进入 Subagent 模式" : "已回到默认执行模式";
       const summary = typeof eventData.summary === "string" && eventData.summary ? eventData.summary : fallback;
       nodes.push(buildSystemMetaNode(event, summary));
       return;
@@ -4818,6 +4929,11 @@ function computeTurnDurationMs(
 function readTurnId(value: Record<string, unknown>) {
   const turnId = value.turn_id;
   return typeof turnId === "string" && turnId ? turnId : null;
+}
+
+function readSessionId(value: Record<string, unknown>) {
+  const sessionId = value.session_id;
+  return typeof sessionId === "string" && sessionId ? sessionId : null;
 }
 
 function readRequestId(value: Record<string, unknown>) {
@@ -5677,7 +5793,7 @@ function App() {
   });
   const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>(() => {
     const stored = window.localStorage.getItem("newman-settings-tab");
-    return isSettingsTab(stored) ? stored : "theme";
+    return isSettingsTab(stored) ? stored : "system";
   });
   const [uiTheme, setUiTheme] = useState<UiTheme>(() => {
     const stored = window.localStorage.getItem("newman-ui-theme");
@@ -5687,6 +5803,7 @@ function App() {
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState(() => window.localStorage.getItem("newman-active-session-id") ?? "");
+  const [optimisticEmptySessionId, setOptimisticEmptySessionId] = useState<string | null>(null);
   const [activeSessionDetail, setActiveSessionDetail] = useState<SessionRecordDetail | null>(null);
   const [activePlan, setActivePlan] = useState<SessionPlanPayload>(null);
   const [activeCollaborationMode, setActiveCollaborationMode] = useState<SessionDetailResponse["collaboration_mode"]>(null);
@@ -5756,11 +5873,16 @@ function App() {
   const [projectConfigPath, setProjectConfigPath] = useState("");
   const [projectConfigContent, setProjectConfigContent] = useState("");
   const [projectConfigDraft, setProjectConfigDraft] = useState("");
+  const [projectEnvPath, setProjectEnvPath] = useState("");
+  const [projectEnvContent, setProjectEnvContent] = useState("");
+  const [projectEnvDraft, setProjectEnvDraft] = useState("");
   const [projectConfigEffectiveWorkspace, setProjectConfigEffectiveWorkspace] = useState("");
   const [projectConfigSourcePriority, setProjectConfigSourcePriority] = useState<string[]>([]);
   const [configWarnings, setConfigWarnings] = useState<string[]>([]);
   const [configLoading, setConfigLoading] = useState(false);
   const [configSaving, setConfigSaving] = useState(false);
+  const [projectEnvLoading, setProjectEnvLoading] = useState(false);
+  const [projectEnvSaving, setProjectEnvSaving] = useState(false);
   const [configReloading, setConfigReloading] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
   const [configNotice, setConfigNotice] = useState<string | null>(null);
@@ -5782,14 +5904,14 @@ function App() {
   const [multiagentError, setMultiagentError] = useState<string | null>(null);
   const [selectedMultiagentRunId, setSelectedMultiagentRunId] = useState<string | null>(null);
   const [selectedMultiagentTaskId, setSelectedMultiagentTaskId] = useState<string | null>(null);
+  const [multiagentRunHistoryExpanded, setMultiagentRunHistoryExpanded] = useState(false);
+  const [multiagentSummaryExpanded, setMultiagentSummaryExpanded] = useState(false);
   const [multiagentRunDetailsById, setMultiagentRunDetailsById] = useState<Record<string, MultiAgentRunDetailResponse>>({});
   const [multiagentDetailLoading, setMultiagentDetailLoading] = useState(false);
   const [multiagentApprovals, setMultiagentApprovals] = useState<MultiAgentPendingApproval[]>([]);
   const [multiagentApprovalActionId, setMultiagentApprovalActionId] = useState<string | null>(null);
   const [multiagentApprovalError, setMultiagentApprovalError] = useState<string | null>(null);
   const [multiagentCancelActionId, setMultiagentCancelActionId] = useState<string | null>(null);
-  const [multiagentChildSessionsById, setMultiagentChildSessionsById] = useState<Record<string, SessionRecordDetail>>({});
-  const [multiagentTranscriptLoading, setMultiagentTranscriptLoading] = useState(false);
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [approvalActionLoading, setApprovalActionLoading] = useState<null | "approve" | "reject">(null);
@@ -5825,12 +5947,15 @@ function App() {
   const chatStageRef = useRef<HTMLDivElement | null>(null);
   const htmlPreviewPanelRef = useRef<HTMLElement | null>(null);
   const multiagentDrawerRef = useRef<HTMLElement | null>(null);
+  const multiagentTriggerRef = useRef<HTMLButtonElement | null>(null);
   const composerFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillUploadFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillUploadFolderInputRef = useRef<HTMLInputElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const composerPlanTrayListRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
+  const sendingMessageRef = useRef(sendingMessage);
+  const stoppingMessageRef = useRef(stoppingMessage);
   const previousWorkspaceSidePanelOpenRef = useRef(false);
   const activeMessageControllerRef = useRef<AbortController | null>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -5845,9 +5970,19 @@ function App() {
   const liveAnswerQueueRef = useRef<LiveAnswerQueueItem[]>([]);
   const liveAnswerFlushFrameRef = useRef<number | null>(null);
   const pendingFinalAnswerRef = useRef<PendingFinalAnswer | null>(null);
+  const deferredHtmlPreviewRef = useRef<HtmlPreviewState | null>(null);
   const liveAnswerDrainPromiseRef = useRef<Promise<void> | null>(null);
   const liveAnswerDrainResolverRef = useRef<(() => void) | null>(null);
   const awaitingInputSelectionsRef = useRef<Record<string, AwaitingUserInputSelection>>({});
+  const loadChatSessionsRef = useRef<typeof loadChatSessions | null>(null);
+  const loadChatWorkspaceRef = useRef<typeof loadChatWorkspace | null>(null);
+  const channelEventSourceRef = useRef<EventSource | null>(null);
+  const channelSessionsRefreshTimerRef = useRef<number | null>(null);
+  const channelSessionsRefreshQueuedRef = useRef(false);
+  const channelSessionsRefreshInFlightRef = useRef(false);
+  const channelWorkspaceRefreshTimerRef = useRef<number | null>(null);
+  const channelWorkspaceRefreshQueuedSessionIdRef = useRef<string | null>(null);
+  const channelWorkspaceRefreshInFlightRef = useRef(false);
 
   const resolveLiveAnswerDrain = () => {
     const resolver = liveAnswerDrainResolverRef.current;
@@ -5865,6 +6000,50 @@ function App() {
       });
     }
     return liveAnswerDrainPromiseRef.current;
+  };
+
+  const matchesWriteFileHtmlPreview = (
+    preview: HtmlPreviewState | null | undefined,
+    path: string | null,
+    toolCallId: string | null,
+  ) =>
+    Boolean(
+      preview?.source === "write_file" &&
+      ((toolCallId && preview.toolCallId === toolCallId) || (path && preview.path === path))
+    );
+
+  const updateDeferredHtmlPreview = (
+    updater: (currentPreview: HtmlPreviewState | null) => HtmlPreviewState | null
+  ) => {
+    const nextPreview = updater(deferredHtmlPreviewRef.current);
+    deferredHtmlPreviewRef.current = nextPreview;
+    if (!nextPreview) {
+      return;
+    }
+    setHtmlPreview((currentPreview) => {
+      if (!matchesWriteFileHtmlPreview(currentPreview, nextPreview.path ?? null, nextPreview.toolCallId ?? null)) {
+        return currentPreview;
+      }
+      return {
+        ...currentPreview,
+        ...nextPreview,
+      };
+    });
+  };
+
+  const resetDeferredHtmlPreview = () => {
+    deferredHtmlPreviewRef.current = null;
+  };
+
+  const flushDeferredHtmlPreview = () => {
+    const pendingPreview = deferredHtmlPreviewRef.current;
+    if (!pendingPreview?.content.trim()) {
+      deferredHtmlPreviewRef.current = null;
+      return;
+    }
+    deferredHtmlPreviewRef.current = null;
+    setHtmlPreview(pendingPreview);
+    setHtmlPreviewView(pendingPreview.initialView ?? "preview");
   };
 
   const resetLiveAnswerStreaming = () => {
@@ -6211,20 +6390,16 @@ function App() {
     if (payload.event === "tool_call_started" && isHtmlWriteFileEventData(payload.data)) {
       const path = getEventPathValue(payload.data);
       const toolCallId = typeof payload.data.tool_call_id === "string" ? payload.data.tool_call_id : null;
-      const argumentsPayload = extractEventArguments(payload.data);
-      const content = argumentsPayload && typeof argumentsPayload.content === "string" ? argumentsPayload.content : "";
-      if (content) {
-        const fallbackTitle = formatCompactPath(path) ?? "HTML 实时预览";
-        setHtmlPreview({
-          source: "write_file",
-          path,
-          toolCallId,
-          streaming: true,
-          saveStatus: "saving",
-          content,
-          title: buildHtmlPreviewTitleFromMarkup(content, fallbackTitle),
-        });
-      }
+      const fallbackTitle = formatCompactPath(path) ?? "HTML 实时预览";
+      updateDeferredHtmlPreview(() => ({
+        source: "write_file",
+        path,
+        toolCallId,
+        streaming: true,
+        saveStatus: "saving",
+        content: "",
+        title: fallbackTitle,
+      }));
       return;
     }
 
@@ -6239,11 +6414,9 @@ function App() {
       const path = getEventPathValue(payload.data);
       const toolCallId = typeof payload.data.tool_call_id === "string" ? payload.data.tool_call_id : null;
       const fallbackTitle = formatCompactPath(path) ?? "HTML 实时预览";
-      setHtmlPreview((currentPreview) => {
-        const sameStream =
-          currentPreview?.source === "write_file" &&
-          ((toolCallId && currentPreview.toolCallId === toolCallId) || currentPreview.path === path);
-        const content = sameStream ? `${currentPreview.content}${delta}` : delta;
+      updateDeferredHtmlPreview((currentPreview) => {
+        const sameStream = matchesWriteFileHtmlPreview(currentPreview, path, toolCallId);
+        const content = sameStream ? `${currentPreview?.content ?? ""}${delta}` : delta;
         return {
           source: "write_file",
           path,
@@ -6263,11 +6436,9 @@ function App() {
       const argumentsPayload = extractEventArguments(payload.data);
       const fallbackContent = argumentsPayload && typeof argumentsPayload.content === "string" ? argumentsPayload.content : "";
       const success = payload.data.success !== false;
-      setHtmlPreview((currentPreview) => {
+      updateDeferredHtmlPreview((currentPreview) => {
         const eventLooksHtml = isHtmlWriteFileEventData(payload.data);
-        const matchesCurrentPreview =
-          currentPreview?.source === "write_file" &&
-          ((toolCallId && currentPreview.toolCallId === toolCallId) || (path && currentPreview.path === path));
+        const matchesCurrentPreview = matchesWriteFileHtmlPreview(currentPreview, path, toolCallId);
         if (!eventLooksHtml && !matchesCurrentPreview) {
           return currentPreview;
         }
@@ -6295,6 +6466,81 @@ function App() {
     }
   };
 
+  // Channel-driven refreshes replace the old Feishu polling path. Keep them
+  // debounced so a single inbound turn does not fan out into repeated fetches.
+  const flushQueuedChannelSessionsRefresh = async () => {
+    if (channelSessionsRefreshInFlightRef.current) {
+      channelSessionsRefreshQueuedRef.current = true;
+      return;
+    }
+    if (!channelSessionsRefreshQueuedRef.current) {
+      return;
+    }
+    channelSessionsRefreshQueuedRef.current = false;
+    channelSessionsRefreshInFlightRef.current = true;
+    try {
+      await loadChatSessionsRef.current?.(undefined, undefined, { silent: true });
+    } finally {
+      channelSessionsRefreshInFlightRef.current = false;
+      if (channelSessionsRefreshQueuedRef.current) {
+        void flushQueuedChannelSessionsRefresh();
+      }
+    }
+  };
+
+  const scheduleChannelSessionsRefresh = (delayMs = 150) => {
+    channelSessionsRefreshQueuedRef.current = true;
+    if (channelSessionsRefreshTimerRef.current !== null) {
+      return;
+    }
+    channelSessionsRefreshTimerRef.current = window.setTimeout(() => {
+      channelSessionsRefreshTimerRef.current = null;
+      void flushQueuedChannelSessionsRefresh();
+    }, delayMs);
+  };
+
+  const flushQueuedChannelWorkspaceRefresh = async () => {
+    const sessionId = channelWorkspaceRefreshQueuedSessionIdRef.current;
+    if (!sessionId) {
+      return;
+    }
+    if (channelWorkspaceRefreshInFlightRef.current) {
+      return;
+    }
+    if (activeSessionIdRef.current !== sessionId) {
+      channelWorkspaceRefreshQueuedSessionIdRef.current = null;
+      return;
+    }
+    if (sendingMessageRef.current || stoppingMessageRef.current) {
+      scheduleChannelWorkspaceRefresh(sessionId, 500);
+      return;
+    }
+    channelWorkspaceRefreshQueuedSessionIdRef.current = null;
+    channelWorkspaceRefreshInFlightRef.current = true;
+    try {
+      await loadChatWorkspaceRef.current?.(sessionId, undefined, { silent: true });
+    } finally {
+      channelWorkspaceRefreshInFlightRef.current = false;
+      if (channelWorkspaceRefreshQueuedSessionIdRef.current === sessionId) {
+        scheduleChannelWorkspaceRefresh(sessionId);
+      }
+    }
+  };
+
+  const scheduleChannelWorkspaceRefresh = (sessionId: string, delayMs = 250) => {
+    if (!sessionId || activeSessionIdRef.current !== sessionId) {
+      return;
+    }
+    channelWorkspaceRefreshQueuedSessionIdRef.current = sessionId;
+    if (channelWorkspaceRefreshTimerRef.current !== null) {
+      return;
+    }
+    channelWorkspaceRefreshTimerRef.current = window.setTimeout(() => {
+      channelWorkspaceRefreshTimerRef.current = null;
+      void flushQueuedChannelWorkspaceRefresh();
+    }, delayMs);
+  };
+
   const waitForLiveAnswerDrain = async (targetLocalId: string) => {
     if (liveAnswerQueueRef.current.length === 0) {
       maybeFinalizeLiveAnswer(targetLocalId);
@@ -6308,6 +6554,19 @@ function App() {
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
+
+  useEffect(() => {
+    sendingMessageRef.current = sendingMessage;
+  }, [sendingMessage]);
+
+  useEffect(() => {
+    stoppingMessageRef.current = stoppingMessage;
+  }, [stoppingMessage]);
+
+  useEffect(() => {
+    loadChatSessionsRef.current = loadChatSessions;
+    loadChatWorkspaceRef.current = loadChatWorkspace;
+  });
 
   useEffect(() => {
     environmentLocationRef.current = environmentLocation;
@@ -6370,12 +6629,14 @@ function App() {
     if (activePage !== "chat") {
       setHtmlPreview(null);
       setHtmlPreviewView("preview");
+      resetDeferredHtmlPreview();
     }
   }, [activePage]);
 
   useEffect(() => {
     setHtmlPreview(null);
     setHtmlPreviewView("preview");
+    resetDeferredHtmlPreview();
     setActiveAwaitingUserInput(null);
     setAwaitingInputSelections({});
     setActiveTurnUsageById({});
@@ -6438,13 +6699,22 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const handleWindowClick = () => {
+    const handleWindowClick = (event: MouseEvent) => {
+      const target = event.target instanceof Node ? event.target : null;
       setOpenSessionMenuId(null);
       setApprovalMenuOpen(false);
+      if (
+        multiagentDrawerOpen &&
+        target &&
+        !multiagentDrawerRef.current?.contains(target) &&
+        !multiagentTriggerRef.current?.contains(target)
+      ) {
+        setMultiagentDrawerOpen(false);
+      }
     };
     window.addEventListener("click", handleWindowClick);
     return () => window.removeEventListener("click", handleWindowClick);
-  }, []);
+  }, [multiagentDrawerOpen]);
 
   useEffect(() => {
     if (!dragging) return;
@@ -6671,38 +6941,6 @@ function App() {
     }
   }
 
-  async function loadMultiagentChildSession(
-    sessionId: string,
-    options?: { signal?: AbortSignal; silent?: boolean }
-  ) {
-    const signal = options?.signal;
-    const silent = options?.silent ?? false;
-    if (!silent) {
-      setMultiagentTranscriptLoading(true);
-    }
-    try {
-      const payload = await fetchJson<SessionDetailResponse>(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}`, { signal });
-      if (signal?.aborted) {
-        return null;
-      }
-      setMultiagentChildSessionsById((current) => ({
-        ...current,
-        [sessionId]: payload.session,
-      }));
-      return payload.session;
-    } catch (error) {
-      if (signal?.aborted) {
-        return null;
-      }
-      setMultiagentError(error instanceof Error ? error.message : "子会话 transcript 加载失败");
-      return null;
-    } finally {
-      if (!silent && !signal?.aborted) {
-        setMultiagentTranscriptLoading(false);
-      }
-    }
-  }
-
   async function cancelMultiagentRun(runId: string) {
     const sessionId = activeSessionIdRef.current;
     if (!sessionId || multiagentCancelActionId) {
@@ -6845,11 +7083,13 @@ function App() {
             : session
         )
       );
+      setOptimisticEmptySessionId((currentId) => (currentId === sessionId ? null : currentId));
       return true;
     } catch (error) {
       if (signal?.aborted) {
         return false;
       }
+      setOptimisticEmptySessionId((currentId) => (currentId === sessionId ? null : currentId));
       setChatError(error instanceof Error ? error.message : "会话内容加载失败");
       return false;
     } finally {
@@ -6894,7 +7134,7 @@ function App() {
     nextMode: CollaborationModeName,
     options?: { createSessionIfMissing?: boolean; preserveComposerOverride?: boolean }
   ) {
-    if (nextMode === "default" && currentCollaborationMode === "plan" && hasIncompletePlanSteps(activePlan)) {
+    if (nextMode !== "plan" && currentCollaborationMode === "plan" && hasIncompletePlanSteps(activePlan)) {
       const confirmed = window.confirm("当前计划还有未完成事项，仍要退出计划模式吗？");
       if (!confirmed) {
         return false;
@@ -6943,12 +7183,29 @@ function App() {
     });
   }
 
+  async function activateComposerSubagentMode() {
+    setPendingComposerMode("subagent");
+    if (activeSessionIdRef.current) {
+      const updated = await updateSessionCollaborationMode("subagent", {
+        createSessionIfMissing: false,
+        preserveComposerOverride: true
+      });
+      if (!updated) {
+        setPendingComposerMode(null);
+      }
+    }
+    requestAnimationFrame(() => {
+      composerTextareaRef.current?.focus();
+    });
+  }
+
   async function removeComposerModeToken() {
-    if ((pendingComposerMode ?? currentCollaborationMode) !== "plan") {
+    const resolvedMode = pendingComposerMode ?? currentCollaborationMode;
+    if (resolvedMode === "default") {
       return;
     }
 
-    if (pendingComposerMode === "plan" && currentCollaborationMode !== "plan") {
+    if (pendingComposerMode === resolvedMode && currentCollaborationMode !== resolvedMode) {
       setPendingComposerMode(null);
       requestAnimationFrame(() => {
         composerTextareaRef.current?.focus();
@@ -6997,9 +7254,49 @@ function App() {
       }
     };
 
-    const timer = window.setInterval(() => {
-      void refreshVisibleSessions();
-    }, CHAT_SESSIONS_REFRESH_INTERVAL_MS);
+    window.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      if (controller) {
+        controller.abort();
+      }
+      window.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [apiBase]);
+
+  useEffect(() => {
+    if (!activeSessionId) {
+      return;
+    }
+
+    let cancelled = false;
+    let controller: AbortController | null = null;
+    let inFlight = false;
+
+    const refreshWorkspace = async () => {
+      if (cancelled || inFlight || document.visibilityState === "hidden" || sendingMessage || stoppingMessage) {
+        return;
+      }
+      const sessionId = activeSessionIdRef.current;
+      if (!sessionId) {
+        return;
+      }
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        await loadChatWorkspaceRef.current?.(sessionId, controller.signal, { silent: true });
+      } finally {
+        controller = null;
+        inFlight = false;
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refreshWorkspace();
+      }
+    };
 
     window.addEventListener("visibilitychange", handleVisibilityChange);
 
@@ -7008,10 +7305,62 @@ function App() {
       if (controller) {
         controller.abort();
       }
-      window.clearInterval(timer);
       window.removeEventListener("visibilitychange", handleVisibilityChange);
     };
+  }, [activeSessionId, apiBase, sendingMessage, stoppingMessage]);
+
+  useEffect(() => {
+    const source = new EventSource(`${apiBase}/api/channels/events/stream`);
+    channelEventSourceRef.current = source;
+
+    source.onmessage = (message) => {
+      const payload = normalizeSessionEventPayload(message.data);
+      if (!payload || !payload.data || typeof payload.data !== "object") {
+        return;
+      }
+      const sessionId =
+        "session_id" in payload.data && typeof payload.data.session_id === "string"
+          ? payload.data.session_id
+          : null;
+      if (!sessionId) {
+        return;
+      }
+
+      if (payload.event === "channel_message_received") {
+        scheduleChannelSessionsRefresh();
+        return;
+      }
+
+      if (payload.event === "final_response" || payload.event === "turn_completed" || payload.event === "error") {
+        scheduleChannelSessionsRefresh();
+        scheduleChannelWorkspaceRefresh(sessionId);
+      }
+    };
+
+    return () => {
+      if (channelEventSourceRef.current === source) {
+        channelEventSourceRef.current = null;
+      }
+      source.close();
+    };
   }, [apiBase]);
+
+  useEffect(() => {
+    return () => {
+      if (channelEventSourceRef.current) {
+        channelEventSourceRef.current.close();
+        channelEventSourceRef.current = null;
+      }
+      if (channelSessionsRefreshTimerRef.current !== null) {
+        window.clearTimeout(channelSessionsRefreshTimerRef.current);
+        channelSessionsRefreshTimerRef.current = null;
+      }
+      if (channelWorkspaceRefreshTimerRef.current !== null) {
+        window.clearTimeout(channelWorkspaceRefreshTimerRef.current);
+        channelWorkspaceRefreshTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!activeSessionId) {
@@ -7027,8 +7376,8 @@ function App() {
       setMultiagentApprovals([]);
       setMultiagentApprovalActionId(null);
       setMultiagentApprovalError(null);
-      setMultiagentChildSessionsById({});
-      setMultiagentTranscriptLoading(false);
+      setMultiagentRunHistoryExpanded(false);
+      setMultiagentSummaryExpanded(false);
       setMultiagentError(null);
       setMultiagentLoading(false);
       setMultiagentDetailLoading(false);
@@ -7049,8 +7398,8 @@ function App() {
     setMultiagentApprovals([]);
     setMultiagentApprovalActionId(null);
     setMultiagentApprovalError(null);
-    setMultiagentChildSessionsById({});
-    setMultiagentTranscriptLoading(false);
+    setMultiagentRunHistoryExpanded(false);
+    setMultiagentSummaryExpanded(false);
     setMultiagentError(null);
     setMultiagentLoading(false);
     setMultiagentDetailLoading(false);
@@ -7099,22 +7448,6 @@ function App() {
     }
     void loadMultiagentRunDetail(selectedMultiagentRunId, { silent: true });
   }, [activePage, selectedMultiagentRunId, multiagentRunDetailsById]);
-
-  useEffect(() => {
-    if (activePage !== "chat" || !selectedMultiagentRunId) {
-      return;
-    }
-    const detail = multiagentRunDetailsById[selectedMultiagentRunId];
-    const task =
-      detail?.tasks.find((item) => item.task_id === selectedMultiagentTaskId) ??
-      detail?.tasks[0] ??
-      null;
-    const childSessionId = task?.child_session_id ?? null;
-    if (!childSessionId || multiagentChildSessionsById[childSessionId]) {
-      return;
-    }
-    void loadMultiagentChildSession(childSessionId);
-  }, [activePage, selectedMultiagentRunId, selectedMultiagentTaskId, multiagentRunDetailsById, multiagentChildSessionsById]);
 
   useEffect(() => {
     if (!pendingComposerMode) {
@@ -7417,6 +7750,27 @@ function App() {
     }
   }
 
+  async function loadProjectEnv(signal?: AbortSignal) {
+    setProjectEnvLoading(true);
+    setConfigError(null);
+
+    try {
+      const data = await fetchJson<ProjectEnvResponse>(`${apiBase}/api/config/env`, { signal });
+      if (signal?.aborted) return;
+      setProjectEnvPath(data.path);
+      setProjectEnvContent(data.content);
+      setProjectEnvDraft(data.content);
+      setProjectConfigEffectiveWorkspace(data.effective_workspace);
+    } catch (error) {
+      if (signal?.aborted) return;
+      setConfigError(error instanceof Error ? error.message : ".env 加载失败");
+    } finally {
+      if (!signal?.aborted) {
+        setProjectEnvLoading(false);
+      }
+    }
+  }
+
   async function loadPluginsWorkspace(signal?: AbortSignal) {
     setPluginsLoading(true);
     setPluginsError(null);
@@ -7444,6 +7798,7 @@ function App() {
     setConfigWarnings([]);
     void loadPluginsWorkspace(controller.signal);
     void loadProjectConfig(controller.signal);
+    void loadProjectEnv(controller.signal);
     return () => controller.abort();
   }, [activePage, apiBase]);
 
@@ -7596,13 +7951,12 @@ ${markup}
     );
   }, [activeLiveTurn, persistedTurns]);
   const selectedMultiagentRunDetail = selectedMultiagentRunId ? multiagentRunDetailsById[selectedMultiagentRunId] ?? null : null;
+  const selectedMultiagentRunListItem =
+    multiagentRuns.find((item) => item.run.run_id === selectedMultiagentRunId) ?? multiagentRuns[0] ?? null;
   const selectedMultiagentTask =
     selectedMultiagentRunDetail?.tasks.find((task) => task.task_id === selectedMultiagentTaskId) ??
     selectedMultiagentRunDetail?.tasks[0] ??
     null;
-  const selectedMultiagentChildSession = selectedMultiagentTask
-    ? multiagentChildSessionsById[selectedMultiagentTask.child_session_id] ?? null
-    : null;
   const selectedMultiagentRunStopping = selectedMultiagentRunDetail
     ? isMultiagentRunStopping(selectedMultiagentRunDetail.run)
     : false;
@@ -7618,9 +7972,17 @@ ${markup}
       ),
     [mergedSessionEvents, selectedMultiagentRunId, selectedMultiagentTask?.task_id]
   );
-  const multiagentRunningCount = multiagentRuns.filter((item) =>
-    ["pending", "running", "waiting_file_lock", "waiting_approval"].includes(item.run.status)
-  ).length;
+  const selectedMultiagentTimelineReversed = useMemo(
+    () => [...selectedMultiagentTimeline].reverse(),
+    [selectedMultiagentTimeline]
+  );
+  const historicalMultiagentRuns = useMemo(() => {
+    if (!selectedMultiagentRunListItem) {
+      return multiagentRuns;
+    }
+    return multiagentRuns.filter((item) => item.run.run_id !== selectedMultiagentRunListItem.run.run_id);
+  }, [multiagentRuns, selectedMultiagentRunListItem]);
+  const showMultiagentDrawerEmptyState = multiagentRuns.length === 0 && multiagentApprovals.length === 0 && !multiagentLoading;
   const multiagentNeedsRefresh =
     multiagentRuns.some((item) => isMultiagentRunActive(item.run.status) || isMultiagentRunStopping(item.run)) ||
     Boolean(
@@ -7634,9 +7996,10 @@ ${markup}
   const isSendingInActiveSession = Boolean(activeSessionId) && sendingMessage && sendingSessionId === activeSessionId;
   const isSendingInOtherSession = sendingMessage && Boolean(sendingSessionId) && sendingSessionId !== activeSessionId;
   const isStoppingInActiveSession = Boolean(activeSessionId) && stoppingMessage && sendingSessionId === activeSessionId;
+  const isOptimisticEmptySession = optimisticEmptySessionId === activeSessionId;
   const showEmptyChatState =
     activePage === "chat" &&
-    !chatLoading &&
+    (!chatLoading || isOptimisticEmptySession) &&
     displayTurns.length === 0;
   const contextPressure =
     activeContextUsage?.budget_pressure ??
@@ -7688,6 +8051,7 @@ ${markup}
   const activeApprovalMode = approvalModeMeta[turnApprovalMode];
   const currentCollaborationMode = activeCollaborationMode?.mode ?? "default";
   const composerDisplayMode = pendingComposerMode ?? currentCollaborationMode;
+  const composerModeTokenMode = composerDisplayMode === "default" ? null : composerDisplayMode;
   const activeSettingsTabOption =
     settingsTabOptions.find((option) => option.id === activeSettingsTab) ?? settingsTabOptions[0];
   const activePlanSteps = getPlanSteps(activePlan);
@@ -7779,6 +8143,10 @@ ${markup}
   const skillUploadSummary = summarizeSkillUploadFiles(skillUploadFiles);
   const skillUploadDirectoryInputProps = { webkitdirectory: "", directory: "" };
   const hasProjectConfigChanges = projectConfigDraft !== projectConfigContent;
+  const hasProjectEnvChanges = projectEnvDraft !== projectEnvContent;
+  const hasProjectSettingsChanges = hasProjectConfigChanges || hasProjectEnvChanges;
+  const enabledPluginCount = plugins.filter((plugin) => plugin.enabled).length;
+  const disabledPluginCount = plugins.length - enabledPluginCount;
 
   const renderSkillTreeNodes = (skill: SkillSummary, entries: WorkspaceEntry[], depth = 0): ReactNode =>
     entries.map((entry) => {
@@ -7901,6 +8269,13 @@ ${markup}
     setApprovalMenuOpen(false);
   };
 
+  const activateOptimisticEmptySession = (session: ChatSession) => {
+    activeSessionIdRef.current = session.id;
+    setOptimisticEmptySessionId(session.id);
+    setChatSessions((currentSessions) => [session, ...currentSessions.filter((item) => item.id !== session.id)]);
+    setActiveSessionId(session.id);
+  };
+
   async function ensureSession() {
     if (activeSessionId) {
       return activeSessionId;
@@ -7913,20 +8288,7 @@ ${markup}
       },
       body: JSON.stringify({})
     });
-    const nextSession = {
-      id: data.session_id,
-      title: data.title,
-      updatedAt: new Date().toISOString(),
-      messageCount: 0,
-      hasConversation: false,
-      background: false,
-      scheduled: false,
-      triggerType: null,
-      sourceTaskId: null
-    };
-    activeSessionIdRef.current = data.session_id;
-    setChatSessions((currentSessions) => [nextSession, ...currentSessions]);
-    setActiveSessionId(data.session_id);
+    activateOptimisticEmptySession(buildOptimisticEmptySession(data));
     return data.session_id;
   }
 
@@ -8164,7 +8526,33 @@ ${markup}
       activeMessageControllerRef.current = null;
       controller.abort();
       resetLiveSessionEventQueue();
-      setLiveSessionEvents([]);
+      setLiveSessionEvents((currentEvents) => {
+        const interruptedTurnId = data.turn_id ?? null;
+        const nextEvents = currentEvents.filter((event) => {
+          if (event.event !== "stream_completed") {
+            return true;
+          }
+          if (!activeLiveTurn || !matchLiveTurnEvent(event, activeLiveTurn)) {
+            return true;
+          }
+          return false;
+        });
+        if (!data.interrupted) {
+          return nextEvents;
+        }
+        const interruptedEvent: SessionEventPayload = {
+          event: "turn_interrupted",
+          data: {
+            message: data.message || "上一次回合被用户中断，当前任务已停止。",
+            ...(interruptedTurnId ? { turn_id: interruptedTurnId } : {})
+          },
+          ...(data.request_id ?? activeLiveTurn?.requestId
+            ? { request_id: data.request_id ?? activeLiveTurn?.requestId ?? undefined }
+            : {}),
+          ts: Date.now()
+        };
+        return coalesceLiveSessionEvents([...nextEvents, interruptedEvent]);
+      });
       setLiveTurn((currentTurn) =>
         currentTurn
           ? {
@@ -8237,6 +8625,7 @@ ${markup}
       const liveTurnLocalId = `live-turn-${Date.now()}`;
       const attachmentSnapshot = submittedAttachments.map(({ file: _file, ...attachment }) => attachment);
       resetLiveAnswerStreaming();
+      resetDeferredHtmlPreview();
       setLiveTurn({
         sessionId,
         localId: liveTurnLocalId,
@@ -8521,15 +8910,26 @@ ${markup}
         setLiveSessionEvents([]);
         setLiveTurn((currentTurn) => (currentTurn && currentTurn.localId === liveTurnLocalId ? null : currentTurn));
       }
+      if (activeSessionIdRef.current === sessionId) {
+        window.requestAnimationFrame(() => {
+          if (activeSessionIdRef.current === sessionId) {
+            flushDeferredHtmlPreview();
+          }
+        });
+      } else {
+        resetDeferredHtmlPreview();
+      }
       resetLiveAnswerStreaming();
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) {
+        resetDeferredHtmlPreview();
         resetLiveAnswerStreaming();
         resetLiveSessionEventQueue();
         return;
       }
       const message = error instanceof Error ? error.message : "发送消息失败";
       setChatError(message);
+      resetDeferredHtmlPreview();
       resetLiveAnswerStreaming();
       resetLiveSessionEventQueue();
       setLiveTurn((currentTurn) =>
@@ -8553,7 +8953,7 @@ ${markup}
   };
 
   const resolveApproval = async (action: "approve" | "reject", approvalRequestId: string | null = pendingApproval?.approval_request_id ?? null) => {
-    if (!approvalRequestId) return;
+    if (!approvalRequestId || !activeSessionId) return;
 
     setApprovalActionLoading(action);
     setApprovalError(null);
@@ -8569,6 +8969,8 @@ ${markup}
       setPendingApproval((current) =>
         current?.approval_request_id === approvalRequestId ? null : current
       );
+      await loadChatWorkspace(activeSessionId, undefined, { silent: true });
+      await loadChatSessions(undefined, activeSessionId, { silent: true });
     } catch (error) {
       setApprovalError(error instanceof Error ? error.message : "审批操作失败");
     } finally {
@@ -8811,7 +9213,7 @@ ${markup}
     if (
       event.key === "Backspace" &&
       !composerValue &&
-      composerDisplayMode === "plan" &&
+      composerModeTokenMode !== null &&
       !sendingMessage &&
       !stoppingMessage &&
       !planModeUpdating
@@ -8867,9 +9269,9 @@ ${markup}
         },
         body: JSON.stringify({})
       });
-      await loadChatSessions(undefined, data.session_id);
-      setActiveSessionId(data.session_id);
+      activateOptimisticEmptySession(buildOptimisticEmptySession(data));
       switchPage("chat");
+      void loadChatSessions(undefined, data.session_id, { silent: true });
     } catch (error) {
       setSessionsError(error instanceof Error ? error.message : "新建会话失败");
     }
@@ -9131,17 +9533,59 @@ ${markup}
       setProjectConfigEffectiveWorkspace(data.effective_workspace);
       setConfigWarnings(data.warnings);
       setConfigNotice("newman.yaml 已保存，点击 Reload 后才会切到新配置。");
+      return true;
     } catch (error) {
       setConfigError(error instanceof Error ? error.message : "项目配置保存失败");
+      return false;
     } finally {
       setConfigSaving(false);
     }
   };
 
+  const saveProjectEnv = async () => {
+    setProjectEnvSaving(true);
+    setConfigError(null);
+    setConfigNotice(null);
+
+    try {
+      const data = await fetchJson<UpdateProjectEnvResponse>(`${apiBase}/api/config/env`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ content: projectEnvDraft })
+      });
+      setProjectEnvPath(data.path);
+      setProjectEnvContent(data.content);
+      setProjectEnvDraft(data.content);
+      setProjectConfigEffectiveWorkspace(data.effective_workspace);
+      setConfigWarnings(data.warnings);
+      setConfigNotice(".env 已保存，点击 Reload 后才会切到新配置。");
+      return true;
+    } catch (error) {
+      setConfigError(error instanceof Error ? error.message : ".env 保存失败");
+      return false;
+    } finally {
+      setProjectEnvSaving(false);
+    }
+  };
+
+  const saveAllProjectSettings = async () => {
+    if (hasProjectConfigChanges) {
+      const saved = await saveProjectConfig();
+      if (!saved) {
+        return;
+      }
+    }
+    if (hasProjectEnvChanges) {
+      await saveProjectEnv();
+    }
+  };
+
   const reloadProjectConfig = async () => {
     if (
-      hasProjectConfigChanges &&
-      !window.confirm("编辑器里还有未保存修改。Reload 只会加载磁盘上的 newman.yaml，确定继续吗？")
+      hasProjectSettingsChanges &&
+      !window.confirm("编辑器里还有未保存修改。Reload 只会加载磁盘上的 newman.yaml 和 .env，确定继续吗？")
     ) {
       return;
     }
@@ -9161,7 +9605,7 @@ ${markup}
       setWorkspacePath(".");
       setWorkspaceRootPath(null);
       setWorkspaceView(null);
-      await Promise.all([loadProjectConfig(), loadPluginsWorkspace()]);
+      await Promise.all([loadProjectConfig(), loadProjectEnv(), loadPluginsWorkspace()]);
     } catch (error) {
       setConfigError(error instanceof Error ? error.message : "项目配置重载失败");
     } finally {
@@ -9293,6 +9737,7 @@ ${markup}
     const showContextMeter = !isHero;
     const showStopTrigger = isSendingInActiveSession;
     const composerInputDisabled = sendingMessage || stoppingMessage;
+    const multiagentModeActive = composerDisplayMode === "subagent";
     const composerPlaceholder = isStoppingInActiveSession
       ? "正在停止当前任务，请稍候…"
       : isSendingInActiveSession
@@ -9316,12 +9761,12 @@ ${markup}
 
           <div className={`composer-layout ${showPlanSidecar ? "with-plan-sidecar" : ""}`}>
             <div className={`composer-pane composer-pane-main ${showPlanSidecar ? "has-plan-sidecar" : ""}`}>
-              {composerDisplayMode === "plan" ? (
+              {composerModeTokenMode ? (
                 <div className="composer-mode-token-row">
                   <button
                     type="button"
-                    className="composer-mode-token"
-                    title="当前处于 Plan mode，删除标签可退出"
+                    className={`composer-mode-token ${composerModeTokenMode === "subagent" ? "mode-subagent" : "mode-plan"}`}
+                    title={composerModeTokenMode === "plan" ? "当前处于 Plan mode，删除标签可退出" : "当前处于 Subagent mode，删除标签可退出"}
                     onMouseDown={(event) => event.preventDefault()}
                     onClick={() => {
                       void removeComposerModeToken();
@@ -9329,9 +9774,15 @@ ${markup}
                     disabled={sendingMessage || stoppingMessage || planModeUpdating}
                   >
                     <span className="composer-mode-token-icon" aria-hidden="true">
-                      <TimelineMarkerIcon name="plan" className="composer-mode-token-icon-svg" />
+                      {composerModeTokenMode === "plan" ? (
+                        <TimelineMarkerIcon name="plan" className="composer-mode-token-icon-svg" />
+                      ) : (
+                        <MultiagentSmallIcon className="composer-mode-token-icon-svg" />
+                      )}
                     </span>
-                    <span className="composer-mode-token-label">计划模式</span>
+                    <span className="composer-mode-token-label">
+                      {composerModeTokenMode === "plan" ? "计划模式" : "Subagent 模式"}
+                    </span>
                     <span className="composer-mode-token-remove" aria-hidden="true">
                       ×
                     </span>
@@ -9469,27 +9920,26 @@ ${markup}
 
                   {!isHero ? (
                     <button
+                      ref={multiagentTriggerRef}
                       type="button"
-                      className={`composer-action-button multiagent-trigger ${multiagentDrawerOpen ? "active" : ""}`}
-                      aria-label="查看多代理运行面板"
-                      title="查看多代理运行面板"
-                      onClick={() => setMultiagentDrawerOpen((current) => !current)}
+                      className={`composer-action-button multiagent-trigger ${
+                        multiagentDrawerOpen || multiagentModeActive ? "active" : ""
+                      }`}
+                      aria-label="激活 Subagent 模式并打开 MultiAgents 看板"
+                      aria-expanded={multiagentDrawerOpen}
+                      title={multiagentDrawerOpen ? "收起 MultiAgents 看板" : "激活 Subagent 模式并打开 MultiAgents 看板"}
+                      onClick={() => {
+                        if (multiagentDrawerOpen) {
+                          setMultiagentDrawerOpen(false);
+                          return;
+                        }
+                        setMultiagentDrawerOpen(true);
+                        if (!multiagentModeActive) {
+                          void activateComposerSubagentMode();
+                        }
+                      }}
                     >
-                      <svg viewBox="0 0 20 20" aria-hidden="true" className="multiagent-trigger-icon">
-                        <path
-                          d="M10 3.25a2.25 2.25 0 1 1 0 4.5 2.25 2.25 0 0 1 0-4.5Zm-5 7.5a2.25 2.25 0 1 1 0 4.5 2.25 2.25 0 0 1 0-4.5Zm10 0a2.25 2.25 0 1 1 0 4.5 2.25 2.25 0 0 1 0-4.5ZM7.05 8.3l1.55 1.55m2.8 0 1.55-1.55m-5.1 3.4h4.3"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.5"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        />
-                      </svg>
-                      {multiagentRuns.length > 0 ? (
-                        <span className="multiagent-trigger-badge" aria-hidden="true">
-                          {multiagentRunningCount > 0 ? multiagentRunningCount : multiagentRuns.length}
-                        </span>
-                      ) : null}
+                      <MultiagentSmallIcon className="multiagent-trigger-icon" />
                     </button>
                   ) : null}
                 </div>
@@ -9569,10 +10019,7 @@ ${markup}
       <div className="drawer-inner multiagent-drawer-inner">
         <div className="drawer-head">
           <div>
-            <h3>Subagents</h3>
-            <p className="multiagent-drawer-kicker">
-              {multiagentRuns.length > 0 ? `${multiagentRuns.length} runs` : "当前会话还没有多代理运行"}
-            </p>
+            <h3>MultiAgents看板</h3>
           </div>
           <button
             type="button"
@@ -9584,363 +10031,331 @@ ${markup}
           </button>
         </div>
 
-        <div className="multiagent-drawer-strip">
-          <div className="multiagent-strip-metric">
-            <span className="multiagent-strip-label">运行中</span>
-            <strong>{multiagentRunningCount}</strong>
-          </div>
-          <div className="multiagent-strip-metric">
-            <span className="multiagent-strip-label">最近会话</span>
-            <strong>{activeSessionDetail ? formatDateTime(activeSessionDetail.updated_at) : "--"}</strong>
-          </div>
-        </div>
-
         {multiagentError ? <div className="workspace-alert error">{multiagentError}</div> : null}
         {multiagentApprovalError ? <div className="workspace-alert error">{multiagentApprovalError}</div> : null}
 
-        <div className="drawer-card">
-          <div className="multiagent-section-head">
-            <span className="drawer-label">审批队列</span>
-            <span className="workspace-tiny-note">{multiagentApprovals.length} pending</span>
-          </div>
-          {multiagentApprovals.length === 0 ? (
-            <p className="multiagent-empty-copy">当前没有等待处理的子代理审批请求。</p>
-          ) : (
-            <div className="multiagent-approval-list">
-              {multiagentApprovals.map((approval) => {
-                const isBusy = multiagentApprovalActionId === approval.approval_request_id;
-                return (
-                  <div key={approval.approval_request_id} className="multiagent-approval-item">
-                    <div className="multiagent-approval-head">
-                      <strong>{approval.task_name}</strong>
-                      <span className="multiagent-status-pill tone-orange">待审批</span>
-                    </div>
-                    <p className="multiagent-summary-copy">{buildApprovalPrompt(approval)}</p>
-                    <div className="multiagent-run-item-meta">
-                      <span>{approval.task_id}</span>
-                      <span>{approval.remaining_seconds}s</span>
-                    </div>
-                    <p className="multiagent-task-activity">{buildApprovalSupportCopy(approval)}</p>
-                    <div className="multiagent-command-item">
-                      <code>{buildApprovalPayloadPreview(approval)}</code>
-                      <span>{buildApprovalPayloadLabel(approval)}</span>
-                    </div>
-                    <div className="multiagent-approval-actions">
-                      <button
-                        type="button"
-                        className="timeline-approval-button ghost"
-                        disabled={multiagentApprovalActionId !== null}
-                        onClick={() => void resolveMultiagentApproval("reject", approval)}
-                      >
-                        {isBusy ? "处理中..." : "拒绝"}
-                      </button>
-                      <button
-                        type="button"
-                        className="timeline-approval-button solid"
-                        disabled={multiagentApprovalActionId !== null}
-                        onClick={() => void resolveMultiagentApproval("approve", approval)}
-                      >
-                        {isBusy ? "处理中..." : "允许继续"}
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
+        {showMultiagentDrawerEmptyState ? (
+          <div className="multiagent-empty-state" role="status" aria-live="polite">
+            <div className="multiagent-empty-state-icon" aria-hidden="true">
+              <MultiagentSmallIcon className="multiagent-empty-state-icon-svg" />
             </div>
-          )}
-        </div>
-
-        <div className="drawer-card multiagent-run-browser">
-          <div className="multiagent-section-head">
-            <span className="drawer-label">运行列表</span>
-            {multiagentLoading ? <span className="workspace-tiny-note">同步中...</span> : null}
+            <p className="multiagent-empty-state-copy">没有MultiAgents运行中</p>
           </div>
-          {multiagentRuns.length === 0 ? (
-            <p className="multiagent-empty-copy">这个会话里还没有记录到 `multiagent` 运行。</p>
-          ) : (
-            <div className="multiagent-run-list">
-              {multiagentRuns.map((item) => {
-                const isActive = item.run.run_id === selectedMultiagentRunId;
-                const isStopping = isMultiagentRunStopping(item.run);
-                return (
-                  <button
-                    key={item.run.run_id}
-                    type="button"
-                    className={`multiagent-run-item ${isActive ? "active" : ""}`}
-                    onClick={() => {
-                      setSelectedMultiagentRunId(item.run.run_id);
-                      setSelectedMultiagentTaskId(null);
-                      void loadMultiagentRunDetail(item.run.run_id, { silent: true });
-                    }}
-                  >
-                    <div className="multiagent-run-item-head">
-                      <strong>{item.run.mode === "parallel" ? "Parallel" : "Sequential"}</strong>
-                      <MultiagentStatusPill status={item.run.status} stopping={isStopping} />
-                    </div>
-                    <div className="multiagent-run-item-meta">
-                      <span>{item.task_count} tasks</span>
-                      <span>{item.run.usage_summary.total_tokens.toLocaleString("zh-CN")} tok</span>
-                    </div>
-                    <div className="multiagent-run-item-foot">
-                      <span>{item.run.parent_turn_id}</span>
-                      <span>{formatDateTime(item.updated_at)}</span>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
-        {selectedMultiagentRunDetail ? (
+        ) : (
           <>
-            <div className="drawer-card">
+            <div className="drawer-card multiagent-run-browser">
               <div className="multiagent-section-head">
-                <span className="drawer-label">运行摘要</span>
-                <MultiagentStatusPill
-                  status={selectedMultiagentRunDetail.run.status}
-                  stopping={selectedMultiagentRunStopping}
-                />
+                <span className="drawer-label">运行列表</span>
+                {multiagentLoading ? <span className="workspace-tiny-note">同步中...</span> : null}
               </div>
-              {isMultiagentRunActive(selectedMultiagentRunDetail.run.status) ? (
-                <div className="multiagent-approval-actions">
-                  <button
-                    type="button"
-                    className={`workspace-danger-button ${selectedMultiagentRunStopping ? "is-stopping" : ""}`}
-                    disabled={multiagentCancelActionId !== null || selectedMultiagentRunStopping}
-                    onClick={() => void cancelMultiagentRun(selectedMultiagentRunDetail.run.run_id)}
-                  >
-                    {multiagentCancelActionId === `run:${selectedMultiagentRunDetail.run.run_id}` ||
-                    selectedMultiagentRunStopping ? (
-                      <>
-                        <span className="workspace-button-spinner" aria-hidden="true" />
-                        停止中...
-                      </>
-                    ) : (
-                      "停止运行"
-                    )}
-                  </button>
-                </div>
-              ) : null}
-              <p className="multiagent-summary-copy">
-                {selectedMultiagentRunDetail.run.result?.summary ?? "运行仍在进行，等待更多子代理结果。"}
-              </p>
-              <div className="multiagent-stat-grid">
-                <div className="multiagent-stat-cell">
-                  <span className="multiagent-stat-label">总 token</span>
-                  <strong>{selectedMultiagentRunDetail.run.usage_summary.total_tokens.toLocaleString("zh-CN")}</strong>
-                </div>
-                <div className="multiagent-stat-cell">
-                  <span className="multiagent-stat-label">文件重叠</span>
-                  <strong>{selectedMultiagentRunDetail.run.result?.file_overlaps.length ?? 0}</strong>
-                </div>
-                <div className="multiagent-stat-cell">
-                  <span className="multiagent-stat-label">文件冲突</span>
-                  <strong>{selectedMultiagentRunDetail.run.result?.file_conflicts.length ?? 0}</strong>
-                </div>
-                <div className="multiagent-stat-cell">
-                  <span className="multiagent-stat-label">失败代理</span>
-                  <strong>{selectedMultiagentRunDetail.run.result?.failed_agents.length ?? 0}</strong>
-                </div>
-              </div>
-            </div>
-
-            <div className="drawer-card">
-              <div className="multiagent-section-head">
-                <span className="drawer-label">任务</span>
-                {multiagentDetailLoading ? <span className="workspace-tiny-note">详情刷新中...</span> : null}
-              </div>
-              <div className="multiagent-task-list">
-                {selectedMultiagentRunDetail.tasks.map((task) => {
-                  const isStopping = isMultiagentTaskStopping(task);
-                  return (
-                    <button
-                      key={task.task_id}
-                      type="button"
-                      className={`multiagent-task-item ${selectedMultiagentTask?.task_id === task.task_id ? "active" : ""}`}
-                      onClick={() => setSelectedMultiagentTaskId(task.task_id)}
-                    >
-                      <div className="multiagent-task-item-head">
-                        <strong>{task.name}</strong>
-                        <MultiagentStatusPill status={task.status} stopping={isStopping} />
-                      </div>
-                      <div className="multiagent-task-item-meta">
-                        <span>{task.progress.completed_turns}/{task.progress.max_turns} turns</span>
-                        <span>{task.usage_summary.total_tokens.toLocaleString("zh-CN")} tok</span>
-                      </div>
-                      {task.current_activity ? <p className="multiagent-task-activity">{task.current_activity}</p> : null}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {selectedMultiagentTask ? (
-              <>
-                <div className="drawer-card">
-                  <div className="multiagent-section-head">
-                    <span className="drawer-label">当前任务</span>
-                    <span className="workspace-tiny-note">{selectedMultiagentTask.transcript_ref}</span>
+              {selectedMultiagentRunListItem ? (
+                <div className="multiagent-run-stack">
+                  <div className="multiagent-run-primary">
+                    <strong>
+                      {buildMultiagentRunTitle(
+                        selectedMultiagentRunListItem.run,
+                        selectedMultiagentRunListItem.task_count,
+                        selectedMultiagentRunDetail
+                      )}
+                    </strong>
+                    <MultiagentStatusPill
+                      status={selectedMultiagentRunListItem.run.status}
+                      stopping={isMultiagentRunStopping(selectedMultiagentRunListItem.run)}
+                    />
                   </div>
-                  {isMultiagentTaskActive(selectedMultiagentTask.status) ? (
-                    <div className="multiagent-approval-actions">
+                  {historicalMultiagentRuns.length > 0 ? (
+                    <div className="multiagent-history-wrap">
                       <button
                         type="button"
-                        className={`workspace-danger-button ${selectedMultiagentTaskStopping ? "is-stopping" : ""}`}
-                        disabled={multiagentCancelActionId !== null || selectedMultiagentTaskStopping}
-                        onClick={() =>
-                          void cancelMultiagentTask(
-                            selectedMultiagentTask.task_id,
-                            selectedMultiagentTask.run_id
-                          )
-                        }
+                        className={`multiagent-collapse-toggle ${multiagentRunHistoryExpanded ? "expanded" : ""}`}
+                        onClick={() => setMultiagentRunHistoryExpanded((current) => !current)}
                       >
-                        {multiagentCancelActionId === `task:${selectedMultiagentTask.task_id}` ||
-                        selectedMultiagentTaskStopping ? (
-                          <>
-                            <span className="workspace-button-spinner" aria-hidden="true" />
-                            停止中...
-                          </>
-                        ) : (
-                          "停止任务"
-                        )}
+                        <span>历史运行</span>
+                        <span className="multiagent-collapse-meta">{historicalMultiagentRuns.length}</span>
+                        <ChevronStrokeIcon className="multiagent-collapse-icon" />
                       </button>
-                    </div>
-                  ) : null}
-                  <p className="multiagent-summary-copy">
-                    {selectedMultiagentTask.result?.summary ?? selectedMultiagentTask.current_activity ?? "任务正在等待更多执行进展。"}
-                  </p>
-                  {selectedMultiagentTask.result?.degraded ? (
-                    <p className="multiagent-degraded-copy">
-                      degraded: {selectedMultiagentTask.result.degraded_reason ?? "degraded"}
-                    </p>
-                  ) : null}
-                  <div className="multiagent-stat-grid compact">
-                    <div className="multiagent-stat-cell">
-                      <span className="multiagent-stat-label">工具调用</span>
-                      <strong>{selectedMultiagentTask.progress.tool_call_count}</strong>
-                    </div>
-                    <div className="multiagent-stat-cell">
-                      <span className="multiagent-stat-label">文件改动</span>
-                      <strong>{selectedMultiagentTask.file_changes.length}</strong>
-                    </div>
-                    <div className="multiagent-stat-cell">
-                      <span className="multiagent-stat-label">终端命令</span>
-                      <strong>{selectedMultiagentTask.terminal_commands.length}</strong>
-                    </div>
-                    <div className="multiagent-stat-cell">
-                      <span className="multiagent-stat-label">发现</span>
-                      <strong>{selectedMultiagentTask.result?.findings.length ?? 0}</strong>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="drawer-card">
-                  <div className="multiagent-section-head">
-                    <span className="drawer-label">Child Transcript</span>
-                    {multiagentTranscriptLoading && !selectedMultiagentChildSession ? (
-                      <span className="workspace-tiny-note">加载中...</span>
-                    ) : selectedMultiagentChildSession ? (
-                      <span className="workspace-tiny-note">{selectedMultiagentChildSession.messages.length} messages</span>
-                    ) : null}
-                  </div>
-                  {selectedMultiagentChildSession ? (
-                    <div className="multiagent-transcript-list">
-                      {selectedMultiagentChildSession.messages.slice(-10).map((message) => (
-                        <div
-                          key={message.id}
-                          className={`multiagent-transcript-message role-${message.role}`}
-                        >
-                          <div className="multiagent-transcript-head">
-                            <strong>{formatSessionMessageRoleLabel(message.role)}</strong>
-                            <span>{formatDateTime(message.created_at)}</span>
-                          </div>
-                          <div className="multiagent-transcript-body">
-                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                              {truncateTranscriptMessage(message.content)}
-                            </ReactMarkdown>
-                          </div>
+                      {multiagentRunHistoryExpanded ? (
+                        <div className="multiagent-run-list">
+                          {historicalMultiagentRuns.map((item) => {
+                            const detail = multiagentRunDetailsById[item.run.run_id] ?? null;
+                            return (
+                              <button
+                                key={item.run.run_id}
+                                type="button"
+                                className="multiagent-run-item compact"
+                                onClick={() => {
+                                  setSelectedMultiagentRunId(item.run.run_id);
+                                  setSelectedMultiagentTaskId(null);
+                                  setMultiagentRunHistoryExpanded(false);
+                                  setMultiagentSummaryExpanded(false);
+                                  void loadMultiagentRunDetail(item.run.run_id, { silent: true });
+                                }}
+                              >
+                                <div className="multiagent-run-item-head">
+                                  <strong>{buildMultiagentRunTitle(item.run, item.task_count, detail)}</strong>
+                                  <MultiagentStatusPill
+                                    status={item.run.status}
+                                    stopping={isMultiagentRunStopping(item.run)}
+                                  />
+                                </div>
+                                <div className="multiagent-run-item-meta">
+                                  <span>{formatDateTime(item.updated_at)}</span>
+                                </div>
+                              </button>
+                            );
+                          })}
                         </div>
-                      ))}
-                      {selectedMultiagentChildSession.messages.length > 10 ? (
-                        <p className="multiagent-empty-copy">仅显示最近 10 条 transcript 消息。</p>
                       ) : null}
                     </div>
-                  ) : (
-                    <p className="multiagent-empty-copy">
-                      {multiagentTranscriptLoading ? "正在加载 child transcript..." : "这个子会话还没有可展示的 transcript。"}
-                    </p>
-                  )}
+                  ) : null}
+                </div>
+              ) : (
+                <p className="multiagent-empty-copy">这个会话里还没有记录到 `multiagent` 运行。</p>
+              )}
+            </div>
+
+            {selectedMultiagentRunDetail ? (
+              <div className="drawer-card">
+                <div className="multiagent-section-head">
+                  <span className="drawer-label">运行摘要</span>
+                  <div className="multiagent-section-actions">
+                    <MultiagentStatusPill
+                      status={selectedMultiagentRunDetail.run.status}
+                      stopping={selectedMultiagentRunStopping}
+                    />
+                    <button
+                      type="button"
+                      className={`multiagent-collapse-toggle summary-toggle ${multiagentSummaryExpanded ? "expanded" : ""}`}
+                      onClick={() => setMultiagentSummaryExpanded((current) => !current)}
+                    >
+                      <span>{multiagentSummaryExpanded ? "收起" : "展开"}</span>
+                      <ChevronStrokeIcon className="multiagent-collapse-icon" />
+                    </button>
+                  </div>
+                </div>
+                <div className="multiagent-summary-compact">
+                  <div className="multiagent-stat-cell emphasis">
+                    <span className="multiagent-stat-label">当前 token</span>
+                    <strong>{selectedMultiagentRunDetail.run.usage_summary.total_tokens.toLocaleString("zh-CN")}</strong>
+                  </div>
+                  <div className="multiagent-task-list compact">
+                    {selectedMultiagentRunDetail.tasks.map((task) => {
+                      const isStopping = isMultiagentTaskStopping(task);
+                      return (
+                        <button
+                          key={task.task_id}
+                          type="button"
+                          className={`multiagent-task-item compact ${selectedMultiagentTask?.task_id === task.task_id ? "active" : ""}`}
+                          onClick={() => setSelectedMultiagentTaskId(task.task_id)}
+                        >
+                          <div className="multiagent-task-item-head">
+                            <strong>{task.name}</strong>
+                            <MultiagentStatusPill status={task.status} stopping={isStopping} />
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
 
-                {selectedMultiagentTask.result?.findings.length ? (
-                  <div className="drawer-card">
-                    <div className="multiagent-section-head">
-                      <span className="drawer-label">Findings</span>
+                {multiagentSummaryExpanded ? (
+                  <div className="multiagent-summary-expanded">
+                    {isMultiagentRunActive(selectedMultiagentRunDetail.run.status) ? (
+                      <div className="multiagent-approval-actions">
+                        <button
+                          type="button"
+                          className={`workspace-danger-button ${selectedMultiagentRunStopping ? "is-stopping" : ""}`}
+                          disabled={multiagentCancelActionId !== null || selectedMultiagentRunStopping}
+                          onClick={() => void cancelMultiagentRun(selectedMultiagentRunDetail.run.run_id)}
+                        >
+                          {multiagentCancelActionId === `run:${selectedMultiagentRunDetail.run.run_id}` ||
+                          selectedMultiagentRunStopping ? (
+                            <>
+                              <span className="workspace-button-spinner" aria-hidden="true" />
+                              停止中...
+                            </>
+                          ) : (
+                            "停止运行"
+                          )}
+                        </button>
+                      </div>
+                    ) : null}
+                    <p className="multiagent-summary-copy">
+                      {selectedMultiagentRunDetail.run.result?.summary ?? "运行仍在进行，等待更多子代理结果。"}
+                    </p>
+
+                    {multiagentApprovals.length > 0 ? (
+                      <div className="multiagent-inline-panel">
+                        <div className="multiagent-section-head">
+                          <span className="drawer-label">待处理审批</span>
+                          <span className="workspace-tiny-note">{multiagentApprovals.length}</span>
+                        </div>
+                        <div className="multiagent-approval-list">
+                          {multiagentApprovals.map((approval) => {
+                            const isBusy = multiagentApprovalActionId === approval.approval_request_id;
+                            return (
+                              <div key={approval.approval_request_id} className="multiagent-approval-item">
+                                <div className="multiagent-approval-head">
+                                  <strong>{approval.task_name}</strong>
+                                  <span className="multiagent-status-pill tone-orange">待审批</span>
+                                </div>
+                                <p className="multiagent-summary-copy">{buildApprovalPrompt(approval)}</p>
+                                <div className="multiagent-approval-actions">
+                                  <button
+                                    type="button"
+                                    className="timeline-approval-button ghost"
+                                    disabled={multiagentApprovalActionId !== null}
+                                    onClick={() => void resolveMultiagentApproval("reject", approval)}
+                                  >
+                                    {isBusy ? "处理中..." : "拒绝"}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="timeline-approval-button solid"
+                                    disabled={multiagentApprovalActionId !== null}
+                                    onClick={() => void resolveMultiagentApproval("approve", approval)}
+                                  >
+                                    {isBusy ? "处理中..." : "允许继续"}
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    <div className="multiagent-stat-grid">
+                      <div className="multiagent-stat-cell">
+                        <span className="multiagent-stat-label">文件重叠</span>
+                        <strong>{selectedMultiagentRunDetail.run.result?.file_overlaps.length ?? 0}</strong>
+                      </div>
+                      <div className="multiagent-stat-cell">
+                        <span className="multiagent-stat-label">文件冲突</span>
+                        <strong>{selectedMultiagentRunDetail.run.result?.file_conflicts.length ?? 0}</strong>
+                      </div>
+                      <div className="multiagent-stat-cell">
+                        <span className="multiagent-stat-label">失败代理</span>
+                        <strong>{selectedMultiagentRunDetail.run.result?.failed_agents.length ?? 0}</strong>
+                      </div>
+                      <div className="multiagent-stat-cell">
+                        <span className="multiagent-stat-label">任务数</span>
+                        <strong>{selectedMultiagentRunDetail.tasks.length}</strong>
+                      </div>
                     </div>
-                    <div className="multiagent-findings-list">
-                      {selectedMultiagentTask.result.findings.slice(0, 6).map((finding, index) => (
-                        <div key={`${finding.title}:${index}`} className="multiagent-finding-item">
-                          <div className="multiagent-finding-head">
-                            <strong>{finding.title}</strong>
-                            <span
-                              className={`multiagent-status-pill tone-${
-                                finding.severity === "info" ? "blue" : finding.severity === "low" ? "green" : "orange"
-                              }`}
+
+                    {selectedMultiagentTask ? (
+                      <div className="multiagent-inline-panel">
+                        <div className="multiagent-section-head">
+                          <span className="drawer-label">当前子代理</span>
+                          {multiagentDetailLoading ? <span className="workspace-tiny-note">详情刷新中...</span> : null}
+                        </div>
+                        {isMultiagentTaskActive(selectedMultiagentTask.status) ? (
+                          <div className="multiagent-approval-actions">
+                            <button
+                              type="button"
+                              className={`workspace-danger-button ${selectedMultiagentTaskStopping ? "is-stopping" : ""}`}
+                              disabled={multiagentCancelActionId !== null || selectedMultiagentTaskStopping}
+                              onClick={() =>
+                                void cancelMultiagentTask(
+                                  selectedMultiagentTask.task_id,
+                                  selectedMultiagentTask.run_id
+                                )
+                              }
                             >
-                              {finding.severity}
-                            </span>
+                              {multiagentCancelActionId === `task:${selectedMultiagentTask.task_id}` ||
+                              selectedMultiagentTaskStopping ? (
+                                <>
+                                  <span className="workspace-button-spinner" aria-hidden="true" />
+                                  停止中...
+                                </>
+                              ) : (
+                                "停止任务"
+                              )}
+                            </button>
                           </div>
-                          {finding.detail ? <p>{finding.detail}</p> : null}
+                        ) : null}
+                        <p className="multiagent-summary-copy">
+                          {selectedMultiagentTask.result?.summary ??
+                            selectedMultiagentTask.current_activity ??
+                            "任务正在等待更多执行进展。"}
+                        </p>
+                        {selectedMultiagentTask.result?.degraded ? (
+                          <p className="multiagent-degraded-copy">
+                            degraded: {selectedMultiagentTask.result.degraded_reason ?? "degraded"}
+                          </p>
+                        ) : null}
+                        <div className="multiagent-stat-grid compact">
+                          <div className="multiagent-stat-cell">
+                            <span className="multiagent-stat-label">工具调用</span>
+                            <strong>{selectedMultiagentTask.progress.tool_call_count}</strong>
+                          </div>
+                          <div className="multiagent-stat-cell">
+                            <span className="multiagent-stat-label">终端命令</span>
+                            <strong>{selectedMultiagentTask.terminal_commands.length}</strong>
+                          </div>
+                          <div className="multiagent-stat-cell">
+                            <span className="multiagent-stat-label">发现</span>
+                            <strong>{selectedMultiagentTask.result?.findings.length ?? 0}</strong>
+                          </div>
+                          <div className="multiagent-stat-cell">
+                            <span className="multiagent-stat-label">轮次</span>
+                            <strong>
+                              {selectedMultiagentTask.progress.completed_turns}/{selectedMultiagentTask.progress.max_turns}
+                            </strong>
+                          </div>
                         </div>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
 
-                {selectedMultiagentTask.file_changes.length ? (
-                  <div className="drawer-card">
-                    <div className="multiagent-section-head">
-                      <span className="drawer-label">文件改动</span>
-                    </div>
-                    <div className="multiagent-file-list">
-                      {selectedMultiagentTask.file_changes.slice(0, 8).map((change, index) => (
-                        <div key={`${change.path}:${index}`} className="multiagent-file-item">
-                          <strong>{change.path}</strong>
-                          <span>{change.tool}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
+                        {selectedMultiagentTask.result?.findings.length ? (
+                          <div className="multiagent-findings-list">
+                            {selectedMultiagentTask.result.findings.slice(0, 6).map((finding, index) => (
+                              <div key={`${finding.title}:${index}`} className="multiagent-finding-item">
+                                <div className="multiagent-finding-head">
+                                  <strong>{finding.title}</strong>
+                                  <span
+                                    className={`multiagent-status-pill tone-${
+                                      finding.severity === "info"
+                                        ? "blue"
+                                        : finding.severity === "low"
+                                          ? "green"
+                                          : "orange"
+                                    }`}
+                                  >
+                                    {finding.severity}
+                                  </span>
+                                </div>
+                                {finding.detail ? <p>{finding.detail}</p> : null}
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
 
-                {selectedMultiagentTask.terminal_commands.length ? (
-                  <div className="drawer-card">
-                    <div className="multiagent-section-head">
-                      <span className="drawer-label">终端命令</span>
-                    </div>
-                    <div className="multiagent-command-list">
-                      {selectedMultiagentTask.terminal_commands.slice(0, 6).map((command, index) => (
-                        <div key={`${command.command}:${index}`} className="multiagent-command-item">
-                          <code>{command.command}</code>
-                          <span>{typeof command.exit_code === "number" ? `exit ${command.exit_code}` : "running"}</span>
-                        </div>
-                      ))}
-                    </div>
+                        {selectedMultiagentTask.terminal_commands.length ? (
+                          <div className="multiagent-command-list">
+                            {selectedMultiagentTask.terminal_commands.slice(0, 6).map((command, index) => (
+                              <div key={`${command.command}:${index}`} className="multiagent-command-item">
+                                <code>{command.command}</code>
+                                <span>{typeof command.exit_code === "number" ? `exit ${command.exit_code}` : "running"}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
-              </>
+              </div>
             ) : null}
 
             <div className="drawer-card">
               <div className="multiagent-section-head">
                 <span className="drawer-label">最近事件</span>
               </div>
-              {selectedMultiagentTimeline.length === 0 ? (
+              {selectedMultiagentTimelineReversed.length === 0 ? (
                 <p className="multiagent-empty-copy">当前还没有可展示的多代理事件。</p>
               ) : (
                 <div className="multiagent-timeline">
-                  {selectedMultiagentTimeline.map((item) => (
+                  {selectedMultiagentTimelineReversed.map((item) => (
                     <div key={item.id} className="multiagent-timeline-item">
                       <span className="multiagent-timeline-time">{formatDateTime(new Date(item.ts).toISOString())}</span>
                       <p>{item.detail}</p>
@@ -9950,7 +10365,7 @@ ${markup}
               )}
             </div>
           </>
-        ) : null}
+        )}
       </div>
     </aside>
   );
@@ -11140,38 +11555,45 @@ ${markup}
         ) : null}
 
         {activePage === "settings" ? (
-          <section className="workspace-page settings-page">
-            <div className="workspace-page-head">
-              <div>
+          <section className="workspace-page settings-page settings-dashboard">
+            <div className="workspace-page-head settings-page-head">
+              <div className="settings-page-title-block">
                 <h2>{activeSettingsTabOption.label}</h2>
+                <div className="settings-segmented" role="tablist" aria-label="设置分区">
+                  {settingsTabOptions.map((option) => (
+                    <button
+                      key={option.id}
+                      type="button"
+                      role="tab"
+                      className={activeSettingsTab === option.id ? "active" : ""}
+                      aria-selected={activeSettingsTab === option.id}
+                      onClick={() => setActiveSettingsTab(option.id)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
               </div>
-              <div className="workspace-page-actions">
-                {activeSettingsTab === "plugins" ? (
+              {activeSettingsTab === "config" ? (
+                <div className="workspace-page-actions settings-page-actions">
                   <button
                     type="button"
                     className="workspace-secondary-button"
-                    onClick={() => void rescanPlugins()}
-                    disabled={pluginsLoading}
+                    onClick={() => void saveAllProjectSettings()}
+                    disabled={configLoading || projectEnvLoading || configSaving || projectEnvSaving || !hasProjectSettingsChanges}
                   >
-                    {pluginsLoading ? "扫描中..." : "重新扫描插件"}
+                    {configSaving || projectEnvSaving ? "保存中..." : "保存变更"}
                   </button>
-                ) : null}
-              </div>
-            </div>
-
-            <div className="workspace-tabbar" role="tablist" aria-label="设置分区">
-              {settingsTabOptions.map((option) => (
-                <button
-                  key={option.id}
-                  type="button"
-                  role="tab"
-                  className={`workspace-tab ${activeSettingsTab === option.id ? "active" : ""}`}
-                  aria-selected={activeSettingsTab === option.id}
-                  onClick={() => setActiveSettingsTab(option.id)}
-                >
-                  {option.label}
-                </button>
-              ))}
+                  <button
+                    type="button"
+                    className="workspace-primary-button"
+                    onClick={() => void reloadProjectConfig()}
+                    disabled={configLoading || projectEnvLoading || configReloading || configSaving || projectEnvSaving}
+                  >
+                    {configReloading ? "Reload 中..." : "Reload 生效"}
+                  </button>
+                </div>
+              ) : null}
             </div>
 
             {configError ? <div className="workspace-alert error">{configError}</div> : null}
@@ -11180,231 +11602,165 @@ ${markup}
             {pluginsNotice ? <div className="workspace-alert success">{pluginsNotice}</div> : null}
 
             <div className="workspace-stack">
-              <article className="workspace-card">
-                <div className="workspace-card-head">
-                  <div>
-                    <h3>地理位置</h3>
-                    <p>优先使用浏览器定位；如果浏览器不给权限，可以手动填写城市作为上下文。</p>
-                  </div>
-                  <div className="workspace-inline-actions">
-                    <button
-                      type="button"
-                      className="workspace-secondary-button"
-                      onClick={() => void refreshEnvironmentLocation({ allowPrompt: true, forcePrompt: true })}
-                    >
-                      获取当前位置
-                    </button>
-                  </div>
-                </div>
-
-                <div className="workspace-card-body">
-                  <div className="workspace-info-grid">
-                    <div className="workspace-mini-card">
-                      <span className="workspace-mini-label">当前状态</span>
-                      <strong>{environmentLocationStatus.message}</strong>
-                    </div>
-                    <div className="workspace-mini-card">
-                      <span className="workspace-mini-label">当前城市</span>
-                      <strong>{environmentLocation?.city ?? "未获取"}</strong>
-                    </div>
-                    <div className="workspace-mini-card">
-                      <span className="workspace-mini-label">访问地址</span>
-                      <strong>{window.location.origin}</strong>
-                    </div>
-                    <div className="workspace-mini-card">
-                      <span className="workspace-mini-label">安全上下文</span>
-                      <strong>{window.isSecureContext ? "是" : "否"}</strong>
-                    </div>
-                  </div>
-
-                  <div className="workspace-detail-block">
-                    <span className="workspace-field-label">手动城市</span>
-                    <div className="location-settings-row">
-                      <input
-                        className="workspace-text-input"
-                        value={manualEnvironmentCity}
-                        onChange={(event) => setManualEnvironmentCity(event.target.value)}
-                        placeholder="例如：武汉"
-                      />
-                      <button
-                        type="button"
-                        className="workspace-secondary-button"
-                        onClick={saveManualEnvironmentCity}
-                        disabled={!manualEnvironmentCity.trim()}
-                      >
-                        保存城市
-                      </button>
-                      <button
-                        type="button"
-                        className="workspace-secondary-button"
-                        onClick={clearManualEnvironmentCity}
-                      >
-                        清除
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="workspace-detail-block">
-                    <span className="workspace-field-label">说明</span>
-                    <p className="workspace-copy">
-                      如果你是从 <code>http://局域网 IP:7775</code> 打开的，很多浏览器不会开放定位能力。优先改用{" "}
-                      <code>http://127.0.0.1:7775</code> 或 <code>http://localhost:7775</code>。
-                    </p>
-                  </div>
-                </div>
-              </article>
-
-              {activeSettingsTab === "theme" ? (
-                <article className="workspace-card">
-                  <div className="workspace-card-head">
-                    <div>
-                      <h3>界面主题</h3>
-                      <p>保留当前原版配色，同时新增一套按参考图提炼的主题，可随时切换。</p>
-                    </div>
-                  </div>
-
-                  <div className="workspace-card-body">
-                    <div className="theme-grid">
-                      {uiThemeOptions.map((option) => {
-                        const active = option.id === uiTheme;
-                        return (
-                          <button
-                            key={option.id}
-                            type="button"
-                            className={`theme-card ${active ? "active" : ""}`}
-                            onClick={() => setUiTheme(option.id)}
-                            aria-pressed={active}
-                          >
-                            <div className={`theme-card-preview ${option.previewClass}`} aria-hidden="true">
-                              <span className="theme-preview-rail" />
-                              <span className="theme-preview-stage" />
-                              <span className="theme-preview-panel theme-preview-panel-hero" />
-                              <span className="theme-preview-panel theme-preview-panel-body" />
-                            </div>
-
-                            <div className="theme-card-copy">
-                              <p className="theme-card-kicker">{option.kicker}</p>
-                              <div className="theme-card-headline">
-                                <strong>{option.label}</strong>
-                                <span className={`workspace-pill ${active ? "accent" : "subtle"}`}>{active ? "当前使用" : "点击切换"}</span>
-                              </div>
-                              <p>{option.description}</p>
-                            </div>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                </article>
-              ) : null}
-
-              {activeSettingsTab === "config" ? (
-                <article className="workspace-card">
-                  <div className="workspace-card-head">
-                    <div>
-                      <h3>项目配置</h3>
-                      <p>{projectConfigPath || "正在定位 newman.yaml"}</p>
-                    </div>
-                    <div className="workspace-inline-actions">
-                      <button
-                        type="button"
-                        className="workspace-secondary-button"
-                        onClick={() => void saveProjectConfig()}
-                        disabled={configLoading || configSaving || !hasProjectConfigChanges}
-                      >
-                        {configSaving ? "保存中..." : "保存配置"}
-                      </button>
-                      <button
-                        type="button"
-                        className="workspace-primary-button"
-                        onClick={() => void reloadProjectConfig()}
-                        disabled={configLoading || configReloading || configSaving}
-                      >
-                        {configReloading ? "Reload 中..." : "Reload 生效"}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="workspace-card-body">
-                    {configLoading ? <div className="workspace-empty">正在加载 newman.yaml...</div> : null}
-
-                    {!configLoading ? (
-                      <>
-                        <div className="workspace-info-grid">
-                          <div className="workspace-mini-card">
-                            <span className="workspace-mini-label">当前生效 workspace</span>
-                            <strong>{projectConfigEffectiveWorkspace || "未识别"}</strong>
-                          </div>
-                          <div className="workspace-mini-card">
-                            <span className="workspace-mini-label">编辑状态</span>
-                            <strong>{hasProjectConfigChanges ? "有未保存修改" : "磁盘内容已同步"}</strong>
-                          </div>
-                        </div>
-
-                        <div className="workspace-detail-block">
-                          <span className="workspace-field-label">生效顺序</span>
-                          <p className="workspace-copy">
-                            {projectConfigSourcePriority.length > 0
-                              ? projectConfigSourcePriority.join(" > ")
-                              : "environment > ~/.newman/config.yaml > newman.yaml > defaults.yaml"}
-                          </p>
-                        </div>
-
-                        <div className="workspace-detail-block">
-                          <span className="workspace-field-label">说明</span>
-                          <p className="workspace-copy">
-                            保存只会写回项目根目录的 <code>newman.yaml</code>。点击 Reload 后，新的 runtime、scheduler 和 channels
-                            才会切到这份配置。
-                          </p>
-                        </div>
-
-                        {configWarnings.length > 0 ? (
-                          <div className="workspace-detail-block">
-                            <span className="workspace-field-label">重载提示</span>
-                            <div className="workspace-list">
-                              {configWarnings.map((warning) => (
-                                <div key={warning} className="workspace-list-row static">
-                                  <p className="workspace-row-copy">{warning}</p>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        ) : null}
-
-                        <div className="workspace-detail-block">
-                          <span className="workspace-field-label">newman.yaml</span>
-                          <textarea
-                            className="workspace-editor"
-                            value={projectConfigDraft}
-                            onChange={(event) => {
-                              setProjectConfigDraft(event.target.value);
-                              setConfigNotice(null);
-                              setConfigError(null);
-                            }}
-                            spellCheck={false}
-                          />
-                        </div>
-                      </>
-                    ) : null}
-                  </div>
-                </article>
-              ) : null}
-
-              {activeSettingsTab === "plugins" ? (
-                <>
-                  <article className="workspace-card">
+              {activeSettingsTab === "system" ? (
+                <div className="system-settings-grid">
+                  <article className="workspace-card settings-card system-settings-panel">
                     <div className="workspace-card-head">
                       <div>
-                        <h3>插件列表</h3>
-                        <p>保留当前工作台风格，只补管理页面，不改整体视觉语义。</p>
+                        <h3>地理位置</h3>
+                        <p>优先使用浏览器定位；如果权限不可用，保留手动城市作为上下文。</p>
+                      </div>
+                      <div className="workspace-inline-actions">
+                        <button
+                          type="button"
+                          className="workspace-secondary-button"
+                          onClick={() => void refreshEnvironmentLocation({ allowPrompt: true, forcePrompt: true })}
+                        >
+                          获取当前位置
+                        </button>
                       </div>
                     </div>
 
                     <div className="workspace-card-body">
+                      <div className="workspace-info-grid compact">
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">当前状态</span>
+                          <strong>{environmentLocationStatus.message}</strong>
+                        </div>
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">当前城市</span>
+                          <strong>{environmentLocation?.city ?? "未获取"}</strong>
+                        </div>
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">访问地址</span>
+                          <strong>{window.location.origin}</strong>
+                        </div>
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">安全上下文</span>
+                          <strong>{window.isSecureContext ? "是" : "否"}</strong>
+                        </div>
+                      </div>
+
+                      <div className="workspace-detail-block">
+                        <span className="workspace-field-label">手动城市</span>
+                        <div className="location-settings-row">
+                          <input
+                            className="workspace-text-input"
+                            value={manualEnvironmentCity}
+                            onChange={(event) => setManualEnvironmentCity(event.target.value)}
+                            placeholder="例如：武汉"
+                          />
+                          <button
+                            type="button"
+                            className="workspace-secondary-button"
+                            onClick={saveManualEnvironmentCity}
+                            disabled={!manualEnvironmentCity.trim()}
+                          >
+                            保存城市
+                          </button>
+                          <button
+                            type="button"
+                            className="workspace-secondary-button"
+                            onClick={clearManualEnvironmentCity}
+                          >
+                            清除
+                          </button>
+                        </div>
+                      </div>
+
+                      <p className="workspace-copy">
+                        如果你是从 <code>http://局域网 IP:7775</code> 打开的，很多浏览器不会开放定位能力。优先改用{" "}
+                        <code>http://127.0.0.1:7775</code> 或 <code>http://localhost:7775</code>。
+                      </p>
+                    </div>
+                  </article>
+
+                  <article className="workspace-card settings-card system-settings-panel">
+                    <div className="workspace-card-head">
+                      <div>
+                        <h3>界面主题</h3>
+                        <p>保留当前两套主题，但切换器压成更紧凑的样式。</p>
+                      </div>
+                    </div>
+
+                    <div className="workspace-card-body">
+                      <div className="theme-compact-grid">
+                        {uiThemeOptions.map((option) => {
+                          const active = option.id === uiTheme;
+                          return (
+                            <button
+                              key={option.id}
+                              type="button"
+                              className={`theme-compact-card ${active ? "active" : ""}`}
+                              onClick={() => setUiTheme(option.id)}
+                              aria-pressed={active}
+                            >
+                              <div className={`theme-card-preview compact ${option.previewClass}`} aria-hidden="true">
+                                <span className="theme-preview-rail" />
+                                <span className="theme-preview-stage" />
+                                <span className="theme-preview-panel theme-preview-panel-hero" />
+                                <span className="theme-preview-panel theme-preview-panel-body" />
+                              </div>
+                              <div className="theme-compact-copy">
+                                <div className="theme-compact-head">
+                                  <strong>{option.label}</strong>
+                                  <span className={`workspace-pill ${active ? "accent" : "subtle"}`}>
+                                    {active ? "当前" : option.kicker}
+                                  </span>
+                                </div>
+                                <p>{option.description}</p>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </article>
+
+                  <article className="workspace-card settings-card system-settings-panel wide">
+                    <div className="workspace-card-head">
+                      <div>
+                        <h3>插件情况</h3>
+                        <p>集中看启停状态、能力规模和加载异常，不再拆成两大块。</p>
+                      </div>
+                      <div className="workspace-inline-actions">
+                        <button
+                          type="button"
+                          className="workspace-secondary-button"
+                          onClick={() => void rescanPlugins()}
+                          disabled={pluginsLoading}
+                        >
+                          {pluginsLoading ? "扫描中..." : "重新扫描插件"}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="workspace-card-body">
+                      <div className="workspace-info-grid compact">
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">插件总数</span>
+                          <strong>{plugins.length}</strong>
+                        </div>
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">已启用</span>
+                          <strong>{enabledPluginCount}</strong>
+                        </div>
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">已停用</span>
+                          <strong>{disabledPluginCount}</strong>
+                        </div>
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">加载异常</span>
+                          <strong>{pluginErrors.length}</strong>
+                        </div>
+                      </div>
+
                       {pluginsLoading && plugins.length === 0 ? <div className="workspace-empty">正在加载插件...</div> : null}
 
-                      {!pluginsLoading || plugins.length > 0 ? (
-                        <div className="plugin-list" role="table" aria-label="插件列表">
+                      {!pluginsLoading && plugins.length === 0 ? <div className="workspace-empty">当前没有已识别插件。</div> : null}
+
+                      {plugins.length > 0 ? (
+                        <div className="plugin-list compact" role="table" aria-label="插件列表">
                           <div className="plugin-list-head" role="row">
                             <span role="columnheader">插件</span>
                             <span role="columnheader">能力</span>
@@ -11427,6 +11783,7 @@ ${markup}
                                 <span>{plugin.skill_count} Skills</span>
                                 <span>{plugin.hook_count} Hooks</span>
                                 <span>{plugin.mcp_server_count} MCP</span>
+                                <span>{plugin.cli_command_count} CLI</span>
                               </div>
                               <p className="plugin-list-path" role="cell" title={plugin.plugin_path}>
                                 {plugin.plugin_path}
@@ -11453,39 +11810,185 @@ ${markup}
                           ))}
                         </div>
                       ) : null}
+
+                      <div className="workspace-detail-block">
+                        <span className="workspace-field-label">加载异常</span>
+                        {pluginErrors.length === 0 ? (
+                          <div className="workspace-empty">当前没有插件加载异常。</div>
+                        ) : (
+                          <div className="workspace-list">
+                            {pluginErrors.map((error, index) => (
+                              <div key={`${error.plugin_path}-${index}`} className="workspace-list-row static">
+                                <div className="workspace-list-row-main">
+                                  <span className="workspace-item-mark error">ERR</span>
+                                  <strong>{error.plugin_name || extractName(error.plugin_path)}</strong>
+                                </div>
+                                <p className="workspace-row-copy">
+                                  {error.message}
+                                  <br />
+                                  {error.plugin_path}
+                                </p>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </article>
+                </div>
+              ) : null}
 
-                  <article className="workspace-card">
+              {activeSettingsTab === "config" ? (
+                <>
+                  <article className="workspace-card settings-card settings-summary-card">
                     <div className="workspace-card-head">
                       <div>
-                        <h3>加载异常</h3>
-                        <p>如果插件目录有清单、版本或权限问题，会集中显示在这里。</p>
+                        <h3>运行配置概览</h3>
+                        <p>保存只写磁盘；Reload 会重新加载项目根目录的 <code>newman.yaml</code> 和 <code>.env</code>。</p>
                       </div>
                     </div>
 
                     <div className="workspace-card-body">
-                      {pluginErrors.length === 0 ? (
-                        <div className="workspace-empty">当前没有插件加载异常。</div>
-                      ) : (
-                        <div className="workspace-list">
-                          {pluginErrors.map((error, index) => (
-                            <div key={`${error.plugin_path}-${index}`} className="workspace-list-row static">
-                              <div className="workspace-list-row-main">
-                                <span className="workspace-item-mark error">ERR</span>
-                                <strong>{error.plugin_name || extractName(error.plugin_path)}</strong>
-                              </div>
-                              <p className="workspace-row-copy">
-                                {error.message}
-                                <br />
-                                {error.plugin_path}
-                              </p>
-                            </div>
-                          ))}
+                      <div className="workspace-info-grid compact">
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">当前生效 workspace</span>
+                          <strong>{projectConfigEffectiveWorkspace || "未识别"}</strong>
                         </div>
-                      )}
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">newman.yaml</span>
+                          <strong>{hasProjectConfigChanges ? "有未保存修改" : "磁盘内容已同步"}</strong>
+                        </div>
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">.env</span>
+                          <strong>{hasProjectEnvChanges ? "有未保存修改" : "磁盘内容已同步"}</strong>
+                        </div>
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">Reload 范围</span>
+                          <strong>runtime / scheduler / channels</strong>
+                        </div>
+                      </div>
+
+                      <div className="workspace-detail-block">
+                        <span className="workspace-field-label">配置生效顺序</span>
+                        <p className="workspace-copy">
+                          {projectConfigSourcePriority.length > 0
+                            ? projectConfigSourcePriority.join(" > ")
+                            : "environment > ~/.newman/config.yaml > newman.yaml > defaults.yaml"}
+                        </p>
+                      </div>
+
+                      <div className="workspace-detail-block">
+                        <span className="workspace-field-label">.env 说明</span>
+                        <p className="workspace-copy">
+                          当前运行时会合并项目根目录 <code>.env</code>、<code>~/.newman/.env</code> 和进程环境变量；
+                          更高优先级依次为 <code>进程环境变量 &gt; ~/.newman/.env &gt; 项目 .env</code>，且只有{" "}
+                          <code>NEWMAN_*</code> 键会参与配置装配。
+                        </p>
+                      </div>
+
+                      {configWarnings.length > 0 ? (
+                        <div className="workspace-detail-block">
+                          <span className="workspace-field-label">重载提示</span>
+                          <div className="workspace-list">
+                            {configWarnings.map((warning) => (
+                              <div key={warning} className="workspace-list-row static">
+                                <p className="workspace-row-copy">{warning}</p>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
                   </article>
+
+                  <div className="settings-editor-grid">
+                    <article className="workspace-card settings-card settings-editor-card">
+                      <div className="workspace-card-head">
+                        <div>
+                          <h3>newman.yaml</h3>
+                          <p>{projectConfigPath || "正在定位 newman.yaml"}</p>
+                        </div>
+                        <div className="workspace-inline-actions">
+                          <button
+                            type="button"
+                            className="workspace-secondary-button"
+                            onClick={() => void saveProjectConfig()}
+                            disabled={configLoading || configSaving || !hasProjectConfigChanges}
+                          >
+                            {configSaving ? "保存中..." : "保存"}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="workspace-card-body">
+                        {configLoading ? <div className="workspace-empty">正在加载 newman.yaml...</div> : null}
+
+                        {!configLoading ? (
+                          <div className="workspace-detail-block">
+                            <span className="workspace-field-label">内容</span>
+                            <textarea
+                              className="workspace-editor settings-editor"
+                              value={projectConfigDraft}
+                              onChange={(event) => {
+                                setProjectConfigDraft(event.target.value);
+                                setConfigNotice(null);
+                                setConfigError(null);
+                              }}
+                              spellCheck={false}
+                            />
+                          </div>
+                        ) : null}
+                      </div>
+                    </article>
+
+                    <article className="workspace-card settings-card settings-editor-card">
+                      <div className="workspace-card-head">
+                        <div>
+                          <h3>.env</h3>
+                          <p>{projectEnvPath || "正在定位 .env"}</p>
+                        </div>
+                        <div className="workspace-inline-actions">
+                          <button
+                            type="button"
+                            className="workspace-secondary-button"
+                            onClick={() => void saveProjectEnv()}
+                            disabled={projectEnvLoading || projectEnvSaving || !hasProjectEnvChanges}
+                          >
+                            {projectEnvSaving ? "保存中..." : "保存"}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="workspace-card-body">
+                        {projectEnvLoading ? <div className="workspace-empty">正在加载 .env...</div> : null}
+
+                        {!projectEnvLoading ? (
+                          <>
+                            <div className="workspace-detail-block">
+                              <span className="workspace-field-label">说明</span>
+                              <p className="workspace-copy">
+                                这里直接编辑项目根目录 <code>.env</code>。常用形式例如{" "}
+                                <code>NEWMAN_SERVER_PORT=8010</code>。
+                              </p>
+                            </div>
+                            <div className="workspace-detail-block">
+                              <span className="workspace-field-label">内容</span>
+                              <textarea
+                                className="workspace-editor settings-editor"
+                                value={projectEnvDraft}
+                                onChange={(event) => {
+                                  setProjectEnvDraft(event.target.value);
+                                  setConfigNotice(null);
+                                  setConfigError(null);
+                                }}
+                                spellCheck={false}
+                              />
+                            </div>
+                          </>
+                        ) : null}
+                      </div>
+                    </article>
+                  </div>
                 </>
               ) : null}
 

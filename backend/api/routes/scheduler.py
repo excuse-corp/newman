@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from backend.scheduler.cron_parser import next_run
 from backend.scheduler.models import ScheduledTask, TaskAction
+from backend.tools.approval_policy import normalize_turn_approval_mode
 
 
 router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
@@ -21,6 +22,7 @@ class CreateTaskRequest(BaseModel):
     action: TaskAction
     timezone: str = Field(default="UTC", min_length=1)
     description: str | None = None
+    approval_mode: str = "auto_allow"
     enabled: bool = True
     max_retries: int = Field(default=5, ge=0, le=5)
     source: Literal["chat", "automation_page", "api"] = "api"
@@ -32,6 +34,7 @@ class UpdateTaskRequest(BaseModel):
     action: TaskAction | None = None
     timezone: str | None = Field(default=None, min_length=1)
     description: str | None = None
+    approval_mode: str | None = None
     enabled: bool | None = None
     max_retries: int | None = Field(default=None, ge=0, le=5)
     source: Literal["chat", "automation_page", "api"] | None = None
@@ -62,6 +65,7 @@ async def create_task(payload: CreateTaskRequest, request: Request):
     runtime = request.app.state.runtime
     action = _normalize_action(payload.action)
     _validate_task_input(runtime, cron=payload.cron, timezone_name=payload.timezone, action=action)
+    approval_mode = normalize_turn_approval_mode(payload.approval_mode)
     task = ScheduledTask(
         task_id=uuid4().hex,
         name=payload.name,
@@ -69,6 +73,7 @@ async def create_task(payload: CreateTaskRequest, request: Request):
         action=action,
         timezone=payload.timezone,
         description=payload.description,
+        approval_mode=approval_mode,
         enabled=payload.enabled,
         max_retries=payload.max_retries,
         source=payload.source,
@@ -86,6 +91,8 @@ async def update_task(task_id: str, payload: UpdateTaskRequest, request: Request
     updates = payload.model_dump(exclude_unset=True)
     if "action" in updates and updates["action"] is not None:
         updates["action"] = _normalize_action(payload.action)
+    if "approval_mode" in updates and updates["approval_mode"] is not None:
+        updates["approval_mode"] = normalize_turn_approval_mode(payload.approval_mode)
     merged = task.model_copy(update=updates)
     _validate_task_input(runtime, cron=merged.cron, timezone_name=merged.timezone, action=merged.action)
     merged.next_run_at = next_run(merged.cron, datetime.now(timezone.utc), merged.timezone).isoformat()

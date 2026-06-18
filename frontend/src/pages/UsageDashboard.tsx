@@ -165,10 +165,20 @@ function formatTokens(value: number) {
   return new Intl.NumberFormat("zh-CN").format(value);
 }
 
+function trimUnitFraction(value: string) {
+  return value.replace(/\.0+$|(\.\d*[1-9])0+$/, "$1");
+}
+
 function compactTokens(value: number) {
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)} 百万`;
-  if (value >= 10_000) return `${(value / 10_000).toFixed(1)} 万`;
-  return String(value);
+  const absoluteValue = Math.abs(value);
+  if (absoluteValue >= 100_000_000) {
+    return `${trimUnitFraction((value / 100_000_000).toFixed(2))} 亿`;
+  }
+  if (absoluteValue >= 10_000) {
+    const fractionDigits = absoluteValue >= 1_000_000 ? 1 : 2;
+    return `${trimUnitFraction((value / 10_000).toFixed(fractionDigits))} 万`;
+  }
+  return formatTokens(value);
 }
 
 function formatTime(value: string) {
@@ -317,7 +327,6 @@ export default function UsageDashboard({
     <section className={rootClassName}>
       <header className="usage-demo-header">
         <div>
-          <p className="usage-demo-kicker">真实消耗统计</p>
           <h1>消耗监控</h1>
           <p className="usage-demo-subtitle">
             按模型返回的真实消耗汇总 · {summary?.range.timezone ?? "Asia/Shanghai"} · {rangeLabel}
@@ -363,28 +372,34 @@ export default function UsageDashboard({
       <section className="usage-kpi-grid" aria-label="总体消耗">
         <article className="usage-kpi-card primary">
           <span className="usage-kpi-label">总消耗</span>
-          <strong>{formatTokens(totals.total_tokens)}</strong>
-          <span>{totals.request_count} 次已返回消耗数据的请求</span>
+          <strong title={formatTokens(totals.total_tokens)}>{compactTokens(totals.total_tokens)}</strong>
+          <span title={`${totals.request_count} 次已返回消耗数据的请求`}>{totals.request_count} 次已返回消耗数据的请求</span>
         </article>
         <article className="usage-kpi-card">
           <span className="usage-kpi-label">输入</span>
-          <strong>{formatTokens(totals.input_tokens)}</strong>
-          <span>占总量 {inputRatio}%</span>
+          <strong title={formatTokens(totals.input_tokens)}>{compactTokens(totals.input_tokens)}</strong>
+          <span title={`占总量 ${inputRatio}%`}>占总量 {inputRatio}%</span>
         </article>
         <article className="usage-kpi-card">
           <span className="usage-kpi-label">输出</span>
-          <strong>{formatTokens(totals.output_tokens)}</strong>
-          <span>占总量 {outputRatio}%</span>
+          <strong title={formatTokens(totals.output_tokens)}>{compactTokens(totals.output_tokens)}</strong>
+          <span title={`占总量 ${outputRatio}%`}>占总量 {outputRatio}%</span>
         </article>
         <article className={`usage-kpi-card ${totals.usage_missing_count ? "warning" : ""}`}>
           <span className="usage-kpi-label">缺失统计</span>
           <strong>{totals.usage_missing_count}</strong>
-          <span>{totals.usage_missing_count ? "未返回消耗数据，不计入汇总" : "全部请求均已返回消耗数据"}</span>
+          <span title={totals.usage_missing_count ? "未返回消耗数据，不计入汇总" : "全部请求均已返回消耗数据"}>
+            {totals.usage_missing_count ? "未返回消耗数据，不计入汇总" : "全部请求均已返回消耗数据"}
+          </span>
         </article>
         <article className="usage-kpi-card evolution">
           <span className="usage-kpi-label">自进化</span>
-          <strong>{formatTokens(evolutionTotals.total_tokens)}</strong>
-          <span>
+          <strong title={formatTokens(evolutionTotals.total_tokens)}>{compactTokens(evolutionTotals.total_tokens)}</strong>
+          <span
+            title={`${evolutionTotals.request_count} 次请求 · 输入 ${formatTokens(evolutionTotals.input_tokens)} / 输出 ${formatTokens(
+              evolutionTotals.output_tokens
+            )}`}
+          >
             {evolutionTotals.request_count} 次请求 · 输入 {compactTokens(evolutionTotals.input_tokens)} / 输出{" "}
             {compactTokens(evolutionTotals.output_tokens)}
           </span>
@@ -430,12 +445,16 @@ export default function UsageDashboard({
             <div className="usage-signal">
               <span>消耗最高模型</span>
               <strong>{topModel?.model ?? "无数据"}</strong>
-              <em>{topModel ? formatTokens(topModel.total_tokens) : "--"}</em>
+              <em title={topModel ? formatTokens(topModel.total_tokens) : undefined}>
+                {topModel ? compactTokens(topModel.total_tokens) : "--"}
+              </em>
             </div>
             <div className="usage-signal">
               <span>消耗最高会话</span>
               <strong>{topSession?.session_title ?? "无数据"}</strong>
-              <em>{topSession ? formatTokens(topSession.total_tokens) : "--"}</em>
+              <em title={topSession ? formatTokens(topSession.total_tokens) : undefined}>
+                {topSession ? compactTokens(topSession.total_tokens) : "--"}
+              </em>
             </div>
             <div className="usage-token-split" aria-label="输入输出占比">
               <span style={{ width: `${inputRatio}%` }} />
@@ -462,7 +481,7 @@ export default function UsageDashboard({
               <div className="usage-meter-row" key={`${bucket.provider_type}:${bucket.model}`}>
                 <div className="usage-meter-topline">
                   <span>{bucket.model}</span>
-                  <strong>{formatTokens(bucket.total_tokens)}</strong>
+                  <strong title={formatTokens(bucket.total_tokens)}>{compactTokens(bucket.total_tokens)}</strong>
                 </div>
                 <div className="usage-meter-track">
                   <span style={{ width: `${Math.max(3, (bucket.total_tokens / maxModelTokens) * 100)}%` }} />
@@ -488,7 +507,7 @@ export default function UsageDashboard({
               <div className="usage-meter-row compact" key={bucket.request_kind}>
                 <div className="usage-meter-topline usage-kind-topline">
                   <span>{requestKindLabel(bucket.request_kind)}</span>
-                  <strong>{formatTokens(bucket.total_tokens)}</strong>
+                  <strong title={formatTokens(bucket.total_tokens)}>{compactTokens(bucket.total_tokens)}</strong>
                 </div>
                 <p className="usage-kind-description">{requestKindDescription(bucket.request_kind)}</p>
                 <div className="usage-meter-track secondary">
@@ -558,7 +577,9 @@ export default function UsageDashboard({
                 </div>
                 <div>
                   <span>{formatTime(record.created_at)}</span>
-                  <b>{record.usage_available ? compactTokens(record.total_tokens) : "缺失"}</b>
+                  <b title={record.usage_available ? formatTokens(record.total_tokens) : undefined}>
+                    {record.usage_available ? compactTokens(record.total_tokens) : "缺失"}
+                  </b>
                 </div>
               </div>
             ))}

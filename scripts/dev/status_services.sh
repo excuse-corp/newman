@@ -12,6 +12,7 @@ echo "Logs: ${LOG_DIR}"
 echo
 service_status_line "backend" "${BACKEND_PID_FILE}" "${BACKEND_PORT}" "http://127.0.0.1:${BACKEND_PORT}/healthz"
 service_status_line "frontend" "${FRONTEND_PID_FILE}" "${FRONTEND_PORT}" "http://127.0.0.1:${FRONTEND_PORT}"
+"${ROOT_DIR}/scripts/dev/status_feishu_cli_channel.sh"
 
 source "${CONDA_SH}"
 conda activate "${ENV_NAME}"

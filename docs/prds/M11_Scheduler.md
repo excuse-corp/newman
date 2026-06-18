@@ -56,6 +56,7 @@ scheduler/
       "task_id": "daily-report",
       "name": "日报生成",
       "cron": "0 18 * * 1-5",
+      "approval_mode": "auto_allow",
       "action": {
         "type": "session_message",
         "prompt": "请根据今天的工作记录生成日报",
@@ -75,6 +76,10 @@ SchedulerEngine 定期检查到期任务
   ↓
 方式 A：注入到指定会话（session_message）
 方式 B：创建新后台会话执行（background_task）
+  ↓
+按任务的 `approval_mode` 执行工具审批策略
+  - `auto_allow`：适合无人值守
+  - `manual`：命中审批时快速失败并记为 `approval_blocked`
   ↓
 任务状态更新（pending → running → completed / failed）
   ↓
@@ -108,6 +113,7 @@ SchedulerEngine 定期检查到期任务
 - 任务定义存储在 `backend_data/scheduler/tasks.json`
 - 失败告警存储在 `backend_data/scheduler/alerts.json`
 - 后台任务创建的会话标记为 `background: true`
+- Scheduler 任务默认 `approval_mode=auto_allow`
 
 ---
 

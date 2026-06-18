@@ -340,11 +340,11 @@ COMPLETION_JUDGE_OUTCOMES = frozenset(
     }
 )
 EXECUTION_TASK_ACTION_RE = re.compile(
-    r"(?:修改|更新|编辑|生成|创建|制作|渲染|写回|导出|插入|新增|添加|追加|替换|修复|继续完成|加入|实现|输出|产出|做一页|做个|做一个|build|generate|render|create|update|edit|fix|insert|append|export|write back|produce|implement|complete)",
+    r"(?:修改|更新|编辑|生成|创建|制作|渲染|写回|导出|插入|新增|添加|追加|替换|修复|排查|调查|诊断|调试|测试|验证|检查|确认|定位|分析|继续完成|加入|实现|输出|产出|做一页|做个|做一个|build|generate|render|create|update|edit|fix|insert|append|export|write back|produce|implement|complete|debug|diagnose|investigate|inspect)",
     re.I,
 )
 EXECUTION_TASK_TARGET_RE = re.compile(
-    r"(?:pptx?|excel|xlsx|csv|word|docx|html|json|md|png|jpg|jpeg|gif|svg|pdf|网页|页面|图片|图像|图|文件|脚本|幻灯片|表格|图表|架构图|第三章|附件)",
+    r"(?:pptx?|excel|xlsx|csv|word|docx|html|json|md|png|jpg|jpeg|gif|svg|pdf|网页|页面|图片|图像|图|文件|脚本|幻灯片|表格|图表|架构图|第三章|附件|原因|问题|错误|报错|异常|bug|日志|终端|工具|权限|路径|cli|lark|代码|配置|接口|服务|运行时|系统|项目)",
     re.I,
 )
 ATTACHMENT_FIRST_REPLY_BLOCKED_TOOLS = frozenset(
@@ -1090,11 +1090,13 @@ class NewmanRuntime:
             output_limit_bytes=self.settings.sandbox.output_limit_bytes,
         )
         path_policy = build_path_access_policy(self.settings)
+        plugin_readable_roots = self.plugin_service.enabled_sandbox_readable_roots()
         sandbox = NativeSandbox(
             workspace=workspace,
             limits=limits,
             config=self.settings.sandbox,
             path_policy=path_policy,
+            extra_readable_roots=plugin_readable_roots,
         )
         self.exec_sandbox = sandbox
         self.tool_context = BuiltinToolContext(
@@ -1105,6 +1107,7 @@ class NewmanRuntime:
             scheduler_store=self.scheduler_store,
             mcp_registry=self.mcp_registry,
             subagent_manager=self.subagent_manager,
+            plugin_service=self.plugin_service,
         )
         tool_context = self.tool_context
         registry = ToolRegistry()

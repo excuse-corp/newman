@@ -38,6 +38,10 @@ start_service \
   "${FRONTEND_COMMAND}" \
   "http://127.0.0.1:${FRONTEND_PORT}"
 
+if is_enabled "${FEISHU_CLI_CHANNEL_ENABLED}"; then
+  "${ROOT_DIR}/scripts/dev/start_feishu_cli_channel.sh"
+fi
+
 PRIMARY_IP="$(primary_ipv4_address || true)"
 
 echo

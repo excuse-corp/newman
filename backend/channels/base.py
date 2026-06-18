@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ChannelMessage(BaseModel):
@@ -11,6 +11,12 @@ class ChannelMessage(BaseModel):
     user_id: str
     conversation_id: str | None = None
     text: str
+    transport: str = "webhook"
+    app_id: str | None = None
+    event_id: str | None = None
+    message_id: str | None = None
+    thread_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
     reply_format: str = "text"
 
 

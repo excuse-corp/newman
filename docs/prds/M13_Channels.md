@@ -110,3 +110,17 @@ Channel Adapter 发送响应
 - 企微使用回调模式 + 主动推送
 - 钉钉使用 Stream 模式
 - 每个 IM 用户映射一个 Newman session_id（通过 user_id 关联）
+
+## 八、Feishu Inbound 扩展
+
+飞书入站通道优先使用官方 Python Channel SDK，通过 WebSocket 长连接接收消息事件，避免内网部署时
+暴露公网 webhook。飞书 transport 直接运行在 Newman 后端进程内，统一复用 session、runtime、审计
+和配置管理。
+
+当前接入面还包含三类自检接口：
+
+- `GET /api/channels/feishu/setup/status`
+- `POST /api/channels/feishu/setup/validate`
+- `POST /api/channels/feishu/setup/test`
+
+详细方案见 [Feishu Inbound Channel Design](../feishu_inbound_channel_design.md)。

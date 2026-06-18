@@ -36,6 +36,62 @@ def build_bwrap_command(
     network_access: bool,
     command: str,
 ) -> list[str]:
+    args = _build_bwrap_base_args(
+        bwrap_executable=bwrap_executable,
+        workspace=workspace,
+        readable_roots=readable_roots,
+        writable_roots=writable_roots,
+        protected_roots=protected_roots,
+        mode=mode,
+        network_access=network_access,
+    )
+    args.extend(
+        [
+            "--",
+            "/usr/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-lc",
+            command,
+        ]
+    )
+    return args
+
+
+def build_bwrap_argv(
+    *,
+    bwrap_executable: str,
+    workspace: Path,
+    readable_roots: list[Path],
+    writable_roots: list[Path],
+    protected_roots: list[Path],
+    mode: str,
+    network_access: bool,
+    argv: list[str],
+) -> list[str]:
+    args = _build_bwrap_base_args(
+        bwrap_executable=bwrap_executable,
+        workspace=workspace,
+        readable_roots=readable_roots,
+        writable_roots=writable_roots,
+        protected_roots=protected_roots,
+        mode=mode,
+        network_access=network_access,
+    )
+    args.extend(["--", *argv])
+    return args
+
+
+def _build_bwrap_base_args(
+    *,
+    bwrap_executable: str,
+    workspace: Path,
+    readable_roots: list[Path],
+    writable_roots: list[Path],
+    protected_roots: list[Path],
+    mode: str,
+    network_access: bool,
+) -> list[str]:
     args: list[str] = [
         bwrap_executable,
         "--new-session",
@@ -67,18 +123,7 @@ def build_bwrap_command(
         else:
             args.extend(["--ro-bind", "/dev/null", str(protected_root)])
 
-    args.extend(
-        [
-            "--chdir",
-            str(workspace),
-            "--",
-            "/usr/bin/bash",
-            "--noprofile",
-            "--norc",
-            "-lc",
-            command,
-        ]
-    )
+    args.extend(["--chdir", str(workspace)])
     return args
 
 

@@ -22,13 +22,16 @@ class ToolRouter:
         return self.registry.get(tool_name)
 
     def static_checks(self, tool: BaseTool, arguments: dict) -> list[str]:
-        checks: list[str] = []
+        custom_checks = getattr(tool, "static_checks", None)
+        checks: list[str] = list(custom_checks(arguments)) if callable(custom_checks) else []
         if tool.meta.name == "terminal":
-            return self._terminal_static_checks(str(arguments.get("command", "")))
+            checks.extend(self._terminal_static_checks(str(arguments.get("command", ""))))
+            return _dedupe_reasons(checks)
         if tool.meta.name.startswith("mcp__"):
-            return self._mcp_tool_static_checks(tool, arguments)
+            checks.extend(self._mcp_tool_static_checks(tool, arguments))
+            return _dedupe_reasons(checks)
         if "path" not in arguments:
-            return checks
+            return _dedupe_reasons(checks)
 
         tool_name = tool.meta.name
         if tool_name not in {
@@ -60,7 +63,7 @@ class ToolRouter:
             checks.append("read_protected_path")
         elif state == "forbidden":
             checks.append("read_outside_readable_paths")
-        return checks
+        return _dedupe_reasons(checks)
 
     def _mcp_tool_static_checks(self, tool: BaseTool, arguments: dict) -> list[str]:
         server = getattr(tool, "server", None)
@@ -202,6 +205,12 @@ TERMINAL_MUTATION_PATTERNS = (
     "make ",
 )
 
+SAFE_TERMINAL_PSEUDO_PATH_PATTERNS = (
+    re.compile(r"^/dev/(?:null|stdin|stdout|stderr)$"),
+    re.compile(r"^/dev/fd/\d+$"),
+    re.compile(r"^/proc/(?:self|\$\$|\$!|\d+)/fd/\d+$"),
+)
+
 
 def _shell_tokens(command: str) -> list[str]:
     try:
@@ -226,6 +235,8 @@ def _looks_like_path_operand(token: str) -> bool:
         return False
     if token in {"|", "||", "&&", ";", ">", ">>", "<", "<<", "<<-", "2>", "1>"}:
         return False
+    if ">" in token or "<" in token:
+        return False
     return token.startswith(("/", "./", "../", "~/")) or "/" in token
 
 
@@ -233,7 +244,14 @@ def _extract_redirection_targets(command: str) -> list[str]:
     targets = re.findall(r"(?:^|\s)(?:\d*>>?|\d*>)([^\s&|;]+)", command)
     if not targets:
         targets = re.findall(r"(?:^|\s)>>?\s*([^\s&|;]+)", command)
-    return [target for target in targets if target]
+    return [target for target in targets if target and not target.startswith("&")]
+
+
+def _is_safe_terminal_pseudo_path(raw: str) -> bool:
+    normalized = (raw or "").strip()
+    if not normalized:
+        return False
+    return any(pattern.fullmatch(normalized) for pattern in SAFE_TERMINAL_PSEUDO_PATH_PATTERNS)
 
 
 def analyze_terminal_command(command: str, path_policy) -> TerminalCommandAnalysis:
@@ -256,7 +274,12 @@ def analyze_terminal_command(command: str, path_policy) -> TerminalCommandAnalys
     matches: list[TerminalPathMatch] = []
     seen: set[str] = set()
     for raw in candidates:
-        path = _resolve_terminal_operand_path(path_policy, raw)
+        if _is_safe_terminal_pseudo_path(raw):
+            path = Path(raw)
+            state = "pseudo"
+        else:
+            path = _resolve_terminal_operand_path(path_policy, raw)
+            state = classify_path(path_policy, path)
         key = str(path)
         if key in seen:
             continue
@@ -265,7 +288,7 @@ def analyze_terminal_command(command: str, path_policy) -> TerminalCommandAnalys
             TerminalPathMatch(
                 raw=raw,
                 path=path,
-                state=classify_path(path_policy, path),
+                state=state,
             )
         )
     return TerminalCommandAnalysis(
