@@ -1,4 +1,13 @@
-![Newman pixel banner](docs/assets/newman-banner.png)
+```text
+███╗   ██╗███████╗██╗    ██╗███╗   ███╗ █████╗ ███╗   ██╗
+████╗  ██║██╔════╝██║    ██║████╗ ████║██╔══██╗████╗  ██║
+██╔██╗ ██║█████╗  ██║ █╗ ██║██╔████╔██║███████║██╔██╗ ██║
+██║╚██╗██║██╔══╝  ██║███╗██║██║╚██╔╝██║██╔══██║██║╚██╗██║
+██║ ╚████║███████╗╚███╔███╔╝██║ ╚═╝ ██║██║  ██║██║ ╚████║
+╚═╝  ╚═══╝╚══════╝ ╚══╝╚══╝ ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝
+
+Local-first AI Agent Runtime and Workbench
+```
 
 <p align="center">
   <strong>Newman</strong> 是一个给牛马干活的本地优先 AI Agent 运行时与工作台。
@@ -10,6 +19,8 @@
 ## Newman for 牛马 Agent
 
 Newman 面向真实工作流：读文件、跑工具、拆长任务、调用子 Agent、沉淀记忆、自我进化、更新技能、接入插件。仓库里包含 FastAPI 后端、React 工作台，以及围绕 `skills/`、`plugins/`、`backend_data/` 组织的本地优先运行时。
+
+> 新用户入口：首次部署、模型配置、基础验证和飞书接入请先读 [docs/getting_started.md](docs/getting_started.md)。
 
 它适合这几类场景：
 
@@ -73,6 +84,8 @@ Newman 的自进化不是简单的“记住聊天记录”，而是把一次次�
 ## 部署指导
 
 > 新机器或稳定运行优先走 Docker；需要改代码、联调或看运行日志时优先走本地开发。
+>
+> 新用户建议先按 [docs/getting_started.md](docs/getting_started.md) 逐步完成部署和接入；本节保留仓库内的部署概览，便于快速查阅。
 
 ### 方案一：Docker 部署
 
@@ -266,8 +279,8 @@ Docker 部署已挂载宿主机 `~/.lark-cli` 和 `~/.local/share/lark-cli`；�
 
 ## 相关文档
 
+- [新用户部署与接入手册](docs/getting_started.md) `推荐先读`
 - [API 文档](docs/Newman_API_v1.md)
-- [新用户部署与接入手册](docs/getting_started.md)
 - [自进化机制](docs/self_evolution.md)
 - [多代理设计](docs/newman_multiagent_design.md)
 - [Plugin Runtime](backend/plugin_runtime/README.md)

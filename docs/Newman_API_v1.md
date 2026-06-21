@@ -31,7 +31,7 @@
 - [channels/service.py](/root/newman/backend/channels/service.py)
 - [channels/feishu_transport.py](/root/newman/backend/channels/feishu_transport.py)
 
-部署、模型配置和飞书接入的用户向步骤统一维护在 [getting_started.md](/root/newman/docs/getting_started.md)。
+部署、模型配置和飞书接入的用户向步骤统一维护在 [getting_started.md](getting_started.md)。
 
 ---
 
@@ -2352,7 +2352,7 @@ multipart/form-data
 - `wecom`：当前仍为 webhook 基线。
 - legacy webhook：`POST /api/channels/{platform}/webhook` 仍保留，用于本地联调和早期兼容。
 
-飞书入站接入的用户向配置步骤不在本文重复维护，统一参考 [getting_started.md](/root/newman/docs/getting_started.md#6-飞书接入)。
+飞书入站接入的用户向配置步骤不在本文重复维护，统一参考 [getting_started.md](getting_started.md#6-飞书接入)。
 
 ## 12.1 获取 Channel 状态
 
