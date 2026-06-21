@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="https://github.com/excuse-corp/newman/raw/main/docs/assets/newman-banner.png" alt="Newman pixel banner" width="100%" />
-</p>
+![Newman pixel banner](docs/assets/newman-banner.png)
 
 <p align="center">
   <strong>Newman</strong> 是一个给牛马干活的本地优先 AI Agent 运行时与工作台。
