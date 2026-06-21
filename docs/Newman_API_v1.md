@@ -478,6 +478,80 @@ text/event-stream
 - 当前会把模型请求 usage 详细写入 PostgreSQL `model_usage_records` 表。
 - 主对话轮次、压缩摘要、记忆提取、多模态分析、RAG rerank 等都会分别写入 usage 记录。
 - `counts_toward_context_window=true` 的记录才会参与聊天页上下文窗口圆环。
+- `subagent_turn` 记录的 `metadata.parent_session_id` 可用于把子代理成本回卷到父任务会话。
+- 若某次模型调用没有返回 usage，但运行时能拿到 `metadata.estimated_input_tokens`，后续 dashboard summary 可选择把它作为“输入侧估算”补入统计。
+
+## 3.2B 获取全局 usage summary
+
+`GET /api/usage/summary`
+
+查询参数：
+
+- `days`: 可选，默认 `7`，范围 `1..366`
+- `tz`: 可选，默认 `Asia/Shanghai`
+- `model`: 可选，按模型名过滤
+- `recent_limit`: 可选，默认 `7`，范围 `1..100`
+- `include_estimated`: 可选，默认 `false`
+  - `false`：只统计 provider 返回的真实 usage
+  - `true`：对缺失 usage 且带 `estimated_input_tokens` 的记录，用输入侧估算补入 summary
+
+响应示例（节选）：
+
+```json
+{
+  "available": true,
+  "filters": {
+    "model": null,
+    "include_estimated": true
+  },
+  "totals": {
+    "request_count": 128,
+    "input_tokens": 482130,
+    "output_tokens": 91342,
+    "total_tokens": 573472,
+    "usage_missing_count": 6,
+    "estimated_request_count": 4,
+    "estimated_input_tokens": 8130,
+    "estimated_output_tokens": 0,
+    "estimated_total_tokens": 8130
+  },
+  "by_session": [
+    {
+      "session_id": "parent-session",
+      "session_title": "飞书日报任务",
+      "request_count": 12,
+      "input_tokens": 52210,
+      "output_tokens": 8124,
+      "total_tokens": 60334,
+      "estimated_request_count": 2,
+      "estimated_input_tokens": 4300,
+      "estimated_output_tokens": 0,
+      "estimated_total_tokens": 4300
+    }
+  ],
+  "recent_records": [
+    {
+      "request_id": "u2",
+      "session_id": "child-session",
+      "session_title": "Subagent: researcher",
+      "attributed_session_id": "parent-session",
+      "attributed_session_title": "飞书日报任务",
+      "request_kind": "subagent_turn",
+      "usage_available": false,
+      "total_tokens": 0,
+      "estimated_total_tokens": 240
+    }
+  ]
+}
+```
+
+说明：
+
+- `totals.*`、`by_*.*` 中的 `request_count/input_tokens/output_tokens/total_tokens` 都是“当前查询口径”的值；是否包含估算，取决于 `filters.include_estimated`。
+- `estimated_*` 字段只表示这次 summary 为了补齐缺失 usage 而额外纳入的估算部分，不包含真实 usage。
+- `usage_missing_count` 是“原始缺失记录数”；即使 `include_estimated=true`，它仍然保留，便于前端同时展示“已补入多少、还有多少仍缺失”。
+- `by_session` 会把 `subagent_turn` 归并到 `metadata.parent_session_id`，这样父会话能看到完整任务成本。
+- `recent_records.session_id` 保留原始记录归属；`recent_records.attributed_session_id` / `attributed_session_title` 表示 dashboard 用于会话排行和任务归因的会话。
 
 ## 3.3A 获取会话结构化事件历史
 

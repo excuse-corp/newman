@@ -119,6 +119,10 @@ body,
   box-shadow: 0 6px 14px rgba(17, 17, 17, 0.08);
 }
 
+.usage-segmented.mode-toggle {
+  min-width: 152px;
+}
+
 .usage-select-label {
   display: inline-flex;
   align-items: center;
@@ -637,6 +641,11 @@ body,
   background: #fff6f4;
 }
 
+.usage-feed-item.estimated {
+  border-color: #e6dcc5;
+  background: #fffaf1;
+}
+
 .usage-feed-item div {
   min-width: 0;
 }
@@ -711,6 +720,10 @@ body,
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     border-radius: 16px;
+  }
+
+  .usage-segmented.mode-toggle {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .usage-kpi-grid {

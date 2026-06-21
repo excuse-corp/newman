@@ -1627,7 +1627,7 @@ class NewmanRuntime:
         answer_visible = False
         answer_started_emitted = False
         defer_answer_visibility = bool(tools)
-        release_deferred_answer_before_stream_end = not emit_answer_started_event
+        release_deferred_answer_before_stream_end = False
         deferred_answer_deltas: list[str] = []
         tool_signal_seen = False
         tool_argument_progress: dict[str, dict[str, object]] = {}

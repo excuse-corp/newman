@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/newman-banner.png" alt="Newman pixel banner" width="100%" />
+  <img src="https://github.com/excuse-corp/newman/raw/main/docs/assets/newman-banner.png" alt="Newman pixel banner" width="100%" />
 </p>
 
 <p align="center">

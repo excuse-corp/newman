@@ -16,6 +16,7 @@ type UsageSummaryResponse = {
   };
   filters: {
     model: string | null;
+    include_estimated: boolean;
   };
   available_models: string[];
   totals: {
@@ -24,6 +25,10 @@ type UsageSummaryResponse = {
     output_tokens: number;
     total_tokens: number;
     usage_missing_count: number;
+    estimated_request_count: number;
+    estimated_input_tokens: number;
+    estimated_output_tokens: number;
+    estimated_total_tokens: number;
   };
   by_day: Array<{
     date: string;
@@ -31,6 +36,10 @@ type UsageSummaryResponse = {
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
+    estimated_request_count: number;
+    estimated_input_tokens: number;
+    estimated_output_tokens: number;
+    estimated_total_tokens: number;
   }>;
   by_model: Array<{
     provider_type: string;
@@ -39,6 +48,10 @@ type UsageSummaryResponse = {
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
+    estimated_request_count: number;
+    estimated_input_tokens: number;
+    estimated_output_tokens: number;
+    estimated_total_tokens: number;
   }>;
   by_request_kind: Array<{
     request_kind: string;
@@ -46,6 +59,10 @@ type UsageSummaryResponse = {
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
+    estimated_request_count: number;
+    estimated_input_tokens: number;
+    estimated_output_tokens: number;
+    estimated_total_tokens: number;
   }>;
   by_session: Array<{
     session_id: string | null;
@@ -54,11 +71,17 @@ type UsageSummaryResponse = {
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
+    estimated_request_count: number;
+    estimated_input_tokens: number;
+    estimated_output_tokens: number;
+    estimated_total_tokens: number;
   }>;
   recent_records: Array<{
     request_id: string;
     session_id: string | null;
     session_title: string | null;
+    attributed_session_id: string | null;
+    attributed_session_title: string | null;
     turn_id: string | null;
     request_kind: string;
     provider_type: string;
@@ -67,6 +90,7 @@ type UsageSummaryResponse = {
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
+    estimated_total_tokens: number;
     finish_reason: string | null;
     created_at: string;
     metadata: Record<string, unknown>;
@@ -90,6 +114,7 @@ const RANGE_DAYS: Record<RangeKey, number> = {
 const REQUEST_KIND_LABELS: Record<string, string> = {
   session_turn: "主对话",
   session_turn_non_stream_fallback: "主对话兜底",
+  subagent_turn: "子代理",
   context_compaction: "上下文压缩",
   manual_context_compaction: "手动压缩",
   memory_extraction: "记忆抽取",
@@ -99,11 +124,15 @@ const REQUEST_KIND_LABELS: Record<string, string> = {
   skill_upload_optimization: "Skill 上传优化",
   rag_rerank: "RAG 重排",
   commentary_fallback: "工具前说明",
+  completion_judge: "收尾判定",
+  tool_limit_finalize: "工具上限收尾",
+  fatal_tool_finalize: "故障收尾",
 };
 
 const REQUEST_KIND_DESCRIPTIONS: Record<string, string> = {
   session_turn: "用户消息触发的主模型调用，包含普通回复和工具调用前后的模型响应。",
   session_turn_non_stream_fallback: "主对话流式响应失败后，系统改用非流式方式重试。",
+  subagent_turn: "多代理模式下子代理自己的模型调用成本，dashboard 会回卷到父任务会话。",
   context_compaction: "会话上下文接近上限时，后台生成 checkpoint 摘要来压缩历史。",
   manual_context_compaction: "用户手动触发的会话 checkpoint 摘要生成。",
   memory_extraction: "后台从会话里抽取稳定用户记忆，合并到 USER.md。",
@@ -113,6 +142,7 @@ const REQUEST_KIND_DESCRIPTIONS: Record<string, string> = {
   skill_upload_optimization: "上传 Skill 时，模型把材料整理成 Newman 兼容的 SKILL.md。",
   rag_rerank: "检索到知识候选后，模型重新排序或筛选最相关内容。",
   commentary_fallback: "模型准备调用工具但缺少可见说明时，补生成一句工具前说明。",
+  completion_judge: "主模型在准备结束本轮前，再做一次是否真的可以收尾的判断。",
   tool_limit_finalize: "达到工具调用上限时，模型生成本轮收尾回复。",
   fatal_tool_finalize: "工具连续失败或不可恢复时，模型生成错误说明和收尾回复。",
 };
@@ -241,6 +271,7 @@ export default function UsageDashboard({
 }) {
   const [activeRange, setActiveRange] = useState<RangeKey>("7d");
   const [modelFilter, setModelFilter] = useState("all");
+  const [includeEstimated, setIncludeEstimated] = useState(true);
   const [summary, setSummary] = useState<UsageSummaryResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -251,6 +282,7 @@ export default function UsageDashboard({
     const params = new URLSearchParams({
       days: String(RANGE_DAYS[activeRange]),
       tz: "Asia/Shanghai",
+      include_estimated: String(includeEstimated),
     });
     if (modelFilter !== "all") {
       params.set("model", modelFilter);
@@ -287,7 +319,7 @@ export default function UsageDashboard({
 
     void load();
     return () => controller.abort();
-  }, [activeRange, apiBase, modelFilter, reloadSeed]);
+  }, [activeRange, apiBase, includeEstimated, modelFilter, reloadSeed]);
 
   const byDay = useMemo(() => buildDaySeries(summary), [summary]);
   const maxDayTokens = Math.max(1, ...byDay.map((bucket) => bucket.total_tokens));
@@ -299,7 +331,16 @@ export default function UsageDashboard({
     output_tokens: 0,
     total_tokens: 0,
     usage_missing_count: 0,
+    estimated_request_count: 0,
+    estimated_input_tokens: 0,
+    estimated_output_tokens: 0,
+    estimated_total_tokens: 0,
   };
+  const resolvedIncludeEstimated = summary?.filters.include_estimated ?? includeEstimated;
+  const actualRequestCount = Math.max(0, totals.request_count - totals.estimated_request_count);
+  const actualInputTokens = Math.max(0, totals.input_tokens - totals.estimated_input_tokens);
+  const actualOutputTokens = Math.max(0, totals.output_tokens - totals.estimated_output_tokens);
+  const unresolvedMissingCount = Math.max(0, totals.usage_missing_count - totals.estimated_request_count);
   const inputRatio = totals.total_tokens > 0 ? Math.round((totals.input_tokens / totals.total_tokens) * 100) : 0;
   const outputRatio = totals.total_tokens > 0 ? 100 - inputRatio : 0;
   const evolutionTotals = (summary?.by_request_kind ?? [])
@@ -322,6 +363,9 @@ export default function UsageDashboard({
   const topSession = summary?.by_session[0] ?? null;
   const rangeLabel = summary ? `${summary.range.start_date} 至 ${summary.range.end_date}` : "--";
   const rootClassName = embedded ? "usage-demo-shell embedded" : "usage-demo-shell";
+  const subtitle = resolvedIncludeEstimated
+    ? "真实 usage + 对缺失 usage 的输入侧估算补齐"
+    : "仅统计模型返回的真实 usage";
 
   return (
     <section className={rootClassName}>
@@ -329,7 +373,7 @@ export default function UsageDashboard({
         <div>
           <h1>消耗监控</h1>
           <p className="usage-demo-subtitle">
-            按模型返回的真实消耗汇总 · {summary?.range.timezone ?? "Asia/Shanghai"} · {rangeLabel}
+            {subtitle} · {summary?.range.timezone ?? "Asia/Shanghai"} · {rangeLabel}
           </p>
         </div>
         <div className="usage-demo-actions" aria-label="筛选条件">
@@ -344,6 +388,21 @@ export default function UsageDashboard({
                 type="button"
                 className={activeRange === key ? "active" : ""}
                 onClick={() => setActiveRange(key as RangeKey)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="usage-segmented mode-toggle" aria-label="统计口径">
+            {[
+              [true, "含估算"],
+              [false, "仅真实"],
+            ].map(([value, label]) => (
+              <button
+                key={String(value)}
+                type="button"
+                className={includeEstimated === value ? "active" : ""}
+                onClick={() => setIncludeEstimated(Boolean(value))}
               >
                 {label}
               </button>
@@ -372,24 +431,66 @@ export default function UsageDashboard({
       <section className="usage-kpi-grid" aria-label="总体消耗">
         <article className="usage-kpi-card primary">
           <span className="usage-kpi-label">总消耗</span>
-          <strong title={formatTokens(totals.total_tokens)}>{compactTokens(totals.total_tokens)}</strong>
-          <span title={`${totals.request_count} 次已返回消耗数据的请求`}>{totals.request_count} 次已返回消耗数据的请求</span>
+          <strong
+            title={
+              resolvedIncludeEstimated
+                ? `真实 ${formatTokens(Math.max(0, totals.total_tokens - totals.estimated_total_tokens))} + 估算 ${formatTokens(
+                    totals.estimated_total_tokens
+                  )}`
+                : formatTokens(totals.total_tokens)
+            }
+          >
+            {compactTokens(totals.total_tokens)}
+          </strong>
+          <span
+            title={
+              resolvedIncludeEstimated
+                ? `${actualRequestCount} 次真实 usage + ${totals.estimated_request_count} 次估算补齐`
+                : `${totals.request_count} 次已返回消耗数据的请求`
+            }
+          >
+            {resolvedIncludeEstimated
+              ? `${actualRequestCount} 次真实 + ${totals.estimated_request_count} 次估算`
+              : `${totals.request_count} 次已返回消耗数据的请求`}
+          </span>
         </article>
         <article className="usage-kpi-card">
           <span className="usage-kpi-label">输入</span>
           <strong title={formatTokens(totals.input_tokens)}>{compactTokens(totals.input_tokens)}</strong>
-          <span title={`占总量 ${inputRatio}%`}>占总量 {inputRatio}%</span>
+          <span
+            title={
+              resolvedIncludeEstimated
+                ? `真实 ${formatTokens(actualInputTokens)} + 估算 ${formatTokens(totals.estimated_input_tokens)}`
+                : `占总量 ${inputRatio}%`
+            }
+          >
+            {resolvedIncludeEstimated ? `估算补入 ${compactTokens(totals.estimated_input_tokens)}` : `占总量 ${inputRatio}%`}
+          </span>
         </article>
         <article className="usage-kpi-card">
           <span className="usage-kpi-label">输出</span>
           <strong title={formatTokens(totals.output_tokens)}>{compactTokens(totals.output_tokens)}</strong>
-          <span title={`占总量 ${outputRatio}%`}>占总量 {outputRatio}%</span>
+          <span title={`占总量 ${outputRatio}%`}>
+            {resolvedIncludeEstimated ? `真实输出 ${compactTokens(actualOutputTokens)}` : `占总量 ${outputRatio}%`}
+          </span>
         </article>
         <article className={`usage-kpi-card ${totals.usage_missing_count ? "warning" : ""}`}>
           <span className="usage-kpi-label">缺失统计</span>
           <strong>{totals.usage_missing_count}</strong>
-          <span title={totals.usage_missing_count ? "未返回消耗数据，不计入汇总" : "全部请求均已返回消耗数据"}>
-            {totals.usage_missing_count ? "未返回消耗数据，不计入汇总" : "全部请求均已返回消耗数据"}
+          <span
+            title={
+              totals.usage_missing_count
+                ? resolvedIncludeEstimated
+                  ? `${totals.estimated_request_count} 条已估算补入，${unresolvedMissingCount} 条仍未计入`
+                  : "未返回消耗数据，不计入汇总"
+                : "全部请求均已返回消耗数据"
+            }
+          >
+            {totals.usage_missing_count
+              ? resolvedIncludeEstimated
+                ? `${totals.estimated_request_count} 条已补入，${unresolvedMissingCount} 条未计入`
+                : "未返回消耗数据，不计入汇总"
+              : "全部请求均已返回消耗数据"}
           </span>
         </article>
         <article className="usage-kpi-card evolution">
@@ -547,7 +648,10 @@ export default function UsageDashboard({
                   <tr key={bucket.session_id ?? "session:unknown"}>
                     <td>
                       <strong>{bucket.session_title ?? "未关联会话"}</strong>
-                      <span>{bucket.session_id ?? "--"}</span>
+                      <span>
+                        {bucket.session_id ?? "--"}
+                        {bucket.estimated_total_tokens > 0 ? ` · 估算 ${compactTokens(bucket.estimated_total_tokens)}` : ""}
+                      </span>
                     </td>
                     <td>{bucket.request_count}</td>
                     <td>{formatTokens(bucket.input_tokens)}</td>
@@ -569,16 +673,33 @@ export default function UsageDashboard({
           </div>
           <div className="usage-feed">
             {(summary?.recent_records ?? []).map((record) => (
-              <div className={`usage-feed-item ${record.usage_available ? "" : "missing"}`} key={record.request_id}>
+              <div
+                className={`usage-feed-item ${
+                  record.usage_available ? "" : resolvedIncludeEstimated && record.estimated_total_tokens > 0 ? "estimated" : "missing"
+                }`}
+                key={record.request_id}
+              >
                 <div>
                   <strong>{record.model}</strong>
                   <span>{requestKindLabel(record.request_kind)}</span>
-                  <span>{record.session_title ?? "未关联会话"}</span>
+                  <span>{record.attributed_session_title ?? record.session_title ?? "未关联会话"}</span>
                 </div>
                 <div>
                   <span>{formatTime(record.created_at)}</span>
-                  <b title={record.usage_available ? formatTokens(record.total_tokens) : undefined}>
-                    {record.usage_available ? compactTokens(record.total_tokens) : "缺失"}
+                  <b
+                    title={
+                      record.usage_available
+                        ? formatTokens(record.total_tokens)
+                        : resolvedIncludeEstimated && record.estimated_total_tokens > 0
+                          ? `估算 ${formatTokens(record.estimated_total_tokens)}`
+                          : undefined
+                    }
+                  >
+                    {record.usage_available
+                      ? compactTokens(record.total_tokens)
+                      : resolvedIncludeEstimated && record.estimated_total_tokens > 0
+                        ? `估算 ${compactTokens(record.estimated_total_tokens)}`
+                        : "缺失"}
                   </b>
                 </div>
               </div>
