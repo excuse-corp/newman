@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Iterable
@@ -21,12 +22,14 @@ from backend.plugin_runtime.models import (
 from backend.plugin_runtime.plugin_loader import PluginLoader
 from backend.plugin_runtime.plugin_registry import PluginRegistry
 from backend.plugin_runtime.skill_parser import parse_skill_file
+from backend.config.loader import _read_dotenv
 
 
 class PluginService:
-    def __init__(self, plugins_dir: Path, skills_dir: Path, state_path: Path):
+    def __init__(self, plugins_dir: Path, skills_dir: Path, state_path: Path, *, project_root: Path | None = None):
         self.plugins_dir = plugins_dir
         self.skills_dir = skills_dir
+        self.project_root = project_root.resolve() if project_root is not None else plugins_dir.resolve().parent
         self.loader = PluginLoader(plugins_dir)
         self.registry = PluginRegistry(state_path)
         self._plugins: list[LoadedPlugin] = []
@@ -374,8 +377,9 @@ class PluginService:
                     ),
                 ]
             )
+        env_source = _plugin_env_source(self.project_root)
         env = {
-            key: os.path.expandvars(str(value))
+            key: _expand_plugin_env_value(str(value), env_source)
             for key, value in (command.env or {}).items()
             if str(key).strip()
         }
@@ -527,6 +531,24 @@ def _dedupe_paths(paths: Iterable[Path]) -> list[Path]:
         seen.add(key)
         deduped.append(path)
     return deduped
+
+
+_ENV_TEMPLATE_PATTERN = re.compile(r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _expand_plugin_env_value(value: str, env_source: dict[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group("braced") or match.group("plain") or ""
+        return env_source.get(name, match.group(0))
+
+    return _ENV_TEMPLATE_PATTERN.sub(replace, value)
+
+
+def _plugin_env_source(project_root: Path) -> dict[str, str]:
+    values = _read_dotenv(project_root / ".env")
+    values.update(_read_dotenv(Path.home() / ".newman" / ".env"))
+    values.update(os.environ)
+    return values
 
 
 def _render_skills_snapshot(skills: list[SkillDescriptor]) -> list[str]:

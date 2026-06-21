@@ -28,6 +28,10 @@
 - [mcp.py](/root/newman/backend/api/routes/mcp.py)
 - [scheduler.py](/root/newman/backend/api/routes/scheduler.py)
 - [channels.py](/root/newman/backend/api/routes/channels.py)
+- [channels/service.py](/root/newman/backend/channels/service.py)
+- [channels/feishu_transport.py](/root/newman/backend/channels/feishu_transport.py)
+
+部署、模型配置和飞书接入的用户向步骤统一维护在 [getting_started.md](/root/newman/docs/getting_started.md)。
 
 ---
 
@@ -2268,12 +2272,13 @@ multipart/form-data
 
 ## 十二、Channels 接口
 
-当前实现是本地联调友好的 Phase 4 基线：
+当前 Channels 实现分两类：
 
-- 支持 `feishu`、`wecom`
-- 支持 webhook 基础验签
-- 支持将 IM 用户映射到 Newman session
-- 当前 webhook 响应返回标准化 payload，尚未真正推送回 IM 平台
+- `feishu`：主路径为官方 Python Channel SDK 长连接，Newman 能接收飞书消息、映射 Newman session，并通过 SDK 回复飞书。
+- `wecom`：当前仍为 webhook 基线。
+- legacy webhook：`POST /api/channels/{platform}/webhook` 仍保留，用于本地联调和早期兼容。
+
+飞书入站接入的用户向配置步骤不在本文重复维护，统一参考 [getting_started.md](/root/newman/docs/getting_started.md#6-飞书接入)。
 
 ## 12.1 获取 Channel 状态
 
@@ -2311,6 +2316,52 @@ multipart/form-data
 
 返回飞书入站配置、SDK 长连接状态和最近错误。`ok=true` 表示 Newman 后端已经通过 Channel SDK 连上飞书。
 
+典型响应：
+
+```json
+{
+  "platform": "feishu",
+  "ok": true,
+  "reason": "ready",
+  "message": "Feishu channel is ready.",
+  "config": {
+    "enabled": true,
+    "transport": "channel_sdk",
+    "domain": "https://open.feishu.cn",
+    "default_turn_approval_mode": "auto_allow",
+    "require_mention_in_group": true,
+    "allowed_chat_ids_count": 0,
+    "allowed_user_open_ids_count": 0,
+    "reply_timeout_seconds": 20,
+    "dedup_ttl_seconds": 600
+  },
+  "status": {
+    "platform": "feishu",
+    "enabled": true,
+    "transport": "channel_sdk",
+    "app_configured": true,
+    "dependency_available": true,
+    "running": true,
+    "connected": true,
+    "connection_state": "connected",
+    "last_event_at": "2026-06-20T10:15:00+00:00",
+    "recent_event_preview": null,
+    "last_error": null,
+    "dedup_cache_size": 0
+  }
+}
+```
+
+常见 `reason`：
+
+- `ready`：配置、依赖和长连接均可用。
+- `channel_disabled`：`channels.feishu.enabled=false`。
+- `transport_not_channel_sdk`：飞书 transport 不是 `channel_sdk`。
+- `missing_credentials`：缺少 `app_id` 或 `app_secret`。
+- `missing_dependency`：缺少 Python 包 `lark-channel-sdk`。
+- `starting`：transport 已启动但 SDK 尚未 ready。
+- `not_started`：配置存在但 transport 尚未运行。
+
 `POST /api/channels/feishu/setup/validate`
 
 请求体可选：
@@ -2322,6 +2373,14 @@ multipart/form-data
 ```
 
 触发一次连接探测，用于确认 `app_id` / `app_secret`、SDK 依赖和出站网络是否可用。
+
+响应包含：
+
+- `ok`
+- `reason`
+- `message`
+- `snapshot`（当 SDK 能返回连接状态时）
+- `status`
 
 `POST /api/channels/feishu/setup/test`
 
@@ -2336,7 +2395,62 @@ multipart/form-data
 
 用于引导用户在飞书端发送一条测试消息，并等待 Newman 确认收到事件。
 
-## 12.3 飞书 Webhook（legacy）
+成功响应示例：
+
+```json
+{
+  "ok": true,
+  "reason": "event_received",
+  "message": "Inbound Feishu event received.",
+  "validation": {
+    "ok": true,
+    "reason": "running_transport"
+  },
+  "status": {
+    "platform": "feishu",
+    "ok": true,
+    "reason": "ready"
+  },
+  "timeout_seconds": 45,
+  "event": {
+    "message_id": "om_xxx",
+    "chat_id": "oc_xxx",
+    "sender_open_id": "ou_xxx",
+    "text_preview": "ping"
+  }
+}
+```
+
+若等待超时，`reason=event_timeout`；若验证失败且 `validate_first=true`，`reason=validation_failed`。
+
+## 12.3 Channel 事件流
+
+`GET /api/channels/events/stream`
+
+返回 `text/event-stream`，用于前端订阅飞书入站产生的 channel 级事件。它不同于会话消息流：
+
+- 会话消息流：`POST /api/sessions/{session_id}/messages`，只覆盖用户主动发起的当前 turn。
+- Channel 事件流：覆盖飞书等外部渠道触发的后台消息，用于让前端在无需刷新页面的情况下看到新建/更新的飞书会话。
+
+事件仍使用统一 SSE 包装：
+
+```json
+{
+  "event": "channel_message_received",
+  "data": {
+    "session_id": "session_xxx",
+    "platform": "feishu",
+    "transport": "channel_sdk",
+    "channel_user_id": "ou_xxx",
+    "channel_conversation_id": "oc_xxx",
+    "content": "请帮我总结今天的安排"
+  },
+  "ts": 1781949600000,
+  "request_id": "req_xxx"
+}
+```
+
+## 12.4 飞书 Webhook（legacy）
 
 `POST /api/channels/feishu/webhook`
 
@@ -2369,7 +2483,7 @@ multipart/form-data
 }
 ```
 
-## 12.4 企业微信 Webhook
+## 12.5 企业微信 Webhook
 
 `POST /api/channels/wecom/webhook`
 
@@ -2765,7 +2879,7 @@ fatal 错误事件示例：
 - hook 当前支持声明式消息和 Python handler 子进程执行，但尚未完全接入与终端同等级别的严格沙箱
 - MCP 目前是 bridge 基线，不是完整官方 MCP 协议栈
 - Scheduler 当前使用内置 cron 解析与轮询执行
-- Channels 当前返回标准化 webhook 响应，尚未接入真实飞书/企微发送端
+- 飞书入站当前已接入 Channel SDK 长连接并可通过 SDK 回复；企微仍停留在 webhook 基线，legacy webhook 只返回标准化响应
 - 自进化当前只覆盖 `MEMORY.md` 和 Skill 目录；不会自动修改系统 prompt、权限配置、后端/前端代码或安装插件
 
 ## 十五、前端联调待办

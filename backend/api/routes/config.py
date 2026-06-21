@@ -113,11 +113,11 @@ async def reload_project_config(request: Request):
 
     next_settings = reload_settings(str(root))
     log_settings_report(str(root))
-    next_runtime = NewmanRuntime(next_settings)
+    next_runtime = NewmanRuntime(next_settings, project_root=root)
     next_scheduler = SchedulerEngine(next_runtime.scheduler_store, next_runtime)
     if hasattr(next_scheduler, "set_session_busy_checker"):
         next_scheduler.set_session_busy_checker(lambda session_id: session_id in app.state.active_message_runs)
-    next_channels = ChannelService(next_settings, next_runtime)
+    next_channels = ChannelService(next_settings, next_runtime, event_broker=app.state.channel_events)
     next_runtime.reload_ecosystem()
     next_scheduler.refresh_schedule()
 

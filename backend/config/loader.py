@@ -30,6 +30,8 @@ server:
 runtime:
   max_tool_depth: 30
   context_compress_threshold: 0.85
+  context_compaction_preserve_recent: 4
+  context_compaction_max_failures: 3
   tool_retry_attempts: 3
   tool_retry_backoff_seconds: 1.0
   provider_retry_attempts: 3
@@ -49,12 +51,13 @@ evolution:
   enabled: true
   turn_interval: 20
   overlap_user_turns: 6
-
-rag:
-  chroma_collection: "knowledge_chunks"
-  lexical_candidate_count: 24
-  vector_candidate_count: 24
-  hybrid_candidate_count: 32
+  max_context_messages: 120
+  max_tool_output_chars: 2000
+  max_memory_updates_per_run: 1
+  max_memory_item_chars: 80
+  max_skill_updates_per_run: 3
+  max_skill_file_bytes: 200000
+  max_skill_total_bytes: 700000
 
 sandbox:
   enabled: true
@@ -78,6 +81,10 @@ approval:
     - "terminal_mutation_or_unknown"
     - "plugin_cli_mutating"
     - "danger_full_access_terminal"
+    - "maintain_memory"
+    - "maintain_skill"
+    - "maintain_plugin"
+    - "maintain_tool"
   timeout_seconds: 120
 
 permissions:
@@ -96,7 +103,6 @@ permissions:
     - ".env"
     - "newman.yaml"
     - "backend_data/uploads"
-    - "backend_data/chroma"
     - "backend_data/sessions"
     - "backend_data/audit"
 
@@ -127,8 +133,6 @@ paths:
   memory_dir: "backend_data/memory"
   audit_dir: "backend_data/audit"
   subagents_dir: "backend_data/subagents"
-  knowledge_dir: "backend_data/knowledge"
-  chroma_dir: "backend_data/chroma"
   plugins_dir: "plugins"
   skills_dir: "skills"
   mcp_dir: "backend_data/mcp"

@@ -37,7 +37,7 @@ def create_app() -> FastAPI:
     app.state.project_root = Path(__file__).resolve().parents[2]
     app.state.active_message_runs = {}
     app.state.settings = settings
-    app.state.runtime = NewmanRuntime(settings)
+    app.state.runtime = NewmanRuntime(settings, project_root=app.state.project_root)
     app.state.scheduler = SchedulerEngine(app.state.runtime.scheduler_store, app.state.runtime)
     app.state.channel_events = ChannelEventBroker()
     app.state.runtime.tool_context.scheduler_engine = app.state.scheduler

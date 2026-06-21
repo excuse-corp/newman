@@ -56,6 +56,7 @@ MUTATING_VERB_MARKERS = (
     "cancel",
 )
 LARK_DEFAULT_IM_USER_ID_ENV = "NEWMAN_LARK_DEFAULT_IM_USER_ID"
+LARK_DEFAULT_IM_IDENTITY_ENV = "NEWMAN_LARK_DEFAULT_IM_IDENTITY"
 
 
 class PluginCLICommandTool(BaseTool):
@@ -148,9 +149,13 @@ class PluginCLICommandTool(BaseTool):
     ) -> ToolExecutionResult:
         args = _coerce_args(arguments)
         preflight_metadata: dict[str, Any] = {}
-        args, default_im_user_id = _apply_default_lark_im_recipient(args, self.command.env)
+        args, default_im_metadata = _apply_default_lark_im_send_options(args, self.command.env)
+        default_im_user_id = default_im_metadata.get("user_id")
+        default_im_identity = default_im_metadata.get("identity")
         if default_im_user_id is not None:
             preflight_metadata["plugin_cli_default_im_user_id"] = default_im_user_id
+        if default_im_identity is not None:
+            preflight_metadata["plugin_cli_default_im_identity"] = default_im_identity
         preflight_error = await self._run_preflight(args, session_id=session_id, metadata=preflight_metadata)
         if preflight_error is not None:
             preflight_error.tool = self.meta.name
@@ -334,16 +339,30 @@ def _is_lark_im_messages_send_invocation(args: list[str]) -> bool:
     return lowered[:2] == ["im", "+messages-send"]
 
 
-def _apply_default_lark_im_recipient(args: list[str], env: dict[str, str]) -> tuple[list[str], str | None]:
+def _apply_default_lark_im_send_options(
+    args: list[str],
+    env: dict[str, str],
+) -> tuple[list[str], dict[str, str]]:
     if not _is_lark_im_messages_send_invocation(args):
-        return args, None
+        return args, {}
+    resolved_args = list(args)
+    metadata: dict[str, str] = {}
     lowered = [item.strip().lower() for item in args]
     if "--chat-id" in lowered or "--user-id" in lowered:
-        return args, None
-    default_user_id = str(env.get(LARK_DEFAULT_IM_USER_ID_ENV, "")).strip()
-    if not default_user_id or not default_user_id.startswith("ou_"):
-        return args, None
-    return [*args, "--user-id", default_user_id], default_user_id
+        pass
+    else:
+        default_user_id = str(env.get(LARK_DEFAULT_IM_USER_ID_ENV, "")).strip()
+        if default_user_id.startswith("ou_"):
+            resolved_args.extend(["--user-id", default_user_id])
+            metadata["user_id"] = default_user_id
+
+    if "--as" not in lowered:
+        default_identity = str(env.get(LARK_DEFAULT_IM_IDENTITY_ENV, "")).strip().lower()
+        if default_identity in {"bot", "user"}:
+            resolved_args.extend(["--as", default_identity])
+            metadata["identity"] = default_identity
+
+    return resolved_args, metadata
 
 
 def _uses_explicit_user_identity(args: list[str]) -> bool:

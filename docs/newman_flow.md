@@ -3,10 +3,16 @@
 ## 一、总览
 
 ```
-用户输入 → API 路由 → Session 管理 → RunLoop 主循环 → Provider 调用 → 工具执行 → 响应返回
-                                                                        ↓
-                                                                  循环直到无工具调用
-                                                                  或达到深度上限
+用户输入 / 飞书入站消息
+        ↓
+API 路由 / ChannelService
+        ↓
+Session 管理 → RunLoop 主循环 → Provider 调用 → 工具执行
+                                      ↓             ↑
+                               无 tool_calls 时判定收口
+                               有 tool_calls 时循环执行
+        ↓
+SSE / 飞书 Channel SDK 回复 / 持久化 assistant message
 ```
 
 ---
@@ -23,6 +29,7 @@ def create_app() -> FastAPI:
     app.state.runtime = NewmanRuntime(settings)        # 初始化运行时（一次性）
     app.state.scheduler = SchedulerEngine(...)         # 初始化定时任务（一次性）
     app.state.channels = ChannelService(...)           # 初始化通道服务（一次性）
+    app.state.channel_events = ChannelEventBroker(...) # 外部渠道事件流（一次性）
 ```
 
 `NewmanRuntime.__init__` 初始化所有核心组件：
@@ -47,6 +54,20 @@ NewmanRuntime
 ├── orchestrator             # 工具编排器（ToolOrchestrator）
 └── exec_sandbox             # 沙箱（NativeSandbox / bwrap）
 ```
+
+ChannelService 初始化：
+
+```
+ChannelService
+├── FeishuChannelTransport   # 飞书官方 Python Channel SDK 长连接
+├── ChannelSessionStore      # 飞书 chat/user/date → Newman session 映射
+├── channel event broker     # 前端订阅 /api/channels/events/stream
+└── legacy webhook channels  # feishu/wecom webhook 基线
+```
+
+FastAPI 生命周期启动后会调用 `ChannelService.start()`，当 `channels.feishu.enabled=true` 且
+`transport=channel_sdk` 时，后端会建立飞书长连接。飞书用户发消息不走
+`POST /api/sessions/{session_id}/messages`，而是由 SDK 回调进入 `ChannelService.handle_transport_message()`。
 
 启动时调用 `reload_ecosystem()`：
 1. `plugin_service.reload()` — 扫描 `plugins/` 目录
@@ -91,7 +112,7 @@ NewmanRuntime
 
 ---
 
-## 三、用户输入 → API 路由
+## 三、输入入口
 
 ### 3.1 创建会话
 
@@ -108,7 +129,7 @@ ThreadManager.create_or_restore()
 
 自进化不会阻塞创建会话响应。`mock` provider 下会跳过调度。
 
-### 3.2 发送消息（核心入口）
+### 3.2 前端发送消息（核心入口）
 
 ```
 POST /api/sessions/{session_id}/messages
@@ -130,7 +151,36 @@ send_message()
                 └── 从 event_queue 中读取事件，推送给前端
 ```
 
-### 3.3 SSE 事件流
+### 3.3 飞书入站消息
+
+飞书入站不经过前端消息 API。当前主路径是官方 Python Channel SDK：
+
+```
+飞书用户消息
+        │
+        ▼
+FeishuChannelTransport._handle_message()
+        │
+        ├── 1. 归一化 ChannelMessage
+        ├── 2. 按 event_id/message_id 去重
+        ├── 3. 群聊非 @ 消息、白名单外消息直接忽略
+        ├── 4. ChannelService.process_transport_message()
+        │       ├── 按 app_id/chat_id/sender_open_id/日期查找或创建 Newman session
+        │       ├── 防止同一飞书 session 并发运行多个 turn
+        │       └── runtime.handle_message(..., turn_approval_mode=auto_allow)
+        ├── 5. 超过短等待阈值时先通过 SDK 回复“已收到，正在处理”
+        └── 6. runtime 结束后通过 SDK 回复最终内容
+```
+
+飞书入站还会写入 channel 级事件流：
+
+```
+GET /api/channels/events/stream
+```
+
+这条 SSE 用于前端感知外部渠道产生的新会话或新消息；它不是普通会话 turn 的消息流。
+
+### 3.4 SSE 事件流
 
 前端通过 SSE 接收实时事件，关键事件类型：
 
@@ -142,10 +192,12 @@ send_message()
 | `hook_triggered` | 钩子触发 |
 | `commentary_delta` | LLM 正在输出 commentary |
 | `commentary_complete` | commentary 输出完成 |
-| `answer_delta` | LLM 正在输出回答 |
+| `assistant_delta` | LLM 正在输出候选回答 |
 | `answer_started` | 回答开始 |
-| `answer_complete` | 回答完成 |
+| `final_response` | 本轮最终 assistant message 已持久化 |
+| `turn_completed` | 本轮结束，携带 finish_reason / turn_outcome |
 | `tool_call_started` | 工具调用开始 |
+| `tool_call_arguments_delta` | 工具调用参数生成进度 |
 | `tool_call_output_delta` | 工具执行实时输出 |
 | `tool_call_finished` | 工具调用完成 |
 | `tool_approval_request` | 请求用户审批 |
@@ -157,6 +209,12 @@ send_message()
 | `error` | 错误 |
 | `turn_interrupted` | 用户中断 |
 | `stream_completed` | 流结束 |
+
+补充：
+
+- `answer_started` 只表示已经开始释放正式回答候选，不是完成信号。
+- 若候选回答随后被判定为未完成，后端会发送 `assistant_delta` 且 `reset=true`，前端需要清空临时回答。
+- `final_response` 才是前端展示最终回答和对齐持久化 assistant message 的主信号。
 
 ---
 
@@ -188,12 +246,16 @@ handle_message(session_id, content, emit, ...)
     │  │                                  │
     │  ├─ 5. _stream_provider_response()   │  ← 调用 LLM
     │  │                                  │
-    │  ├─ 6. decide_turn_step()            │  ← 首轮决策：继续/结束/阻塞
-    │  ├─ 6.5 completion judge（可选）     │  ← 执行型任务的 finalize 再校验
+    │  ├─ 6. invalid tool call recovery    │  ← 模型调用不存在工具时回灌纠偏
+    │  │                                  │
+    │  ├─ 7. ensure commentary             │  ← 工具调用前补齐可见行动说明
+    │  │                                  │
+    │  ├─ 8. decide_turn_step()            │  ← 继续/结束/阻塞
+    │  ├─ 8.5 completion judge（可选）     │  ← 执行型任务的 finalize 再校验
     │  │                                  │
     │  ├─── [无工具调用] → finalize → return│
     │  │                                  │
-    │  ├─ 7. 逐个执行工具调用              │
+    │  ├─ 9. 逐个执行工具调用              │
     │  │   ├── 权限检查                    │
     │  │   ├── 路由到工具                  │
     │  │   ├── static_checks              │
@@ -238,20 +300,23 @@ PromptAssembler.assemble()
 ```
 _stream_provider_response(assembled, tools, emit, ...)
         │
-        ├── provider.chat(messages, tools)  # 调用 LLM API
+        ├── provider.chat_stream(messages, tools)  # 调用 LLM 流式 API
         │       │
         │       └── 流式返回 token
-        │           ├── content tokens      → emit("answer_delta")
+        │           ├── content tokens      → emit("assistant_delta")
         │           ├── thinking tokens     → 解析 <think> 标签
         │           ├── commentary tokens   → emit("commentary_delta")
-        │           └── tool_call tokens    → 解析工具调用
+        │           ├── tool_call_delta      → emit("tool_call_arguments_delta")
+        │           └── tool_call            → ProviderResponse.tool_calls
         │
         └── 返回 ProviderResponse
                 ├── content: str           # 最终回答
                 ├── commentary: str        # 过程说明
                 ├── thinking: str          # 思考过程
                 ├── tool_calls: list       # 工具调用列表
+                ├── invalid_tool_calls: list
                 ├── usage: TokenUsage      # token 用量
+                ├── provider_state: dict    # provider 特有状态，如 reasoning replay 字段
                 └── finish_reason: str     # 结束原因
 ```
 
@@ -354,15 +419,20 @@ tool_call (from LLM response)
 
 ## 六、Turn 决策：`decide_turn_step()`
 
-LLM 返回后，系统需要决定下一步：
+LLM 返回后，系统先做硬分支，再做收口判断：
 
 ```
 ProviderResponse
         │
+        ├── 有 invalid_tool_calls？
+        │   └── YES → 注入 invalid_tool_call_feedback 后继续
+        │           ├── commentary/thinking/think 伪工具 → 下一轮禁用工具直接回答一次
+        │           └── 其他不存在工具 → 要求只使用当前可用工具
+        │
         ├── 有 tool_calls？
         │   └── YES → "continue"（继续执行工具）
         │
-        └── NO → 检查是否为有效最终回答
+        └── NO → 这段文本只是候选 assistant 回答，必须判断是否允许收口
                 │
                 ├── final_answer_gate_reason()
                 │   ├── 空回答 → "empty_final_answer"
@@ -392,6 +462,13 @@ ProviderResponse
                     └── "finalize_blocked"（强制结束，标记为阻塞）
 ```
 
+当前完成判断仍是“确定性 gate + 可选 LLM judge”的组合：
+
+- 确定性 gate 位于 `backend/runtime/turn_completion.py`，主要负责拦截空回答、明显行动说明和未解决工具失败。
+- LLM completion judge 位于 `backend/runtime/run_loop.py`，只在本地 gate 认为可 finalize 且用户请求看起来像执行型任务时触发。
+- judge 返回 `continue` / `ask_user` 时，后端会发送 `assistant_delta(reset=true)` 撤回已经流出的候选回答，再把反馈作为 system message 注入下一轮。
+- `answer_started` 只是候选回答开始，不代表已经完成；`final_response` 才代表最终 assistant message 已持久化。
+
 ---
 
 ## 七、终态分支
@@ -400,7 +477,7 @@ ProviderResponse
 RunLoop 结束的 7 种方式：
 
 1. finalize（正常结束）
-   └── LLM 返回有效最终回答 → emit("answer_complete") → emit("SessionEnd")
+   └── LLM 返回有效最终回答 → 保存 assistant message → emit("final_response") → emit("turn_completed") → emit("SessionEnd")
                                       └── 达到 20 个 user turn 时后台 schedule_evolution("turn_interval")
 
 2. finalize_blocked（收口被拦截）
@@ -410,17 +487,20 @@ RunLoop 结束的 7 种方式：
    └── 工具返回 turn_outcome=awaiting_user，或 completion judge 要求改走 request_user_input → 暂停等待
 
 4. tool_limit（工具调用上限）
-   └── tool_depth >= max_tool_depth → 注入指令要求给出阶段性结论
+   └── tool_depth >= max_tool_depth → 注入指令要求给出阶段性结论，finish_reason="tool_limit_reached"
 
 5. fatal_tool_error（致命工具错误）
-   └── 工具返回 recovery_class="fatal" → 终止并说明原因
+   └── 工具返回 recovery_class="fatal" → 尝试无工具收口或使用 fallback 说明原因
 
 6. provider_error（LLM 提供商错误）
-   └── API 调用失败 → 输出错误信息
+   └── API 调用失败 → 保存 provider failure assistant message，并 emit("error")
 
 7. context_irreducible（上下文不可压缩）
    └── 上下文溢出且无法压缩 → 输出溢出提示
 ```
+
+所有正常终态都会持久化一条 `role="assistant"` 的 SessionMessage；工具调用过程中的行动说明则以
+`role="assistant"` 且 `metadata.tool_calls` 记录，用于下一轮 prompt 恢复工具协议，不作为最终回答展示。
 
 ---
 
@@ -597,7 +677,50 @@ EvolutionService.run_for_session()
 
 ---
 
-## 十二、完整时序图
+## 十二、Channels 与飞书入站
+
+### 12.1 飞书 Channel SDK 链路
+
+```
+FeishuChannelTransport
+        │
+        ├── start()
+        │   └── 官方 Python Channel SDK 建立长连接
+        │
+        ├── 收到 message event
+        │   ├── _normalize_message()
+        │   ├── dedup.try_record(event_id/message_id)
+        │   ├── 过滤群聊非 @ 消息
+        │   └── _on_message(ChannelMessage)
+        │
+        └── _send_response()
+            └── SDK send(..., reply_to=message_id)
+```
+
+`ChannelService.process_transport_message()` 负责把飞书消息接入 Newman Runtime：
+
+- session key 按 `feishu:{app_id}:{chat_id}:{sender_open_id}:{YYYY-MM-DD}` 聚合；
+- 同一个飞书 session 正在运行时，新消息会收到“上一个任务还在处理”；
+- 飞书入站默认使用 `default_turn_approval_mode=auto_allow`，避免卡在 Newman 页面审批；
+- 处理超过短等待阈值时，先回复“已收到，正在处理，完成后回复。”，最终结果再补发；
+- 异常时回复统一兜底文案，不把 traceback 暴露给飞书用户。
+
+### 12.2 Channel 状态与事件
+
+```
+GET /api/channels/status
+GET /api/channels/feishu/setup/status
+POST /api/channels/feishu/setup/validate
+POST /api/channels/feishu/setup/test
+GET /api/channels/events/stream
+```
+
+`/api/channels/events/stream` 是外部渠道事件流，供前端感知飞书入站带来的会话变化；普通对话的
+turn 级事件仍走 `POST /api/sessions/{session_id}/messages` 返回的 SSE。
+
+---
+
+## 十三、完整时序图
 
 ```
 用户                  前端                 API                 RunLoop              LLM               工具/沙箱
@@ -608,7 +731,7 @@ EvolutionService.run_for_session()
  │                    │                   │                    │── 创建 user msg ──→│                    │
  │                    │                   │                    │── SessionStart ───→│                    │
  │                    │                   │                    │── assemble prompt ─→│                    │
- │                    │                   │                    │── provider.chat() ──────────────────────→│
+ │                    │                   │                    │── provider.chat_stream() ───────────────→│
  │                    │                   │                    │                   │                    │
  │                    │                   │                    │←──── streaming tokens ──────────────────│
  │                    │                   │←── SSE events ─────│                   │                    │
@@ -631,11 +754,16 @@ EvolutionService.run_for_session()
  │                    │                   │                    │                   │                    │
  │                    │                   │                    │── 回到循环顶部 ────→│                    │
  │                    │                   │                    │── assemble prompt ─→│                    │
- │                    │                   │                    │── provider.chat() ──────────────────────→│
+ │                    │                   │                    │── provider.chat_stream() ───────────────→│
  │                    │                   │                    │                   │                    │
  │                    │                   │                    │←──── response (无 tool_calls) ───────────│
  │                    │                   │                    │                   │                    │
- │                    │                   │                    │── finalize ────────→│                    │
+ │                    │                   │                    │── completion gate/judge                  │
+ │                    │                   │                    │   ├── continue → 回到循环顶部             │
+ │                    │                   │                    │   └── final                              │
+ │                    │                   │                    │── 保存 assistant message                 │
+ │                    │                   │←── final_response ──│                    │
+ │                    │                   │←── turn_completed ──│                    │
  │                    │                   │                    │── SessionEnd hook ─→│                    │
  │                    │                   │                    │                   │                    │
  │                    │                   │←── stream_completed─│                   │                    │

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/newman-banner.svg" alt="Newman pixel banner" width="100%" />
+  <img src="docs/assets/newman-banner.png" alt="Newman pixel banner" width="100%" />
 </p>
 
 <p align="center">
@@ -239,6 +239,8 @@ NEWMAN_CHANNELS__FEISHU__APP_ID=cli_xxx
 NEWMAN_CHANNELS__FEISHU__APP_SECRET=your_feishu_app_secret
 ```
 
+`.env.example` 和 `.env.docker.example` 已包含这些字段；`newman.yaml` / `docker/newman.yaml` 默认已使用 `channel_sdk`。
+
 飞书开放平台侧需要准备：
 
 - 创建自建应用并启用机器人能力。
@@ -262,15 +264,13 @@ lark-cli auth login --recommend
 lark-cli auth status
 ```
 
-Docker 部署已挂载宿主机 `~/.lark-cli` 和 `~/.local/share/lark-cli`；如果要让 Newman 默认给固定飞书用户发 IM，可在 `.env` / `.env.docker` 设置 `NEWMAN_LARK_DEFAULT_IM_USER_ID`。
+Docker 部署已挂载宿主机 `~/.lark-cli` 和 `~/.local/share/lark-cli`；如果要让 Newman 默认给固定飞书用户发 IM，可在 `.env` / `.env.docker` 设置 `NEWMAN_LARK_DEFAULT_IM_USER_ID`。如需默认使用应用身份发送，再设置 `NEWMAN_LARK_DEFAULT_IM_IDENTITY=bot`；显式传入的目标和身份始终优先。
 
 ## 相关文档
 
 - [API 文档](docs/Newman_API_v1.md)
+- [新用户部署与接入手册](docs/getting_started.md)
 - [自进化机制](docs/self_evolution.md)
 - [多代理设计](docs/newman_multiagent_design.md)
-- [飞书接入配置清单](docs/feishu_setup.md)
-- [飞书入站 Channel 设计](docs/feishu_inbound_channel_design.md)
-- [飞书 CLI Channel 接入设计](docs/feishu_cli_channel_design.md)
 - [Plugin Runtime](backend/plugin_runtime/README.md)
 - [Skill Runtime](backend/skill_runtime/README.md)

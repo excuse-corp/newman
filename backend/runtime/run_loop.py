@@ -776,8 +776,9 @@ def _schema_placeholder(schema: object) -> object:
 
 
 class NewmanRuntime:
-    def __init__(self, settings: AppConfig):
+    def __init__(self, settings: AppConfig, *, project_root: Path | None = None):
         self.settings = settings
+        self.project_root = project_root.resolve() if project_root is not None else Path(__file__).resolve().parents[2]
         self.provider = LimitedProvider(
             build_provider(settings.provider),
             max_concurrent_requests=settings.runtime.provider_max_concurrent_requests,
@@ -808,6 +809,7 @@ class NewmanRuntime:
             settings.paths.plugins_dir,
             settings.paths.skills_dir,
             settings.paths.data_dir / "plugin_state.json",
+            project_root=self.project_root,
         )
         self.skill_registry = SkillRegistry(self.plugin_service, settings.paths.memory_dir)
         self.evolution_store = EvolutionStore(settings.paths.evolution_dir)

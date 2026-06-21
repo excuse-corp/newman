@@ -29,6 +29,7 @@ frontend/.vite/
 # Temporary Docker ignores
 .dockerignore
 .env.docker*
+!.env.docker.example
 docker-compose*.yml
 docker/
 backend/sandbox/Dockerfile
@@ -41,3 +42,4 @@ ref/
 test_runtimespace/
 skills/AOG-ai-daily-news/
 skills/newman-image-responses/
+docs/prds/
