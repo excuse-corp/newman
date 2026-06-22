@@ -1,0 +1,104 @@
+# Docker deployment config. Runtime secrets should be provided by .env.docker.
+
+server:
+  host: "0.0.0.0"
+  port: 8005
+  cors_origins:
+    - "http://localhost:7775"
+    - "http://127.0.0.1:7775"
+    - "http://localhost:17775"
+    - "http://127.0.0.1:17775"
+    - "http://localhost:8005"
+    - "http://127.0.0.1:8005"
+    - "http://localhost:18005"
+    - "http://127.0.0.1:18005"
+
+postgres_dsn: "postgresql://postgres:postgres@postgres:5432/newman"
+
+runtime:
+  max_tool_depth: 30
+  context_compress_threshold: 0.85
+  context_compaction_preserve_recent: 4
+  context_compaction_max_failures: 3
+  tool_retry_attempts: 3
+  tool_retry_backoff_seconds: 1.0
+  provider_retry_attempts: 3
+  provider_retry_backoff_seconds: 1.0
+  provider_max_concurrent_requests: 1
+  provider_min_interval_seconds: 0.0
+
+sandbox:
+  enabled: false
+  backend: "linux_bwrap"
+  mode: "workspace-write"
+  network_access: true
+  writable_roots: []
+  timeout: 30
+  output_limit_bytes: 10240
+
+approval:
+  level1_blacklist:
+    - "rm -rf /"
+    - "sudo"
+    - "su "
+    - "chmod 777 /"
+    - "chown root"
+  level2_patterns:
+    - "write_file_outside_workspace"
+    - "process_spawn"
+    - "terminal_mutation_or_unknown"
+    - "plugin_cli_mutating"
+    - "danger_full_access_terminal"
+    - "maintain_memory"
+    - "maintain_skill"
+    - "maintain_plugin"
+    - "maintain_tool"
+  timeout_seconds: 120
+
+permissions:
+  readable_paths:
+    - "."
+  writable_paths:
+    - "test_runtimespace"
+    - "backend_data/memory"
+    - "skills"
+    - "plugins"
+    - "backend/tools"
+    - "outputs"
+  protected_paths:
+    - ".env"
+    - ".env.docker"
+    - "newman.yaml"
+    - "backend_data/uploads"
+    - "backend_data/sessions"
+    - "backend_data/audit"
+
+channels:
+  feishu:
+    enabled: true
+    transport: "channel_sdk"
+    domain: "https://open.feishu.cn"
+    default_turn_approval_mode: "auto_allow"
+    require_mention_in_group: true
+    allowed_chat_ids: []
+    allowed_user_open_ids: []
+    reply_timeout_seconds: 20
+    dedup_ttl_seconds: 600
+  wecom:
+    enabled: true
+
+paths:
+  workspace: "/root/newman/test_runtimespace"
+  browse_root: "/root/newman"
+  output_root: "/root/newman/test_runtimespace/outputs/chat"
+  data_dir: "backend_data"
+  sessions_dir: "backend_data/sessions"
+  memory_dir: "backend_data/memory"
+  audit_dir: "backend_data/audit"
+  subagents_dir: "backend_data/subagents"
+  plugins_dir: "plugins"
+  skills_dir: "skills"
+  mcp_dir: "backend_data/mcp"
+  scheduler_dir: "backend_data/scheduler"
+  channels_dir: "backend_data/channels"
+  evolution_dir: "backend_data/evolution"

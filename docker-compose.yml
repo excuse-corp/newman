@@ -1,0 +1,72 @@
+name: newman
+
+services:
+  postgres:
+    image: docker.1ms.run/library/postgres:15.4
+    environment:
+      POSTGRES_DB: newman
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - newman_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d newman"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      NEWMAN_SERVER_HOST: "0.0.0.0"
+      NEWMAN_SERVER_PORT: "8005"
+    volumes:
+      - ./backend_data:/root/newman/backend_data
+      - ./plugins:/root/newman/plugins
+      - ./skills:/root/newman/skills
+      - ./outputs:/root/newman/outputs
+      - ./test_runtimespace:/root/newman/test_runtimespace
+      - ./backend/tools:/root/newman/backend/tools
+      - ./docker/newman.yaml:/root/newman/newman.yaml:ro
+      - ${HOME}/.lark-cli:/root/.lark-cli
+      - ${HOME}/.local/share/lark-cli:/root/.local/share/lark-cli
+    ports:
+      - "${NEWMAN_BACKEND_PORT:-18005}:8005"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8005/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    ports:
+      - "${NEWMAN_FRONTEND_PORT:-17775}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  newman_postgres_data:
