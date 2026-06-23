@@ -43,6 +43,10 @@ Docker 部署需要：
 - 飞书自建应用的 `app_secret`
 - 官方 `lark-cli` 安装和授权
 
+如果要使用 Google / 联网搜索工具，还需要：
+
+- `SERPAPI_API_KEY`
+
 ## 2. Docker 部署
 
 Docker 是新用户优先推荐路径。
@@ -67,6 +71,12 @@ NEWMAN_MODELS_MULTIMODAL_TYPE=openai_compatible
 NEWMAN_MODELS_MULTIMODAL_MODEL=gpt-4.1
 NEWMAN_MODELS_MULTIMODAL_ENDPOINT=https://api.openai.com/v1
 NEWMAN_MODELS_MULTIMODAL_API_KEY=your_api_key_here
+```
+
+如果要启用 Google / 联网搜索，再补：
+
+```dotenv
+SERPAPI_API_KEY=your_serpapi_api_key_here
 ```
 
 如果 endpoint 在宿主机本地，容器内不要写 `127.0.0.1`，改用：
@@ -140,6 +150,12 @@ NEWMAN_MODELS_MULTIMODAL_TYPE=openai_compatible
 NEWMAN_MODELS_MULTIMODAL_MODEL=gpt-4.1
 NEWMAN_MODELS_MULTIMODAL_ENDPOINT=https://api.openai.com/v1
 NEWMAN_MODELS_MULTIMODAL_API_KEY=your_api_key_here
+```
+
+如果要启用 Google / 联网搜索，再补：
+
+```dotenv
+SERPAPI_API_KEY=your_serpapi_api_key_here
 ```
 
 ### 3.4 启动
