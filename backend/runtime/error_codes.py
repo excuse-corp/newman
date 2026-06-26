@@ -163,6 +163,22 @@ DEFAULT_TOOL_ERROR = ErrorDescriptor(
 )
 
 API_ERROR_MAP = {
+    "auth": ErrorDescriptor(
+        "NEWMAN-API-004",
+        "warning",
+        "high",
+        "认证失败",
+        "recoverable",
+        "Use a valid admin credential, then retry the request.",
+    ),
+    "forbidden": ErrorDescriptor(
+        "NEWMAN-API-005",
+        "warning",
+        "medium",
+        "请求来源不被允许",
+        "recoverable",
+        "Retry from an allowed origin or through the main application entrypoint.",
+    ),
     "validation": ErrorDescriptor(
         "NEWMAN-API-001",
         "warning",

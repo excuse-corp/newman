@@ -88,7 +88,10 @@ function extractErrorMessage(payload: unknown, fallback: string) {
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init)
+  const response = await fetch(url, {
+    credentials: "include",
+    ...init
+  })
   const text = await response.text()
   const payload = text ? JSON.parse(text) : null
   if (!response.ok) {

@@ -154,7 +154,10 @@ const PROVIDER_TYPE_LABELS: Record<string, string> = {
 };
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const response = await fetch(url, {
+    credentials: "include",
+    ...init,
+  });
   const text = await response.text();
   let payload: unknown = null;
 

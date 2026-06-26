@@ -770,6 +770,13 @@ type ReloadProjectConfigResponse = {
   warnings: string[];
 };
 
+type RegenerateTokenResponse = {
+  rotated: boolean;
+  admin_token: string;
+  instance_token: string;
+  auth_method: string;
+};
+
 type InterruptTurnResponse = {
   interrupted: boolean;
   session_id: string;
@@ -1119,6 +1126,24 @@ function getApiBase() {
   }
   return window.location.origin;
 }
+
+function readEnvValue(content: string, key: string) {
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const [currentKey, ...rest] = line.split("=");
+    if (currentKey.trim() === key) {
+      return rest.join("=").trim();
+    }
+  }
+  return "";
+}
+
+type AppProps = {
+  onLogout?: () => Promise<void> | void;
+};
 
 function formatDateTime(value: string | null | undefined) {
   if (!value) {
@@ -2973,7 +2998,10 @@ function countOutputLines(output: string | null | undefined) {
 }
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const response = await fetch(url, {
+    credentials: "include",
+    ...init,
+  });
   const text = await response.text();
   let payload: unknown = null;
 
@@ -5785,7 +5813,7 @@ function normalizeSessionEventPayload(payload: unknown): SessionEventPayload | n
   };
 }
 
-function App() {
+function App({ onLogout }: AppProps) {
   const apiBase = getApiBase();
   const [activePage, setActivePage] = useState<WorkspacePage>(() => {
     const stored = window.localStorage.getItem("newman-active-page");
@@ -5886,6 +5914,8 @@ function App() {
   const [configReloading, setConfigReloading] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
   const [configNotice, setConfigNotice] = useState<string | null>(null);
+  const [instanceTokenRotating, setInstanceTokenRotating] = useState(false);
+  const [latestRegeneratedAdminToken, setLatestRegeneratedAdminToken] = useState<string | null>(null);
   const [pluginBusyName, setPluginBusyName] = useState<string | null>(null);
   const [leftWidth, setLeftWidth] = useState(() => readStoredNumber("newman-left-rail-width", 220, LEFT_MIN, LEFT_MAX));
   const [leftRailCollapsed, setLeftRailCollapsed] = useState(false);
@@ -7310,7 +7340,7 @@ function App() {
   }, [activeSessionId, apiBase, sendingMessage, stoppingMessage]);
 
   useEffect(() => {
-    const source = new EventSource(`${apiBase}/api/channels/events/stream`);
+    const source = new EventSource(`${apiBase}/api/channels/events/stream`, { withCredentials: true });
     channelEventSourceRef.current = source;
 
     source.onmessage = (message) => {
@@ -8145,6 +8175,10 @@ ${markup}
   const hasProjectConfigChanges = projectConfigDraft !== projectConfigContent;
   const hasProjectEnvChanges = projectEnvDraft !== projectEnvContent;
   const hasProjectSettingsChanges = hasProjectConfigChanges || hasProjectEnvChanges;
+  const currentInstanceToken = useMemo(
+    () => readEnvValue(projectEnvContent, "NEWMAN_AUTH__ADMIN_TOKEN"),
+    [projectEnvContent]
+  );
   const enabledPluginCount = plugins.filter((plugin) => plugin.enabled).length;
   const disabledPluginCount = plugins.length - enabledPluginCount;
 
@@ -8692,6 +8726,7 @@ ${markup}
               return fetch(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
                 method: "POST",
                 body,
+                credentials: "include",
                 signal: controller.signal,
               });
             })()
@@ -8700,6 +8735,7 @@ ${markup}
               headers: {
                 "Content-Type": "application/json",
               },
+              credentials: "include",
               signal: controller.signal,
               body: JSON.stringify({
                 content: trimmed,
@@ -9610,6 +9646,32 @@ ${markup}
       setConfigError(error instanceof Error ? error.message : "项目配置重载失败");
     } finally {
       setConfigReloading(false);
+    }
+  };
+
+  const regenerateInstanceToken = async () => {
+    if (
+      hasProjectEnvChanges &&
+      !window.confirm("`.env` 编辑器里还有未保存修改。重新生成实例访问密钥会刷新磁盘上的 `.env`，确定继续吗？")
+    ) {
+      return;
+    }
+
+    setInstanceTokenRotating(true);
+    setConfigError(null);
+    setConfigNotice(null);
+
+    try {
+      const data = await fetchJson<RegenerateTokenResponse>(`${apiBase}/api/auth/regenerate-token`, {
+        method: "POST"
+      });
+      setLatestRegeneratedAdminToken(data.instance_token || data.admin_token);
+      setConfigNotice("实例访问密钥已重新生成并立即生效，当前浏览器会话已切换到新密钥。");
+      await loadProjectEnv();
+    } catch (error) {
+      setConfigError(error instanceof Error ? error.message : "实例访问密钥重新生成失败");
+    } finally {
+      setInstanceTokenRotating(false);
     }
   };
 
@@ -11574,24 +11636,33 @@ ${markup}
                   ))}
                 </div>
               </div>
-              {activeSettingsTab === "config" ? (
+              {activeSettingsTab === "config" || onLogout ? (
                 <div className="workspace-page-actions settings-page-actions">
-                  <button
-                    type="button"
-                    className="workspace-secondary-button"
-                    onClick={() => void saveAllProjectSettings()}
-                    disabled={configLoading || projectEnvLoading || configSaving || projectEnvSaving || !hasProjectSettingsChanges}
-                  >
-                    {configSaving || projectEnvSaving ? "保存中..." : "保存变更"}
-                  </button>
-                  <button
-                    type="button"
-                    className="workspace-primary-button"
-                    onClick={() => void reloadProjectConfig()}
-                    disabled={configLoading || projectEnvLoading || configReloading || configSaving || projectEnvSaving}
-                  >
-                    {configReloading ? "Reload 中..." : "Reload 生效"}
-                  </button>
+                  {onLogout ? (
+                    <button type="button" className="workspace-secondary-button" onClick={() => void onLogout()}>
+                      退出登录
+                    </button>
+                  ) : null}
+                  {activeSettingsTab === "config" ? (
+                    <>
+                      <button
+                        type="button"
+                        className="workspace-secondary-button"
+                        onClick={() => void saveAllProjectSettings()}
+                        disabled={configLoading || projectEnvLoading || configSaving || projectEnvSaving || !hasProjectSettingsChanges}
+                      >
+                        {configSaving || projectEnvSaving ? "保存中..." : "保存变更"}
+                      </button>
+                      <button
+                        type="button"
+                        className="workspace-primary-button"
+                        onClick={() => void reloadProjectConfig()}
+                        disabled={configLoading || projectEnvLoading || configReloading || configSaving || projectEnvSaving}
+                      >
+                        {configReloading ? "Reload 中..." : "Reload 生效"}
+                      </button>
+                    </>
+                  ) : null}
                 </div>
               ) : null}
             </div>
@@ -11882,8 +11953,35 @@ ${markup}
                         <p className="workspace-copy">
                           当前运行时会合并项目根目录 <code>.env</code>、<code>~/.newman/.env</code> 和进程环境变量；
                           更高优先级依次为 <code>进程环境变量 &gt; ~/.newman/.env &gt; 项目 .env</code>，且只有{" "}
-                          <code>NEWMAN_*</code> 键会参与配置装配。
+                          <code>NEWMAN_*</code> 键会参与主配置装配。像 <code>SERPAPI_API_KEY</code> 这类集成密钥也可以放在这里，由运行时直接读取。
                         </p>
+                      </div>
+
+                      <div className="workspace-detail-block">
+                        <span className="workspace-field-label">实例访问密钥</span>
+                        <p className="workspace-copy">
+                          当前实例通过项目根目录 <code>.env</code> 中的 <code>NEWMAN_AUTH__ADMIN_TOKEN</code> 做接口鉴权。
+                          它不是账号密码，而是这个 Newman 实例自己的访问密钥；当前浏览器通过 HttpOnly Cookie 持续保持会话。
+                        </p>
+                        <div className="workspace-mini-card">
+                          <span className="workspace-mini-label">当前值</span>
+                          <strong>{currentInstanceToken || "尚未生成"}</strong>
+                        </div>
+                        <div className="workspace-inline-actions">
+                          <button
+                            type="button"
+                            className="workspace-secondary-button"
+                            onClick={() => void regenerateInstanceToken()}
+                            disabled={instanceTokenRotating || projectEnvLoading}
+                          >
+                            {instanceTokenRotating ? "重新生成中..." : "重新生成并立即生效"}
+                          </button>
+                        </div>
+                        {latestRegeneratedAdminToken ? (
+                          <p className="workspace-copy">
+                            本次新密钥：<code>{latestRegeneratedAdminToken}</code>
+                          </p>
+                        ) : null}
                       </div>
 
                       {configWarnings.length > 0 ? (
@@ -11967,8 +12065,8 @@ ${markup}
                             <div className="workspace-detail-block">
                               <span className="workspace-field-label">说明</span>
                               <p className="workspace-copy">
-                                这里直接编辑项目根目录 <code>.env</code>。常用形式例如{" "}
-                                <code>NEWMAN_SERVER_PORT=8010</code>。
+                                这里直接编辑项目根目录 <code>.env</code>。常用形式例如 <code>NEWMAN_SERVER_PORT=8010</code>、
+                                <code>SERPAPI_API_KEY=xxx</code> 或 <code>NEWMAN_CHANNELS__FEISHU__APP_ID=cli_xxx</code>。
                               </p>
                             </div>
                             <div className="workspace-detail-block">

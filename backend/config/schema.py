@@ -15,6 +15,16 @@ class ServerConfig(BaseModel):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
 
 
+class AuthConfig(BaseModel):
+    enabled: bool = True
+    admin_token: str | None = None
+    bootstrap_key_required: bool = False
+    cookie_name: str = "newman_admin_session"
+    cookie_secure: bool = False
+    cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    session_ttl_hours: int = Field(default=168, ge=1, le=24 * 365)
+
+
 class ModelConfig(BaseModel):
     type: Literal["mock", "openai_compatible", "anthropic_compatible"] = "mock"
     model: str = "newman-dev"
@@ -150,6 +160,7 @@ class ChannelsConfig(BaseModel):
 
 class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)

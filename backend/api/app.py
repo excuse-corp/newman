@@ -5,10 +5,14 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.api.auth_utils import announce_bootstrap_state
+from backend.api.middleware.auth import auth_middleware
 from backend.api.middleware.error_handler import install_error_handlers
 from backend.api.middleware.request_id import request_id_middleware
 from backend.api.routes.approvals import router as approvals_router
 from backend.api.routes.audit import router as audit_router
+from backend.api.routes.auth import router as auth_router
+from backend.api.routes.bootstrap import router as bootstrap_router
 from backend.api.routes.channels import router as channels_router
 from backend.api.routes.config import router as config_router
 from backend.api.routes.evolution import router as evolution_router
@@ -33,6 +37,7 @@ from backend.scheduler.scheduler_engine import SchedulerEngine
 def create_app() -> FastAPI:
     settings = get_settings()
     log_settings_report()
+    announce_bootstrap_state(settings)
     app = FastAPI(title="Newman API", version="0.6.0")
     app.state.project_root = Path(__file__).resolve().parents[2]
     app.state.active_message_runs = {}
@@ -45,6 +50,7 @@ def create_app() -> FastAPI:
         app.state.scheduler.set_session_busy_checker(lambda session_id: session_id in app.state.active_message_runs)
     app.state.channels = ChannelService(settings, app.state.runtime, event_broker=app.state.channel_events)
 
+    app.middleware("http")(auth_middleware)
     app.middleware("http")(request_id_middleware)
     app.add_middleware(
         CORSMiddleware,
@@ -55,6 +61,8 @@ def create_app() -> FastAPI:
     )
     install_error_handlers(app)
 
+    app.include_router(auth_router)
+    app.include_router(bootstrap_router)
     app.include_router(sessions_router)
     app.include_router(messages_router)
     app.include_router(subagents_router)

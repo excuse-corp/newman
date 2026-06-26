@@ -26,7 +26,16 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(HTTPException)
     async def handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
-        kind = "not_found" if exc.status_code == 404 else "conflict" if exc.status_code == 409 else "validation"
+        if exc.status_code == 401:
+            kind = "auth"
+        elif exc.status_code == 403:
+            kind = "forbidden"
+        elif exc.status_code == 404:
+            kind = "not_found"
+        elif exc.status_code == 409:
+            kind = "conflict"
+        else:
+            kind = "validation"
         return api_error_response(request, status_code=exc.status_code, kind=kind, message=str(exc.detail))
 
     @app.exception_handler(Exception)

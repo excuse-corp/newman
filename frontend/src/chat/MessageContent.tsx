@@ -319,7 +319,7 @@ function AttachmentFileCard({
     setPreviewLoading(true);
     setPreviewError(null);
     try {
-      const response = await fetch(href);
+      const response = await fetch(href, { credentials: "include" });
       if (!response.ok) {
         throw new Error(`预览加载失败：${response.status}`);
       }

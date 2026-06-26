@@ -1,24 +1,22 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from backend.channels.service import ChannelService
+from backend.api.runtime_reload import reload_project_runtime
 from backend.config.loader import (
     get_project_config_path,
     get_project_dotenv_path,
-    log_settings_report,
+    parse_dotenv_content,
     read_project_config_text,
     read_project_dotenv_text,
-    reload_settings,
     resolve_project_root,
     validate_project_config_content,
     validate_project_dotenv_content,
 )
-from backend.runtime.run_loop import NewmanRuntime
-from backend.scheduler.scheduler_engine import SchedulerEngine
 
 
 router = APIRouter(prefix="/api/config", tags=["config"])
@@ -88,9 +86,15 @@ async def update_project_config(payload: UpdateProjectConfigRequest, request: Re
 @router.put("/env")
 async def update_project_dotenv(payload: UpdateProjectDotenvRequest, request: Request):
     root = _project_root(request)
-    next_settings = validate_project_dotenv_content(payload.content, str(root))
     path = get_project_dotenv_path(str(root))
+    previous_values = parse_dotenv_content(path.read_text(encoding="utf-8")) if path.exists() else {}
+    next_values = parse_dotenv_content(payload.content)
+    next_settings = validate_project_dotenv_content(payload.content, str(root))
     path.write_text(payload.content, encoding="utf-8")
+    for key in previous_values:
+        if key not in next_values:
+            os.environ.pop(key, None)
+    os.environ.update(next_values)
     warnings = _build_reload_warnings(request.app.state.settings, next_settings)
     return {
         "saved": True,
@@ -104,47 +108,9 @@ async def update_project_dotenv(payload: UpdateProjectDotenvRequest, request: Re
 
 @router.post("/reload")
 async def reload_project_config(request: Request):
-    app = request.app
     root = _project_root(request)
-    previous_settings = app.state.settings
-    previous_runtime = app.state.runtime
-    previous_scheduler = app.state.scheduler
-    previous_channels = app.state.channels
-
-    next_settings = reload_settings(str(root))
-    log_settings_report(str(root))
-    next_runtime = NewmanRuntime(next_settings, project_root=root)
-    next_scheduler = SchedulerEngine(next_runtime.scheduler_store, next_runtime)
-    if hasattr(next_scheduler, "set_session_busy_checker"):
-        next_scheduler.set_session_busy_checker(lambda session_id: session_id in app.state.active_message_runs)
-    next_channels = ChannelService(next_settings, next_runtime, event_broker=app.state.channel_events)
-    next_runtime.reload_ecosystem()
-    next_scheduler.refresh_schedule()
-
-    await previous_scheduler.stop()
-    if hasattr(previous_channels, "stop"):
-        await previous_channels.stop()
-    try:
-        app.state.settings = next_settings
-        app.state.runtime = next_runtime
-        app.state.scheduler = next_scheduler
-        app.state.channels = next_channels
-        await next_scheduler.start()
-        if hasattr(next_channels, "start"):
-            await next_channels.start()
-    except Exception:
-        app.state.settings = previous_settings
-        app.state.runtime = previous_runtime
-        app.state.scheduler = previous_scheduler
-        app.state.channels = previous_channels
-        next_runtime.close()
-        if hasattr(previous_channels, "start"):
-            await previous_channels.start()
-        await previous_scheduler.start()
-        raise
-
-    previous_runtime.close()
-    warnings = _build_reload_warnings(previous_settings, next_settings)
+    warnings = await reload_project_runtime(request.app, root)
+    next_settings = request.app.state.settings
     return {
         "reloaded": True,
         "path": str(get_project_config_path(str(root))),
@@ -156,12 +122,3 @@ async def reload_project_config(request: Request):
 def _project_root(request: Request) -> Path:
     configured = getattr(request.app.state, "project_root", None)
     return resolve_project_root(str(configured) if configured else None)
-
-
-def _build_reload_warnings(previous_settings, next_settings) -> list[str]:
-    warnings: list[str] = []
-    if previous_settings.server.host != next_settings.server.host or previous_settings.server.port != next_settings.server.port:
-        warnings.append("`server.host` / `server.port` 的变化需要重启进程后才能真正改变监听地址。")
-    if previous_settings.server.cors_origins != next_settings.server.cors_origins:
-        warnings.append("`server.cors_origins` 已写入配置，但现有 CORS 中间件需要重启进程后才会更新。")
-    return warnings

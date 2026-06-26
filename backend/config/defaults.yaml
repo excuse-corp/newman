@@ -12,6 +12,14 @@ server:
     - "http://localhost:7775"
     - "http://127.0.0.1:7775"
 
+auth:
+  enabled: true
+  admin_token: null
+  cookie_name: "newman_admin_session"
+  cookie_secure: false
+  cookie_samesite: "lax"
+  session_ttl_hours: 168
+
 models:
   primary:
     type: "mock"
