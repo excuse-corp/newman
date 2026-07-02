@@ -79,6 +79,38 @@ const markdownSchema = {
   },
 };
 
+async function copyTextToClipboard(value: string) {
+  const writeWithClipboardApi = navigator.clipboard?.writeText;
+
+  if (writeWithClipboardApi && window.isSecureContext) {
+    try {
+      await writeWithClipboardApi.call(navigator.clipboard, value);
+      return;
+    } catch {
+      // Fall back for browsers that expose the API but reject it in the current context.
+    }
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.top = "0";
+  textarea.style.left = "0";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+
+  const copied = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  if (!copied) {
+    throw new Error("copy_failed");
+  }
+}
+
 const URL_TOKEN_REGEX = /(https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+)/g;
 const URL_TRAILING_PUNCTUATION = /[),.;!?，。；：！？、】【」』》〉）]+$/u;
 const MARKDOWN_IMAGE_SOURCE_REGEX = /!\[[^\]]*\]\(([^)\n]+)\)/g;
@@ -664,7 +696,7 @@ function MarkdownCodeBlock({
 
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(codeText);
+      await copyTextToClipboard(codeText);
       setCopyState("copied");
     } catch {
       setCopyState("failed");

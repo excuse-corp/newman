@@ -85,3 +85,6 @@ paths:
   mcp_dir: "backend_data/mcp"
   scheduler_dir: "backend_data/scheduler"
   channels_dir: "backend_data/channels"
+
+evolution:
+  analysis_max_tokens: 10000

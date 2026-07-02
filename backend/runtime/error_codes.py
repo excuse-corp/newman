@@ -162,6 +162,98 @@ DEFAULT_TOOL_ERROR = ErrorDescriptor(
     "Stop and inspect the raw output before deciding the next action.",
 )
 
+PROVIDER_ERROR_MAP = {
+    "timeout_error": ErrorDescriptor(
+        "NEWMAN-PROVIDER-001",
+        "warning",
+        "medium",
+        "主模型连接超时",
+        "recoverable",
+        "Wait briefly and retry; if the timeout repeats, inspect the provider, gateway, and streaming path.",
+    ),
+    "network_error": ErrorDescriptor(
+        "NEWMAN-PROVIDER-002",
+        "warning",
+        "medium",
+        "主模型网络请求失败",
+        "recoverable",
+        "Retry after a short delay; if the failure repeats, inspect provider connectivity and gateway health.",
+    ),
+    "upstream_error": ErrorDescriptor(
+        "NEWMAN-PROVIDER-003",
+        "warning",
+        "medium",
+        "主模型上游暂时不可用",
+        "recoverable",
+        "Retry after a short delay; if the failure repeats, report the upstream outage.",
+    ),
+    "response_parse_error": ErrorDescriptor(
+        "NEWMAN-PROVIDER-004",
+        "error",
+        "high",
+        "主模型响应无法解析",
+        "fatal",
+        "Stop and inspect the provider or gateway response format before continuing.",
+    ),
+    "auth_error": ErrorDescriptor(
+        "NEWMAN-PROVIDER-005",
+        "error",
+        "critical",
+        "主模型认证失败",
+        "fatal",
+        "Stop and fix the provider credential or identity before retrying.",
+    ),
+    "configuration_error": ErrorDescriptor(
+        "NEWMAN-PROVIDER-006",
+        "error",
+        "high",
+        "主模型配置无效",
+        "fatal",
+        "Stop and fix the provider configuration before retrying.",
+    ),
+    "rate_limit_error": ErrorDescriptor(
+        "NEWMAN-PROVIDER-007",
+        "warning",
+        "medium",
+        "主模型触发频率限制",
+        "recoverable",
+        "Back off briefly and retry later with a smaller or slower request rate.",
+    ),
+    "request_error": ErrorDescriptor(
+        "NEWMAN-PROVIDER-008",
+        "error",
+        "high",
+        "主模型请求被上游拒绝",
+        "fatal",
+        "Stop and correct the request shape or required parameters before retrying.",
+    ),
+    "empty_response": ErrorDescriptor(
+        "NEWMAN-PROVIDER-009",
+        "warning",
+        "medium",
+        "主模型响应为空",
+        "recoverable",
+        "Retry once; if it repeats, inspect the streaming response and gateway truncation path.",
+    ),
+    "stream_incomplete": ErrorDescriptor(
+        "NEWMAN-PROVIDER-010",
+        "warning",
+        "medium",
+        "主模型流式响应中断",
+        "recoverable",
+        "Retry after a short delay; if it repeats, inspect the provider stream, gateway buffering, and connection close path.",
+    ),
+}
+
+DEFAULT_PROVIDER_ERROR = ErrorDescriptor(
+    "NEWMAN-PROVIDER-999",
+    "error",
+    "high",
+    "未知主模型错误",
+    "fatal",
+    "Stop and inspect the provider error details before continuing.",
+)
+
 API_ERROR_MAP = {
     "auth": ErrorDescriptor(
         "NEWMAN-API-004",
@@ -218,6 +310,10 @@ def resolve_tool_error(category: str, success: bool) -> ErrorDescriptor:
     if success:
         return SUCCESS
     return TOOL_ERROR_MAP.get(category, DEFAULT_TOOL_ERROR)
+
+
+def resolve_provider_error(kind: str) -> ErrorDescriptor:
+    return PROVIDER_ERROR_MAP.get(kind, DEFAULT_PROVIDER_ERROR)
 
 
 def resolve_api_error(kind: str) -> ErrorDescriptor:

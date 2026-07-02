@@ -52,9 +52,6 @@ export default function LoginPage({ onLoggedIn }: LoginPageProps) {
             <span className="setup-brand-title-cn">牛马</span>
           </h1>
           <span className="setup-brand-kicker">Unlock · 解锁</span>
-          <p className="setup-brand-tagline">
-            输入这个实例的访问密钥。验证成功后，服务端会写入 HttpOnly Cookie，当前浏览器直接恢复访问。
-          </p>
         </header>
 
         <form className="setup-card setup-form" onSubmit={handleSubmit}>
@@ -83,7 +80,7 @@ export default function LoginPage({ onLoggedIn }: LoginPageProps) {
                 className="setup-input"
                 value={adminToken}
                 onChange={(event) => setAdminToken(event.target.value)}
-                placeholder="粘贴 .env 中的 admin token"
+                placeholder="粘贴实例访问密钥"
                 autoComplete="off"
                 spellCheck={false}
                 autoFocus
@@ -97,9 +94,6 @@ export default function LoginPage({ onLoggedIn }: LoginPageProps) {
             <button type="submit" className="setup-submit" disabled={submitting || !adminToken.trim()}>
               {submitting ? "验证中…" : "进入 Newman"}
             </button>
-            <p className="setup-foot-note">
-              没有账号系统 · 密钥写在项目根目录 <code>.env</code>，可在 Settings &gt; Config 重新生成
-            </p>
           </div>
         </form>
       </div>

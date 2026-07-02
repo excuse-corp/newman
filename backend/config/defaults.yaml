@@ -67,6 +67,7 @@ evolution:
   overlap_user_turns: 6
   max_context_messages: 120
   max_tool_output_chars: 2000
+  analysis_max_tokens: 10000
   max_memory_updates_per_run: 1
   max_memory_item_chars: 80
   max_skill_updates_per_run: 3

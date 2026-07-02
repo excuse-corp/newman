@@ -3068,8 +3068,13 @@ function resolveNextSelectedMultiagentTaskId(tasks: MultiAgentTaskRecord[], curr
 function buildMultiagentRunTitle(
   run: MultiAgentRunRecord,
   taskCount: number,
-  detail?: MultiAgentRunDetailResponse | null
+  detail?: MultiAgentRunDetailResponse | null,
+  taskDescription?: string | null
 ) {
+  const normalizedTaskDescription = taskDescription?.replace(/\s+/g, " ").trim();
+  if (normalizedTaskDescription) {
+    return normalizedTaskDescription;
+  }
   const names =
     detail?.tasks.map((task) => task.name.trim()).filter(Boolean) ??
     run.result?.agent_reports.map((report) => report.name.trim()).filter(Boolean) ??
@@ -3078,7 +3083,11 @@ function buildMultiagentRunTitle(
   if (taskCount <= 1) {
     return firstName;
   }
-  return `${firstName} 等 ${taskCount} 个子任务`;
+  return `${firstName} 等 ${taskCount} 个 Subagent`;
+}
+
+function formatMultiagentSubagentCount(taskCount: number) {
+  return `${taskCount} 个 Subagent`;
 }
 
 function formatMultiagentStatusLabel(status: MultiAgentRunStatus | MultiAgentTaskStatus | MultiAgentAgentReport["status"]) {
@@ -7983,6 +7992,16 @@ ${markup}
   const selectedMultiagentRunDetail = selectedMultiagentRunId ? multiagentRunDetailsById[selectedMultiagentRunId] ?? null : null;
   const selectedMultiagentRunListItem =
     multiagentRuns.find((item) => item.run.run_id === selectedMultiagentRunId) ?? multiagentRuns[0] ?? null;
+  const multiagentTaskDescriptionsByTurnId = useMemo(() => {
+    const descriptions = new Map<string, string>();
+    displayTurns.forEach((turn) => {
+      const content = turn.userMessage.content.replace(/\s+/g, " ").trim();
+      if (content) {
+        descriptions.set(turn.id, content);
+      }
+    });
+    return descriptions;
+  }, [displayTurns]);
   const selectedMultiagentTask =
     selectedMultiagentRunDetail?.tasks.find((task) => task.task_id === selectedMultiagentTaskId) ??
     selectedMultiagentRunDetail?.tasks[0] ??
@@ -8012,6 +8031,13 @@ ${markup}
     }
     return multiagentRuns.filter((item) => item.run.run_id !== selectedMultiagentRunListItem.run.run_id);
   }, [multiagentRuns, selectedMultiagentRunListItem]);
+  const selectedMultiagentApprovals = useMemo(
+    () =>
+      selectedMultiagentRunId
+        ? multiagentApprovals.filter((approval) => approval.run_id === selectedMultiagentRunId)
+        : multiagentApprovals,
+    [multiagentApprovals, selectedMultiagentRunId]
+  );
   const showMultiagentDrawerEmptyState = multiagentRuns.length === 0 && multiagentApprovals.length === 0 && !multiagentLoading;
   const multiagentNeedsRefresh =
     multiagentRuns.some((item) => isMultiagentRunActive(item.run.status) || isMultiagentRunStopping(item.run)) ||
@@ -10113,17 +10139,21 @@ ${markup}
               {selectedMultiagentRunListItem ? (
                 <div className="multiagent-run-stack">
                   <div className="multiagent-run-primary">
-                    <strong>
+                    <strong className="multiagent-run-title">
                       {buildMultiagentRunTitle(
                         selectedMultiagentRunListItem.run,
                         selectedMultiagentRunListItem.task_count,
-                        selectedMultiagentRunDetail
+                        selectedMultiagentRunDetail,
+                        multiagentTaskDescriptionsByTurnId.get(selectedMultiagentRunListItem.run.parent_turn_id)
                       )}
                     </strong>
-                    <MultiagentStatusPill
-                      status={selectedMultiagentRunListItem.run.status}
-                      stopping={isMultiagentRunStopping(selectedMultiagentRunListItem.run)}
-                    />
+                    <div className="multiagent-run-primary-meta">
+                      <span>{formatMultiagentSubagentCount(selectedMultiagentRunListItem.task_count)}</span>
+                      <MultiagentStatusPill
+                        status={selectedMultiagentRunListItem.run.status}
+                        stopping={isMultiagentRunStopping(selectedMultiagentRunListItem.run)}
+                      />
+                    </div>
                   </div>
                   {historicalMultiagentRuns.length > 0 ? (
                     <div className="multiagent-history-wrap">
@@ -10132,7 +10162,7 @@ ${markup}
                         className={`multiagent-collapse-toggle ${multiagentRunHistoryExpanded ? "expanded" : ""}`}
                         onClick={() => setMultiagentRunHistoryExpanded((current) => !current)}
                       >
-                        <span>历史运行</span>
+                        <span>历史任务</span>
                         <span className="multiagent-collapse-meta">{historicalMultiagentRuns.length}</span>
                         <ChevronStrokeIcon className="multiagent-collapse-icon" />
                       </button>
@@ -10154,13 +10184,21 @@ ${markup}
                                 }}
                               >
                                 <div className="multiagent-run-item-head">
-                                  <strong>{buildMultiagentRunTitle(item.run, item.task_count, detail)}</strong>
+                                  <strong>
+                                    {buildMultiagentRunTitle(
+                                      item.run,
+                                      item.task_count,
+                                      detail,
+                                      multiagentTaskDescriptionsByTurnId.get(item.run.parent_turn_id)
+                                    )}
+                                  </strong>
                                   <MultiagentStatusPill
                                     status={item.run.status}
                                     stopping={isMultiagentRunStopping(item.run)}
                                   />
                                 </div>
                                 <div className="multiagent-run-item-meta">
+                                  <span>{formatMultiagentSubagentCount(item.task_count)}</span>
                                   <span>{formatDateTime(item.updated_at)}</span>
                                 </div>
                               </button>
@@ -10179,7 +10217,7 @@ ${markup}
             {selectedMultiagentRunDetail ? (
               <div className="drawer-card">
                 <div className="multiagent-section-head">
-                  <span className="drawer-label">运行摘要</span>
+                  <span className="drawer-label">任务摘要</span>
                   <div className="multiagent-section-actions">
                     <MultiagentStatusPill
                       status={selectedMultiagentRunDetail.run.status}
@@ -10199,6 +10237,10 @@ ${markup}
                   <div className="multiagent-stat-cell emphasis">
                     <span className="multiagent-stat-label">当前 token</span>
                     <strong>{selectedMultiagentRunDetail.run.usage_summary.total_tokens.toLocaleString("zh-CN")}</strong>
+                  </div>
+                  <div className="multiagent-subagent-list-head">
+                    <span className="multiagent-stat-label">Subagent 列表</span>
+                    <span>{formatMultiagentSubagentCount(selectedMultiagentRunDetail.tasks.length)}</span>
                   </div>
                   <div className="multiagent-task-list compact">
                     {selectedMultiagentRunDetail.tasks.map((task) => {
@@ -10246,14 +10288,14 @@ ${markup}
                       {selectedMultiagentRunDetail.run.result?.summary ?? "运行仍在进行，等待更多子代理结果。"}
                     </p>
 
-                    {multiagentApprovals.length > 0 ? (
+                    {selectedMultiagentApprovals.length > 0 ? (
                       <div className="multiagent-inline-panel">
                         <div className="multiagent-section-head">
                           <span className="drawer-label">待处理审批</span>
-                          <span className="workspace-tiny-note">{multiagentApprovals.length}</span>
+                          <span className="workspace-tiny-note">{selectedMultiagentApprovals.length}</span>
                         </div>
                         <div className="multiagent-approval-list">
-                          {multiagentApprovals.map((approval) => {
+                          {selectedMultiagentApprovals.map((approval) => {
                             const isBusy = multiagentApprovalActionId === approval.approval_request_id;
                             return (
                               <div key={approval.approval_request_id} className="multiagent-approval-item">
@@ -10301,7 +10343,7 @@ ${markup}
                         <strong>{selectedMultiagentRunDetail.run.result?.failed_agents.length ?? 0}</strong>
                       </div>
                       <div className="multiagent-stat-cell">
-                        <span className="multiagent-stat-label">任务数</span>
+                        <span className="multiagent-stat-label">Subagent</span>
                         <strong>{selectedMultiagentRunDetail.tasks.length}</strong>
                       </div>
                     </div>
@@ -10484,6 +10526,18 @@ ${markup}
             </button>
           ))}
         </nav>
+
+        {compactLeftRail ? (
+          <button
+            type="button"
+            className="session-create-button compact-session-create-button"
+            aria-label="新建会话"
+            title="新建会话"
+            onClick={() => void createDraftSession()}
+          >
+            <span className="session-create-button-mark" aria-hidden="true" />
+          </button>
+        ) : null}
 
         {!compactLeftRail ? (
           <section className="rail-section">

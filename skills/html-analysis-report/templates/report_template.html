@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{TITLE}}</title>
+  <style>
+    @font-face {
+      font-family: 'WorkSans';
+      src: url('./_shared/fonts/WorkSans-Regular.ttf') format('truetype');
+      font-weight: 400;
+    }
+    @font-face {
+      font-family: 'WorkSans';
+      src: url('./_shared/fonts/WorkSans-Bold.ttf') format('truetype');
+      font-weight: 700;
+    }
+    :root {
+      --bg: #fafaf8;
+      --bg2: #f0efe8;
+      --ink: #1a1a1a;
+      --muted: #6b7280;
+      --rule: #d4d4d4;
+      --accent: #b91c1c;
+      --accent2: #1e40af;
+      --font: 'WorkSans', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif;
+      --max: 920px;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { font-size: 16px; scroll-behavior: smooth; }
+    body {
+      font-family: var(--font);
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.8;
+      padding: 2rem 1rem;
+    }
+    article.page { max-width: var(--max); margin: 0 auto; }
+
+    /* Header */
+    .report-header {
+      background: linear-gradient(135deg, #1a1a2e 0%, #2d1b3d 100%);
+      color: #fff;
+      padding: 48px 40px;
+      border-radius: 16px;
+      margin-bottom: 32px;
+      position: relative;
+      overflow: hidden;
+    }
+    .report-header::after {
+      content: '';
+      position: absolute;
+      top: -50%;
+      right: -20%;
+      width: 400px;
+      height: 400px;
+      background: radial-gradient(circle, rgba(185,28,28,0.15) 0%, transparent 70%);
+      border-radius: 50%;
+    }
+    .report-header h1 { font-size: 26px; font-weight: 700; margin-bottom: 8px; position: relative; }
+    .report-header .subtitle { font-size: 14px; opacity: 0.85; position: relative; }
+    .report-header .meta { font-size: 12px; opacity: 0.6; margin-top: 16px; position: relative; }
+
+    /* Sections */
+    .section {
+      background: #fff;
+      border-radius: 12px;
+      padding: 32px;
+      margin-bottom: 24px;
+      box-shadow: 0 1px 8px rgba(0,0,0,.04);
+    }
+    .section h2 {
+      font-size: 20px;
+      font-weight: 700;
+      margin-bottom: 20px;
+      padding-bottom: 10px;
+      border-bottom: 2px solid var(--accent);
+      color: var(--ink);
+    }
+    .section h3 {
+      font-size: 16px;
+      font-weight: 700;
+      margin: 20px 0 12px;
+      color: var(--accent2);
+    }
+    .section h4 {
+      font-size: 14px;
+      font-weight: 700;
+      margin: 16px 0 8px;
+      color: var(--ink);
+    }
+    p { margin-bottom: 12px; font-size: 15px; }
+    strong { color: var(--accent); }
+
+    /* Callout */
+    .callout {
+      background: var(--bg2);
+      border-left: 4px solid var(--accent);
+      padding: 16px 20px;
+      border-radius: 0 8px 8px 0;
+      margin: 16px 0;
+      font-size: 14px;
+    }
+    .callout.blue { border-left-color: var(--accent2); }
+    .callout p { margin-bottom: 6px; }
+
+    /* Quote */
+    blockquote {
+      background: var(--bg2);
+      border-left: 4px solid var(--accent);
+      padding: 16px 20px;
+      margin: 16px 0;
+      font-style: italic;
+      border-radius: 0 8px 8px 0;
+    }
+    blockquote cite { display: block; font-style: normal; font-size: 13px; color: var(--muted); margin-top: 8px; }
+
+    /* Table */
+    .table-wrap { overflow-x: auto; max-height: 600px; margin: 16px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    thead th { background: #1a1a2e; color: #fff; padding: 10px 12px; text-align: left; font-weight: 600; }
+    tbody td { padding: 8px 12px; border-bottom: 1px solid var(--rule); }
+    tbody tr:hover { background: var(--bg2); }
+
+    /* Grid */
+    .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 20px 0; }
+    .metric-card {
+      background: var(--bg2);
+      border-radius: 10px;
+      padding: 20px;
+      text-align: center;
+    }
+    .metric-card .num { font-size: 36px; font-weight: 700; color: var(--accent); }
+    .metric-card .label { font-size: 13px; color: var(--muted); margin-top: 4px; }
+
+    /* Dimension card */
+    .dim-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin: 20px 0; }
+    .dim-card {
+      background: #fff;
+      border: 1px solid var(--rule);
+      border-radius: 10px;
+      padding: 20px;
+      border-top: 3px solid var(--accent);
+    }
+    .dim-card h4 { margin-top: 0; color: var(--accent); font-size: 15px; }
+    .dim-card ul { padding-left: 18px; font-size: 13px; }
+    .dim-card li { margin-bottom: 6px; }
+
+    /* Indicator table */
+    .indicator-row { display: grid; grid-template-columns: 120px 1fr 1fr 100px; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--rule); font-size: 13px; align-items: center; }
+    .indicator-row.header { font-weight: 700; border-bottom: 2px solid var(--ink); color: var(--accent2); }
+    .indicator-tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+    .tag-quant { background: #dbeafe; color: #1e40af; }
+    .tag-qual { background: #fef3c7; color: #92400e; }
+    .tag-behav { background: #d1fae5; color: #065f46; }
+
+    /* Footer */
+    footer .sources { margin-top: 40px; }
+    footer .sources h2 { font-size: 16px; margin-bottom: 12px; }
+    footer .sources ol { padding-left: 1.2rem; font-size: 13px; color: var(--muted); }
+    footer .sources li { margin-bottom: 8px; }
+    footer .sources .src-title { color: var(--ink); }
+    footer .sources .src-url { color: var(--accent2); word-break: break-all; }
+
+    sup a { color: var(--accent); text-decoration: none; font-size: 0.75em; font-weight: 600; }
+    sup a:hover { text-decoration: underline; }
+
+    @media (max-width: 600px) {
+      .report-header { padding: 28px 20px; }
+      .report-header h1 { font-size: 20px; }
+      .section { padding: 20px 16px; }
+      .indicator-row { grid-template-columns: 1fr; gap: 4px; }
+    }
+  </style>
+</head>
+<body>
+<article class="page">
+
+<!-- Header -->
+<div class="report-header">
+  <h1>{{TITLE}}</h1>
+  <div class="subtitle">{{SUBTITLE}}</div>
+  <div class="meta">{{META}}</div>
+</div>
+
+<!-- Sections: replace this block with actual content sections -->
+<div class="section">
+  <h2>Section Title</h2>
+  <p>Replace this with your report content.</p>
+</div>
+
+<!-- Footer: References -->
+<footer>
+  <div class="sources">
+    <h2>参考文献</h2>
+    <ol>
+      <!-- Add references here -->
+    </ol>
+  </div>
+</footer>
+
+</article>
+</body>
+</html>

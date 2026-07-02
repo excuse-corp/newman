@@ -4,6 +4,7 @@ import asyncio
 import json
 import mimetypes
 import re
+from time import monotonic
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
@@ -47,6 +48,7 @@ from backend.runtime.output_paths import (
 )
 from backend.runtime.prompt_assembler import PromptAssembler
 from backend.runtime.result_normalizer import normalize_result
+from backend.runtime.error_codes import resolve_provider_error
 from backend.runtime.session_task import SessionTask
 from backend.runtime.thinking_parser import ThinkTagStreamParser
 from backend.runtime.turn_completion import TurnStepDecision, build_blocked_fallback, decide_turn_step, final_candidate_from_response
@@ -1632,6 +1634,19 @@ class NewmanRuntime:
         tool_signal_seen = False
         tool_argument_progress: dict[str, dict[str, object]] = {}
         provider_state: dict[str, object] = {}
+        stream_started_at = monotonic()
+        first_chunk_at: float | None = None
+        last_chunk_at: float | None = None
+        zero_arg_tool_delta_count = 0
+
+        def tool_argument_bytes_visible() -> bool:
+            for progress in tool_argument_progress.values():
+                try:
+                    if int(progress.get("argument_bytes", 0)) > 0:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+            return False
 
         async def flush_commentary(*, force: bool = False, delta: str | None = None) -> None:
             nonlocal commentary_visible, commentary_complete_pending
@@ -1878,11 +1893,17 @@ class NewmanRuntime:
 
         try:
             async for chunk in self.provider.chat_stream(assembled, tools=tools):
+                now = monotonic()
+                if first_chunk_at is None:
+                    first_chunk_at = now
+                last_chunk_at = now
                 if chunk.type == "text" and chunk.delta:
                     for event in parser.feed(chunk.delta):
                         await consume_parse_event(event)
                 elif chunk.type == "tool_call_delta" and chunk.tool_call_delta:
                     delta = chunk.tool_call_delta
+                    if not delta.arguments_delta:
+                        zero_arg_tool_delta_count += 1
                     pending_key = f"pending:{delta.index}"
                     key = delta.id or pending_key
                     existing_progress = tool_argument_progress.get(key) or tool_argument_progress.get(pending_key)
@@ -1900,7 +1921,10 @@ class NewmanRuntime:
                     await prepare_for_tool_signal(resolved_name)
                     await emit_tool_argument_progress(chunk.tool_call_delta)
                 elif chunk.type == "tool_call" and chunk.tool_call:
-                    if _is_provider_tool_name_allowed(chunk.tool_call.name, allowed_tool_names):
+                    if self._is_invalid_provider_tool_call(chunk.tool_call):
+                        invalid_tool_call_indexes.add(len(tool_calls) + len(invalid_tool_calls))
+                        invalid_tool_calls.append(chunk.tool_call)
+                    elif _is_provider_tool_name_allowed(chunk.tool_call.name, allowed_tool_names):
                         await prepare_for_tool_signal(chunk.tool_call.name)
                         tool_calls.append(chunk.tool_call)
                         await flush_commentary(force=True)
@@ -1925,9 +1949,25 @@ class NewmanRuntime:
             details.setdefault("partial_answer_visible", answer_visible)
             details.setdefault("partial_commentary_visible", commentary_visible)
             details.setdefault("partial_tool_signal_seen", tool_signal_seen or bool(tool_argument_progress))
+            details.setdefault("partial_tool_arguments_visible", tool_argument_bytes_visible())
+            details.setdefault(
+                "provider_stream_elapsed_ms",
+                int((monotonic() - stream_started_at) * 1000),
+            )
+            if first_chunk_at is not None:
+                details.setdefault(
+                    "provider_first_chunk_ms",
+                    int((first_chunk_at - stream_started_at) * 1000),
+                )
+            if last_chunk_at is not None:
+                details.setdefault(
+                    "provider_last_chunk_ms",
+                    int((last_chunk_at - stream_started_at) * 1000),
+                )
+            details.setdefault("provider_zero_arg_tool_delta_count", zero_arg_tool_delta_count)
             details.setdefault(
                 "partial_response_visible",
-                answer_visible or commentary_visible or tool_signal_seen or bool(tool_argument_progress),
+                answer_visible or bool(tool_calls) or bool(invalid_tool_calls) or tool_argument_bytes_visible(),
             )
             exc.details = details
             raise
@@ -2031,6 +2071,9 @@ class NewmanRuntime:
                     result,
                     partial_response_visible=partial_response_visible,
                     will_retry=will_retry,
+                    attempt_count=attempt,
+                    max_attempts=max_attempts,
+                    tool_schema_count=len(tools),
                 )
                 delay = self._provider_retry_backoff_seconds(attempt) if will_retry else 0.0
                 await self._emit_provider_stream_error(
@@ -2127,6 +2170,13 @@ class NewmanRuntime:
             return
         if response.content.strip():
             return
+        provider_state_keys = []
+        stream_debug = None
+        if isinstance(response.provider_state, dict):
+            provider_state_keys = sorted(str(key) for key in response.provider_state.keys())
+            raw_stream_debug = response.provider_state.get("_stream_debug")
+            if isinstance(raw_stream_debug, dict):
+                stream_debug = raw_stream_debug
         raise ProviderError(
             self.settings.provider.type,
             "empty_response",
@@ -2136,8 +2186,18 @@ class NewmanRuntime:
                 "finish_reason": response.finish_reason,
                 "model": response.model or self.settings.provider.model,
                 "commentary_present": bool(response.commentary.strip()),
+                "thinking_present": bool(response.thinking.strip()),
+                "thinking_length": len(response.thinking),
+                "provider_state_keys": provider_state_keys,
+                "provider_stream_debug": stream_debug,
             },
         )
+
+    def _is_invalid_provider_tool_call(self, tool_call: ToolCall) -> bool:
+        arguments = tool_call.arguments
+        if not isinstance(arguments, dict):
+            return False
+        return bool(arguments.get("__parse_error__"))
 
     async def _ensure_tool_response_commentary(
         self,
@@ -3686,6 +3746,17 @@ class NewmanRuntime:
             retryable=error.retryable,
             attempt_count=attempt_count,
         )
+        descriptor = resolve_provider_error(error.kind)
+        result.error_code = descriptor.code
+        result.severity = descriptor.severity
+        result.risk_level = descriptor.risk_level
+        result.frontend_message = descriptor.message
+        result.recovery_class = descriptor.recovery_class
+        result.recommended_next_step = descriptor.recommended_next_step
+        result.metadata.setdefault("frontend_message", result.frontend_message)
+        result.metadata.setdefault("risk_level", result.risk_level)
+        result.metadata.setdefault("recovery_class", result.recovery_class)
+        result.metadata.setdefault("recommended_next_step", result.recommended_next_step)
         if isinstance(max_attempts_raw, int | float):
             result.metadata["max_attempts"] = int(max_attempts_raw)
         for key in (
@@ -3693,6 +3764,11 @@ class NewmanRuntime:
             "partial_content_length",
             "partial_commentary_length",
             "partial_tool_call_count",
+            "partial_tool_arguments_visible",
+            "provider_stream_elapsed_ms",
+            "provider_first_chunk_ms",
+            "provider_last_chunk_ms",
+            "provider_zero_arg_tool_delta_count",
             "retry_suppressed_reason",
             "retry_suppressed_message",
             "transport_fallback_attempted",
@@ -3702,7 +3778,7 @@ class NewmanRuntime:
         ):
             if key in error.details:
                 result.metadata[key] = error.details[key]
-        return normalize_result(result)
+        return result
 
     async def _emit_provider_stream_error(
         self,
@@ -3749,6 +3825,9 @@ class NewmanRuntime:
             payload["partial_commentary_length"] = partial_commentary_length
         if partial_tool_call_count is not None:
             payload["partial_tool_call_count"] = partial_tool_call_count
+        partial_tool_arguments_visible = result.metadata.get("partial_tool_arguments_visible")
+        if isinstance(partial_tool_arguments_visible, bool):
+            payload["partial_tool_arguments_visible"] = partial_tool_arguments_visible
         retry_suppressed_reason = result.metadata.get("retry_suppressed_reason")
         if isinstance(retry_suppressed_reason, str):
             payload["retry_suppressed_reason"] = retry_suppressed_reason
@@ -3804,10 +3883,17 @@ class NewmanRuntime:
         *,
         partial_response_visible: bool,
         will_retry: bool,
+        attempt_count: int | None = None,
+        max_attempts: int | None = None,
+        tool_schema_count: int = 0,
     ) -> bool:
         if will_retry or partial_response_visible:
             return False
-        return result.category == "response_parse_error"
+        if result.category == "response_parse_error":
+            return True
+        if result.category == "empty_response":
+            return tool_schema_count > 0 and bool(max_attempts) and attempt_count == max_attempts
+        return False
 
     async def _emit_fatal_error(
         self,

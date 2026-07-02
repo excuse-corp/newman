@@ -72,6 +72,7 @@ class AnthropicCompatibleProvider(BaseProvider):
         tool_buffers: dict[int, dict[str, str]] = {}
         finish_reason = "stop"
         usage = TokenUsage()
+        saw_message_stop = False
 
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout) as client:
@@ -136,6 +137,7 @@ class AnthropicCompatibleProvider(BaseProvider):
                                 usage.output_tokens = usage_delta.output_tokens
                                 usage.total_tokens = usage.input_tokens + usage.output_tokens
                         elif event == "message_stop":
+                            saw_message_stop = True
                             break
         except httpx.TimeoutException as exc:
             raise ProviderError("anthropic_compatible", "timeout_error", "Anthropic-compatible streaming request timed out", True) from exc
@@ -144,6 +146,15 @@ class AnthropicCompatibleProvider(BaseProvider):
             raise _http_error("anthropic_compatible", exc) from exc
         except httpx.HTTPError as exc:
             raise ProviderError("anthropic_compatible", "network_error", f"Anthropic-compatible streaming failed: {exc}", True) from exc
+
+        if not saw_message_stop:
+            raise ProviderError(
+                "anthropic_compatible",
+                "stream_incomplete",
+                "Anthropic-compatible stream ended before message_stop was received",
+                True,
+                details={"finish_reason": finish_reason},
+            )
 
         for index in sorted(tool_buffers):
             item = tool_buffers[index]
@@ -187,6 +198,9 @@ def _build_payload(
     }
     if tools:
         payload["tools"] = tools
+    response_format = kwargs.get("response_format")
+    if isinstance(response_format, dict):
+        payload["response_format"] = response_format
     return payload
 
 

@@ -398,6 +398,10 @@ input {
   box-shadow: 0 0 0 2px rgba(17, 17, 17, 0.12);
 }
 
+.compact-session-create-button {
+  flex: 0 0 auto;
+}
+
 .session-create-button-mark {
   position: relative;
   display: block;
@@ -798,7 +802,8 @@ input {
 
 .screen-shell.with-compact-rail .rail-nav-item,
 .screen-shell.with-compact-rail .settings-trigger,
-.screen-shell.with-compact-rail .rail-collapse-toggle {
+.screen-shell.with-compact-rail .rail-collapse-toggle,
+.screen-shell.with-compact-rail .compact-session-create-button {
   justify-content: center;
   width: 40px;
   height: 40px;
@@ -825,17 +830,21 @@ input {
 
 .screen-shell.with-compact-rail .rail-collapse-toggle:hover,
 .screen-shell.with-compact-rail .settings-trigger:hover,
-.screen-shell.with-compact-rail .rail-nav-item:not(.active):hover {
+.screen-shell.with-compact-rail .rail-nav-item:not(.active):hover,
+.screen-shell.with-compact-rail .compact-session-create-button:hover {
   transform: translateY(-1px);
+  opacity: 1;
 }
 
 .screen-shell.with-compact-rail .settings-trigger,
-.screen-shell.with-compact-rail .rail-collapse-toggle {
+.screen-shell.with-compact-rail .rail-collapse-toggle,
+.screen-shell.with-compact-rail .compact-session-create-button {
   border-color: transparent;
 }
 
 .screen-shell.with-compact-rail .settings-trigger:not(.active):hover,
-.screen-shell.with-compact-rail .rail-collapse-toggle:hover {
+.screen-shell.with-compact-rail .rail-collapse-toggle:hover,
+.screen-shell.with-compact-rail .compact-session-create-button:hover {
   background: #f2ede6;
   color: #4e453c;
   box-shadow: inset 0 0 0 1px #e5dbcf;
@@ -5931,7 +5940,7 @@ input {
 }
 
 .composer-layout.with-plan-sidecar {
-  grid-template-columns: minmax(0, 1fr) clamp(258px, 31vw, 308px);
+  grid-template-columns: minmax(0, 1fr) clamp(320px, 32vw, 392px);
   align-items: start;
 }
 
@@ -5963,8 +5972,8 @@ input {
   align-content: start;
   min-width: 0;
   min-height: 0;
-  height: clamp(204px, 24vh, 268px);
-  max-height: clamp(204px, 24vh, 268px);
+  height: clamp(228px, 28vh, 336px);
+  max-height: clamp(228px, 28vh, 336px);
   overflow: hidden;
   border-left: 1px solid rgba(216, 206, 193, 0.86);
   border-radius: 0 18px 18px 0;
@@ -5980,7 +5989,7 @@ input {
 
 .composer-plan-tray-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
 }
@@ -6033,7 +6042,7 @@ input {
 
 .composer-plan-tray-meta {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: flex-end;
   gap: 8px;
   flex: 0 0 auto;
@@ -6043,6 +6052,7 @@ input {
   border: 1px solid rgba(19, 19, 20, 0.08);
   background: rgba(255, 255, 255, 0.74);
   color: #4e463f;
+  white-space: nowrap;
 }
 
 .composer-plan-tray-explanation {
@@ -6065,11 +6075,12 @@ input {
 
 .composer-plan-item {
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  grid-template-columns: 18px 2.6ch minmax(0, 1fr);
   align-items: flex-start;
-  gap: 8px;
+  column-gap: 8px;
+  row-gap: 4px;
   min-height: 0;
-  padding: 7px 0;
+  padding: 9px 0;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -6121,15 +6132,15 @@ input {
 
 .composer-plan-item-text {
   min-width: 0;
-  display: -webkit-box;
-  overflow: hidden;
+  display: block;
+  overflow: visible;
   color: #1f1a16;
   font-size: 0.86rem;
   font-weight: 600;
-  line-height: 1.36;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: normal;
   word-break: break-word;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
 }
 
 .composer-plan-item.status-completed .composer-plan-item-text {
@@ -6145,12 +6156,15 @@ input {
 }
 
 .composer-plan-item-chip {
+  grid-column: 3;
   min-height: 24px;
   align-self: start;
+  justify-self: start;
   padding: 0 9px;
   border: 1px solid rgba(97, 119, 184, 0.14);
   background: rgba(97, 119, 184, 0.1);
   color: #47629b;
+  white-space: nowrap;
 }
 
 .composer-plan-item-chip.blocked {
@@ -7241,10 +7255,24 @@ input {
   background: rgba(255, 255, 255, 0.82);
 }
 
-.multiagent-run-primary strong {
+.multiagent-run-primary strong,
+.multiagent-run-title {
   min-width: 0;
   font-size: 0.94rem;
   line-height: 1.4;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.multiagent-run-primary-meta {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 8px;
+  color: #6f665d;
+  font-size: 0.76rem;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .multiagent-run-item.active,
@@ -7274,7 +7302,10 @@ input {
 .multiagent-run-item-head strong,
 .multiagent-task-item-head strong,
 .multiagent-finding-head strong {
+  min-width: 0;
   font-size: 0.88rem;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .multiagent-run-item-meta,
@@ -7393,6 +7424,16 @@ input {
   gap: 8px;
 }
 
+.multiagent-subagent-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #6f665d;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
 .multiagent-task-item.compact {
   padding: 10px 12px;
 }
@@ -7450,6 +7491,8 @@ input {
 .multiagent-timeline-item {
   display: grid;
   gap: 4px;
+  min-width: 0;
+  overflow: hidden;
   padding: 10px 12px;
   border-left: 2px solid rgba(17, 17, 17, 0.12);
   background: rgba(255, 255, 255, 0.56);
@@ -7460,6 +7503,9 @@ input {
   color: #443d36;
   font-size: 0.82rem;
   line-height: 1.55;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .multiagent-timeline-time {
@@ -7472,6 +7518,11 @@ input {
   .multiagent-run-primary {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .multiagent-run-primary-meta {
+    flex-wrap: wrap;
+    white-space: normal;
   }
 
   .multiagent-section-actions {

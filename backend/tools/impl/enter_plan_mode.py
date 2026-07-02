@@ -25,21 +25,16 @@ class EnterPlanModeTool(BaseTool):
             },
             risk_level="low",
             approval_behavior="confirmable",
-            force_user_confirmation=True,
             timeout_seconds=5,
         )
 
     async def run(self, arguments: dict[str, Any], session_id: str) -> ToolExecutionResult:
-        reason = str(arguments.get("reason", "")).strip()
         mode_payload = build_collaboration_mode_payload(PLAN_COLLABORATION_MODE, source="tool")
-        summary = "已进入计划模式，接下来先拆解执行清单"
-        if reason:
-            summary = f"已进入计划模式：{reason}"
         return ToolExecutionResult(
             success=True,
             tool=self.meta.name,
             action="update",
-            summary=summary,
+            summary="已进入计划模式",
             stdout="Plan mode enabled",
             metadata={
                 "collaboration_mode": mode_payload,

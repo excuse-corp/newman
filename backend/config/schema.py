@@ -77,6 +77,7 @@ class EvolutionConfig(BaseModel):
     overlap_user_turns: int = 6
     max_context_messages: int = 120
     max_tool_output_chars: int = 2_000
+    analysis_max_tokens: int = 10_000
     max_memory_updates_per_run: int = 1
     max_memory_item_chars: int = 80
     max_skill_updates_per_run: int = 3

@@ -115,6 +115,17 @@ export default function EvolutionPage({ apiBase }: EvolutionPageProps) {
     () => selectedRun?.changes.filter((change) => change.validation_status === "passed").length ?? 0,
     [selectedRun]
   )
+  const analysisError =
+    selectedRun && typeof selectedRun.metadata.analysis_error === "string" ? selectedRun.metadata.analysis_error : null
+  const analysisMeta =
+    selectedRun &&
+    selectedRun.metadata &&
+    typeof selectedRun.metadata === "object" &&
+    "analysis" in selectedRun.metadata &&
+    selectedRun.metadata.analysis &&
+    typeof selectedRun.metadata.analysis === "object"
+      ? (selectedRun.metadata.analysis as Record<string, unknown>)
+      : null
 
   useEffect(() => {
     void loadRuns()
@@ -279,6 +290,20 @@ export default function EvolutionPage({ apiBase }: EvolutionPageProps) {
                   {selectedRun.errors.map((item) => (
                     <p key={item}>{item}</p>
                   ))}
+                </div>
+              ) : null}
+
+              {analysisError ? (
+                <div className="evolution-error-list">
+                  <p>{analysisError}</p>
+                </div>
+              ) : null}
+
+              {selectedRun.status === "failed" ? (
+                <div className="evolution-detail-actions">
+                  <span className="evolution-detail-source">
+                    分析结果：{analysisMeta ? "已返回结构化结果" : "未返回可用结构化结果"}
+                  </span>
                 </div>
               ) : null}
 

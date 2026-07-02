@@ -19,7 +19,7 @@ from backend.memory.checkpoint_store import CheckpointStore
 from backend.plugin_runtime.models import SkillDescriptor
 from backend.plugin_runtime.service import PluginService
 from backend.plugin_runtime.skill_parser import parse_skill_file
-from backend.providers.base import BaseProvider
+from backend.providers.base import BaseProvider, ProviderError, ProviderResponse
 from backend.sessions.models import CheckpointRecord, SessionMessage, SessionRecord, utc_now
 from backend.sessions.session_store import SessionStore
 from backend.skill_runtime.registry import SkillRegistry
@@ -30,6 +30,7 @@ from backend.usage.store import PostgresModelUsageStore
 AUTO_MEMORY_BEGIN = "<!-- BEGIN AUTO EVOLUTION MEMORY -->"
 AUTO_MEMORY_END = "<!-- END AUTO EVOLUTION MEMORY -->"
 EMPTY_MEMORY_ITEM = "暂无条目"
+EVOLUTION_ANALYSIS_SCHEMA_NAME = "newman_evolution_analysis"
 TEXT_SKILL_FILENAMES = {"SKILL.md", "README.md", "requirements.txt"}
 TEXT_SKILL_SUFFIXES = {
     ".md",
@@ -129,6 +130,7 @@ class EvolutionService:
         except Exception as exc:
             self._mark_session_processed(session, fingerprint, trigger, "analysis_failed")
             run.errors.append(f"analysis_failed: {exc}")
+            run.metadata["analysis_error"] = str(exc)
             return self._finish_run(run, "failed", "Evolution analysis failed.")
 
         run.metadata["analysis"] = analysis
@@ -144,20 +146,7 @@ class EvolutionService:
         return self._finish_run(run, status, run.summary)
 
     async def _analyze_context(self, context: dict[str, Any]) -> dict[str, Any]:
-        response = await self.provider.chat(
-            [
-                {"role": "system", "content": EVOLUTION_ANALYSIS_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "请基于以下材料生成 Newman 自进化更新计划，只输出 JSON。\n\n"
-                        f"```json\n{json.dumps(context, ensure_ascii=False, indent=2)}\n```"
-                    ),
-                },
-            ],
-            temperature=0.1,
-            max_tokens=2400,
-        )
+        response = await self._request_evolution_analysis(context)
         record_model_usage(
             self.usage_store,
             ModelRequestContext(
@@ -169,12 +158,65 @@ class EvolutionService:
                 metadata={
                     "trigger": context["trigger"],
                     "context_message_count": len(context["messages"]),
+                    "finish_reason": response.finish_reason,
                 },
             ),
             response,
         )
         payload = _parse_json_object(response.content)
-        return payload if isinstance(payload, dict) else {}
+        if isinstance(payload, dict) and payload:
+            return payload
+        preview = _truncate_text(response.content.strip(), 800)
+        finish_reason = str(response.finish_reason or "")
+        if finish_reason == "length":
+            raise ValueError("evolution analysis output was truncated before producing valid JSON")
+        raise ValueError(f"evolution analysis did not return valid JSON: {preview or '[empty response]'}")
+
+    async def _request_evolution_analysis(self, context: dict[str, Any]) -> ProviderResponse:
+        messages = [
+            {"role": "system", "content": EVOLUTION_ANALYSIS_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "请基于以下材料生成 Newman 自进化更新计划，只输出 JSON。\n\n"
+                    f"```json\n{json.dumps(context, ensure_ascii=False, indent=2)}\n```"
+                ),
+            },
+        ]
+        kwargs: dict[str, Any] = {
+            "temperature": 0.1,
+            "max_tokens": self.config.analysis_max_tokens,
+        }
+        response_format = _evolution_analysis_response_format(self.provider_type)
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        try:
+            response = await self.provider.chat(messages, **kwargs)
+            response.provider_state.setdefault("evolution_analysis", {})
+            response.provider_state["evolution_analysis"].update(
+                {
+                    "used_response_format": response_format is not None,
+                    "response_format_fallback": False,
+                }
+            )
+            return response
+        except ProviderError as exc:
+            if response_format is None or not _supports_response_format_fallback(exc):
+                raise
+            fallback_kwargs = {
+                "temperature": 0.1,
+                "max_tokens": self.config.analysis_max_tokens,
+            }
+            response = await self.provider.chat(messages, **fallback_kwargs)
+            response.provider_state.setdefault("evolution_analysis", {})
+            response.provider_state["evolution_analysis"].update(
+                {
+                    "used_response_format": False,
+                    "response_format_fallback": True,
+                    "fallback_reason": exc.message,
+                }
+            )
+            return response
 
     def _apply_memory_updates(self, run: EvolutionRunRecord, raw_updates: Any) -> None:
         updates = self._normalize_memory_updates(raw_updates)
@@ -828,6 +870,78 @@ def _parse_json_object(content: str) -> dict[str, Any]:
         if isinstance(payload, dict):
             return payload
     return {}
+
+
+def _evolution_analysis_response_format(provider_type: str) -> dict[str, Any] | None:
+    if provider_type != "openai_compatible":
+        return None
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": EVOLUTION_ANALYSIS_SCHEMA_NAME,
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "memory_updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "text": {"type": "string"},
+                                "reason": {"type": "string"},
+                                "evidence_message_ids": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["text", "reason", "evidence_message_ids"],
+                        },
+                    },
+                    "skill_update_requests": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "skill_name": {"type": "string"},
+                                "skill_path": {"type": "string"},
+                                "reason": {"type": "string"},
+                                "desired_change": {"type": "string"},
+                            },
+                            "required": ["skill_name", "skill_path", "reason", "desired_change"],
+                        },
+                    },
+                    "skip_reason": {
+                        "type": ["string", "null"],
+                    },
+                },
+                "required": ["memory_updates", "skill_update_requests", "skip_reason"],
+            },
+        },
+    }
+
+
+def _supports_response_format_fallback(exc: ProviderError) -> bool:
+    detail = " ".join(
+        part
+        for part in (
+            exc.message,
+            str(exc.details.get("response_text", "")) if isinstance(exc.details, dict) else "",
+        )
+        if part
+    ).lower()
+    markers = (
+        "response_format",
+        "json_schema",
+        "unsupported",
+        "not support",
+        "invalid parameter",
+        "unknown parameter",
+    )
+    return any(marker in detail for marker in markers)
 
 
 def _unified_diff(before: str, after: str, path: str) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from copy import deepcopy
@@ -21,8 +22,28 @@ OPENAI_COMPATIBLE_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         }
     }
 }
+OPENAI_COMPATIBLE_MODEL_PROFILE_PREFIXES: tuple[tuple[str, dict[str, Any]], ...] = (
+    (
+        "deepseek",
+        {
+            "provider": {
+                "stream_idle_timeout_seconds": 300.0,
+            },
+            "messages": {
+                "system_role_policy": "system_first_only",
+            }
+        },
+    ),
+)
 DEFAULT_REASONING_CONTENT_FIELD = "reasoning_content"
+DEFAULT_REASONING_RESPONSE_FIELDS = (
+    DEFAULT_REASONING_CONTENT_FIELD,
+    "reasoning",
+)
 INTERNAL_MESSAGE_KEYS = {"provider_state"}
+RUNTIME_SYSTEM_NOTE_PREFIX = "Runtime system note:\n\n"
+STREAM_DEBUG_SAMPLE_LIMIT = 6
+STREAM_DEBUG_PREVIEW_CHARS = 160
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -80,9 +101,13 @@ class OpenAICompatibleProvider(BaseProvider):
         payload = _build_payload(self.config, messages, tools, stream=True, **kwargs)
         partial_tool_calls: dict[int, dict[str, str]] = {}
         provider_state: dict[str, Any] = {}
+        finish_reason = "stop"
+        saw_done = False
+        saw_content = False
+        stream_debug_samples: list[dict[str, Any]] = []
 
         try:
-            async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            async with httpx.AsyncClient(timeout=_streaming_http_timeout(self.config)) as client:
                 async with client.stream(
                     "POST",
                     f"{self.config.endpoint.rstrip('/')}/chat/completions",
@@ -90,16 +115,23 @@ class OpenAICompatibleProvider(BaseProvider):
                     json=payload,
                 ) as response:
                     response.raise_for_status()
-                    async for data in _iter_sse_json(response):
+                    async for data in _iter_sse_json(
+                        response,
+                        first_event_timeout_seconds=max(float(self.config.timeout), 1.0),
+                        idle_timeout_seconds=_streaming_idle_timeout_seconds(self.config),
+                    ):
                         if data == "[DONE]":
+                            saw_done = True
                             break
                         if not isinstance(data, dict):
                             continue
                         choice = (data.get("choices") or [{}])[0]
                         delta = choice.get("delta") or {}
                         usage = _parse_usage(data.get("usage", {})) if isinstance(data.get("usage"), dict) else None
+                        _record_stream_debug_sample(self.config, choice, delta, stream_debug_samples)
                         _accumulate_response_provider_state(self.config, delta, provider_state)
                         if content := delta.get("content"):
+                            saw_content = True
                             yield ProviderChunk(type="text", delta=str(content), finish_reason=choice.get("finish_reason"))
                         for tool_call in delta.get("tool_calls", []) or []:
                             index = int(tool_call.get("index", 0))
@@ -128,7 +160,8 @@ class OpenAICompatibleProvider(BaseProvider):
                                     ),
                                     finish_reason=choice.get("finish_reason"),
                                 )
-                        finish_reason = choice.get("finish_reason")
+                        if choice.get("finish_reason") is not None:
+                            finish_reason = str(choice["finish_reason"])
                         if usage and usage.total_tokens > 0:
                             yield ProviderChunk(type="usage", usage=usage, finish_reason=finish_reason)
         except httpx.TimeoutException as exc:
@@ -139,6 +172,23 @@ class OpenAICompatibleProvider(BaseProvider):
         except httpx.HTTPError as exc:
             raise ProviderError("openai_compatible", "network_error", f"OpenAI-compatible streaming failed: {exc}", True) from exc
 
+        if not saw_done:
+            raise ProviderError(
+                "openai_compatible",
+                "stream_incomplete",
+                "OpenAI-compatible stream ended before [DONE] was received",
+                True,
+                details={"finish_reason": finish_reason},
+            )
+
+        if not saw_content and not partial_tool_calls:
+            debug_payload = _build_stream_debug_payload(
+                finish_reason=finish_reason,
+                provider_state=provider_state,
+                stream_debug_samples=stream_debug_samples,
+            )
+            if debug_payload:
+                provider_state["_stream_debug"] = debug_payload
         if provider_state:
             yield ProviderChunk(type="provider_state", provider_state=provider_state)
         for index in sorted(partial_tool_calls):
@@ -146,7 +196,21 @@ class OpenAICompatibleProvider(BaseProvider):
             try:
                 arguments = json.loads(item["arguments"] or "{}")
             except JSONDecodeError as exc:
-                raise ProviderError("openai_compatible", "response_parse_error", f"OpenAI-compatible tool call arguments invalid: {exc}") from exc
+                invalid_name = item["name"] or "__invalid_tool_call__"
+                yield ProviderChunk(
+                    type="tool_call",
+                    tool_call=ToolCall(
+                        id=item["id"] or f"tool_{index}",
+                        name=invalid_name,
+                        arguments={
+                            "__parse_error__": True,
+                            "__raw_arguments__": item["arguments"],
+                            "__error__": str(exc),
+                        },
+                    ),
+                    finish_reason="invalid_tool_call",
+                )
+                continue
             yield ProviderChunk(
                 type="tool_call",
                 tool_call=ToolCall(
@@ -155,7 +219,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     arguments=arguments,
                 ),
             )
-        yield ProviderChunk(type="done", finish_reason="stop")
+        yield ProviderChunk(type="done", finish_reason=finish_reason)
 
     def estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
         return estimate_message_tokens(_prepare_messages_for_payload(self.config, messages), model=self.config.model)
@@ -180,7 +244,40 @@ def _build_payload(
         payload["stream_options"] = {"include_usage": True}
     if tools:
         payload["tools"] = tools
+    response_format = kwargs.get("response_format")
+    if isinstance(response_format, dict):
+        payload["response_format"] = response_format
     return payload
+
+
+def _streaming_http_timeout(config: ModelConfig) -> httpx.Timeout:
+    total_timeout = max(float(config.timeout), 1.0)
+    return httpx.Timeout(total_timeout, connect=min(total_timeout, 10.0), read=None, write=total_timeout, pool=total_timeout)
+
+
+def _streaming_idle_timeout_seconds(config: ModelConfig) -> float | None:
+    capabilities = _model_capabilities(config)
+    provider = capabilities.get("provider")
+    if isinstance(provider, dict):
+        raw = provider.get("stream_idle_timeout_seconds")
+        parsed = _positive_timeout_or_none(raw)
+        if parsed is not None:
+            return parsed
+    return max(float(config.timeout), 1.0)
+
+
+def _positive_timeout_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() == "none":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number
 
 
 def _prepare_messages_for_payload(config: ModelConfig, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -198,7 +295,7 @@ def _prepare_messages_for_payload(config: ModelConfig, messages: list[dict[str, 
                         value = str(raw_value)
                 next_message[replay_field] = value
         prepared.append(next_message)
-    return prepared
+    return _normalize_messages_for_payload(config, prepared)
 
 
 def _message_has_tool_calls(message: dict[str, Any]) -> bool:
@@ -206,9 +303,20 @@ def _message_has_tool_calls(message: dict[str, Any]) -> bool:
 
 
 def _model_capabilities(config: ModelConfig) -> dict[str, Any]:
-    profile = OPENAI_COMPATIBLE_MODEL_PROFILES.get(config.model, {})
+    profile = _model_profile(config.model)
     capabilities = _deep_merge_dicts(profile, config.capabilities if isinstance(config.capabilities, dict) else {})
     return capabilities
+
+
+def _model_profile(model_name: str) -> dict[str, Any]:
+    exact_profile = OPENAI_COMPATIBLE_MODEL_PROFILES.get(model_name)
+    if isinstance(exact_profile, dict):
+        return exact_profile
+    normalized = model_name.strip().lower()
+    for prefix, profile in OPENAI_COMPATIBLE_MODEL_PROFILE_PREFIXES:
+        if normalized.startswith(prefix):
+            return profile
+    return {}
 
 
 def _deep_merge_dicts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -219,6 +327,136 @@ def _deep_merge_dicts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str
         else:
             result[key] = value
     return result
+
+
+def _normalize_messages_for_payload(config: ModelConfig, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if _system_role_policy(config) != "system_first_only":
+        return messages
+
+    normalized: list[dict[str, Any]] = []
+    deferred_messages: list[dict[str, Any]] = []
+    pending_tool_call_ids: set[str] = set()
+    seen_system_message = False
+
+    for message in messages:
+        next_message = dict(message)
+
+        if _message_has_tool_calls(next_message):
+            if deferred_messages:
+                normalized.extend(deferred_messages)
+                deferred_messages = []
+            normalized.append(next_message)
+            pending_tool_call_ids = _assistant_tool_call_ids(next_message)
+            continue
+
+        if pending_tool_call_ids:
+            if next_message.get("role") == "tool":
+                normalized.append(next_message)
+                tool_call_id = next_message.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id in pending_tool_call_ids:
+                    pending_tool_call_ids.remove(tool_call_id)
+                if not pending_tool_call_ids and deferred_messages:
+                    normalized.extend(deferred_messages)
+                    deferred_messages = []
+                continue
+
+            deferred_messages.append(_coerce_runtime_system_note(next_message))
+            continue
+
+        if next_message.get("role") != "system":
+            normalized.append(next_message)
+            continue
+
+        if not seen_system_message:
+            seen_system_message = True
+            normalized.append(next_message)
+            continue
+
+        normalized.append(_coerce_runtime_system_note(next_message))
+
+    if deferred_messages:
+        normalized.extend(deferred_messages)
+    return _drop_incomplete_tool_call_turns(normalized)
+
+
+def _system_role_policy(config: ModelConfig) -> str:
+    capabilities = _model_capabilities(config)
+    direct_policy = capabilities.get("system_role_policy")
+    if isinstance(direct_policy, str) and direct_policy.strip():
+        return direct_policy.strip().lower()
+    messages_capabilities = capabilities.get("messages")
+    if isinstance(messages_capabilities, dict):
+        nested_policy = messages_capabilities.get("system_role_policy")
+        if isinstance(nested_policy, str) and nested_policy.strip():
+            return nested_policy.strip().lower()
+    return ""
+
+
+def _assistant_tool_call_ids(message: dict[str, Any]) -> set[str]:
+    if not _message_has_tool_calls(message):
+        return set()
+    ids: set[str] = set()
+    for raw_tool_call in message.get("tool_calls") or []:
+        if not isinstance(raw_tool_call, dict):
+            continue
+        tool_call_id = raw_tool_call.get("id")
+        if isinstance(tool_call_id, str) and tool_call_id:
+            ids.add(tool_call_id)
+    return ids
+
+
+def _drop_incomplete_tool_call_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    index = 0
+    total = len(messages)
+    while index < total:
+        message = messages[index]
+        if not _message_has_tool_calls(message):
+            normalized.append(message)
+            index += 1
+            continue
+
+        pending_ids = _assistant_tool_call_ids(message)
+        if not pending_ids:
+            normalized.append(message)
+            index += 1
+            continue
+
+        block: list[dict[str, Any]] = [message]
+        cursor = index + 1
+        while cursor < total:
+            next_message = messages[cursor]
+            if next_message.get("role") == "tool":
+                tool_call_id = next_message.get("tool_call_id")
+                block.append(next_message)
+                if isinstance(tool_call_id, str) and tool_call_id in pending_ids:
+                    pending_ids.remove(tool_call_id)
+                cursor += 1
+                if not pending_ids:
+                    break
+                continue
+            break
+
+        if pending_ids:
+            index = cursor
+            continue
+
+        normalized.extend(block)
+        index = cursor
+    return normalized
+
+
+def _coerce_runtime_system_note(message: dict[str, Any]) -> dict[str, Any]:
+    if message.get("role") != "system":
+        return message
+    content = message.get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False) if content is not None else ""
+    return {
+        **message,
+        "role": "user",
+        "content": f"{RUNTIME_SYSTEM_NOTE_PREFIX}{content}",
+    }
 
 
 def _coerce_reasoning_field_names(value: Any) -> list[str]:
@@ -254,7 +492,7 @@ def _reasoning_replay_fields(config: ModelConfig) -> list[str]:
 
 
 def _reasoning_response_fields(config: ModelConfig) -> set[str]:
-    fields = {DEFAULT_REASONING_CONTENT_FIELD}
+    fields = set(DEFAULT_REASONING_RESPONSE_FIELDS)
     reasoning = _model_capabilities(config).get("reasoning")
     if isinstance(reasoning, dict):
         for key in ("response_field", "response_fields", "replay_field", "replay_fields", "field", "fields"):
@@ -262,6 +500,69 @@ def _reasoning_response_fields(config: ModelConfig) -> set[str]:
                 if field.strip():
                     fields.add(field.strip())
     return fields
+
+
+def _truncate_stream_debug_value(value: Any, limit: int = STREAM_DEBUG_PREVIEW_CHARS) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
+def _record_stream_debug_sample(
+    config: ModelConfig,
+    choice: dict[str, Any],
+    delta: dict[str, Any],
+    samples: list[dict[str, Any]],
+) -> None:
+    if len(samples) >= STREAM_DEBUG_SAMPLE_LIMIT:
+        return
+
+    sample: dict[str, Any] = {
+        "finish_reason": choice.get("finish_reason"),
+        "choice_keys": sorted(str(key) for key in choice.keys()),
+        "delta_keys": sorted(str(key) for key in delta.keys()),
+    }
+
+    reasoning_fields: dict[str, dict[str, Any]] = {}
+    for field in sorted(_reasoning_response_fields(config)):
+        if field not in delta:
+            continue
+        value = delta.get(field)
+        reasoning_fields[field] = {
+            "type": type(value).__name__,
+            "preview": _truncate_stream_debug_value(value),
+            "length": len(str(value or "")),
+        }
+    if reasoning_fields:
+        sample["reasoning_fields"] = reasoning_fields
+
+    content = delta.get("content")
+    if content is not None:
+        sample["content_type"] = type(content).__name__
+        sample["content_preview"] = _truncate_stream_debug_value(content)
+        sample["content_length"] = len(str(content or ""))
+
+    tool_calls = delta.get("tool_calls")
+    if isinstance(tool_calls, list):
+        sample["tool_call_count"] = len(tool_calls)
+
+    samples.append(sample)
+
+
+def _build_stream_debug_payload(
+    *,
+    finish_reason: str,
+    provider_state: dict[str, Any],
+    stream_debug_samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "finish_reason": finish_reason,
+        "provider_state_keys": sorted(str(key) for key in provider_state.keys() if not str(key).startswith("_")),
+    }
+    if stream_debug_samples:
+        payload["samples"] = stream_debug_samples
+    return payload
 
 
 def _extract_response_provider_state(config: ModelConfig, message: dict[str, Any]) -> dict[str, Any]:
@@ -303,8 +604,36 @@ def _parse_openai_tool_calls(raw_calls: list[dict[str, Any]] | None) -> list[Too
     return tool_calls
 
 
-async def _iter_sse_json(response: httpx.Response) -> AsyncIterator[dict[str, Any] | str]:
-    async for line in response.aiter_lines():
+async def _iter_sse_json(
+    response: httpx.Response,
+    *,
+    first_event_timeout_seconds: float | None,
+    idle_timeout_seconds: float | None,
+) -> AsyncIterator[dict[str, Any] | str]:
+    iterator = response.aiter_lines().__aiter__()
+    saw_any_line = False
+    while True:
+        timeout_seconds = first_event_timeout_seconds if not saw_any_line else idle_timeout_seconds
+        try:
+            if timeout_seconds is None:
+                line = await iterator.__anext__()
+            else:
+                line = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_seconds)
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError as exc:
+            raise ProviderError(
+                "openai_compatible",
+                "timeout_error",
+                "OpenAI-compatible streaming request timed out",
+                True,
+                details={
+                    "timeout_phase": "first_event" if not saw_any_line else "idle",
+                    "timeout_seconds": timeout_seconds,
+                },
+            ) from exc
+
+        saw_any_line = True
         if not line or not line.startswith("data:"):
             continue
         payload = line[5:].strip()
