@@ -24,6 +24,15 @@ exec node ./node_modules/vite/bin/vite.js --host "${FRONTEND_HOST}" --port "${FR
 EOF
 )
 
+FRONTEND_POLLING_COMMAND=$(cat <<EOF
+source "${CONDA_SH}" && \
+conda activate "${ENV_NAME}" && \
+cd "${ROOT_DIR}/frontend" && \
+export CHOKIDAR_USEPOLLING=true CHOKIDAR_INTERVAL="\${CHOKIDAR_INTERVAL:-1000}" && \
+exec node ./node_modules/vite/bin/vite.js --host "${FRONTEND_HOST}" --port "${FRONTEND_PORT}" --strictPort
+EOF
+)
+
 start_service \
   "backend" \
   "${BACKEND_PID_FILE}" \
@@ -32,13 +41,27 @@ start_service \
   "${BACKEND_COMMAND}" \
   "http://127.0.0.1:${BACKEND_PORT}/healthz"
 
-start_service \
+if ! start_service \
   "frontend" \
   "${FRONTEND_PID_FILE}" \
   "${FRONTEND_LOG_FILE}" \
   "${FRONTEND_PORT}" \
   "${FRONTEND_COMMAND}" \
-  "http://127.0.0.1:${FRONTEND_PORT}"
+  "http://127.0.0.1:${FRONTEND_PORT}" \
+  "silent"; then
+  if grep -q "ENOSPC: System limit for number of file watchers reached" "${FRONTEND_LOG_FILE}"; then
+    echo "Frontend hit the file watcher limit; retrying with CHOKIDAR_USEPOLLING=true."
+    start_service \
+      "frontend" \
+      "${FRONTEND_PID_FILE}" \
+      "${FRONTEND_LOG_FILE}" \
+      "${FRONTEND_PORT}" \
+      "${FRONTEND_POLLING_COMMAND}" \
+      "http://127.0.0.1:${FRONTEND_PORT}"
+  else
+    exit 1
+  fi
+fi
 
 if is_enabled "${FEISHU_CLI_CHANNEL_ENABLED}"; then
   "${ROOT_DIR}/scripts/dev/start_feishu_cli_channel.sh"

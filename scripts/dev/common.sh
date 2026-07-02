@@ -155,6 +155,23 @@ wait_for_listener() {
   return 1
 }
 
+wait_for_listener_or_exit() {
+  local port="$1"
+  local timeout_seconds="$2"
+  local launcher_pid="$3"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    if find_listener_pids_by_port "${port}" | grep -q .; then
+      return 0
+    fi
+    if ! is_pid_running "${launcher_pid}"; then
+      return 1
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 wait_for_http_ok() {
   local url="$1"
   local timeout_seconds="$2"
@@ -190,6 +207,7 @@ start_service() {
   local port="$4"
   local command="$5"
   local ready_url="${6:-}"
+  local failure_log_mode="${7:-show}"
 
   mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 
@@ -213,15 +231,23 @@ start_service() {
   nohup bash -lc "${command}" >>"${log_file}" 2>&1 &
   local launcher_pid=$!
 
-  if ! wait_for_listener "${port}" "${STARTUP_TIMEOUT_SECONDS}"; then
-    echo "Failed to start ${name}: no listener appeared on port ${port}" >&2
-    tail -n 40 "${log_file}" >&2 || true
+  if ! wait_for_listener_or_exit "${port}" "${STARTUP_TIMEOUT_SECONDS}" "${launcher_pid}"; then
+    if [[ "${failure_log_mode}" != "silent" ]]; then
+      echo "Failed to start ${name}: no listener appeared on port ${port}" >&2
+    fi
+    if [[ "${failure_log_mode}" != "silent" ]]; then
+      tail -n 40 "${log_file}" >&2 || true
+    fi
     return 1
   fi
 
   if [[ -n "${ready_url}" ]] && ! wait_for_http_ok "${ready_url}" "${STARTUP_TIMEOUT_SECONDS}"; then
-    echo "Failed to verify ${name}: ${ready_url} did not become healthy" >&2
-    tail -n 40 "${log_file}" >&2 || true
+    if [[ "${failure_log_mode}" != "silent" ]]; then
+      echo "Failed to verify ${name}: ${ready_url} did not become healthy" >&2
+    fi
+    if [[ "${failure_log_mode}" != "silent" ]]; then
+      tail -n 40 "${log_file}" >&2 || true
+    fi
     return 1
   fi
 

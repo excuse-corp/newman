@@ -73,9 +73,9 @@ channels:
     enabled: true
 
 paths:
-  workspace: "/root/newman/test_runtimespace"
-  browse_root: "/root/newman"
-  output_root: "/root/newman/test_runtimespace/outputs/chat"
+  workspace: "test_runtimespace"
+  browse_root: "."
+  output_root: "test_runtimespace/outputs/chat"
   data_dir: "backend_data"
   sessions_dir: "backend_data/sessions"
   memory_dir: "backend_data/memory"
