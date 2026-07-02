@@ -12,7 +12,7 @@ ensure_conda
 source "${CONDA_SH}"
 conda activate "${ENV_NAME}"
 
-PG_CTL_BIN="$(command -v pg_ctl)"
+PG_CTL_BIN="$(command -v pg_ctl || true)"
 
 if [[ -z "${PG_CTL_BIN}" ]]; then
   echo "pg_ctl not found in conda env '${ENV_NAME}'. Please recreate the env from environment.yml." >&2
@@ -20,8 +20,10 @@ if [[ -z "${PG_CTL_BIN}" ]]; then
 fi
 
 run_as_pg_user() {
-  if [[ "$(id -u)" -eq 0 ]]; then
-    chmod o+rx /root /root/anaconda3 /root/anaconda3/envs /root/anaconda3/envs/"${ENV_NAME}" "${ROOT_DIR}" "${ROOT_DIR}/backend_data" 2>/dev/null || true
+  if [[ "$(id -u)" -eq 0 ]] && supports_linux_service_user; then
+    for path in "${HOME:-}" "$(dirname "${CONDA_SH}")/../.." "${CONDA_PREFIX:-}" "${ROOT_DIR}" "${ROOT_DIR}/backend_data"; do
+      [[ -n "${path}" && -e "${path}" ]] && chmod o+rx "${path}" 2>/dev/null || true
+    done
     chmod 700 "${PG_DATA_DIR}" 2>/dev/null || true
     su -s /bin/bash "${PG_SYSTEM_USER}" -c "$1"
   else

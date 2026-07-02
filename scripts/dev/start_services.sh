@@ -17,6 +17,8 @@ EOF
 )
 
 FRONTEND_COMMAND=$(cat <<EOF
+source "${CONDA_SH}" && \
+conda activate "${ENV_NAME}" && \
 cd "${ROOT_DIR}/frontend" && \
 exec node ./node_modules/vite/bin/vite.js --host "${FRONTEND_HOST}" --port "${FRONTEND_PORT}" --strictPort
 EOF

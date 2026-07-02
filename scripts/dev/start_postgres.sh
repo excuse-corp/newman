@@ -15,10 +15,10 @@ ensure_conda
 source "${CONDA_SH}"
 conda activate "${ENV_NAME}"
 
-PG_CTL_BIN="$(command -v pg_ctl)"
-INITDB_BIN="$(command -v initdb)"
-PSQL_BIN="$(command -v psql)"
-CREATEDB_BIN="$(command -v createdb)"
+PG_CTL_BIN="$(command -v pg_ctl || true)"
+INITDB_BIN="$(command -v initdb || true)"
+PSQL_BIN="$(command -v psql || true)"
+CREATEDB_BIN="$(command -v createdb || true)"
 
 if [[ -z "${PG_CTL_BIN}" || -z "${INITDB_BIN}" || -z "${PSQL_BIN}" || -z "${CREATEDB_BIN}" ]]; then
   echo "PostgreSQL binaries not found in conda env '${ENV_NAME}'. Please recreate the env from environment.yml." >&2
@@ -28,11 +28,13 @@ fi
 mkdir -p "${PG_DATA_DIR}" "${PG_RUN_DIR}"
 
 run_as_pg_user() {
-  if [[ "$(id -u)" -eq 0 ]]; then
+  if [[ "$(id -u)" -eq 0 ]] && supports_linux_service_user; then
     if ! getent passwd "${PG_SYSTEM_USER}" >/dev/null; then
       useradd -m -r -s /bin/bash "${PG_SYSTEM_USER}"
     fi
-    chmod o+rx /root /root/anaconda3 /root/anaconda3/envs /root/anaconda3/envs/"${ENV_NAME}" "${ROOT_DIR}" "${ROOT_DIR}/backend_data"
+    for path in "${HOME:-}" "$(dirname "${CONDA_SH}")/../.." "${CONDA_PREFIX:-}" "${ROOT_DIR}" "${ROOT_DIR}/backend_data"; do
+      [[ -n "${path}" && -e "${path}" ]] && chmod o+rx "${path}" 2>/dev/null || true
+    done
     chown -R "${PG_SYSTEM_USER}:${PG_SYSTEM_USER}" "${PG_DATA_DIR}" "${PG_RUN_DIR}"
     chmod 700 "${PG_DATA_DIR}"
     chmod 750 "${PG_RUN_DIR}"

@@ -7,8 +7,46 @@ BACKEND_PID_FILE="${RUN_DIR}/backend.pid"
 FRONTEND_PID_FILE="${RUN_DIR}/frontend.pid"
 BACKEND_LOG_FILE="${LOG_DIR}/backend.log"
 FRONTEND_LOG_FILE="${LOG_DIR}/frontend.log"
-CONDA_PREFIX_DEFAULT="/root/anaconda3"
-CONDA_SH="${CONDA_PREFIX_DEFAULT}/etc/profile.d/conda.sh"
+
+detect_conda_sh() {
+  local explicit="${NEWMAN_CONDA_SH:-}"
+  if [[ -n "${explicit}" ]]; then
+    printf '%s\n' "${explicit}"
+    return 0
+  fi
+
+  local prefix="${NEWMAN_CONDA_PREFIX:-}"
+  if [[ -z "${prefix}" ]] && command -v conda >/dev/null 2>&1; then
+    prefix="$(conda info --base 2>/dev/null || true)"
+  fi
+  if [[ -z "${prefix}" && -n "${CONDA_EXE:-}" ]]; then
+    prefix="$(cd "$(dirname "${CONDA_EXE}")/.." >/dev/null 2>&1 && pwd || true)"
+  fi
+
+  local candidate
+  for candidate in \
+    "${prefix}" \
+    "${CONDA_PREFIX:-}" \
+    "/root/anaconda3" \
+    "/root/miniconda3" \
+    "${HOME:-}/anaconda3" \
+    "${HOME:-}/miniconda3" \
+    "${HOME:-}/mambaforge" \
+    "${HOME:-}/miniforge3" \
+    "/opt/anaconda3" \
+    "/opt/miniconda3" \
+    "/opt/homebrew/anaconda3" \
+    "/opt/homebrew/miniconda3"; do
+    if [[ -n "${candidate}" && -f "${candidate}/etc/profile.d/conda.sh" ]]; then
+      printf '%s\n' "${candidate}/etc/profile.d/conda.sh"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "${prefix:-/root/anaconda3}/etc/profile.d/conda.sh"
+}
+
+CONDA_SH="$(detect_conda_sh)"
 ENV_NAME="${NEWMAN_CONDA_ENV:-newman}"
 BACKEND_HOST="${NEWMAN_BACKEND_HOST:-0.0.0.0}"
 BACKEND_PORT="${NEWMAN_BACKEND_PORT:-8005}"
@@ -29,9 +67,36 @@ FEISHU_CLI_CHANNEL_DATA_DIR="${ROOT_DIR}/backend_data/channels/feishu_cli"
 FEISHU_CLI_CHANNEL_EVENTS_FILE="${FEISHU_CLI_CHANNEL_DATA_DIR}/events.ndjson"
 
 primary_ipv4_address() {
+  local ip
   if command -v hostname >/dev/null 2>&1; then
-    hostname -I 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i !~ /^127\./) { print $i; exit } }'
+    ip="$(hostname -I 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i !~ /^127\./) { print $i; exit } }' || true)"
+    if [[ -n "${ip}" ]]; then
+      printf '%s\n' "${ip}"
+      return 0
+    fi
   fi
+
+  if command -v ipconfig >/dev/null 2>&1; then
+    for iface in en0 en1; do
+      ip="$(ipconfig getifaddr "${iface}" 2>/dev/null || true)"
+      if [[ -n "${ip}" ]]; then
+        printf '%s\n' "${ip}"
+        return 0
+      fi
+    done
+  fi
+
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1 || true)"
+    if [[ -n "${ip}" ]]; then
+      printf '%s\n' "${ip}"
+      return 0
+    fi
+  fi
+}
+
+supports_linux_service_user() {
+  [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]] && command -v getent >/dev/null 2>&1 && command -v useradd >/dev/null 2>&1
 }
 
 ensure_host_service_control() {
@@ -47,6 +112,7 @@ ensure_host_service_control() {
 ensure_conda() {
   if [[ ! -f "${CONDA_SH}" ]]; then
     echo "conda.sh not found: ${CONDA_SH}" >&2
+    echo "Set NEWMAN_CONDA_SH=/path/to/conda.sh or ensure conda is available on PATH." >&2
     exit 1
   fi
 }
@@ -195,31 +261,34 @@ stop_service() {
   local pid_file="$2"
   local port="$3"
 
-  declare -A targets=()
+  local targets=""
   local pid
 
   if [[ -f "${pid_file}" ]]; then
     pid="$(tr -d '[:space:]' <"${pid_file}")"
     if [[ -n "${pid}" ]]; then
-      targets["${pid}"]=1
+      targets="${targets}${pid}"$'\n'
     fi
   fi
 
   while IFS= read -r pid; do
-    [[ -n "${pid}" ]] && targets["${pid}"]=1
+    [[ -n "${pid}" ]] && targets="${targets}${pid}"$'\n'
   done < <(find_listener_pids_by_port "${port}" || true)
 
-  if [[ "${#targets[@]}" -eq 0 ]]; then
+  targets="$(printf '%s' "${targets}" | sed '/^[[:space:]]*$/d' | sort -u)"
+
+  if [[ -z "${targets}" ]]; then
     rm -f "${pid_file}"
     echo "${name} is not running"
     return 0
   fi
 
-  for pid in "${!targets[@]}"; do
+  while IFS= read -r pid; do
+    [[ -z "${pid}" ]] && continue
     kill_pid_gracefully "${pid}"
-  done
+  done <<<"${targets}"
   rm -f "${pid_file}"
-  echo "Stopped ${name} on port ${port}: ${!targets[*]}"
+  echo "Stopped ${name} on port ${port}: $(printf '%s' "${targets}" | paste -sd ',' -)"
 }
 
 service_status_line() {

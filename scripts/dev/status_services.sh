@@ -17,7 +17,7 @@ service_status_line "frontend" "${FRONTEND_PID_FILE}" "${FRONTEND_PORT}" "http:/
 source "${CONDA_SH}"
 conda activate "${ENV_NAME}"
 
-PG_CTL_BIN="$(command -v pg_ctl)"
+PG_CTL_BIN="$(command -v pg_ctl || true)"
 PG_DATA_DIR="${ROOT_DIR}/backend_data/postgres"
 PG_SYSTEM_USER="${NEWMAN_PG_SYSTEM_USER:-newmanpg}"
 
@@ -35,8 +35,10 @@ postgres_has_listener() {
 
 postgres_is_running() {
   if [[ -n "${PG_CTL_BIN}" ]]; then
-    if [[ "$(id -u)" -eq 0 ]] && getent passwd "${PG_SYSTEM_USER}" >/dev/null 2>&1; then
-      chmod o+rx /root /root/anaconda3 /root/anaconda3/envs /root/anaconda3/envs/"${ENV_NAME}" "${ROOT_DIR}" "${ROOT_DIR}/backend_data" 2>/dev/null || true
+    if [[ "$(id -u)" -eq 0 ]] && supports_linux_service_user && getent passwd "${PG_SYSTEM_USER}" >/dev/null 2>&1; then
+      for path in "${HOME:-}" "$(dirname "${CONDA_SH}")/../.." "${CONDA_PREFIX:-}" "${ROOT_DIR}" "${ROOT_DIR}/backend_data"; do
+        [[ -n "${path}" && -e "${path}" ]] && chmod o+rx "${path}" 2>/dev/null || true
+      done
       chmod 700 "${PG_DATA_DIR}" 2>/dev/null || true
       if su -s /bin/bash "${PG_SYSTEM_USER}" -c "'${PG_CTL_BIN}' -D '${PG_DATA_DIR}' status >/dev/null 2>&1" >/dev/null 2>&1; then
         return 0
