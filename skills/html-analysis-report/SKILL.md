@@ -1,10 +1,10 @@
 ---
-name: html-analysis-report
-description: Generate professional HTML analysis reports with a polished editorial design. Collects info from uploaded files, provided links, and web search. All claims are cited with source links. Generates sections incrementally to handle long reports.
+name: report
+description: Generate professional HTML analysis reports with a polished editorial design. Collects full source material from uploaded files, provided links, and web search. All claims are cited with source links. Generates sections incrementally to handle long reports.
 when_to_use: Use when the user asks to create an analysis report, research report, or thematic analysis in HTML format, especially when referencing a template design or asking for "分析报告", "专题分析", "HTML报告", "report generation".
 ---
 
-# HTML Analysis Report Generator
+# Report Generator
 
 ## Goal
 
@@ -29,6 +29,31 @@ Generate a self-contained HTML analysis report with a polished editorial design.
 | 用户上传文件 | `parse_attachment` | 最高优先级，用户提供的附件内容 |
 | 用户提供的链接 | `fetch_url` | 用户明确给出的 URL，逐个抓取 |
 | 自主搜索 | `google_search` → `fetch_url` | 用户未提供足够信息时主动搜索 |
+
+### 附件全量读取要求（MUST FOLLOW）
+
+`parse_attachment` 的 `stdout` 只保证返回附件元数据和一段 `content_excerpt`，不能把它当成全量正文。生成报告时，只要用户上传了附件，就必须按下面流程拿到完整解析内容：
+
+1. **逐个附件调用 `parse_attachment`**
+   - 优先使用当前回合附件元数据里的 `attachment_id`。
+   - 如果没有明确 `attachment_id`，使用 `selector.order_index`、`selector.kind`、`selector.kind_index` 或 `selector.filename` 定位。
+   - 多个附件必须逐个解析，不要只解析第一个附件。
+
+2. **读取解析产物路径，而不是只读 excerpt**
+   - `parse_attachment` 成功后，解析返回 JSON。
+   - 如果返回 `parsed_markdown_path`，必须用 `read_file` 读取该 Markdown 文件的完整内容。
+   - 如果返回 `parsed_chunks_path`，说明附件解析器生成了结构化 chunks；当 Markdown 过长或需要分段定位时，读取 chunks JSON，并按 chunk 顺序建立材料索引。
+   - 如果返回 `parsed_structure_path`，用于表格、幻灯片、PDF 结构化分析时读取结构信息。
+   - 如果返回 `parsed_html_path`，仅在需要保留原始 HTML/富文本结构时读取。
+
+3. **建立附件材料索引**
+   - 为每个附件记录：`attachment_id`、文件名、类型、原文件路径、`parsed_markdown_path`、`parsed_chunks_path`、摘要、读取状态。
+   - 将完整 Markdown 或 chunk 摘要写入 `research_notes.md`，并保留可追溯路径。
+   - 引用附件内容时，使用附件文件名和章节/页码/表名/slide 编号等定位信息；如果原附件无法提供页码，使用解析后的标题或 chunk 序号。
+
+4. **失败处理**
+   - 如果某个附件解析失败，必须在报告前置说明或交付说明中标注该附件未被纳入分析。
+   - 不得基于解析失败或未读取完整内容的附件编造结论。
 
 **搜索策略：**
 - 先根据报告主题确定 3-5 个核心搜索关键词
@@ -59,13 +84,42 @@ Generate a self-contained HTML analysis report with a polished editorial design.
 - 每个 section 可以独立审核和修改
 - 用户可以对某个 section 提出修改意见，只重生成该块
 
+### 长上下文应对方案（MUST FOLLOW）
+
+当附件或网页材料过长时，不要尝试把所有原文一次性放进模型上下文。采用“材料索引 + 分段证据包 + 分块写作”的方案：
+
+1. **材料索引层**
+   - 先把全部来源登记到 `research_notes.md`：来源编号、来源类型、路径/URL、标题、时间、可信度、可引用范围。
+   - 对超长附件，优先读取 `parsed_chunks_path`，生成 `chunk_index.md`，记录每个 chunk 的主题、关键词、页码/章节线索和关键信息。
+   - 对网页来源，保留 URL、抓取时间和核心摘录。
+
+2. **证据包层**
+   - 每个报告 section 写作前，单独创建一个 `evidence/0X_section.md`。
+   - 只从材料索引中抽取该 section 需要的证据、数据、引用和冲突信息。
+   - 每条证据保留来源编号和定位信息，避免写作阶段丢失出处。
+
+3. **分块写作层**
+   - 每次只生成一个 section 的 HTML 片段。
+   - 生成前读取对应 `evidence/0X_section.md` 和必要的少量原文 chunk。
+   - section 生成后立即写入 `sections/0X_sectionname.html`，不要把全部 section 都留在上下文里。
+
+4. **最终组装层**
+   - 组装时只读取模板、section HTML 片段、参考文献列表和必要元数据。
+   - 不再重新读取所有原始材料，避免上下文再次膨胀。
+
+5. **质量控制**
+   - 每个 section 结尾前检查：是否所有事实都有来源、是否有来源但证据不足的断言、是否遗漏冲突观点。
+   - 如材料超长导致无法覆盖全部内容，在报告方法说明中明确“已基于附件解析 chunks 和证据索引进行分段分析”。
+
 ## Workflow
 
 ### Phase 1: 信息收集 (Information Gathering)
 
 1. **解析用户上传的文件**（如有）
-   - 使用 `parse_attachment` 读取附件内容
-   - 提取关键数据、观点、引用
+   - 使用 `parse_attachment` 逐个解析附件
+   - 解析后读取 `parsed_markdown_path` 获取附件全量 Markdown
+   - 对超长附件读取 `parsed_chunks_path`，建立 chunk 级材料索引
+   - 提取关键数据、观点、引用，并记录附件文件名、章节/页码/表名/slide 或 chunk 定位
 
 2. **抓取用户提供的链接**（如有）
    - 使用 `fetch_url` 逐个抓取
@@ -80,6 +134,7 @@ Generate a self-contained HTML analysis report with a polished editorial design.
    - 将收集到的信息整理为结构化笔记
    - 每条信息标注来源编号和 URL
    - 保存到临时文件 `research_notes.md`
+   - 对超长来源额外保存 `chunk_index.md` 和 `evidence/` 分 section 证据包
 
 ### Phase 2: 大纲确认 (Outline Confirmation)
 
@@ -94,6 +149,7 @@ Generate a self-contained HTML analysis report with a polished editorial design.
 1. 读取 HTML 模板：`read_file` → `templates/report_template.html`
 2. **逐个 section 生成内容：**
    - 根据大纲和收集的信息，生成该 section 的 HTML 片段
+   - 只读取该 section 对应的 evidence 文件和必要原文 chunk
    - 使用模板组件（callout、table、metric-grid 等）
    - 每个事实性陈述标注引用 `[n]`
    - 写入 `sections/0X_sectionname.html`
@@ -178,6 +234,7 @@ The template provides these reusable HTML components:
 | Step | Tool | Purpose |
 |------|------|---------|
 | 信息收集 | `parse_attachment` | 解析用户上传的文件 |
+| 附件全量读取 | `read_file` | 读取 `parsed_markdown_path`、`parsed_chunks_path`、`parsed_structure_path` |
 | 信息收集 | `fetch_url` | 抓取用户提供的链接或搜索结果 |
 | 信息收集 | `google_search` | 自主搜索补充信息 |
 | 大纲确认 | `request_user_input` | 让用户确认报告大纲 |

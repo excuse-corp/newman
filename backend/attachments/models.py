@@ -27,6 +27,12 @@ class SavedAttachment:
     analysis_status: str = "saved"
     parsed_markdown_path: Path | None = None
     parsed_markdown_relative_path: str | None = None
+    parsed_html_path: Path | None = None
+    parsed_html_relative_path: str | None = None
+    parsed_structure_path: Path | None = None
+    parsed_structure_relative_path: str | None = None
+    parsed_chunks_path: Path | None = None
+    parsed_chunks_relative_path: str | None = None
     warnings: list[str] = field(default_factory=list)
     analysis_error: str | None = None
 
@@ -52,6 +58,18 @@ class SavedAttachment:
             payload["parsed_markdown_path"] = str(self.parsed_markdown_path)
         if self.parsed_markdown_relative_path is not None:
             payload["parsed_markdown_relative_path"] = self.parsed_markdown_relative_path
+        if self.parsed_html_path is not None:
+            payload["parsed_html_path"] = str(self.parsed_html_path)
+        if self.parsed_html_relative_path is not None:
+            payload["parsed_html_relative_path"] = self.parsed_html_relative_path
+        if self.parsed_structure_path is not None:
+            payload["parsed_structure_path"] = str(self.parsed_structure_path)
+        if self.parsed_structure_relative_path is not None:
+            payload["parsed_structure_relative_path"] = self.parsed_structure_relative_path
+        if self.parsed_chunks_path is not None:
+            payload["parsed_chunks_path"] = str(self.parsed_chunks_path)
+        if self.parsed_chunks_relative_path is not None:
+            payload["parsed_chunks_relative_path"] = self.parsed_chunks_relative_path
         if self.analysis_error:
             payload["analysis_error"] = self.analysis_error
         return payload
@@ -61,4 +79,7 @@ class SavedAttachment:
 class ParsedAttachment:
     markdown: str
     plain_text: str
+    html: str | None = None
+    structure: dict[str, object] | None = None
+    chunks: list[dict[str, object]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)

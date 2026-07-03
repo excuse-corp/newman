@@ -172,10 +172,16 @@ def build_user_message_for_provider(message: SessionMessage) -> str:
                     label = _attachment_summary_label(summary_item, attachments)
                     summary = str(summary_item.get("summary") or "").strip()
                     markdown_path = str(summary_item.get("markdown_path") or "").strip()
+                    structure_path = str(summary_item.get("structure_path") or "").strip()
+                    chunks_path = str(summary_item.get("chunks_path") or "").strip()
                     if summary:
                         detail = f"- {label}: {summary}"
                         if markdown_path:
                             detail += f" | parsed_markdown={markdown_path}"
+                        if structure_path:
+                            detail += f" | parsed_structure={structure_path}"
+                        if chunks_path:
+                            detail += f" | parsed_chunks={chunks_path}"
                         lines.append(detail)
                     elif isinstance(summary_item.get("analysis_error"), str) and str(summary_item["analysis_error"]).strip():
                         lines.append(f"- {label}: 解析失败，{str(summary_item['analysis_error']).strip()}")

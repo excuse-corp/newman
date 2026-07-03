@@ -335,6 +335,12 @@ def _render_attachment_payload(attachment, *, excerpt: str) -> str:
     }
     if attachment.parsed_markdown_path is not None:
         payload["parsed_markdown_path"] = str(attachment.parsed_markdown_path)
+    if getattr(attachment, "parsed_html_path", None) is not None:
+        payload["parsed_html_path"] = str(attachment.parsed_html_path)
+    if getattr(attachment, "parsed_structure_path", None) is not None:
+        payload["parsed_structure_path"] = str(attachment.parsed_structure_path)
+    if getattr(attachment, "parsed_chunks_path", None) is not None:
+        payload["parsed_chunks_path"] = str(attachment.parsed_chunks_path)
     if excerpt:
         payload["content_excerpt"] = excerpt
     if attachment.analysis_error:

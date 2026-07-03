@@ -133,6 +133,24 @@ class AttachmentService:
         parsed_markdown_relative_path = _normalize_optional_string(metadata.get("parsed_markdown_relative_path"))
         if parsed_markdown_relative_path:
             attachment.parsed_markdown_relative_path = parsed_markdown_relative_path
+        parsed_html_path = _normalize_optional_string(metadata.get("parsed_html_path"))
+        if parsed_html_path:
+            attachment.parsed_html_path = Path(parsed_html_path).expanduser()
+        parsed_html_relative_path = _normalize_optional_string(metadata.get("parsed_html_relative_path"))
+        if parsed_html_relative_path:
+            attachment.parsed_html_relative_path = parsed_html_relative_path
+        parsed_structure_path = _normalize_optional_string(metadata.get("parsed_structure_path"))
+        if parsed_structure_path:
+            attachment.parsed_structure_path = Path(parsed_structure_path).expanduser()
+        parsed_structure_relative_path = _normalize_optional_string(metadata.get("parsed_structure_relative_path"))
+        if parsed_structure_relative_path:
+            attachment.parsed_structure_relative_path = parsed_structure_relative_path
+        parsed_chunks_path = _normalize_optional_string(metadata.get("parsed_chunks_path"))
+        if parsed_chunks_path:
+            attachment.parsed_chunks_path = Path(parsed_chunks_path).expanduser()
+        parsed_chunks_relative_path = _normalize_optional_string(metadata.get("parsed_chunks_relative_path"))
+        if parsed_chunks_relative_path:
+            attachment.parsed_chunks_relative_path = parsed_chunks_relative_path
         return attachment
 
     def restore_many(self, metadata_items: list[dict[str, Any]]) -> list[SavedAttachment]:
@@ -228,6 +246,28 @@ class AttachmentService:
     def _apply_parsed_attachment(self, attachment: SavedAttachment, parsed: ParsedAttachment, outputs_dir: Path) -> None:
         markdown_path = outputs_dir / f"{attachment.attachment_id}.md"
         markdown_path.write_text(parsed.markdown, encoding="utf-8")
+        if parsed.html:
+            html_path = outputs_dir / f"{attachment.attachment_id}.html"
+            html_path.write_text(parsed.html, encoding="utf-8")
+            attachment.parsed_html_path = html_path
+            attachment.parsed_html_relative_path = self._relative_path(html_path)
+        if parsed.structure:
+            structure_path = outputs_dir / f"{attachment.attachment_id}.structure.json"
+            structure_path.write_text(json.dumps(parsed.structure, ensure_ascii=False, indent=2), encoding="utf-8")
+            attachment.parsed_structure_path = structure_path
+            attachment.parsed_structure_relative_path = self._relative_path(structure_path)
+        if parsed.chunks:
+            chunks_path = outputs_dir / f"{attachment.attachment_id}.chunks.json"
+            chunks_manifest = {
+                "schema_version": "v1",
+                "attachment_id": attachment.attachment_id,
+                "filename": attachment.filename,
+                "chunk_count": len(parsed.chunks),
+                "chunks": parsed.chunks,
+            }
+            chunks_path.write_text(json.dumps(chunks_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            attachment.parsed_chunks_path = chunks_path
+            attachment.parsed_chunks_relative_path = self._relative_path(chunks_path)
         attachment.summary = _build_summary(parsed.plain_text)
         attachment.analysis_status = "parsed"
         attachment.parsed_markdown_path = markdown_path
@@ -324,6 +364,9 @@ class AttachmentService:
                 "status": item.analysis_status,
                 "summary": item.summary,
                 "markdown_path": str(item.parsed_markdown_path) if item.parsed_markdown_path is not None else None,
+                "html_path": str(item.parsed_html_path) if item.parsed_html_path is not None else None,
+                "structure_path": str(item.parsed_structure_path) if item.parsed_structure_path is not None else None,
+                "chunks_path": str(item.parsed_chunks_path) if item.parsed_chunks_path is not None else None,
                 "warnings": list(item.warnings),
                 "analysis_error": item.analysis_error,
             }
