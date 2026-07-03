@@ -435,6 +435,20 @@ input {
   overscroll-behavior: contain;
 }
 
+.session-list-empty {
+  min-height: 190px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  color: rgba(109, 99, 87, 0.48);
+}
+
+.session-list-empty-icon {
+  width: 44px;
+  height: 44px;
+  filter: drop-shadow(0 10px 18px rgba(63, 54, 43, 0.08));
+}
+
 .session-list,
 .conversation-pane {
   scrollbar-width: thin;

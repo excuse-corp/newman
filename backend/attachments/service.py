@@ -14,8 +14,8 @@ from backend.attachments.parser import parse_attachment
 from backend.providers.base import ProviderError
 
 
-MAX_ATTACHMENTS_PER_TURN = 5
-MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+MAX_ATTACHMENTS_PER_TURN = 10
+MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 DOCUMENT_SUFFIXES = {".doc", ".docx", ".pdf"}
 SPREADSHEET_SUFFIXES = {".xls", ".xlsx"}
@@ -51,7 +51,7 @@ class AttachmentService:
             if not data:
                 raise ValueError(f"《{filename}》为空文件，无法上传")
             if len(data) > MAX_ATTACHMENT_BYTES:
-                raise ValueError(f"《{filename}》超过 20MB，无法上传")
+                raise ValueError(f"《{filename}》超过 200MB，无法上传")
             if suffix in IMAGE_SUFFIXES and upload.content_type and upload.content_type not in IMAGE_CONTENT_TYPES:
                 raise ValueError(f"《{filename}》图片格式不支持，仅支持 PNG、JPEG、WEBP")
             attachment_id = uuid4().hex
@@ -374,7 +374,7 @@ class AttachmentService:
 
     def _validate_upload_count(self, uploads: list[UploadFile]) -> None:
         if len(uploads) > MAX_ATTACHMENTS_PER_TURN:
-            raise ValueError("一次最多上传 5 个附件，请移除多余文件后重试")
+            raise ValueError("一次最多上传 10 个附件，请移除多余文件后重试")
 
     def _turn_dirs(self, session_id: str, turn_id: str) -> tuple[Path, Path]:
         base = self.workspace_root

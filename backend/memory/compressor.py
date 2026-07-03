@@ -54,6 +54,9 @@ class ContextUsageSnapshot:
     effective_context_window: int
     auto_compact_limit: int
     soft_compact_limit: int
+    assembled_prompt_tokens: int
+    assembled_pressure: float
+    assembled_budget_pressure: float
     projected_next_prompt_tokens: int
     projected_pressure: float
     budget_pressure: float
@@ -74,6 +77,9 @@ class ContextUsageSnapshot:
             "effective_context_window": self.effective_context_window,
             "auto_compact_limit": self.auto_compact_limit,
             "soft_compact_limit": self.soft_compact_limit,
+            "assembled_prompt_tokens": self.assembled_prompt_tokens,
+            "assembled_pressure": self.assembled_pressure,
+            "assembled_budget_pressure": self.assembled_budget_pressure,
             "confirmed_prompt_tokens": self.confirmed_prompt_tokens,
             "confirmed_pressure": self.confirmed_pressure,
             "confirmed_request_kind": self.confirmed_request_kind,
@@ -332,6 +338,8 @@ def build_context_usage_snapshot(
 ) -> ContextUsageSnapshot:
     budget = build_context_compaction_budget(model_config, runtime_config)
     assembled_estimate = provider.estimate_tokens(assembled_messages)
+    assembled_pressure = assembled_estimate / budget.effective_context_window if budget.effective_context_window else 0.0
+    assembled_budget_pressure = assembled_estimate / budget.auto_compact_limit if budget.auto_compact_limit else 0.0
     projection_source = "assembled_prompt_estimate"
     projected_next_prompt_tokens = assembled_estimate
     confirmed_prompt_tokens: int | None = None
@@ -383,6 +391,9 @@ def build_context_usage_snapshot(
         effective_context_window=budget.effective_context_window,
         auto_compact_limit=budget.auto_compact_limit,
         soft_compact_limit=budget.soft_compact_limit,
+        assembled_prompt_tokens=assembled_estimate,
+        assembled_pressure=assembled_pressure,
+        assembled_budget_pressure=assembled_budget_pressure,
         confirmed_prompt_tokens=confirmed_prompt_tokens,
         confirmed_pressure=confirmed_pressure,
         confirmed_request_kind=confirmed_request_kind,

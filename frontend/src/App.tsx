@@ -203,6 +203,9 @@ type SessionDetailResponse = {
     effective_context_window: number;
     auto_compact_limit: number;
     soft_compact_limit: number;
+    assembled_prompt_tokens?: number;
+    assembled_pressure?: number | null;
+    assembled_budget_pressure?: number | null;
     confirmed_prompt_tokens: number | null;
     confirmed_pressure: number | null;
     confirmed_request_kind: string | null;
@@ -601,6 +604,7 @@ type LiveAnswerQueueItem =
 
 const LIVE_ANSWER_MAX_CHARS_PER_FRAME = 28;
 const LIVE_STREAM_BROWSER_YIELD_EVERY_EVENTS = 4;
+const UNASSIGNED_COMPOSER_DRAFT_KEY = "__new_session__";
 
 type PendingFinalAnswer = {
   localId: string;
@@ -611,6 +615,24 @@ type PendingFinalAnswer = {
   awaitingUserInput: AwaitingUserInputPayload | null;
   assistantMessageId: string | null;
   createdAt: string | null;
+};
+
+type LiveAnswerStreamState = {
+  queue: LiveAnswerQueueItem[];
+  pendingFinal: PendingFinalAnswer | null;
+  frame: number | null;
+  drainPromise: Promise<void> | null;
+  drainResolver: (() => void) | null;
+};
+
+type LiveSessionEventStreamState = {
+  queue: SessionEventPayload[];
+  frame: number | null;
+};
+
+type ComposerDraft = {
+  value: string;
+  attachments: ComposerAttachment[];
 };
 
 type ComposerAttachment = ChatAttachment & {
@@ -811,8 +833,8 @@ const approvalModeMeta: Record<
   }
 };
 
-const MAX_COMPOSER_ATTACHMENTS = 5;
-const MAX_COMPOSER_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_COMPOSER_ATTACHMENTS = 10;
+const MAX_COMPOSER_ATTACHMENT_BYTES = 200 * 1024 * 1024;
 const COMPOSER_ATTACHMENT_ACCEPT =
   "image/png,image/jpeg,image/webp,.doc,.docx,.xls,.xlsx,.pdf,.ppt,.pptx,.md,.txt,.json,.html,.htm";
 const COMPOSER_ATTACHMENT_EXTENSIONS = new Set([
@@ -2131,6 +2153,28 @@ function ScheduledSessionIcon({ className }: { className?: string }) {
       <path d="M2.75 6.25h10.5" />
       <path d="M5.2 9.2h2.1" />
       <path d="M5.2 11.35h4.7" />
+    </svg>
+  );
+}
+
+function EmptySessionListIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 48 48"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M13.5 18.5h21l3.5 12.25a3 3 0 0 1-2.9 3.75H12.9a3 3 0 0 1-2.9-3.75L13.5 18.5Z" />
+      <path d="M16.75 18.5 19 12.75h10l2.25 5.75" />
+      <path d="M18 27.25h3.75l1.25 2.5h2l1.25-2.5H30" />
+      <path d="M17.5 38.25h13" opacity={0.45} />
+      <path d="M36 13.25h.01" />
+      <path d="M11.5 11.5h.01" />
     </svg>
   );
 }
@@ -5850,13 +5894,12 @@ function App({ onLogout }: AppProps) {
   const [awaitingInputDrafts, setAwaitingInputDrafts] = useState<Record<string, string>>({});
   const [sessionEvents, setSessionEvents] = useState<SessionEventPayload[]>([]);
   const [activeTurnUsageById, setActiveTurnUsageById] = useState<Record<string, TurnUsageSummary>>({});
-  const [liveSessionEvents, setLiveSessionEvents] = useState<SessionEventPayload[]>([]);
+  const [liveSessionEventsBySession, setLiveSessionEventsBySession] = useState<Record<string, SessionEventPayload[]>>({});
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
-  const [sendingMessage, setSendingMessage] = useState(false);
-  const [stoppingMessage, setStoppingMessage] = useState(false);
-  const [sendingSessionId, setSendingSessionId] = useState<string | null>(null);
-  const [liveTurn, setLiveTurn] = useState<LiveTurnState | null>(null);
+  const [runningSessionIds, setRunningSessionIds] = useState<string[]>([]);
+  const [stoppingSessionIds, setStoppingSessionIds] = useState<string[]>([]);
+  const [liveTurnsBySession, setLiveTurnsBySession] = useState<Record<string, LiveTurnState>>({});
   const [openSessionMenuId, setOpenSessionMenuId] = useState<string | null>(null);
   const [memoryFiles, setMemoryFiles] = useState<Record<MemoryKey, MemoryFile>>({
     memory: { path: "", content: "", updated_at: null },
@@ -5957,9 +6000,8 @@ function App({ onLogout }: AppProps) {
   const [approvalError, setApprovalError] = useState<string | null>(null);
   const [planModeUpdating, setPlanModeUpdating] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
-  const [composerValue, setComposerValue] = useState("");
+  const [composerDraftsBySession, setComposerDraftsBySession] = useState<Record<string, ComposerDraft>>({});
   const [pendingComposerMode, setPendingComposerMode] = useState<CollaborationModeName | null>(null);
-  const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [turnApprovalMode, setTurnApprovalMode] = useState<TurnApprovalMode>(() => {
     const stored = window.localStorage.getItem(TURN_APPROVAL_MODE_STORAGE_KEY);
     return isTurnApprovalMode(stored) ? stored : "manual";
@@ -5993,25 +6035,20 @@ function App({ onLogout }: AppProps) {
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const composerPlanTrayListRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
-  const sendingMessageRef = useRef(sendingMessage);
-  const stoppingMessageRef = useRef(stoppingMessage);
+  const runningSessionIdsRef = useRef<string[]>([]);
+  const stoppingSessionIdsRef = useRef<string[]>([]);
   const previousWorkspaceSidePanelOpenRef = useRef(false);
-  const activeMessageControllerRef = useRef<AbortController | null>(null);
+  const activeMessageControllersRef = useRef<Record<string, AbortController>>({});
   const shouldAutoScrollRef = useRef(true);
   const lastComposerPlanFocusRef = useRef<string | null>(null);
   const attachmentPreviewUrlsRef = useRef<string[]>([]);
   const liveAttachmentUrlsRef = useRef<string[]>([]);
-  const liveSessionEventQueueRef = useRef<SessionEventPayload[]>([]);
+  const liveSessionEventStreamsRef = useRef<Record<string, LiveSessionEventStreamState>>({});
   const environmentLocationRef = useRef<EnvironmentLocationContext | null>(environmentLocation);
   const environmentLocationRefreshRef = useRef<Promise<EnvironmentLocationContext | null> | null>(null);
   const environmentLocationPromptAttemptedRef = useRef(false);
-  const liveSessionEventFlushFrameRef = useRef<number | null>(null);
-  const liveAnswerQueueRef = useRef<LiveAnswerQueueItem[]>([]);
-  const liveAnswerFlushFrameRef = useRef<number | null>(null);
-  const pendingFinalAnswerRef = useRef<PendingFinalAnswer | null>(null);
+  const liveAnswerStreamsRef = useRef<Record<string, LiveAnswerStreamState>>({});
   const deferredHtmlPreviewRef = useRef<HtmlPreviewState | null>(null);
-  const liveAnswerDrainPromiseRef = useRef<Promise<void> | null>(null);
-  const liveAnswerDrainResolverRef = useRef<(() => void) | null>(null);
   const awaitingInputSelectionsRef = useRef<Record<string, AwaitingUserInputSelection>>({});
   const loadChatSessionsRef = useRef<typeof loadChatSessions | null>(null);
   const loadChatWorkspaceRef = useRef<typeof loadChatWorkspace | null>(null);
@@ -6023,22 +6060,139 @@ function App({ onLogout }: AppProps) {
   const channelWorkspaceRefreshQueuedSessionIdRef = useRef<string | null>(null);
   const channelWorkspaceRefreshInFlightRef = useRef(false);
 
-  const resolveLiveAnswerDrain = () => {
-    const resolver = liveAnswerDrainResolverRef.current;
-    liveAnswerDrainResolverRef.current = null;
-    liveAnswerDrainPromiseRef.current = null;
+  const composerDraftKey = activeSessionId || UNASSIGNED_COMPOSER_DRAFT_KEY;
+  const activeComposerDraft = composerDraftsBySession[composerDraftKey] ?? { value: "", attachments: [] };
+  const composerValue = activeComposerDraft.value;
+  const composerAttachments = activeComposerDraft.attachments;
+  const sendingMessage = runningSessionIds.length > 0;
+  const stoppingMessage = stoppingSessionIds.length > 0;
+
+  const setSessionRunning = (sessionId: string, running: boolean) => {
+    setRunningSessionIds((current) => {
+      const exists = current.includes(sessionId);
+      if (running) {
+        return exists ? current : [...current, sessionId];
+      }
+      return current.filter((item) => item !== sessionId);
+    });
+  };
+
+  const setSessionStopping = (sessionId: string, stopping: boolean) => {
+    setStoppingSessionIds((current) => {
+      const exists = current.includes(sessionId);
+      if (stopping) {
+        return exists ? current : [...current, sessionId];
+      }
+      return current.filter((item) => item !== sessionId);
+    });
+  };
+
+  const setComposerValue = (valueOrUpdater: string | ((currentValue: string) => string)) => {
+    const key = activeSessionIdRef.current || UNASSIGNED_COMPOSER_DRAFT_KEY;
+    setComposerDraftsBySession((current) => {
+      const draft = current[key] ?? { value: "", attachments: [] };
+      const nextValue = typeof valueOrUpdater === "function" ? valueOrUpdater(draft.value) : valueOrUpdater;
+      return {
+        ...current,
+        [key]: {
+          ...draft,
+          value: nextValue
+        }
+      };
+    });
+  };
+
+  const setComposerAttachmentsForActiveSession = (
+    updater: ComposerAttachment[] | ((currentAttachments: ComposerAttachment[]) => ComposerAttachment[])
+  ) => {
+    const key = activeSessionIdRef.current || UNASSIGNED_COMPOSER_DRAFT_KEY;
+    setComposerDraftsBySession((current) => {
+      const draft = current[key] ?? { value: "", attachments: [] };
+      const nextAttachments = typeof updater === "function" ? updater(draft.attachments) : updater;
+      return {
+        ...current,
+        [key]: {
+          ...draft,
+          attachments: nextAttachments
+        }
+      };
+    });
+  };
+
+  const clearComposerDraftForSession = (sessionId: string) => {
+    setComposerDraftsBySession((current) => {
+      if (!current[sessionId]) {
+        return current;
+      }
+      const { [sessionId]: _removed, ...remaining } = current;
+      return remaining;
+    });
+  };
+
+  const getLiveSessionEventStream = (sessionId: string): LiveSessionEventStreamState => {
+    const existing = liveSessionEventStreamsRef.current[sessionId];
+    if (existing) {
+      return existing;
+    }
+    const next = { queue: [], frame: null };
+    liveSessionEventStreamsRef.current[sessionId] = next;
+    return next;
+  };
+
+  const getLiveAnswerStream = (sessionId: string): LiveAnswerStreamState => {
+    const existing = liveAnswerStreamsRef.current[sessionId];
+    if (existing) {
+      return existing;
+    }
+    const next: LiveAnswerStreamState = {
+      queue: [],
+      pendingFinal: null,
+      frame: null,
+      drainPromise: null,
+      drainResolver: null
+    };
+    liveAnswerStreamsRef.current[sessionId] = next;
+    return next;
+  };
+
+  const updateLiveTurnForSession = (sessionId: string, updater: (currentTurn: LiveTurnState | null) => LiveTurnState | null) => {
+    setLiveTurnsBySession((current) => {
+      const nextTurn = updater(current[sessionId] ?? null);
+      if (nextTurn === current[sessionId]) {
+        return current;
+      }
+      if (!nextTurn) {
+        if (!current[sessionId]) {
+          return current;
+        }
+        const { [sessionId]: _removed, ...remaining } = current;
+        return remaining;
+      }
+      return {
+        ...current,
+        [sessionId]: nextTurn
+      };
+    });
+  };
+
+  const resolveLiveAnswerDrain = (sessionId: string) => {
+    const stream = getLiveAnswerStream(sessionId);
+    const resolver = stream.drainResolver;
+    stream.drainResolver = null;
+    stream.drainPromise = null;
     if (resolver) {
       resolver();
     }
   };
 
-  const ensureLiveAnswerDrainPromise = () => {
-    if (!liveAnswerDrainPromiseRef.current) {
-      liveAnswerDrainPromiseRef.current = new Promise<void>((resolve) => {
-        liveAnswerDrainResolverRef.current = resolve;
+  const ensureLiveAnswerDrainPromise = (sessionId: string) => {
+    const stream = getLiveAnswerStream(sessionId);
+    if (!stream.drainPromise) {
+      stream.drainPromise = new Promise<void>((resolve) => {
+        stream.drainResolver = resolve;
       });
     }
-    return liveAnswerDrainPromiseRef.current;
+    return stream.drainPromise;
   };
 
   const matchesWriteFileHtmlPreview = (
@@ -6085,14 +6239,23 @@ function App({ onLogout }: AppProps) {
     setHtmlPreviewView(pendingPreview.initialView ?? "preview");
   };
 
-  const resetLiveAnswerStreaming = () => {
-    if (liveAnswerFlushFrameRef.current !== null) {
-      window.cancelAnimationFrame(liveAnswerFlushFrameRef.current);
-      liveAnswerFlushFrameRef.current = null;
+  const resetLiveAnswerStreaming = (sessionId?: string) => {
+    const resetStream = (key: string, stream: LiveAnswerStreamState) => {
+      if (stream.frame !== null) {
+        window.cancelAnimationFrame(stream.frame);
+        stream.frame = null;
+      }
+      stream.queue = [];
+      stream.pendingFinal = null;
+      resolveLiveAnswerDrain(key);
+    };
+
+    if (sessionId) {
+      resetStream(sessionId, getLiveAnswerStream(sessionId));
+      return;
     }
-    liveAnswerQueueRef.current = [];
-    pendingFinalAnswerRef.current = null;
-    resolveLiveAnswerDrain();
+
+    Object.entries(liveAnswerStreamsRef.current).forEach(([key, stream]) => resetStream(key, stream));
   };
 
   const refreshEnvironmentLocation = async ({
@@ -6246,48 +6409,63 @@ function App({ onLogout }: AppProps) {
     awaitingInputSelectionsRef.current = awaitingInputSelections;
   }, [awaitingInputSelections]);
 
-  const flushLiveSessionEventQueue = () => {
-    liveSessionEventFlushFrameRef.current = null;
-    const queuedEvents = liveSessionEventQueueRef.current;
+  const flushLiveSessionEventQueue = (sessionId: string) => {
+    const stream = getLiveSessionEventStream(sessionId);
+    stream.frame = null;
+    const queuedEvents = stream.queue;
     if (queuedEvents.length === 0) {
       return;
     }
-    liveSessionEventQueueRef.current = [];
-    setLiveSessionEvents((currentEvents) => coalesceLiveSessionEvents([...currentEvents, ...queuedEvents]));
+    stream.queue = [];
+    setLiveSessionEventsBySession((current) => ({
+      ...current,
+      [sessionId]: coalesceLiveSessionEvents([...(current[sessionId] ?? []), ...queuedEvents])
+    }));
   };
 
-  const scheduleLiveSessionEventFlush = () => {
-    if (liveSessionEventFlushFrameRef.current !== null) {
+  const scheduleLiveSessionEventFlush = (sessionId: string) => {
+    const stream = getLiveSessionEventStream(sessionId);
+    if (stream.frame !== null) {
       return;
     }
-    liveSessionEventFlushFrameRef.current = window.requestAnimationFrame(() => {
-      flushLiveSessionEventQueue();
+    stream.frame = window.requestAnimationFrame(() => {
+      flushLiveSessionEventQueue(sessionId);
     });
   };
 
-  const enqueueLiveSessionEvent = (payload: SessionEventPayload) => {
-    liveSessionEventQueueRef.current.push(payload);
-    scheduleLiveSessionEventFlush();
+  const enqueueLiveSessionEvent = (sessionId: string, payload: SessionEventPayload) => {
+    getLiveSessionEventStream(sessionId).queue.push(payload);
+    scheduleLiveSessionEventFlush(sessionId);
   };
 
-  const resetLiveSessionEventQueue = () => {
-    if (liveSessionEventFlushFrameRef.current !== null) {
-      window.cancelAnimationFrame(liveSessionEventFlushFrameRef.current);
-      liveSessionEventFlushFrameRef.current = null;
+  const resetLiveSessionEventQueue = (sessionId?: string) => {
+    const resetStream = (stream: LiveSessionEventStreamState) => {
+      if (stream.frame !== null) {
+        window.cancelAnimationFrame(stream.frame);
+        stream.frame = null;
+      }
+      stream.queue = [];
+    };
+
+    if (sessionId) {
+      resetStream(getLiveSessionEventStream(sessionId));
+      return;
     }
-    liveSessionEventQueueRef.current = [];
+
+    Object.values(liveSessionEventStreamsRef.current).forEach(resetStream);
   };
 
-  const maybeFinalizeLiveAnswer = (targetLocalId: string) => {
-    const pendingFinal = pendingFinalAnswerRef.current;
+  const maybeFinalizeLiveAnswer = (sessionId: string, targetLocalId: string) => {
+    const stream = getLiveAnswerStream(sessionId);
+    const pendingFinal = stream.pendingFinal;
     if (!pendingFinal || pendingFinal.localId !== targetLocalId) {
-      if (liveAnswerQueueRef.current.length === 0) {
-        resolveLiveAnswerDrain();
+      if (stream.queue.length === 0) {
+        resolveLiveAnswerDrain(sessionId);
       }
       return;
     }
-    pendingFinalAnswerRef.current = null;
-    setLiveTurn((currentTurn) => {
+    stream.pendingFinal = null;
+    updateLiveTurnForSession(sessionId, (currentTurn) => {
       if (!currentTurn || currentTurn.localId !== targetLocalId) {
         return currentTurn;
       }
@@ -6307,20 +6485,21 @@ function App({ onLogout }: AppProps) {
         }
       };
     });
-    resolveLiveAnswerDrain();
+    resolveLiveAnswerDrain(sessionId);
   };
 
-  const scheduleLiveAnswerFlush = (targetLocalId: string) => {
-    if (liveAnswerFlushFrameRef.current !== null) {
+  const scheduleLiveAnswerFlush = (sessionId: string, targetLocalId: string) => {
+    const stream = getLiveAnswerStream(sessionId);
+    if (stream.frame !== null) {
       return;
     }
-    ensureLiveAnswerDrainPromise();
-    liveAnswerFlushFrameRef.current = window.requestAnimationFrame(() => {
-      liveAnswerFlushFrameRef.current = null;
+    ensureLiveAnswerDrainPromise(sessionId);
+    stream.frame = window.requestAnimationFrame(() => {
+      stream.frame = null;
 
-      const queue = liveAnswerQueueRef.current;
+      const queue = stream.queue;
       if (queue.length === 0) {
-        maybeFinalizeLiveAnswer(targetLocalId);
+        maybeFinalizeLiveAnswer(sessionId, targetLocalId);
         return;
       }
 
@@ -6357,7 +6536,7 @@ function App({ onLogout }: AppProps) {
       }
 
       if (consumed > 0) {
-        setLiveTurn((currentTurn) => {
+        updateLiveTurnForSession(sessionId, (currentTurn) => {
           if (!currentTurn || currentTurn.localId !== targetLocalId) {
             return currentTurn;
           }
@@ -6376,38 +6555,39 @@ function App({ onLogout }: AppProps) {
       }
 
       if (queue.length > 0) {
-        scheduleLiveAnswerFlush(targetLocalId);
+        scheduleLiveAnswerFlush(sessionId, targetLocalId);
         return;
       }
-      maybeFinalizeLiveAnswer(targetLocalId);
+      maybeFinalizeLiveAnswer(sessionId, targetLocalId);
     });
   };
 
-  const enqueueLiveAnswerEvent = (targetLocalId: string, payload: SessionEventPayload) => {
+  const enqueueLiveAnswerEvent = (sessionId: string, targetLocalId: string, payload: SessionEventPayload) => {
+    const stream = getLiveAnswerStream(sessionId);
     if (payload.event === "assistant_delta") {
       if (payload.data.reset === true) {
-        liveAnswerQueueRef.current.push({
+        stream.queue.push({
           kind: "reset"
         });
       } else if (typeof payload.data.delta === "string" && payload.data.delta) {
         splitLiveAnswerDelta(payload.data.delta).forEach((delta) => {
-          liveAnswerQueueRef.current.push({
+          stream.queue.push({
             kind: "delta",
             delta
           });
         });
       } else if (typeof payload.data.content === "string") {
-        liveAnswerQueueRef.current.push({
+        stream.queue.push({
           kind: "snapshot",
           content: payload.data.content
         });
       }
-      scheduleLiveAnswerFlush(targetLocalId);
+      scheduleLiveAnswerFlush(sessionId, targetLocalId);
       return;
     }
 
     if (payload.event === "final_response") {
-      pendingFinalAnswerRef.current = {
+      stream.pendingFinal = {
         localId: targetLocalId,
         content: typeof payload.data.content === "string" ? payload.data.content : "",
         attachments: parseMessageAttachments(payload.data.attachments),
@@ -6417,10 +6597,10 @@ function App({ onLogout }: AppProps) {
         assistantMessageId: typeof payload.data.message_id === "string" ? payload.data.message_id : null,
         createdAt: typeof payload.data.created_at === "string" ? payload.data.created_at : null
       };
-      if (liveAnswerQueueRef.current.length === 0) {
-        maybeFinalizeLiveAnswer(targetLocalId);
+      if (stream.queue.length === 0) {
+        maybeFinalizeLiveAnswer(sessionId, targetLocalId);
       } else {
-        ensureLiveAnswerDrainPromise();
+        ensureLiveAnswerDrainPromise(sessionId);
       }
     }
   };
@@ -6550,7 +6730,7 @@ function App({ onLogout }: AppProps) {
       channelWorkspaceRefreshQueuedSessionIdRef.current = null;
       return;
     }
-    if (sendingMessageRef.current || stoppingMessageRef.current) {
+    if (runningSessionIdsRef.current.includes(sessionId) || stoppingSessionIdsRef.current.includes(sessionId)) {
       scheduleChannelWorkspaceRefresh(sessionId, 500);
       return;
     }
@@ -6580,14 +6760,15 @@ function App({ onLogout }: AppProps) {
     }, delayMs);
   };
 
-  const waitForLiveAnswerDrain = async (targetLocalId: string) => {
-    if (liveAnswerQueueRef.current.length === 0) {
-      maybeFinalizeLiveAnswer(targetLocalId);
+  const waitForLiveAnswerDrain = async (sessionId: string, targetLocalId: string) => {
+    const stream = getLiveAnswerStream(sessionId);
+    if (stream.queue.length === 0) {
+      maybeFinalizeLiveAnswer(sessionId, targetLocalId);
     }
-    if (liveAnswerQueueRef.current.length === 0 && !pendingFinalAnswerRef.current) {
+    if (stream.queue.length === 0 && !stream.pendingFinal) {
       return;
     }
-    await ensureLiveAnswerDrainPromise();
+    await ensureLiveAnswerDrainPromise(sessionId);
   };
 
   useEffect(() => {
@@ -6595,12 +6776,12 @@ function App({ onLogout }: AppProps) {
   }, [activeSessionId]);
 
   useEffect(() => {
-    sendingMessageRef.current = sendingMessage;
-  }, [sendingMessage]);
+    runningSessionIdsRef.current = runningSessionIds;
+  }, [runningSessionIds]);
 
   useEffect(() => {
-    stoppingMessageRef.current = stoppingMessage;
-  }, [stoppingMessage]);
+    stoppingSessionIdsRef.current = stoppingSessionIds;
+  }, [stoppingSessionIds]);
 
   useEffect(() => {
     loadChatSessionsRef.current = loadChatSessions;
@@ -6708,18 +6889,18 @@ function App({ onLogout }: AppProps) {
 
   useEffect(() => {
     return () => {
-      activeMessageControllerRef.current?.abort();
-      activeMessageControllerRef.current = null;
+      Object.values(activeMessageControllersRef.current).forEach((controller) => controller.abort());
+      activeMessageControllersRef.current = {};
       resetLiveAnswerStreaming();
       resetLiveSessionEventQueue();
     };
   }, []);
 
   useEffect(() => {
-    const nextLiveUrls =
-      liveTurn?.userMessage.attachments
-        .map((attachment) => attachment.previewUrl)
-        .filter((url): url is string => typeof url === "string" && url.startsWith("blob:")) ?? [];
+    const nextLiveUrls = Object.values(liveTurnsBySession)
+      .flatMap((turn) => turn.userMessage.attachments)
+      .map((attachment) => attachment.previewUrl)
+      .filter((url): url is string => typeof url === "string" && url.startsWith("blob:"));
 
     liveAttachmentUrlsRef.current
       .filter((url) => !nextLiveUrls.includes(url))
@@ -6729,7 +6910,7 @@ function App({ onLogout }: AppProps) {
       });
 
     liveAttachmentUrlsRef.current = nextLiveUrls;
-  }, [liveTurn]);
+  }, [liveTurnsBySession]);
 
   useEffect(() => {
     const onResize = () => setViewportWidth(window.innerWidth);
@@ -7314,10 +7495,15 @@ function App({ onLogout }: AppProps) {
     let inFlight = false;
 
     const refreshWorkspace = async () => {
-      if (cancelled || inFlight || document.visibilityState === "hidden" || sendingMessage || stoppingMessage) {
+      const sessionId = activeSessionIdRef.current;
+      if (
+        cancelled ||
+        inFlight ||
+        document.visibilityState === "hidden" ||
+        (sessionId && (runningSessionIdsRef.current.includes(sessionId) || stoppingSessionIdsRef.current.includes(sessionId)))
+      ) {
         return;
       }
-      const sessionId = activeSessionIdRef.current;
       if (!sessionId) {
         return;
       }
@@ -7346,7 +7532,7 @@ function App({ onLogout }: AppProps) {
       }
       window.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [activeSessionId, apiBase, sendingMessage, stoppingMessage]);
+  }, [activeSessionId, apiBase]);
 
   useEffect(() => {
     const source = new EventSource(`${apiBase}/api/channels/events/stream`, { withCredentials: true });
@@ -7949,8 +8135,8 @@ ${markup}
       }) as CSSProperties,
     [effectiveMultiagentDrawerWidth]
   );
-  const activeLiveTurn = liveTurn?.sessionId === activeSessionId ? liveTurn : null;
-  const activeLiveSessionEvents = activeLiveTurn ? liveSessionEvents : [];
+  const activeLiveTurn = activeSessionId ? liveTurnsBySession[activeSessionId] ?? null : null;
+  const activeLiveSessionEvents = activeLiveTurn ? liveSessionEventsBySession[activeSessionId] ?? [] : [];
   const liveTurnLocalId = activeLiveTurn?.localId ?? null;
   const liveTurnRequestId = activeLiveTurn?.requestId ?? null;
   const liveTurnServerTurnId = activeLiveTurn?.serverTurnId ?? null;
@@ -7982,10 +8168,13 @@ ${markup}
     if (!persistedMatch || (persistedMatch.status !== "completed" && persistedMatch.status !== "failed")) {
       return;
     }
-    resetLiveAnswerStreaming();
-    resetLiveSessionEventQueue();
-    setLiveSessionEvents((currentEvents) => currentEvents.filter((event) => !matchLiveTurnEvent(event, activeLiveTurn)));
-    setLiveTurn((currentTurn) =>
+    resetLiveAnswerStreaming(activeLiveTurn.sessionId);
+    resetLiveSessionEventQueue(activeLiveTurn.sessionId);
+    setLiveSessionEventsBySession((current) => ({
+      ...current,
+      [activeLiveTurn.sessionId]: (current[activeLiveTurn.sessionId] ?? []).filter((event) => !matchLiveTurnEvent(event, activeLiveTurn))
+    }));
+    updateLiveTurnForSession(activeLiveTurn.sessionId, (currentTurn) =>
       currentTurn && turnMatchesLiveTurn(persistedMatch, currentTurn) ? null : currentTurn
     );
   }, [activeLiveTurn, persistedTurns]);
@@ -8049,18 +8238,18 @@ ${markup}
             (task) => isMultiagentTaskActive(task.status) || isMultiagentTaskStopping(task)
           ))
     );
-  const isSendingInActiveSession = Boolean(activeSessionId) && sendingMessage && sendingSessionId === activeSessionId;
-  const isSendingInOtherSession = sendingMessage && Boolean(sendingSessionId) && sendingSessionId !== activeSessionId;
-  const isStoppingInActiveSession = Boolean(activeSessionId) && stoppingMessage && sendingSessionId === activeSessionId;
+  const isSendingInActiveSession = Boolean(activeSessionId) && runningSessionIds.includes(activeSessionId);
+  const isStoppingInActiveSession = Boolean(activeSessionId) && stoppingSessionIds.includes(activeSessionId);
   const isOptimisticEmptySession = optimisticEmptySessionId === activeSessionId;
   const showEmptyChatState =
     activePage === "chat" &&
     (!chatLoading || isOptimisticEmptySession) &&
     displayTurns.length === 0;
   const contextPressure =
-    activeContextUsage?.budget_pressure ??
+    activeContextUsage?.assembled_budget_pressure ??
     (activeContextUsage && activeContextUsage.auto_compact_limit > 0
-      ? activeContextUsage.projected_next_prompt_tokens / activeContextUsage.auto_compact_limit
+      ? (activeContextUsage.assembled_prompt_tokens ?? activeContextUsage.projected_next_prompt_tokens) /
+        activeContextUsage.auto_compact_limit
       : null);
   const contextProgress = contextPressure === null ? null : Math.min(Math.max(contextPressure, 0), 1);
   const contextPercent = contextPressure === null ? null : Math.max(0, Math.round(contextPressure * 100));
@@ -8092,10 +8281,15 @@ ${markup}
     !activeContextUsage
       ? "当前还没有上下文使用量数据"
       : [
-          `Context 预算使用率 ${contextPercentLabel}`,
-          `预计下一轮：${formatTokenCount(activeContextUsage.projected_next_prompt_tokens)} / ${formatTokenCount(
+          `当前可见上下文 ${contextPercentLabel}`,
+          `可见上下文：${formatTokenCount(
+            activeContextUsage.assembled_prompt_tokens ?? activeContextUsage.projected_next_prompt_tokens
+          )} / ${formatTokenCount(
             activeContextUsage.auto_compact_limit
           )} tokens`,
+          `运行时预算压力：${formatTokenCount(activeContextUsage.projected_next_prompt_tokens)} / ${formatTokenCount(
+            activeContextUsage.auto_compact_limit
+          )} tokens（${activeContextUsage.projection_source}）`,
           `已确认：${formatTokenCount(activeContextUsage.confirmed_prompt_tokens)} / ${formatTokenCount(
             activeContextUsage.effective_context_window
           )} tokens`,
@@ -8180,8 +8374,8 @@ ${markup}
   const showComposerSlashMenu =
     composerFocused &&
     slashCommandQuery !== null &&
-    !sendingMessage &&
-    !stoppingMessage &&
+    !isSendingInActiveSession &&
+    !isStoppingInActiveSession &&
     !planModeUpdating &&
     availableSlashCommands.length > 0;
   const hasMemoryChanges =
@@ -8414,7 +8608,7 @@ ${markup}
 
     setChatError(null);
     if (composerAttachments.length + files.length > MAX_COMPOSER_ATTACHMENTS) {
-      setChatError("一次最多上传 5 个附件，请移除多余文件后重试");
+      setChatError("一次最多上传 10 个附件，请移除多余文件后重试");
       return;
     }
 
@@ -8431,7 +8625,7 @@ ${markup}
         return;
       }
       if (file.size > MAX_COMPOSER_ATTACHMENT_BYTES) {
-        nextError ??= `《${file.name}》超过 20MB，无法上传`;
+        nextError ??= `《${file.name}》超过 200MB，无法上传`;
         return;
       }
       const previewUrl = isImageAttachmentExtension(extension) ? URL.createObjectURL(file) : null;
@@ -8455,7 +8649,7 @@ ${markup}
       });
     });
     if (additions.length > 0) {
-      setComposerAttachments((current) => [...current, ...additions]);
+      setComposerAttachmentsForActiveSession((current) => [...current, ...additions]);
     }
     if (nextError) {
       setChatError(nextError);
@@ -8469,7 +8663,7 @@ ${markup}
   };
 
   const handleComposerPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
-    if (sendingMessage || stoppingMessage || planModeUpdating) {
+    if (isSendingInActiveSession || isStoppingInActiveSession || planModeUpdating) {
       return;
     }
 
@@ -8550,7 +8744,7 @@ ${markup}
   };
 
   const removeComposerAttachment = (attachmentId: string) => {
-    setComposerAttachments((current) => {
+    setComposerAttachmentsForActiveSession((current) => {
       const target = current.find((attachment) => attachment.id === attachmentId);
       if (target?.previewUrl) {
         URL.revokeObjectURL(target.previewUrl);
@@ -8561,20 +8755,16 @@ ${markup}
   };
 
   const stopActiveComposerRun = async () => {
-    if (stoppingMessage) {
+    const sessionId = activeSessionId;
+    if (!sessionId || stoppingSessionIds.includes(sessionId)) {
       return;
     }
-    const controller = activeMessageControllerRef.current;
+    const controller = activeMessageControllersRef.current[sessionId];
     if (!controller) {
       return;
     }
 
-    const sessionId = sendingSessionId;
-    if (!sessionId) {
-      return;
-    }
-
-    setStoppingMessage(true);
+    setSessionStopping(sessionId, true);
     setPendingApproval(null);
     setApprovalError(null);
     setChatError(null);
@@ -8583,11 +8773,12 @@ ${markup}
       const data = await fetchJson<InterruptTurnResponse>(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/interrupt`, {
         method: "POST"
       });
-      activeMessageControllerRef.current = null;
+      delete activeMessageControllersRef.current[sessionId];
       controller.abort();
-      resetLiveSessionEventQueue();
-      setLiveSessionEvents((currentEvents) => {
+      resetLiveSessionEventQueue(sessionId);
+      setLiveSessionEventsBySession((current) => {
         const interruptedTurnId = data.turn_id ?? null;
+        const currentEvents = current[sessionId] ?? [];
         const nextEvents = currentEvents.filter((event) => {
           if (event.event !== "stream_completed") {
             return true;
@@ -8598,7 +8789,10 @@ ${markup}
           return false;
         });
         if (!data.interrupted) {
-          return nextEvents;
+          return {
+            ...current,
+            [sessionId]: nextEvents
+          };
         }
         const interruptedEvent: SessionEventPayload = {
           event: "turn_interrupted",
@@ -8611,9 +8805,12 @@ ${markup}
             : {}),
           ts: Date.now()
         };
-        return coalesceLiveSessionEvents([...nextEvents, interruptedEvent]);
+        return {
+          ...current,
+          [sessionId]: coalesceLiveSessionEvents([...nextEvents, interruptedEvent])
+        };
       });
-      setLiveTurn((currentTurn) =>
+      updateLiveTurnForSession(sessionId, (currentTurn) =>
         currentTurn
           ? {
               ...currentTurn,
@@ -8630,13 +8827,17 @@ ${markup}
       );
       await loadChatSessions(undefined, sessionId);
       await loadChatWorkspace(sessionId, undefined, { silent: true });
-      setLiveTurn(null);
-      resetLiveSessionEventQueue();
-      setLiveSessionEvents([]);
+      updateLiveTurnForSession(sessionId, () => null);
+      resetLiveSessionEventQueue(sessionId);
+      setLiveSessionEventsBySession((current) => {
+        const { [sessionId]: _removed, ...remaining } = current;
+        return remaining;
+      });
     } catch (error) {
       setChatError(error instanceof Error ? error.message : "停止当前任务失败");
     } finally {
-      setStoppingMessage(false);
+      setSessionStopping(sessionId, false);
+      setSessionRunning(sessionId, false);
     }
   };
 
@@ -8645,22 +8846,22 @@ ${markup}
     const submittedAttachments = submission?.attachments ?? composerAttachments;
     const shouldClearComposer = submission?.clearComposer ?? !submission;
     const trimmed = submittedContent.trim();
-    if ((!trimmed && submittedAttachments.length === 0) || sendingMessage) return;
+    const initialSessionId = activeSessionId || null;
+    if ((!trimmed && submittedAttachments.length === 0) || (initialSessionId && runningSessionIds.includes(initialSessionId))) return;
     const awaitedRequestAtSubmit = activeAwaitingUserInput?.requestId ?? null;
     const desiredCollaborationMode = pendingComposerMode ?? currentCollaborationMode;
 
     setChatError(null);
-    setSendingMessage(true);
-    setSendingSessionId(null);
     const controller = new AbortController();
-    activeMessageControllerRef.current = controller;
+    let streamingSessionId: string | null = null;
 
     const finishStreamingState = () => {
-      if (activeMessageControllerRef.current === controller) {
-        activeMessageControllerRef.current = null;
+      if (streamingSessionId && activeMessageControllersRef.current[streamingSessionId] === controller) {
+        delete activeMessageControllersRef.current[streamingSessionId];
       }
-      setSendingMessage(false);
-      setSendingSessionId(null);
+      if (streamingSessionId) {
+        setSessionRunning(streamingSessionId, false);
+      }
     };
 
     try {
@@ -8668,7 +8869,12 @@ ${markup}
       if (controller.signal.aborted) {
         return;
       }
-      setSendingSessionId(sessionId);
+      streamingSessionId = sessionId;
+      if (runningSessionIdsRef.current.includes(sessionId)) {
+        return;
+      }
+      activeMessageControllersRef.current[sessionId] = controller;
+      setSessionRunning(sessionId, true);
 
       if (desiredCollaborationMode !== currentCollaborationMode) {
         const synced = await updateSessionCollaborationMode(desiredCollaborationMode, {
@@ -8684,9 +8890,9 @@ ${markup}
       const createdAt = new Date().toISOString();
       const liveTurnLocalId = `live-turn-${Date.now()}`;
       const attachmentSnapshot = submittedAttachments.map(({ file: _file, ...attachment }) => attachment);
-      resetLiveAnswerStreaming();
+      resetLiveAnswerStreaming(sessionId);
       resetDeferredHtmlPreview();
-      setLiveTurn({
+      updateLiveTurnForSession(sessionId, () => ({
         sessionId,
         localId: liveTurnLocalId,
         requestId: null,
@@ -8713,7 +8919,7 @@ ${markup}
           errorMessage: null
         },
         status: "running"
-      });
+      }));
 
       setChatSessions((currentSessions) =>
         currentSessions.map((session) =>
@@ -8728,11 +8934,16 @@ ${markup}
         )
       );
       if (shouldClearComposer) {
-        setComposerValue("");
-        setComposerAttachments([]);
+        clearComposerDraftForSession(sessionId);
+        if (!initialSessionId) {
+          clearComposerDraftForSession(UNASSIGNED_COMPOSER_DRAFT_KEY);
+        }
       }
-      resetLiveSessionEventQueue();
-      setLiveSessionEvents([]);
+      resetLiveSessionEventQueue(sessionId);
+      setLiveSessionEventsBySession((current) => {
+        const { [sessionId]: _removed, ...remaining } = current;
+        return remaining;
+      });
       switchPage("chat");
       const environmentContext = buildEnvironmentContext(environmentLocationRef.current);
       void refreshEnvironmentLocation({ allowPrompt: true });
@@ -8776,7 +8987,7 @@ ${markup}
       }
 
       const requestId = response.headers.get("x-request-id");
-      setLiveTurn((currentTurn) =>
+      updateLiveTurnForSession(sessionId, (currentTurn) =>
         currentTurn && currentTurn.localId === liveTurnLocalId
           ? {
               ...currentTurn,
@@ -8789,13 +9000,13 @@ ${markup}
         const isViewingStreamSession = activeSessionIdRef.current === sessionId;
         const payloadTurnId = readTurnId(payload.data);
         if (shouldPersistLiveSessionEvent(payload)) {
-          enqueueLiveSessionEvent(payload);
+          enqueueLiveSessionEvent(sessionId, payload);
         }
         if (payload.event === "assistant_delta" || payload.event === "final_response") {
-          enqueueLiveAnswerEvent(liveTurnLocalId, payload);
+          enqueueLiveAnswerEvent(sessionId, liveTurnLocalId, payload);
         }
         if (payload.event === "error") {
-          resetLiveAnswerStreaming();
+          resetLiveAnswerStreaming(sessionId);
         }
         if (isViewingStreamSession) {
           applyHtmlPreviewStreamEvent(payload);
@@ -8876,7 +9087,7 @@ ${markup}
             }
           }
         }
-        setLiveTurn((currentTurn) => {
+        updateLiveTurnForSession(sessionId, (currentTurn) => {
           if (!currentTurn || currentTurn.localId !== liveTurnLocalId) {
             return currentTurn;
           }
@@ -8945,8 +9156,8 @@ ${markup}
           return nextTurn;
         });
       });
-      flushLiveSessionEventQueue();
-      await waitForLiveAnswerDrain(liveTurnLocalId);
+      flushLiveSessionEventQueue(sessionId);
+      await waitForLiveAnswerDrain(sessionId, liveTurnLocalId);
       finishStreamingState();
 
       await loadChatSessions(undefined, sessionId);
@@ -8968,9 +9179,12 @@ ${markup}
         });
       }
       if (refreshed && activeSessionIdRef.current === sessionId) {
-        resetLiveSessionEventQueue();
-        setLiveSessionEvents([]);
-        setLiveTurn((currentTurn) => (currentTurn && currentTurn.localId === liveTurnLocalId ? null : currentTurn));
+        resetLiveSessionEventQueue(sessionId);
+        setLiveSessionEventsBySession((current) => {
+          const { [sessionId]: _removed, ...remaining } = current;
+          return remaining;
+        });
+        updateLiveTurnForSession(sessionId, (currentTurn) => (currentTurn && currentTurn.localId === liveTurnLocalId ? null : currentTurn));
       }
       if (activeSessionIdRef.current === sessionId) {
         window.requestAnimationFrame(() => {
@@ -8981,20 +9195,26 @@ ${markup}
       } else {
         resetDeferredHtmlPreview();
       }
-      resetLiveAnswerStreaming();
+      resetLiveAnswerStreaming(sessionId);
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) {
         resetDeferredHtmlPreview();
-        resetLiveAnswerStreaming();
-        resetLiveSessionEventQueue();
+        if (streamingSessionId) {
+          resetLiveAnswerStreaming(streamingSessionId);
+          resetLiveSessionEventQueue(streamingSessionId);
+        }
         return;
       }
       const message = error instanceof Error ? error.message : "发送消息失败";
       setChatError(message);
       resetDeferredHtmlPreview();
-      resetLiveAnswerStreaming();
-      resetLiveSessionEventQueue();
-      setLiveTurn((currentTurn) =>
+      if (streamingSessionId) {
+        resetLiveAnswerStreaming(streamingSessionId);
+        resetLiveSessionEventQueue(streamingSessionId);
+      }
+      const failedSessionId = streamingSessionId ?? activeSessionIdRef.current;
+      if (failedSessionId) {
+        updateLiveTurnForSession(failedSessionId, (currentTurn) =>
         currentTurn
           ? {
               ...currentTurn,
@@ -9008,7 +9228,8 @@ ${markup}
               }
             }
           : currentTurn
-      );
+        );
+      }
     } finally {
       finishStreamingState();
     }
@@ -9144,13 +9365,13 @@ ${markup}
     const submittedSelection = awaitingInputSelections[request.requestId] ?? null;
     const isSubmittedRequest = Boolean(submittedSelection);
     const requestStateClass = isSubmittedRequest ? "submitted" : isActiveRequest ? "active" : "resolved";
-    const isActionDisabled = isSubmittedRequest || !isActiveRequest || sendingMessage || stoppingMessage || planModeUpdating;
+    const isActionDisabled = isSubmittedRequest || !isActiveRequest || isSendingInActiveSession || isStoppingInActiveSession || planModeUpdating;
     const statusLabel = isSubmittedRequest
       ? submittedSelection?.value === "free_text"
         ? "已回复"
         : "已选择"
       : isActiveRequest
-        ? (sendingMessage ? "正在发送" : "等待回复")
+        ? (isSendingInActiveSession ? "正在发送" : "等待回复")
         : "已处理";
     const title = getAwaitingInputTitle(request);
     const requestOptions = request.options;
@@ -9276,8 +9497,8 @@ ${markup}
       event.key === "Backspace" &&
       !composerValue &&
       composerModeTokenMode !== null &&
-      !sendingMessage &&
-      !stoppingMessage &&
+      !isSendingInActiveSession &&
+      !isStoppingInActiveSession &&
       !planModeUpdating
     ) {
       event.preventDefault();
@@ -9824,15 +10045,13 @@ ${markup}
     const isComposerEmpty = !composerValue.trim() && composerAttachments.length === 0;
     const showContextMeter = !isHero;
     const showStopTrigger = isSendingInActiveSession;
-    const composerInputDisabled = sendingMessage || stoppingMessage;
+    const composerInputDisabled = isStoppingInActiveSession;
     const multiagentModeActive = composerDisplayMode === "subagent";
     const composerPlaceholder = isStoppingInActiveSession
       ? "正在停止当前任务，请稍候…"
       : isSendingInActiveSession
         ? "当前正在执行，点击右侧按钮可立即停止…"
-        : isSendingInOtherSession
-          ? "另一个会话正在执行，当前会话暂时不能发送"
-          : "输入你的任务，可附附件；按 Enter 发送，Shift + Enter 换行";
+        : "输入你的任务，可附附件；按 Enter 发送，Shift + Enter 换行";
 
     return (
       <div className={`composer-main ${variant === "hero" ? "composer-main-hero" : ""}`}>
@@ -9859,7 +10078,7 @@ ${markup}
                     onClick={() => {
                       void removeComposerModeToken();
                     }}
-                    disabled={sendingMessage || stoppingMessage || planModeUpdating}
+                    disabled={isSendingInActiveSession || isStoppingInActiveSession || planModeUpdating}
                   >
                     <span className="composer-mode-token-icon" aria-hidden="true">
                       {composerModeTokenMode === "plan" ? (
@@ -9956,7 +10175,7 @@ ${markup}
                     className="composer-action-button attach-trigger"
                     aria-label="添加附件"
                     onClick={() => composerFileInputRef.current?.click()}
-                    disabled={sendingMessage || stoppingMessage || planModeUpdating}
+                    disabled={isSendingInActiveSession || isStoppingInActiveSession || planModeUpdating}
                   >
                     <span className="session-create-button-mark" aria-hidden="true" />
                   </button>
@@ -10038,7 +10257,7 @@ ${markup}
                       <div
                         className={`context-ring ${contextProgress === null ? "is-empty" : ""} ${contextRingStateClass}`}
                         style={{ ["--context-progress" as string]: String(contextRingProgress) }}
-                        aria-label={contextPercent === null ? "Context 预算使用率暂不可用" : `Context 预算使用率 ${contextPercentLabel}`}
+                        aria-label={contextPercent === null ? "当前可见上下文暂不可用" : `当前可见上下文 ${contextPercentLabel}`}
                         title={contextRingTitle}
                       >
                         <span>{contextPercentLabel}</span>
@@ -10056,9 +10275,9 @@ ${markup}
                       }
                       void submitComposer();
                     }}
-                    disabled={stoppingMessage || planModeUpdating || isSendingInOtherSession || (!showStopTrigger && isComposerEmpty)}
-                    aria-label={showStopTrigger ? (stoppingMessage ? "正在停止当前任务" : "停止当前任务") : "发送"}
-                    title={showStopTrigger ? (stoppingMessage ? "正在停止当前任务" : "点击立即停止当前任务") : "发送"}
+                    disabled={isStoppingInActiveSession || planModeUpdating || (!showStopTrigger && isComposerEmpty)}
+                    aria-label={showStopTrigger ? (isStoppingInActiveSession ? "正在停止当前任务" : "停止当前任务") : "发送"}
+                    title={showStopTrigger ? (isStoppingInActiveSession ? "正在停止当前任务" : "点击立即停止当前任务") : "发送"}
                   >
                     {showStopTrigger ? (
                       <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -10557,7 +10776,11 @@ ${markup}
             {sessionsLoading && chatSessions.length === 0 ? <div className="workspace-empty">正在加载会话...</div> : null}
 
             <div className="session-list">
-              {!sessionsLoading && chatSessions.length === 0 ? <div className="workspace-empty">当前还没有会话，点击右上角开始。</div> : null}
+              {!sessionsLoading && chatSessions.length === 0 ? (
+                <div className="session-list-empty" role="status" aria-label="暂无会话">
+                  <EmptySessionListIcon className="session-list-empty-icon" />
+                </div>
+              ) : null}
               {chatSessions.map((session) => {
                 const displayTitle = session.scheduled ? scheduledSessionTitle(session.title) : session.title;
                 return (
