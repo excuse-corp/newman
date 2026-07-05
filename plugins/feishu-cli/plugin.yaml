@@ -1,0 +1,55 @@
+name: feishu-cli
+version: 1.1.0
+description: Feishu CLI integration for Newman via the system lark-cli binary and its embedded Agent Skills.
+enabled_by_default: true
+skills:
+  - name: lark-cli
+    path: skills/lark-cli/SKILL.md
+hooks: []
+mcp_servers: []
+required_permissions: []
+sandbox:
+  readable_roots:
+    - ~/.lark-cli
+    - ~/.local/share/lark-cli
+  writable_roots:
+    - ~/.lark-cli
+    - ~/.local/share/lark-cli
+preflight:
+  bins:
+    - lark-cli
+  readable_paths:
+    - ~/.lark-cli/config.json
+    - ~/.local/share/lark-cli
+commands:
+  - tool_name: lark_cli
+    executable: lark-cli
+    description: >-
+      Run lark-cli through a structured argv wrapper. Pass only the arguments after `lark-cli`;
+      use `lark_cli_skill` first when you need the current version-matched Lark skill guidance.
+      For `im +messages-send`, omit `--chat-id`/`--user-id` or `--as` when you want Newman
+      to apply configured defaults.
+    env:
+      NEWMAN_LARK_DEFAULT_IM_USER_ID: ${NEWMAN_LARK_DEFAULT_IM_USER_ID}
+      NEWMAN_LARK_DEFAULT_IM_IDENTITY: ${NEWMAN_LARK_DEFAULT_IM_IDENTITY}
+    timeout_seconds: 90
+    confirmation_flag: --yes
+    confirmation_protocol:
+      exit_code: 10
+      error_type: confirmation_required
+    readonly_prefixes:
+      - ["auth", "status"]
+      - ["auth", "qrcode"]
+      - ["config", "show"]
+      - ["doctor"]
+      - ["schema"]
+  - tool_name: lark_cli_skill
+    executable: lark-cli
+    default_args:
+      - skills
+    description: Read the current lark-cli embedded skill index and raw skill markdown. Pass only the argv tail after `lark-cli skills`, for example `['list']` or `['read', 'lark-doc']`.
+    timeout_seconds: 30
+    readonly_prefixes:
+      - ["list"]
+      - ["read"]
+    allow_stdin: false

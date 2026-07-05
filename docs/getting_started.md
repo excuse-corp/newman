@@ -6,20 +6,20 @@
 
 Newman 有两种部署方式：
 
-- Docker 部署：推荐给新机器、稳定运行、少改代码的场景。
-- 本地开发部署：推荐给需要改代码、联调后端/前端、查看本地日志的场景。
+- Docker 部署：Windows 用户优先推荐，减少本机 Python / Node / PostgreSQL 依赖差异，适合稳定运行。
+- 源码部署：macOS / Linux 用户优先推荐，便于本地调试、查看日志和接入系统工具。
 
 ## 1. 部署前准备
 
 ### 1.1 基础依赖
 
-Docker 部署需要：
+Windows Docker 部署需要：
 
 - Docker
 - Docker Compose
 - 能访问模型服务 endpoint
 
-本地开发部署需要：
+macOS / Linux 源码部署需要：
 
 - Conda
 - Node.js 20
@@ -37,19 +37,18 @@ Docker 部署需要：
 - `NEWMAN_MODELS_MULTIMODAL_API_KEY`
 - `NEWMAN_MODELS_MULTIMODAL_MODEL`
 
-如果要使用飞书，还需要：
+如果要使用飞书，按使用场景准备：
 
-- 飞书自建应用的 `app_id`
-- 飞书自建应用的 `app_secret`
-- 官方 `lark-cli` 安装和授权
+- 飞书里给 Newman 发消息：需要飞书自建应用的 `app_id` / `app_secret`，并开启机器人和长连接事件。
+- Newman 主动操作飞书资源：还需要安装并授权官方 `lark-cli`，仓库内置 `plugins/feishu-cli` 插件负责把 Newman 连接到 `lark-cli`。
 
 如果要使用 Google / 联网搜索工具，还需要：
 
 - `SERPAPI_API_KEY`
 
-## 2. Docker 部署
+## 2. Docker 部署（Windows 推荐）
 
-Docker 是新用户优先推荐路径。
+Docker 是 Windows 用户优先推荐路径。macOS / Linux 用户建议优先阅读后面的源码部署方案。
 
 ### 2.1 准备环境变量
 
@@ -92,6 +91,16 @@ docker compose build
 docker compose up -d
 ```
 
+Windows Docker Desktop 默认按 `linux/amd64` 构建，避免镜像代理偶发返回错误架构导致 `exec /bin/sh: exec format error`。如果构建时拉取镜像层出现 `EOF`，可以在 PowerShell 中临时切换镜像代理后重建：
+
+```powershell
+$env:NEWMAN_DOCKER_REGISTRY="docker.1ms.run/library"
+docker compose build --no-cache
+docker compose up -d
+```
+
+可选镜像代理示例：`docker.m.daocloud.io/library`、`docker.1ms.run/library`；如果本机可直连 Docker Hub，也可以设为 `docker.io/library`。如需改目标平台，可设置 `NEWMAN_DOCKER_PLATFORM`，例如 `$env:NEWMAN_DOCKER_PLATFORM="linux/amd64"`。
+
 默认地址：
 
 - 前端工作台：`http://127.0.0.1:17775`
@@ -115,7 +124,7 @@ docker compose up -d --build
 NEWMAN_FRONTEND_PORT=7775 NEWMAN_BACKEND_PORT=8005 docker compose up -d --build
 ```
 
-## 3. 本地开发部署
+## 3. 源码部署（macOS / Linux 推荐）
 
 ### 3.1 创建环境
 
@@ -250,18 +259,84 @@ curl http://127.0.0.1:8005/api/plugins
 
 这两条链路可以分别配置；只需要飞书里和 Newman 对话时，先做“飞书 -> Newman”。需要 Newman 主动操作飞书资源时，再做“Newman -> 飞书”。
 
-### 6.1 飞书 -> Newman
+### 6.1 需要安装什么
+
+#### Docker 部署
+
+Docker 镜像内已安装：
+
+- Newman 后端依赖
+- `lark-channel-sdk`，用于飞书长连接入站
+- `lark-cli`，用于 Newman 主动操作飞书资源
+- `feishu-cli` 插件，位于 `plugins/feishu-cli`
+
+宿主机还需要安装并登录 `lark-cli`，仅当你要使用“Newman -> 飞书”出站能力时需要：
+
+```bash
+npx @larksuite/cli@latest install
+lark-cli config init --new
+lark-cli auth login --recommend
+lark-cli auth status
+```
+
+Docker Compose 会把宿主机登录态挂载进容器：
+
+```text
+~/.lark-cli
+~/.local/share/lark-cli
+```
+
+#### 源码部署
+
+源码部署需要先安装 Newman 后端依赖：
+
+```bash
+conda activate newman
+python -m pip install -e ./backend
+```
+
+这会安装后端声明的 Python 依赖，包括飞书长连接需要的 `lark-channel-sdk`。
+
+如果还要让 Newman 主动操作飞书资源，再安装并登录 `lark-cli`：
+
+```bash
+npx @larksuite/cli@latest install
+lark-cli config init --new
+lark-cli auth login --recommend
+lark-cli auth status
+```
+
+如果 `npx` 不可用，先安装 Node.js 20，并确认：
+
+```bash
+node -v
+npx -v
+```
+
+### 6.2 飞书 -> Newman：在飞书里和机器人对话
 
 Newman 入站使用官方 Python Channel SDK。它是 Newman 主动向飞书建立长连接，所以内网部署不需要公网 webhook 地址。
 
-在飞书开放平台创建自建应用，并完成：
+#### 第一步：创建飞书自建应用
+
+在飞书开放平台创建自建应用，并完成这些配置：
 
 1. 启用机器人能力。
 2. 事件订阅选择“使用长连接接收事件”。
 3. 订阅 `im.message.receive_v1`。
-4. 开通接收消息、发送消息所需权限。
+4. 开通接收消息和机器人发送消息权限。
 5. 发布或安装应用到目标企业、测试企业或可见范围。
 6. 记录 `app_id` 和 `app_secret`。
+
+常见需要的能力和权限：
+
+- 机器人能力：必须开启。
+- 长连接事件：必须开启。
+- 事件订阅：`im.message.receive_v1`。
+- 消息发送权限：至少需要机器人发送消息权限，例如 `im:message:send_as_bot`。
+- 可见范围：确保你本人或目标群所在组织可使用该应用。
+
+#### 第二步：确认 Newman 配置使用 Channel SDK
 
 `newman.yaml` / `docker/newman.yaml` 默认已经使用：
 
@@ -275,14 +350,18 @@ channels:
     require_mention_in_group: true
 ```
 
-在 `.env` 或 `.env.docker` 填入：
+通常不需要手工改这段配置。
+
+#### 第三步：填写 app_id 和 app_secret
+
+Docker 部署编辑 `.env.docker`，源码部署编辑 `.env`：
 
 ```dotenv
 NEWMAN_CHANNELS__FEISHU__APP_ID=cli_xxx
 NEWMAN_CHANNELS__FEISHU__APP_SECRET=xxx
 ```
 
-可选白名单：
+可选白名单。配置后，只有指定群或用户可以触发 Newman：
 
 ```dotenv
 NEWMAN_CHANNELS__FEISHU__ALLOWED_CHAT_IDS=oc_xxx,oc_yyy
@@ -295,7 +374,23 @@ NEWMAN_CHANNELS__FEISHU__ALLOWED_USER_OPEN_IDS=ou_xxx,ou_yyy
 NEWMAN_CHANNELS__FEISHU__REQUIRE_MENTION_IN_GROUP=false
 ```
 
-重启后检查状态：
+#### 第四步：重启服务
+
+Docker：
+
+```bash
+docker compose up -d --build
+```
+
+源码部署：
+
+```bash
+./scripts/dev/restart_services.sh
+```
+
+#### 第五步：检查入站状态
+
+Docker 默认后端端口是 `18005`，源码部署默认后端端口是 `8005`。下面以源码端口为例；Docker 用户把 `8005` 替换为 `18005`。
 
 ```bash
 curl http://127.0.0.1:8005/api/channels/feishu/setup/status
@@ -308,7 +403,7 @@ curl http://127.0.0.1:8005/api/channels/feishu/setup/status
 - `status.dependency_available=true`：已安装 `lark-channel-sdk`。
 - `status.connected=true`：SDK 长连接已连接。
 
-主动验证连接：
+主动验证连接配置：
 
 ```bash
 curl -X POST http://127.0.0.1:8005/api/channels/feishu/setup/validate
@@ -320,13 +415,35 @@ curl -X POST http://127.0.0.1:8005/api/channels/feishu/setup/validate
 curl -X POST http://127.0.0.1:8005/api/channels/feishu/setup/test
 ```
 
-执行后，在飞书里给机器人发一条消息。接口会等待并返回是否收到事件。
+执行后，在飞书里给机器人发一条消息：
 
-### 6.2 Newman -> 飞书
+- 单聊：直接给机器人发消息。
+- 群聊：默认需要 `@机器人`。
+
+接口会等待并返回是否收到事件。成功后，Newman 应能创建或复用飞书会话，并在飞书里回复。
+
+### 6.3 Newman -> 飞书：主动操作飞书资源
 
 Newman 主动操作飞书资源通过 `feishu-cli` 插件调用系统 `lark-cli`。
 
-安装并授权官方 CLI：
+这一步用于这些场景：
+
+- 在 Newman 对话里让它读取或编辑飞书文档。
+- 让 Newman 操作飞书表格、多维表格、云盘、日历、任务、审批等。
+- 让 Newman 主动给飞书用户或群发送消息。
+
+#### 第一步：确认插件进入仓库
+
+仓库应包含：
+
+```text
+plugins/feishu-cli/plugin.yaml
+plugins/feishu-cli/skills/lark-cli/SKILL.md
+```
+
+这个插件只提供工具声明和使用说明，不包含飞书密钥或登录态。
+
+#### 第二步：安装并登录 lark-cli
 
 ```bash
 npx @larksuite/cli@latest install
@@ -335,12 +452,17 @@ lark-cli auth login --recommend
 lark-cli auth status
 ```
 
-Docker 部署时，Compose 会挂载宿主机：
+`lark-cli auth login --recommend` 会按提示完成浏览器或二维码登录。完成后，确认 `lark-cli auth status` 至少有一个可用身份：
+
+- `bot`：适合应用身份发送消息、操作应用可访问资源。
+- `user`：适合以当前用户身份访问用户有权限的资源。
+
+Docker 部署时，登录命令在宿主机执行即可，因为 Compose 已挂载：
 
 - `~/.lark-cli`
 - `~/.local/share/lark-cli`
 
-所以通常在宿主机完成 `lark-cli` 登录即可。
+#### 第三步：配置默认发消息目标（可选）
 
 如果希望 Newman 主动发 IM 时默认发给固定用户，可以配置：
 
@@ -356,7 +478,9 @@ NEWMAN_LARK_DEFAULT_IM_IDENTITY=bot
 - 显式传入的目标和身份始终优先。
 - `NEWMAN_LARK_DEFAULT_IM_IDENTITY` 只接受 `bot` 或 `user`。
 
-检查插件：
+改完 `.env` / `.env.docker` 后重启服务。
+
+#### 第四步：检查插件状态
 
 ```bash
 curl http://127.0.0.1:8005/api/plugins
@@ -367,6 +491,40 @@ curl http://127.0.0.1:8005/api/plugins
 - `feishu-cli` 插件存在。
 - 插件 preflight 能找到 `lark-cli`。
 - 插件 preflight 能读取 `~/.lark-cli` 登录态。
+
+如果使用 Docker，把端口换成：
+
+```bash
+curl http://127.0.0.1:18005/api/plugins
+```
+
+#### 第五步：在 Newman 里测试
+
+在 Newman 工作台中新建对话，发送类似任务：
+
+```text
+查看当前 lark-cli 已登录身份，并说明 Newman 是否可以主动操作飞书资源。
+```
+
+如果配置了默认 IM 目标，也可以测试：
+
+```text
+给默认飞书联系人发一条消息：Newman 飞书出站测试成功。
+```
+
+如果没有配置默认目标，任务里需要明确收件人或群聊。
+
+### 6.4 飞书接入完成标准
+
+按顺序满足以下条件，就可以认为飞书接入完成：
+
+1. `GET /api/channels/feishu/setup/status` 返回 `ok=true`。
+2. `POST /api/channels/feishu/setup/validate` 成功。
+3. `POST /api/channels/feishu/setup/test` 执行时，飞书给机器人发消息能被 Newman 收到。
+4. 飞书机器人能回复单聊消息。
+5. 群聊中 `@机器人` 后 Newman 能回复。
+6. 如果启用 Newman 主动操作飞书资源，`lark-cli auth status` 有可用身份。
+7. 如果启用 Newman 主动操作飞书资源，`GET /api/plugins` 里 `feishu-cli` 插件存在且 preflight 通过。
 
 ## 7. 新用户验收清单
 
@@ -412,7 +570,16 @@ NEWMAN_CHANNELS__FEISHU__APP_SECRET=
 
 ### 8.4 飞书状态是 `missing_dependency`
 
-当前 Python 环境缺少 `lark-channel-sdk`。本项目后端依赖已经声明该包；如果是手工环境，重新安装后端依赖：
+当前 Python 环境缺少 `lark-channel-sdk`。
+
+Docker 部署通常不需要单独处理，重新构建镜像即可：
+
+```bash
+docker compose build --no-cache backend
+docker compose up -d
+```
+
+源码部署重新安装后端依赖：
 
 ```bash
 python -m pip install -e ./backend
@@ -439,14 +606,22 @@ python -m pip install -e ./backend
 
 ### 8.7 Newman 主动发飞书消息提示缺少目标或身份
 
-检查：
+如果你希望 Newman 默认发给固定用户，检查：
 
 ```dotenv
 NEWMAN_LARK_DEFAULT_IM_USER_ID=ou_xxx
 NEWMAN_LARK_DEFAULT_IM_IDENTITY=bot
 ```
 
-或者在任务中明确说明发送目标和使用 `bot` / `user` 身份。
+否则，在任务中明确说明发送目标和使用 `bot` / `user` 身份。
+
+还要确认：
+
+```bash
+lark-cli auth status
+```
+
+至少有一个可用身份。
 
 ### 8.8 `lark-cli auth status` 显示 user `needs_refresh`
 

@@ -1,4 +1,7 @@
-FROM docker.m.daocloud.io/library/python:3.11-slim
+ARG TARGETPLATFORM=linux/amd64
+ARG DOCKER_REGISTRY=docker.m.daocloud.io/library
+
+FROM --platform=${TARGETPLATFORM} ${DOCKER_REGISTRY}/python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

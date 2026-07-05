@@ -10,7 +10,7 @@ Local-first AI Agent Runtime and Workbench
 ```
 
 <p align="center">
-  <strong>Newman</strong> 是一个给牛马干活的本地优先 AI Agent 运行时与工作台。
+  <strong>Newman</strong> 是一个给牛马干活的本地优先 AI Agent 工作台。
   它不只负责聊天，而是围绕本地工作区、长任务推进、Skill / Plugin 生态和可审计数据目录，把能持续交付和自进化的 Agent 基线做出来。
 </p>
 
@@ -83,11 +83,11 @@ Newman 的自进化不是简单的“记住聊天记录”，而是把一次次�
 
 ## 部署指导
 
-> 新机器或稳定运行优先走 Docker；需要改代码、联调或看运行日志时优先走本地开发。
+> Windows 环境建议优先走 Docker 部署，减少本机 Python / Node / PostgreSQL 依赖差异；macOS 和 Linux 环境建议优先走源码部署，便于本地调试、查看日志和接入系统工具。
 >
 > 新用户建议先按 [docs/getting_started.md](docs/getting_started.md) 逐步完成部署和接入；本节保留仓库内的部署概览，便于快速查阅。
 
-### 方案一：Docker 部署
+### 方案一：Docker 部署（Windows 推荐）
 
 1. 准备容器环境变量。
 
@@ -110,6 +110,16 @@ cd /path/to/newman
 docker compose build
 docker compose up -d
 ```
+
+Windows Docker Desktop 默认按 `linux/amd64` 构建，避免镜像代理偶发返回错误架构导致 `exec /bin/sh: exec format error`。如果镜像代理下载层时出现 `EOF`，可以在 PowerShell 中临时切换代理后重建：
+
+```powershell
+$env:NEWMAN_DOCKER_REGISTRY="docker.1ms.run/library"
+docker compose build --no-cache
+docker compose up -d
+```
+
+可选镜像代理示例：`docker.m.daocloud.io/library`、`docker.1ms.run/library`；如果本机可直连 Docker Hub，也可以设为 `docker.io/library`。
 
 3. 默认访问地址。
 
@@ -139,10 +149,11 @@ NEWMAN_FRONTEND_PORT=7775 NEWMAN_BACKEND_PORT=8005 docker compose up -d --build
 Docker 模式注意事项：
 
 - 容器内访问宿主机服务时，不要写 `127.0.0.1`，应改用 `host.docker.internal`。
+- Docker 构建平台默认是 `linux/amd64`；如需覆盖，设置 `NEWMAN_DOCKER_PLATFORM` 后再执行 `docker compose build --no-cache`。
 - 后端会挂载 `backend_data/`、`plugins/`、`skills/`、`outputs/` 和 `backend/tools/`，便于保留本地数据和扩展能力。
 - Docker 默认对外暴露的是 `17775 -> 80` 和 `18005 -> 8005`。
 
-### 方案二：本地开发部署
+### 方案二：源码部署（macOS / Linux 推荐）
 
 1. 创建并进入 Conda 环境。
 

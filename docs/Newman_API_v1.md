@@ -1,41 +1,13 @@
-# Newman API 文档 v1.6
+# Newman API 文档 v1.7
 
-2026 · Phase 4 基线接口 + 自进化日志 + 轻量多阶段规划 + Linux 原生沙箱 + 多模态输入归一化
+本文档描述 Newman 当前 FastAPI 服务已落地的 HTTP 接口与 SSE 事件协议。接口实现以 `backend/api/app.py` 和 `backend/api/routes/` 为准。
 
-本文档对应当前已落地的 FastAPI 接口与 SSE 事件协议实现，覆盖：
+部署、模型配置、飞书接入等用户向步骤见：
 
-- Phase 2：知识检索与错误恢复基线
-- Phase 3：插件/Skill、MCP bridge、Scheduler
-- Phase 4：前端工作台所需工作区接口、会话压缩入口、Channels webhook 基线
-- Phase 4.5：轻量多阶段任务规划、文件导航与安全编辑工具
-- Phase 4.6：Linux 原生终端沙箱（bubblewrap）
-- Phase 4.7：图文联合解析与归一化用户输入
-- Phase 4.8：全自动自进化（MEMORY.md + Skill 目录更新）与 Evolution Log
+- [getting_started.md](getting_started.md)
+- [feishu_cc_connect_codex_reusable_solution.md](feishu_cc_connect_codex_reusable_solution.md)
 
-代码入口：
-
-- [app.py](/root/newman/backend/api/app.py)
-- [sessions.py](/root/newman/backend/api/routes/sessions.py)
-- [messages.py](/root/newman/backend/api/routes/messages.py)
-- [message_rendering.py](/root/newman/backend/runtime/message_rendering.py)
-- [multimodal.py](/root/newman/backend/providers/multimodal.py)
-- [config.py](/root/newman/backend/api/routes/config.py)
-- [workspace.py](/root/newman/backend/api/routes/workspace.py)
-- [evolution.py](/root/newman/backend/api/routes/evolution.py)
-- [evolution/service.py](/root/newman/backend/evolution/service.py)
-- [plugins.py](/root/newman/backend/api/routes/plugins.py)
-- [tools.py](/root/newman/backend/api/routes/tools.py)
-- [mcp.py](/root/newman/backend/api/routes/mcp.py)
-- [scheduler.py](/root/newman/backend/api/routes/scheduler.py)
-- [channels.py](/root/newman/backend/api/routes/channels.py)
-- [channels/service.py](/root/newman/backend/channels/service.py)
-- [channels/feishu_transport.py](/root/newman/backend/channels/feishu_transport.py)
-
-部署、模型配置和飞书接入的用户向步骤统一维护在 [getting_started.md](getting_started.md)。
-
----
-
-## 一、总览
+## 1. 总览
 
 ### Base URL
 
@@ -43,7 +15,14 @@
 http://localhost:8005
 ```
 
-### 推荐启动方式
+Docker 默认端口映射：
+
+```text
+Frontend: http://127.0.0.1:17775
+Backend:  http://127.0.0.1:18005
+```
+
+本地源码运行默认：
 
 ```bash
 conda activate newman
@@ -51,85 +30,27 @@ conda activate newman
 uvicorn backend.main:app --reload
 ```
 
-本地默认依赖：
-
-- PostgreSQL: `127.0.0.1:65437`
-- Database: `newman`
-- Chroma 持久化目录: `backend_data/chroma/`
-- 知识文档与解析产物目录: `backend_data/knowledge/`
-
 ### 内容类型
 
 - REST：`application/json`
+- 文件上传：`multipart/form-data`
 - SSE：`text/event-stream`
 
 ### 请求追踪
 
-每个 HTTP 响应头返回：
+每个 HTTP 响应都会带：
 
 ```text
 x-request-id: <uuid>
 ```
 
-### 健康检查
+SSE payload 里也会带 `request_id`。
 
-`GET /healthz`
+### 认证
 
-响应示例：
+若启用实例鉴权，前端通常先走首次配置或登录接口，再通过 cookie 访问后续 API。
 
-```json
-{
-  "ok": true,
-  "version": "0.6.0",
-  "provider": "mock",
-  "sandbox_enabled": true,
-  "sandbox": {
-    "enabled": true,
-    "backend": "linux_bwrap",
-    "mode": "workspace-write",
-    "platform": "linux",
-    "platform_supported": true,
-    "available": true,
-    "network_access": false
-  },
-  "tools": [
-    "read_file",
-    "read_file_range",
-    "list_dir",
-    "list_files",
-    "search_files",
-    "grep",
-    "fetch_url",
-    "terminal",
-    "write_file",
-    "edit_file",
-    "update_plan",
-    "search_knowledge_base",
-    "mcp__example-inline__echo_context"
-  ],
-  "knowledge_documents": 1,
-  "plugins_enabled": 1,
-  "scheduler_running": true,
-  "channels_enabled": 2
-}
-```
-
-`GET /readyz`
-
-响应示例：
-
-```json
-{
-  "ok": true,
-  "knowledge_dir": "/root/newman/backend_data/knowledge",
-  "sessions_dir": "/root/newman/backend_data/sessions",
-  "plugins_dir": "/root/newman/plugins",
-  "skills_dir": "/root/newman/skills",
-  "mcp_dir": "/root/newman/backend_data/mcp",
-  "scheduler_dir": "/root/newman/backend_data/scheduler",
-  "channels_dir": "/root/newman/backend_data/channels"
-}
-```
+也可用 `Authorization: Bearer <admin_token>` 访问受保护接口，具体由 `backend/api/middleware/auth.py` 处理。
 
 ### 统一错误格式
 
@@ -147,41 +68,142 @@ x-request-id: <uuid>
 }
 ```
 
----
+## 2. 健康检查
 
-## 二、当前内置工具
+### `GET /healthz`
 
-当前内置工具分为 3 类：
+返回运行时健康状态、工具列表、插件、调度器和 Channel 状态。
 
-- 读取与定位：`read_file`、`read_file_range`、`list_dir`、`list_files`、`search_files`、`grep`
-- 编辑与执行：`write_file`、`edit_file`、`terminal`
-- 协作与知识：`update_plan`、`fetch_url`、`search_knowledge_base`
+示例：
 
-说明：
+```json
+{
+  "ok": true,
+  "version": "0.6.0",
+  "provider": "openai_compatible",
+  "sandbox_enabled": true,
+  "sandbox": {
+    "enabled": true,
+    "backend": "linux_bwrap",
+    "mode": "workspace-write",
+    "platform": "linux",
+    "platform_supported": true,
+    "available": true,
+    "network_access": false
+  },
+  "tools": ["read_file", "search_files", "terminal", "update_plan"],
+  "plugins_enabled": 1,
+  "scheduler_running": true,
+  "channels_enabled": 1
+}
+```
 
-- `list_files` 是 `list_dir` 的别名。
-- `grep` 是 `search_files` 的别名。
-- `read_file` 只用于“小文件完整读取”：只接收 `path`，返回完整文件内容的 base64 JSON 载荷 `{ "dataBase64": "..." }`；当前限制为不超过 `65536` 字节。
-- `read_file_range` 只用于“文本分段读取”：接收 `path`、`offset`、`limit`，其中 `offset` 为 1-based 起始行号，`limit` 为单次最多返回的行数；当前仅支持 UTF-8 文本文件。
-- 选择建议：
-  - 需要完整原始文件字节，且文件较小：用 `read_file`
-  - 文件较大，或只想看某段文本：用 `read_file_range`
-- `read_file` / `read_file_range` 的完整输出只会在当前 turn 的后续推理里临时可见；session 持久化历史只保留摘要和元数据，不会把 base64 或大段文本原样长期写进 `session.messages`。
-- `write_file`、`edit_file` 默认需要审批。
-- `terminal` 采用两级前置审批：Level 1 黑名单直接拒绝，Level 2 风险模式进入人工审批；Linux 沙箱内的明显只读命令会自动放行。
-- 若配置了插件 MCP server，运行时还会额外挂载 `mcp__...` 工具。
-- `terminal` 在 Linux 下默认走原生沙箱；当前阶段仅实现 Linux，macOS / Windows 为待做。
-- 当前内置工具会从 `backend/tools/impl/` 动态发现；新增模块只要导出 `build_tools(context)`，并在生态重载后即可注册。
+### `GET /readyz`
 
----
+返回关键数据目录。
 
-## 三、会话接口
+```json
+{
+  "ok": true,
+  "sessions_dir": "/root/newman/backend_data/sessions",
+  "plugins_dir": "/root/newman/plugins",
+  "skills_dir": "/root/newman/skills",
+  "mcp_dir": "/root/newman/backend_data/mcp",
+  "scheduler_dir": "/root/newman/backend_data/scheduler",
+  "channels_dir": "/root/newman/backend_data/channels"
+}
+```
 
-## 3.1 创建会话
+## 3. 首次配置与认证
 
-`POST /api/sessions`
+### `GET /api/bootstrap/status`
 
-请求体：
+返回是否需要首次配置。
+
+```json
+{
+  "enabled": true,
+  "needs_setup": true
+}
+```
+
+### `POST /api/bootstrap/setup`
+
+首次写入模型配置、可选飞书配置，并生成实例访问密钥。
+
+请求：
+
+```json
+{
+  "primary_endpoint": "https://api.example.com/v1",
+  "primary_api_key": "sk_xxx",
+  "primary_model": "gpt-4.1-mini",
+  "share_primary_for_multimodal": true,
+  "multimodal_model": "gpt-4.1",
+  "serpapi_api_key": "",
+  "feishu_app_id": "",
+  "feishu_app_secret": "",
+  "login_after_setup": true
+}
+```
+
+响应：
+
+```json
+{
+  "configured": true,
+  "authenticated": true,
+  "admin_token_configured": true,
+  "warnings": []
+}
+```
+
+### `GET /api/auth/status`
+
+```json
+{
+  "enabled": true,
+  "needs_setup": false,
+  "authenticated": true,
+  "auth_method": "cookie",
+  "admin_token_configured": true
+}
+```
+
+### `POST /api/auth/login`
+
+```json
+{
+  "admin_token": "instance_token"
+}
+```
+
+登录成功后写入认证 cookie。
+
+### `POST /api/auth/logout`
+
+清除认证 cookie。
+
+### `POST /api/auth/regenerate-token`
+
+重新生成实例访问密钥，并写入当前项目 `.env`。
+
+响应：
+
+```json
+{
+  "rotated": true,
+  "admin_token": "new_token",
+  "instance_token": "new_token",
+  "auth_method": "cookie"
+}
+```
+
+## 4. 会话接口
+
+### `POST /api/sessions`
+
+创建或恢复会话。
 
 ```json
 {
@@ -189,7 +211,7 @@ x-request-id: <uuid>
 }
 ```
 
-响应体：
+响应：
 
 ```json
 {
@@ -199,24 +221,19 @@ x-request-id: <uuid>
   "evolution": {
     "scheduled": true,
     "trigger": "new_session_created",
-    "source_session_id": "9a62e9e8a71e4de8bf4f7f721f0a5b22",
+    "source_session_id": "previous_session_id",
     "reason": "background_task_started"
   }
 }
 ```
 
-- `/api/sessions` 返回普通 JSON，适合常规创建流程。
-- 若前端需要把“会话创建成功”也纳入统一事件流，可使用 `/api/sessions/stream`。
-- 创建新会话不会等待自进化完成。
-- 后端会在响应返回后，后台异步对“上一个非空会话”执行一次 `new_session_created` 自进化。
-- 自进化只自动处理 `MEMORY.md` 经验沉淀与 Skill 目录更新；不会自动改权限、系统 prompt、后端/前端代码或安装插件。
-- `mock` provider 下不会调度自进化任务，此时 `evolution.scheduled = false`，`reason = "mock_provider"`。
+### `POST /api/sessions/stream`
 
-## 3.2 获取会话列表
+流式创建会话，返回 `session_created` SSE 事件。
 
-`GET /api/sessions`
+### `GET /api/sessions`
 
-响应体：
+返回会话列表。
 
 ```json
 [
@@ -230,384 +247,27 @@ x-request-id: <uuid>
 ]
 ```
 
-## 3.2A 流式创建会话
+### `GET /api/sessions/{session_id}`
 
-`POST /api/sessions/stream`
+返回会话详情、计划草稿、协作模式、checkpoint 与上下文占用。
 
-响应类型：
+顶层字段：
 
-```text
-text/event-stream
-```
+- `session`
+- `plan`
+- `collaboration_mode`
+- `plan_draft`
+- `approved_plan`
+- `workflow_state`
+- `awaiting_user_input`
+- `checkpoint`
+- `context_usage`
 
-事件示例：
+`context_usage` 口径见 [context_compression.md](context_compression.md)。
 
-```json
-{
-  "event": "session_created",
-  "data": {
-    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-    "title": "供应商合同抽取",
-    "created": true,
-    "evolution": {
-      "scheduled": true,
-      "trigger": "new_session_created",
-      "source_session_id": "9a62e9e8a71e4de8bf4f7f721f0a5b22",
-      "reason": "background_task_started"
-    }
-  },
-  "ts": 1741234567890,
-  "request_id": "req_xxx"
-}
-```
+### `PATCH /api/sessions/{session_id}`
 
-## 3.3 获取会话详情
-
-`GET /api/sessions/{session_id}`
-
-响应体：
-
-```json
-{
-  "session": {
-    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-    "title": "供应商合同抽取",
-    "messages": [
-      {
-        "id": "turn_user_001",
-        "role": "user",
-        "content": "帮我看看这张图里的报错是什么意思",
-        "created_at": "2026-04-12T08:30:00+00:00",
-        "metadata": {
-          "approval_mode": "manual",
-          "turn_id": "turn_user_001",
-          "request_id": "req_abc123",
-          "original_content": "帮我看看这张图里的报错是什么意思",
-          "input_modalities": ["text", "image"],
-          "attachments": [
-            {
-              "attachment_id": "att_001",
-              "kind": "image",
-              "filename": "error.png",
-              "content_type": "image/png",
-              "path": "/root/newman/backend_data/uploads/chat/1c2030c74d144c40aef2b0e6f59718f5/error.png",
-              "summary": "设置页保存后出现 TypeError 报错截图",
-              "analysis_status": "completed"
-            }
-          ],
-          "multimodal_parse": {
-            "schema_version": "v1",
-            "status": "completed",
-            "parser_provider": "openai_compatible",
-            "parser_model": "qwen-vl-plus",
-            "normalized_user_input": "请结合截图中的报错，解释原因并指出优先排查的文件或模块。",
-            "task_intent": "debug_screenshot",
-            "key_facts": [
-              "保存动作后立即报错",
-              "截图中包含 TypeError"
-            ],
-            "ocr_text": [
-              "TypeError: Cannot read properties of undefined"
-            ],
-            "uncertainties": [
-              "仅凭截图无法确认根因在前端还是后端"
-            ],
-            "attachment_summaries": [
-              "设置页保存后出现 TypeError 报错截图"
-            ]
-          }
-        }
-      },
-      {
-        "id": "msg_asst_001",
-        "role": "assistant",
-        "content": "我先对照 PRD 和现有代码看一下。",
-        "created_at": "2026-04-12T08:30:06+00:00",
-        "metadata": {
-          "turn_id": "turn_user_001",
-          "request_id": "req_abc123",
-          "finish_reason": "stop"
-        }
-      }
-    ],
-    "metadata": {
-      "plan": {
-        "explanation": "先确认代码结构，再改后端，最后更新前端和文档。",
-        "steps": [
-          {
-            "step": "检查运行时与工具注册点",
-            "status": "completed"
-          },
-          {
-            "step": "补齐后端工具与计划状态",
-            "status": "in_progress"
-          },
-          {
-            "step": "更新前端展示和 API 文档",
-            "status": "pending"
-          }
-        ],
-        "updated_at": "2026-04-03T09:30:00+00:00",
-        "current_step": "补齐后端工具与计划状态",
-        "progress": {
-          "total": 3,
-          "completed": 1,
-          "in_progress": 1,
-          "pending": 1
-        }
-      }
-    },
-    "updated_at": "2026-04-02T08:10:00+00:00"
-  },
-  "plan": {
-    "explanation": "先确认代码结构，再改后端，最后更新前端和文档。",
-    "steps": [
-      {
-        "step": "检查运行时与工具注册点",
-        "status": "completed"
-      },
-      {
-        "step": "补齐后端工具与计划状态",
-        "status": "in_progress"
-      },
-      {
-        "step": "更新前端展示和 API 文档",
-        "status": "pending"
-      }
-    ],
-    "updated_at": "2026-04-03T09:30:00+00:00",
-    "current_step": "补齐后端工具与计划状态",
-    "progress": {
-      "total": 3,
-      "completed": 1,
-      "in_progress": 1,
-      "pending": 1
-    }
-  },
-  "checkpoint": null,
-  "context_usage": {
-    "effective_context_window": 95000,
-    "auto_compact_limit": 95000,
-    "soft_compact_limit": 80750,
-    "confirmed_prompt_tokens": 1248,
-    "confirmed_pressure": 0.013136842105263158,
-    "confirmed_request_kind": "session_turn",
-    "confirmed_recorded_at": "2026-04-11T15:20:00+00:00",
-    "projected_next_prompt_tokens": 1376,
-    "projected_pressure": 0.01448421052631579,
-    "budget_pressure": 0.01448421052631579,
-    "projection_source": "confirmed_plus_delta",
-    "projected_over_soft_limit": false,
-    "projected_over_limit": false,
-    "compaction_stage": null,
-    "compaction_fail_streak": 0,
-    "context_irreducible": false,
-    "last_compaction_failure_reason": null
-  }
-}
-```
-
-说明：
-
-- `session.metadata.plan` 与顶层 `plan` 字段内容相同，后者只是为了前端读取更直接。
-- 只有在模型调用 `update_plan` 工具后，`plan` 才会出现。
-- Web chat 回合里的 `session.messages[*].metadata` 现在会尽量补齐 `turn_id`，便于前端把同一轮的用户消息、过程事件和最终回答聚合成一个 turn 容器。
-- 通过 `/api/sessions/{session_id}/messages` 发起的 HTTP 回合，消息元数据通常还会包含 `request_id`；最终 assistant 消息会额外写入 `finish_reason`。
-- 带附件的用户消息现在会保留原始 `content`，并把图片解析结果写入 `metadata.multimodal_parse`；前端展示用户气泡时应优先读取 `metadata.original_content`。
-- `metadata.input_modalities` 表示本轮输入模态集合；当前 web chat 已落地 `text` 与 `image`。
-- `metadata.attachments[*].summary` 是单附件摘要；`metadata.multimodal_parse.normalized_user_input` 是给主模型和工具路由使用的整轮归一化请求，两者不要混用。
-- 若图片预解析失败，`metadata.multimodal_parse.status = "failed"`，并会额外追加一条 `role=system`、`metadata.type = "attachment_analysis_warning"` 的告警消息。
-- `context_usage.effective_context_window` 使用的是“有效上下文窗口”，当前定义为配置的模型 `context_window * 95%`。
-- `context_usage.auto_compact_limit` 目前与 `effective_context_window` 等值，继续保留这个字段名是为了兼容现有前端和 API。
-- `context_usage.soft_compact_limit = auto_compact_limit * runtime.context_compress_threshold`，默认用于提前执行 checkpoint 压缩。
-- `context_usage.confirmed_*` 表示最近一次真实模型请求里已确认的 prompt 占用；只有最近一条 `counts_toward_context_window=true` 且 `usage_available=true` 的记录才会填充这些字段。
-- `context_usage.projected_*` 表示“如果现在再发起下一次模型请求”，运行时估算出的上下文占用与压力。
-- `context_usage.budget_pressure = projected_next_prompt_tokens / auto_compact_limit`，前端单圆环按这个值展示。
-- 若存在最近一次真实 usage 记录，且新消息增量可估算，则 `projection_source = "confirmed_plus_delta"`；否则会退回 `projection_source = "assembled_prompt_estimate"`。
-- 投影估算基于当前完整 prompt 组装结果，而不只是 `session.messages`：会一并考虑 Stable Memory、工具总览、checkpoint summary 和当前会话消息。
-- `projected_over_soft_limit = true` 表示下一次请求的估算 prompt 已超过软压缩线；`projected_over_limit = true` 表示已超过硬压缩线，不等同于一定超过模型硬 context window。
-- 若存在 `checkpoint.summary`，其内容现在是基于 LLM 生成的 handoff summary，而不是简单的消息逐条拼接文本。
-- `compaction_stage`、`compaction_fail_streak`、`context_irreducible` 和 `last_compaction_failure_reason` 用于前端展示压缩状态与失败原因。
-
-## 3.2A 获取会话 usage 记录
-
-`GET /api/sessions/{session_id}/usage`
-
-查询参数：
-
-- `limit`: 可选，默认 `100`，最大 `500`
-
-响应示例：
-
-```json
-{
-  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-  "available": true,
-  "records": [
-    {
-      "request_id": "a4d8b7...",
-      "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-      "turn_id": "7b78...",
-      "request_kind": "session_turn",
-      "counts_toward_context_window": true,
-      "streaming": true,
-      "provider_type": "openai_compatible",
-      "model": "minimax-m2.5",
-      "context_window": 100000,
-      "effective_context_window": 95000,
-      "usage_available": true,
-      "input_tokens": 1420,
-      "output_tokens": 221,
-      "total_tokens": 1641,
-      "finish_reason": "stop",
-      "created_at": "2026-04-11T15:20:00+00:00",
-      "metadata": {
-        "assembled_message_count": 9,
-        "tool_schema_count": 12,
-        "estimated_input_tokens": 1398,
-        "response_content_length": 328,
-        "tool_call_count": 0
-      }
-    }
-  ]
-}
-```
-
-说明：
-
-- 当前会把模型请求 usage 详细写入 PostgreSQL `model_usage_records` 表。
-- 主对话轮次、压缩摘要、记忆提取、多模态分析、RAG rerank 等都会分别写入 usage 记录。
-- `counts_toward_context_window=true` 的记录才会参与聊天页上下文窗口圆环。
-- `subagent_turn` 记录的 `metadata.parent_session_id` 可用于把子代理成本回卷到父任务会话。
-- 若某次模型调用没有返回 usage，但运行时能拿到 `metadata.estimated_input_tokens`，后续 dashboard summary 可选择把它作为“输入侧估算”补入统计。
-
-## 3.2B 获取全局 usage summary
-
-`GET /api/usage/summary`
-
-查询参数：
-
-- `days`: 可选，默认 `7`，范围 `1..366`
-- `tz`: 可选，默认 `Asia/Shanghai`
-- `model`: 可选，按模型名过滤
-- `recent_limit`: 可选，默认 `7`，范围 `1..100`
-- `include_estimated`: 可选，默认 `false`
-  - `false`：只统计 provider 返回的真实 usage
-  - `true`：对缺失 usage 且带 `estimated_input_tokens` 的记录，用输入侧估算补入 summary
-
-响应示例（节选）：
-
-```json
-{
-  "available": true,
-  "filters": {
-    "model": null,
-    "include_estimated": true
-  },
-  "totals": {
-    "request_count": 128,
-    "input_tokens": 482130,
-    "output_tokens": 91342,
-    "total_tokens": 573472,
-    "usage_missing_count": 6,
-    "estimated_request_count": 4,
-    "estimated_input_tokens": 8130,
-    "estimated_output_tokens": 0,
-    "estimated_total_tokens": 8130
-  },
-  "by_session": [
-    {
-      "session_id": "parent-session",
-      "session_title": "飞书日报任务",
-      "request_count": 12,
-      "input_tokens": 52210,
-      "output_tokens": 8124,
-      "total_tokens": 60334,
-      "estimated_request_count": 2,
-      "estimated_input_tokens": 4300,
-      "estimated_output_tokens": 0,
-      "estimated_total_tokens": 4300
-    }
-  ],
-  "recent_records": [
-    {
-      "request_id": "u2",
-      "session_id": "child-session",
-      "session_title": "Subagent: researcher",
-      "attributed_session_id": "parent-session",
-      "attributed_session_title": "飞书日报任务",
-      "request_kind": "subagent_turn",
-      "usage_available": false,
-      "total_tokens": 0,
-      "estimated_total_tokens": 240
-    }
-  ]
-}
-```
-
-说明：
-
-- `totals.*`、`by_*.*` 中的 `request_count/input_tokens/output_tokens/total_tokens` 都是“当前查询口径”的值；是否包含估算，取决于 `filters.include_estimated`。
-- `estimated_*` 字段只表示这次 summary 为了补齐缺失 usage 而额外纳入的估算部分，不包含真实 usage。
-- `usage_missing_count` 是“原始缺失记录数”；即使 `include_estimated=true`，它仍然保留，便于前端同时展示“已补入多少、还有多少仍缺失”。
-- `by_session` 会把 `subagent_turn` 归并到 `metadata.parent_session_id`，这样父会话能看到完整任务成本。
-- `recent_records.session_id` 保留原始记录归属；`recent_records.attributed_session_id` / `attributed_session_title` 表示 dashboard 用于会话排行和任务归因的会话。
-
-## 3.3A 获取会话结构化事件历史
-
-`GET /api/sessions/{session_id}/events`
-
-查询参数：
-
-- `limit`: 可选，默认 `200`，返回最近 N 条结构化事件
-
-响应示例：
-
-```json
-{
-  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-  "events": [
-    {
-      "event": "tool_call_started",
-      "data": {
-        "tool": "read_file",
-        "arguments": {
-          "path": "/root/newman/README.md"
-        }
-      },
-      "request_id": "req_xxx",
-      "ts": 1741234567890
-    },
-    {
-      "event": "tool_call_finished",
-      "data": {
-        "tool": "read_file",
-        "success": true,
-        "summary": "文件已读取完成"
-      },
-      "request_id": "req_xxx",
-      "ts": 1741234567999
-    }
-  ]
-}
-```
-
-说明：
-
-- 该接口面向前端恢复 timeline / trace / 审批状态，返回结构化事件数组。
-- 数据源复用会话审计日志，但会过滤为 `event/data/request_id/ts` 结构。
-- 返回顺序与原始事件写入顺序一致。
-- 若当前会话没有审计日志，则返回空数组。
-
-## 3.4 删除会话
-
-`DELETE /api/sessions/{session_id}`
-
-## 3.4A 重命名会话
-
-`PATCH /api/sessions/{session_id}`
-
-请求体：
+重命名会话。
 
 ```json
 {
@@ -615,287 +275,160 @@ text/event-stream
 }
 ```
 
-响应示例：
+### `DELETE /api/sessions/{session_id}`
+
+删除会话。
+
+### `PATCH /api/sessions/{session_id}/collaboration-mode`
+
+切换协作模式。
 
 ```json
 {
-  "updated": true,
-  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-  "title": "新的会话标题",
-  "updated_at": "2026-04-08T08:10:00+00:00"
+  "mode": "plan"
 }
 ```
 
-## 3.5 手动压缩会话
+`mode` 支持：
 
-`POST /api/sessions/{session_id}/compress`
+- `default`
+- `plan`
+- `subagent`
 
-响应示例：
+### `GET /api/sessions/{session_id}/plan-draft`
+
+读取计划草稿。
+
+### `PUT /api/sessions/{session_id}/plan-draft`
+
+保存计划草稿。传空字符串会清除草稿。
+
+```json
+{
+  "markdown": "1. 检查接口\n2. 修改实现\n3. 运行测试"
+}
+```
+
+### `GET /api/sessions/{session_id}/usage`
+
+返回该会话及其子代理会话的模型 usage 记录。
+
+查询参数：
+
+- `limit`：默认 `100`，最大 `500`
+
+### `GET /api/sessions/{session_id}/events`
+
+返回结构化事件历史，供前端恢复 timeline。
+
+查询参数：
+
+- `limit`：默认 `200`
+
+### `GET /api/sessions/{session_id}/multiagent-runs`
+
+返回该会话下的 multi-agent run 列表。
+
+查询参数：
+
+- `turn_id`：可选，按父 turn 过滤
+
+### `POST /api/sessions/{session_id}/compress`
+
+手动压缩会话上下文。
+
+响应：
 
 ```json
 {
   "compressed": true,
-  "checkpoint": {
-    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-    "checkpoint_id": "cp_xxx",
-    "summary": "## Current Progress\n- 已确认前端缺少真实事件聚合逻辑。\n\n## Important Context\n- 用户要求 Trace 节点使用用户可理解的进展文案。\n\n## What Remains To Be Done\n- 对齐事件聚合规则并更新展示。",
-    "turn_range": [0, 8],
-    "created_at": "2026-04-02T10:00:00+00:00",
-    "metadata": {
-      "preserve_recent": 4,
-      "preserve_unit": "segment",
-      "compression_level": "manual",
-      "original_message_count": 12,
-      "compressed_message_count": 8,
-      "newly_compressed_message_count": 4,
-      "transcript_retained": true,
-      "microcompact_count": 1,
-      "compact_boundary": {
-        "type": "checkpoint_archived_prefix",
-        "message_count": 8
-      },
-      "summary_strategy": "llm_handoff_summary",
-      "summary_model": "qwen3-coder-plus",
-      "summary_usage": {
-        "input_tokens": 1620,
-        "output_tokens": 214,
-        "total_tokens": 1834
-      }
-    }
-  },
-  "session": {
-    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-    "title": "供应商合同抽取",
-    "messages": ["...完整 transcript，省略..."]
-  },
+  "checkpoint": {},
+  "session": {},
   "microcompact_count": 1
 }
 ```
 
-说明：
+若无可压缩内容：
 
-- 手动压缩与自动压缩现在共用同一套逻辑：都会生成或刷新 checkpoint，并保留完整 `session.messages` 作为 UI/audit transcript。
-- prompt 组装时会使用 `checkpoint.summary + 未归档的新消息`，不会把已归档前缀再次拼入主模型请求。
-- 归档边界按最近完整 segment 保留，而不是按完整 `turn_id` 保留；同一 turn 里较早且已闭合的 tool group 可以被归档。
-- 达到压缩阈值时会先执行旧工具输出 microcompact；原始工具输出会尽量落盘到 `backend_data/sessions/tool_outputs/{session_id}/`，模型上下文只保留摘要和 artifact 引用。
-- `checkpoint.summary` 通过一次独立的 LLM handoff summary 请求生成，提示词参考 Codex 本地 compact 方案，要求输出“当前进展、关键约束、剩余工作、关键引用”等可供后续模型继续任务的摘要。
-- 该摘要会主动排除低价值内部过程细节，例如逐步工具流水、文件读写维护记录、workflow/request/turn 等内部标识，以及仅用于压测或填充上下文的噪声材料。
-- 若已存在旧 checkpoint，压缩请求会把旧 `summary` 与本轮将被裁剪的历史消息一起交给模型，要求产出一份“替换旧 summary 的刷新版摘要”，而不是简单字符串追加。
-- 若当前 provider 为 `mock`，或压缩摘要请求失败/返回空内容，则会退回到结构化归档摘要：保留旧 summary，并附加 `## Archived Message Snapshot` 文本快照。
-- 当 checkpoint 边界之后没有可归档 segment 时，接口会返回 `{"compressed": false, "reason": "nothing_to_compress"}`。
-- 压缩触发阈值基于纯比例硬线计算：
-  - `auto_compact_limit = effective_context_window`
-  - `soft_compact_limit = auto_compact_limit * runtime.context_compress_threshold`
-  - 达到软线先执行 tool output microcompact，仍超线再执行 checkpoint 压缩；达到硬线后，压缩失败会阻断后续主模型请求
-- 前端聊天历史保持原样；压缩只通过当前 turn timeline 中的 `checkpoint_created` 小提示体现。
+```json
+{
+  "compressed": false,
+  "reason": "nothing_to_compress",
+  "microcompact_count": 0
+}
+```
 
-## 3.6 恢复 Checkpoint
+### `POST /api/sessions/{session_id}/restore-checkpoint`
 
-`POST /api/sessions/{session_id}/restore-checkpoint`
+把 checkpoint 摘要恢复为显式 system message。
 
-响应示例：
+响应：
 
 ```json
 {
   "restored": true,
-  "checkpoint": {
-    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-    "checkpoint_id": "cp_xxx",
-    "summary": "## Current Progress\n- 已完成首轮接口排查。\n\n## Important Context\n- 用户要求不要在主区暴露技术术语。\n\n## What Remains To Be Done\n- 继续对齐 Trace Timeline 的聚合规则。",
-    "turn_range": [0, 8],
-    "created_at": "2026-04-02T10:00:00+00:00",
-    "metadata": {
-      "preserve_recent": 4,
-      "compression_level": "automatic",
-      "original_message_count": 18
-    }
-  },
-  "session": {
-    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-    "title": "供应商合同抽取",
-    "messages": []
+  "checkpoint": {},
+  "session": {}
+}
+```
+
+## 5. 消息与 SSE
+
+### `POST /api/sessions/{session_id}/messages`
+
+发送一轮用户消息，响应类型为 `text/event-stream`。
+
+JSON 请求：
+
+```json
+{
+  "content": "请总结当前工作区结构",
+  "approval_mode": "manual",
+  "environment_context": {
+    "city": "Shanghai"
   }
 }
 ```
 
-说明：
+表单请求支持：
 
-- 恢复不会重建原始 Working History。
-- 当前实现会把 checkpoint 摘要恢复为一条显式的 `system` message，并重新纳入后续上下文。
-- `restore-checkpoint` 不会在主循环中自动触发，只有显式调用该接口时才会执行。
-- 当 session 中已经存在 `checkpoint_restore` 消息时，后续上下文组装不会再额外从 checkpoint 文件重复补一份 `summary`。
+- `content`
+- `attachments`
+- `images`
+- `approval_mode`
+- `environment_context`：JSON 字符串
 
----
+`approval_mode` 常用值：
 
-## 四、消息接口
+- `manual`
+- `auto_approve_level2`
+- `auto_allow`
 
-## 4.1 发送消息并接收 SSE
+行为说明：
 
-`POST /api/sessions/{session_id}/messages`
+- 同一 `session_id` 同时只允许一个活跃回合。
+- 若当前会话已有运行任务，返回 `409`。
+- 若 Scheduler 正在同一会话执行任务，也返回 `409`。
+- 上传附件会先保存到运行目录，再写入 user message metadata。
+- SSE 断开后，worker 可能进入 detached 状态继续运行。
 
-请求体：
+### `POST /api/sessions/{session_id}/interrupt`
 
-```json
-{
-  "content": "请帮我总结当前工作区的结构",
-  "approval_mode": "manual"
-}
-```
+停止当前会话活跃任务。
 
-也支持 `multipart/form-data`：
-
-- `content`: 文本内容，可为空
-- `images`: 可重复上传的图片字段，仅支持 `jpg/jpeg/png`
-- `approval_mode`: 可选，支持：
-  - `manual`：本轮每个命中 Level 2 的工具都需要点击确认
-  - `auto_approve_level2`：本轮命中的 Level 2 工具默认放行
-
-当上传图片时，后端会：
-
-1. 保存原始图片到 `backend_data/uploads/chat/{session_id}/`
-2. 先把当前 user message 持久化到 session，正文仍保留用户原话
-3. 调用 `models.multimodal` 做“图文联合解析”
-4. 将单图片摘要写入 `metadata.attachments[*].summary`
-5. 将整轮解析结果写入 `metadata.multimodal_parse`
-6. 主模型后续看到的是“原始请求 + 附件信息 + 归一化输入”的增强版消息；session transcript 里仍保留原话
-
-审批模式说明：
-
-- `approval_mode` 会随本轮用户消息一起写入该条 user message 的 `metadata.approval_mode`
-- 后端按该次请求提交的值锁定本轮审批策略
-- `auto_approve_level2` 只影响 Level 2 命中的审批；工具自身 `requires_approval=true` 的 mandatory 审批仍需人工确认
-- 用户发送后即使在前端切换 UI 选项，也不会影响已经开始执行的这一轮
-- 未传 `approval_mode` 时，默认值为 `manual`
-
-多模态解析字段说明：
-
-- `metadata.original_content`: 用户本轮原始文本；当前前端构建 turn 时应优先用它作为 user bubble 文本
-- `metadata.attachments`: 附件列表，包含文件名、路径、摘要、解析状态
-- `metadata.multimodal_parse.schema_version`: 当前固定为 `v1`
-- `metadata.multimodal_parse.status`:
-  - `completed`: 已完成图文联合解析
-  - `failed`: 多模态解析失败，本轮继续按原始文本推进
-- `metadata.multimodal_parse.normalized_user_input`: 面向主模型和工具路由的归一化请求
-- `metadata.multimodal_parse.task_intent`: 对任务类型的简要归类
-- `metadata.multimodal_parse.key_facts`: 与任务最相关的视觉事实
-- `metadata.multimodal_parse.ocr_text`: 从图片里读到的关键文本
-- `metadata.multimodal_parse.uncertainties`: 当前仍无法确认的点
-- `metadata.multimodal_parse.attachment_summaries`: 与附件顺序一一对应的简短摘要
-
-一个带图消息的 user message 示例：
-
-```json
-{
-  "id": "turn_user_001",
-  "role": "user",
-  "content": "帮我看看这张图里的报错是什么意思",
-  "created_at": "2026-04-12T08:30:00+00:00",
-  "metadata": {
-    "approval_mode": "manual",
-    "turn_id": "turn_user_001",
-    "request_id": "req_abc123",
-    "original_content": "帮我看看这张图里的报错是什么意思",
-    "input_modalities": ["text", "image"],
-    "attachments": [
-      {
-        "attachment_id": "att_001",
-        "kind": "image",
-        "filename": "error.png",
-        "content_type": "image/png",
-        "path": "/root/newman/backend_data/uploads/chat/1c2030c74d144c40aef2b0e6f59718f5/error.png",
-        "summary": "设置页保存后出现 TypeError 报错截图",
-        "analysis_status": "completed"
-      }
-    ],
-    "multimodal_parse": {
-      "schema_version": "v1",
-      "status": "completed",
-      "parser_provider": "openai_compatible",
-      "parser_model": "qwen-vl-plus",
-      "normalized_user_input": "请结合截图中的报错，解释原因并指出优先排查的文件或模块。",
-      "task_intent": "debug_screenshot",
-      "key_facts": [
-        "保存动作后立即报错",
-        "截图中包含 TypeError"
-      ],
-      "ocr_text": [
-        "TypeError: Cannot read properties of undefined"
-      ],
-      "uncertainties": [
-        "仅凭截图无法确认根因在前端还是后端"
-      ],
-      "attachment_summaries": [
-        "设置页保存后出现 TypeError 报错截图"
-      ]
-    }
-  }
-}
-```
-
-响应类型：
-
-```text
-text/event-stream
-```
-
-当前实现说明：
-
-- 通过 Runtime 进入主循环
-- 默认 Provider 为 `mock`
-- 支持普通消息和 `/tool ...` 调试指令
-- 支持图片附件与多模态预解析
-- 同一 `session_id` 同时只允许一个活跃回合；若上一轮仍在执行或等待审批，再次发送会返回 `409`
-- 单轮最大工具调用深度默认 30
-- 插件 hook 会通过 `hook_triggered` 事件回传
-- 结束时统一发送 `stream_completed`
-- 若需要主动停止当前回合，可调用 `POST /api/sessions/{session_id}/interrupt`
-
-多模态失败退化规则：
-
-- 如果 `models.multimodal` 调用超时或失败，后端不会丢弃本轮 user turn
-- 当前 user message 会保留原始 `content`
-- `metadata.attachments[*].analysis_status = "failed"`
-- `metadata.multimodal_parse.status = "failed"`
-- session 中会追加一条 `attachment_analysis_warning` system message
-- SSE 仍会继续返回本轮最终回答，同时发出 `attachment_processed { ok: false }`
-
-工具深度上限说明：
-
-- 当单轮工具调用达到 `max_tool_depth` 上限时，后端不会直接中断成空错误
-- 当前实现会禁止继续调用新工具，并基于已有上下文输出一个阶段性答复
-- 最终答复会明确提示用户：已到当前使用工具上限，可以输入“继续”
-- 此时 `final_response.finish_reason = "tool_limit_reached"`
-
-示例：
-
-```text
-/tool read_file {"path":"/root/newman/docs/prds/Newman_PRD_v9.md"}
-/tool read_file_range {"path":"README.md","offset":1,"limit":120}
-/tool list_dir {"path":"backend","recursive":false}
-/tool search_files {"query":"handle_message","path":"backend","glob":"*.py"}
-/tool edit_file {"path":"README.md","edits":[{"old_text":"old","new_text":"new"}]}
-/tool update_plan {"steps":[{"step":"检查现状","status":"completed"},{"step":"实现后端","status":"in_progress"},{"step":"更新前端","status":"pending"}]}
-/tool search_knowledge_base {"query":"混合检索","limit":3}
-/tool mcp__example-inline__echo_context {"text":"hello"}
-```
-
-## 4.2 停止当前会话中的运行任务
-
-`POST /api/sessions/{session_id}/interrupt`
-
-响应示例：
+响应：
 
 ```json
 {
   "interrupted": true,
   "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-  "request_id": "req_abc123",
-  "turn_id": "turn_user_001",
-  "message": "当前任务已停止"
+  "request_id": "req_xxx",
+  "turn_id": "turn_xxx",
+  "message": "上一次回合被用户中断，当前任务已停止。"
 }
 ```
 
-若当前没有活跃任务：
+无活跃任务：
 
 ```json
 {
@@ -905,31 +438,52 @@ text/event-stream
 }
 ```
 
-说明：
-
-- 成功停止后，后端会取消当前 worker，并在 session 中追加一条 `role=system`、`metadata.type="turn_interrupted"` 的消息。
-- 同时会把结构化 `turn_interrupted` 事件写入审计日志，因此 `GET /api/sessions/{session_id}/events` 可恢复该状态。
-- 若当前会话正有一条活跃的 `/messages` SSE 连接，后端会先把 `turn_interrupted` 推回这条流，再结束本轮并发送 `stream_completed`。
-
----
-
-## 五、审批接口
-
-## 5.1 审批通过
-
-`GET /api/sessions/{session_id}/pending-approval`
-
-响应示例：
+### SSE 事件格式
 
 ```json
 {
-  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "event": "assistant_delta",
+  "data": {},
+  "ts": 1741234567890,
+  "request_id": "req_xxx"
+}
+```
+
+常见事件：
+
+- `session_created`
+- `answer_started`
+- `assistant_delta`
+- `tool_call_started`
+- `tool_call_finished`
+- `tool_error_feedback`
+- `tool_approval_request`
+- `approval_resolved`
+- `attachment_received`
+- `attachment_processed`
+- `checkpoint_created`
+- `plan_updated`
+- `user_input_requested`
+- `turn_interrupted`
+- `final_response`
+- `error`
+- `stream_completed`
+
+## 6. 审批接口
+
+### `GET /api/sessions/{session_id}/pending-approval`
+
+返回当前会话待审批工具调用。
+
+```json
+{
+  "session_id": "session_id",
   "pending": {
     "approval_request_id": "apr_xxx",
-    "turn_id": "turn_user_001",
+    "turn_id": "turn_xxx",
     "tool": "terminal",
     "arguments": {
-      "command": "echo hi > /tmp/x"
+      "command": "npm install"
     },
     "reason": "terminal_mutation_or_unknown",
     "timeout_seconds": 120,
@@ -938,18 +492,7 @@ text/event-stream
 }
 ```
 
-若当前没有待审批请求：
-
-```json
-{
-  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-  "pending": null
-}
-```
-
-`POST /api/sessions/{session_id}/approve`
-
-请求体：
+### `POST /api/sessions/{session_id}/approve`
 
 ```json
 {
@@ -957,21 +500,7 @@ text/event-stream
 }
 ```
 
-响应示例：
-
-```json
-{
-  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-  "approval_request_id": "apr_xxx",
-  "approved": true
-}
-```
-
-## 5.2 审批拒绝
-
-`POST /api/sessions/{session_id}/reject`
-
-请求体：
+### `POST /api/sessions/{session_id}/reject`
 
 ```json
 {
@@ -979,1466 +508,325 @@ text/event-stream
 }
 ```
 
-响应示例：
+approve / reject 响应：
 
 ```json
 {
-  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
+  "session_id": "session_id",
   "approval_request_id": "apr_xxx",
-  "approved": false
+  "approved": true,
+  "already_resolved": false
 }
 ```
 
----
+### `GET /api/sessions/{session_id}/multiagent-approvals`
 
-## 六、审计与配置接口
+返回父会话下所有子代理待审批项。
 
-## 6.1 获取审计日志
+### `POST /api/sessions/{session_id}/multiagent-approvals/{approval_request_id}/approve`
 
-`GET /api/audit/{session_id}`
+通过子代理工具审批。
 
-响应体：
+### `POST /api/sessions/{session_id}/multiagent-approvals/{approval_request_id}/reject`
+
+拒绝子代理工具审批。
+
+## 7. 配置接口
+
+### `GET /api/config/project`
+
+读取项目 `newman.yaml`。
+
+### `PUT /api/config/project`
+
+保存项目 `newman.yaml`。
 
 ```json
 {
-  "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-  "events": [
-    "{\"event\":\"tool_call_started\",\"data\":{\"tool\":\"read_file\"},\"request_id\":\"req_xxx\"}"
-  ]
+  "content": "server:\n  port: 8005\n"
 }
 ```
 
-说明：
+保存前会校验 YAML 和配置结构。该接口不会自动 reload。
 
-- 这是调试接口，返回原始审计日志行，不保证适合前端直接恢复 timeline。
-- 前端恢复会话过程状态时，优先使用 `GET /api/sessions/{session_id}/events`。
+### `GET /api/config/env`
 
-## 6.2 获取项目配置文件
+读取项目 `.env`。
 
-`GET /api/config/project`
+### `PUT /api/config/env`
 
-响应示例：
+保存项目 `.env`，并同步更新当前进程环境变量。
 
 ```json
 {
-  "path": "/root/newman/newman.yaml",
-  "content": "server:\n  port: 8005\npaths:\n  workspace: \".\"\n",
-  "effective_workspace": "/root/newman",
-  "source_priority": [
-    "environment",
-    "~/.newman/config.yaml",
-    "newman.yaml",
-    "defaults.yaml"
-  ],
-  "reload_supported": true
+  "content": "NEWMAN_MODELS_PRIMARY_MODEL=gpt-4.1-mini\n"
 }
 ```
 
-说明：
+### `POST /api/config/reload`
 
-- `content` 返回项目根目录下 `newman.yaml` 的完整文本。
-- `effective_workspace` 返回当前已生效配置解析后的绝对路径。
-- `source_priority` 表示配置合并优先级，越靠前优先级越高。
-
-## 6.3 保存项目配置文件
-
-`PUT /api/config/project`
-
-请求体：
-
-```json
-{
-  "content": "server:\n  port: 8010\npaths:\n  workspace: \"workspace\"\n"
-}
-```
-
-响应示例：
-
-```json
-{
-  "saved": true,
-  "path": "/root/newman/newman.yaml",
-  "content": "server:\n  port: 8010\npaths:\n  workspace: \"workspace\"\n",
-  "effective_workspace": "/root/newman/workspace",
-  "requires_reload": true,
-  "warnings": []
-}
-```
-
-说明：
-
-- 保存前会先校验 YAML 语法以及配置结构；顶层必须是 YAML 对象。
-- 该接口只负责写入 `newman.yaml`，不会自动热重载当前进程。
-- `warnings` 会提示“即使 reload 也不能立刻生效”的配置项变化，例如监听地址或 CORS。
-
-## 6.4 重载项目配置
-
-`POST /api/config/reload`
-
-响应示例：
+重新加载配置、runtime、scheduler 与 channels。
 
 ```json
 {
   "reloaded": true,
   "path": "/root/newman/newman.yaml",
-  "effective_workspace": "/root/newman/workspace",
-  "warnings": [
-    "`server.host` / `server.port` 的变化需要重启进程后才能真正改变监听地址。"
-  ]
+  "effective_workspace": "/root/newman",
+  "warnings": []
 }
 ```
 
-说明：
+## 8. 工作区接口
 
-- 该接口会重新加载配置，并热替换 `settings`、`runtime`、`scheduler` 与 `channels` 服务实例。
-- 新运行时会先重建生态并刷新 scheduler；若启动新实例失败，会回滚到旧实例。
-- `server.host`、`server.port` 和 `server.cors_origins` 的变化会写入配置，但仍需要重启进程才能完全生效。
+### `GET /api/workspace/memory`
 
----
+读取 stable memory 文件。
 
-## 七、工作区接口
+返回 `newman`、`user`、`memory`、`skills` 四类文件内容和更新时间。
 
-这些接口主要服务 Phase 4 前端工作台。
+### `PUT /api/workspace/memory/{memory_key}`
 
-## 7.1 获取 Stable Memory 文件
+更新 stable memory 文件。
 
-`GET /api/workspace/memory`
-
-响应示例：
-
-```json
-{
-  "latest_updated_at": "2026-04-09T09:00:00+00:00",
-  "files": {
-    "newman": {
-      "path": "/root/newman/backend_data/memory/Newman.md",
-      "content": "# Newman System Prompt ...",
-      "updated_at": "2026-04-09T08:55:00+00:00"
-    },
-    "user": {
-      "path": "/root/newman/backend_data/memory/USER.md",
-      "content": "# USER.md\n\n<!-- BEGIN AUTO USER MEMORY -->\n## User Memory\n仅记录跨 session 稳定成立的用户偏好、沟通方式和长期协作约定，不记录一次性任务或项目事实。\n\n- 暂无条目\n<!-- END AUTO USER MEMORY -->",
-      "updated_at": "2026-04-09T09:00:00+00:00"
-    },
-    "memory": {
-      "path": "/root/newman/backend_data/memory/MEMORY.md",
-      "content": "# MEMORY.md\n\n<!-- BEGIN AUTO EVOLUTION MEMORY -->\n## Learned Experience\n\n- 前端修改后应运行构建检查，并在必要时验证实际渲染。\n<!-- END AUTO EVOLUTION MEMORY -->",
-      "updated_at": "2026-04-09T08:30:00+00:00"
-    },
-    "skills": {
-      "path": "/root/newman/backend_data/memory/SKILLS_SNAPSHOT.md",
-      "content": "# SKILLS_SNAPSHOT.md\n\n当前可用 skill 快照 ...",
-      "updated_at": "2026-04-09T08:40:00+00:00"
-    }
-  }
-}
-```
-
-说明：
-
-- `latest_updated_at` 用于前端展示“最近一次记忆更新时间”。
-- 若某个 memory 文件尚不存在，则其 `content` 为空字符串，`updated_at` 为 `null`。
-- `MEMORY.md` 会被注入 Stable Context，用于保存 Newman 自动沉淀的跨 session 经验。
-- `USER.md` 仍用于用户偏好和长期协作约定；当前自进化 MVP 的自动经验写入目标是 `MEMORY.md`。
-
-## 7.2 更新 Stable Memory 文件
-
-`PUT /api/workspace/memory/{memory_key}`
-
-支持的 `memory_key`：
+`memory_key` 支持：
 
 - `newman`
 - `user`
 - `memory`
 - `skills`
 
-说明：
-
-- 该接口是人工编辑入口；全自动自进化写入 `MEMORY.md` 时不通过该 API，而是由后端 `EvolutionService` 直接写文件并记录 evolution run。
+### `GET /api/workspace/roots`
 
-请求体：
+返回 workspace、browse root、output root、可读根、可写根和保护根。
 
-```json
-{
-  "content": "# Updated memory"
-}
-```
+### `GET /api/workspace/files?path=.`
 
-响应示例：
+浏览目录或读取文本文件预览。
 
-```json
-{
-  "saved": true,
-  "memory_key": "memory",
-  "path": "/root/newman/backend_data/memory/MEMORY.md",
-  "updated_at": "2026-04-09T09:10:00+00:00"
-}
-```
+目录最多返回前 `200` 项；文件内容最多返回前 `20000` 字符。
 
-## 7.2A 获取工作区根权限信息
+### `GET /api/workspace/file-content?path=...&download=false`
 
-`GET /api/workspace/roots`
-
-响应示例：
-
-```json
-{
-  "workspace": "/root/newman",
-  "readable_roots": [
-    "/root/newman",
-    "/root/newman/backend",
-    "/root/newman/docs"
-  ],
-  "writable_roots": [
-    "/root/newman"
-  ],
-  "protected_roots": [
-    "/root/newman/backend_data/secrets"
-  ]
-}
-```
-
-说明：
-
-- 该接口返回当前路径访问策略展开后的绝对路径集合。
-- 前端可用它判断哪些目录允许浏览、编辑或需要特别标识。
-
-## 7.3 浏览工作区文件
-
-`GET /api/workspace/files?path=.`
-
-目录响应：
-
-```json
-{
-  "path": "/root/newman",
-  "type": "dir",
-  "access": "writable",
-  "entries": [
-    {
-      "name": "backend",
-      "path": "/root/newman/backend",
-      "type": "dir",
-      "access": "writable"
-    }
-  ]
-}
-```
-
-文件响应：
-
-```json
-{
-  "path": "/root/newman/docs/Newman_API_v1.md",
-  "type": "file",
-  "access": "readable",
-  "content": "# Newman API 文档 ..."
-}
-```
-
-说明：
-
-- 若 `path` 指向目录，当前最多返回前 `200` 个子项，并默认跳过隐藏/忽略路径。
-- 若 `path` 指向文件，返回的是文本预览内容，当前最多截断到前 `20000` 个字符。
-- `access` 来自当前路径权限模型，常见值包括 `writable`、`readable`、`protected`。
-
-## 7.3A 获取文件原始内容
-
-`GET /api/workspace/file-content?path=frontend/src/assets/newman-logo.png`
-
-说明：
-
-- 该接口直接返回文件响应，自动推断 `Content-Type`，并设置 `content-disposition: inline`。
-- 适合前端预览图片、PDF 或需要完整内容的文件；相比 `GET /api/workspace/files` 不会进行文本截断。
-
----
-
-## 7.4 自进化接口
-
-自进化接口服务前端 Evolution Log 页面。当前实现是**全自动、无事前审批**：
-
-- 正常触发：新 session 创建时总结上一个 session；当前 session 每累计 20 个 user turn 做一次增量总结。
-- 自动范围：更新 `backend_data/memory/MEMORY.md`，以及修改对应 Skill 目录内的 `SKILL.md`、脚本、`requirements.txt`、参考文档等文件。
-- 不自动处理：权限配置、系统 prompt、后端/前端代码、插件安装、高权限工具新增。
-- 保障机制：每次运行保存快照、diff、验证结果；验证失败自动回滚；前端可事后手动回滚整次运行。
-
-### 7.4.1 获取自进化运行列表
-
-`GET /api/evolution/runs?limit=50`
-
-响应示例：
-
-```json
-{
-  "runs": [
-    {
-      "run_id": "ev_xxx",
-      "trigger": "new_session_created",
-      "source_session_id": "9a62e9e8a71e4de8bf4f7f721f0a5b22",
-      "status": "applied",
-      "created_at": "2026-05-29T08:00:00+00:00",
-      "updated_at": "2026-05-29T08:00:12+00:00",
-      "summary": "memory 更新 1 项；skill 文件更新 2 项",
-      "message_range": [0, 18],
-      "user_turn_count": 7,
-      "changes": [
-        {
-          "change_id": "chg_xxx",
-          "kind": "memory_update",
-          "action": "append",
-          "target_path": "/root/newman/backend_data/memory/MEMORY.md",
-          "summary": "新增 1 条经验记忆",
-          "reason": "会话中完成标准依赖构建验证。",
-          "diff": "--- a/.../MEMORY.md\n+++ b/.../MEMORY.md\n...",
-          "before_exists": true,
-          "snapshot_path": "/root/newman/backend_data/evolution/snapshots/ev_xxx/abc.before",
-          "validation_status": "passed",
-          "validation_errors": []
-        }
-      ],
-      "errors": [],
-      "metadata": {}
-    }
-  ]
-}
-```
-
-### 7.4.2 获取自进化运行详情
-
-`GET /api/evolution/runs/{run_id}`
-
-响应体：
-
-```json
-{
-  "run": {
-    "run_id": "ev_xxx",
-    "trigger": "turn_interval",
-    "status": "partial",
-    "changes": [],
-    "errors": []
-  }
-}
-```
-
-### 7.4.3 手动触发自进化
-
-`POST /api/evolution/run`
-
-请求体：
-
-```json
-{
-  "session_id": "9a62e9e8a71e4de8bf4f7f721f0a5b22",
-  "trigger": "manual"
-}
-```
-
-说明：
-
-- 该接口主要用于调试和手动补跑；常规使用不需要前端主动调用。
-- `trigger` 支持 `manual`、`new_session_created`、`turn_interval`。
-- 当前 provider 为 `mock` 时会跳过自进化。
-
-### 7.4.4 回滚一次自进化
-
-`POST /api/evolution/runs/{run_id}/rollback`
-
-响应体：
-
-```json
-{
-  "run": {
-    "run_id": "ev_xxx",
-    "status": "rolled_back",
-    "summary": "已回滚本次自进化变更"
-  }
-}
-```
-
-说明：
-
-- 回滚会按该 run 记录的快照恢复所有变更文件。
-- 如果某个文件是自进化中新建的，回滚时会删除该文件。
-- 回滚后会执行 `reload_ecosystem()`，使 Skill 快照与工具快照重新同步。
-
----
-
-## 八、知识库接口
-
-## 8.1 导入知识文档
-
-`POST /api/knowledge/documents/import`
-
-请求体：
-
-```json
-{
-  "source_path": "docs/prds/M07_RAG.md"
-}
-```
-
-说明：
-
-- 仅支持 workspace 内文件
-- 当前支持文本类文件：`.md`、`.txt`、`.json`、`.csv`、`.py`、`.yaml`、`.yml`、`.log`
-- 文档类解析支持：`.pdf`、`.docx`、`.pptx`、`.xlsx`
-- 若是图片文件，请改用 `/api/knowledge/documents/upload`
-
-## 8.2 列出知识文档
-
-`GET /api/knowledge/documents`
-
-响应示例：
-
-```json
-{
-  "documents": [
-    {
-      "document_id": "doc_xxx",
-      "title": "M07_RAG.md",
-      "source_path": "docs/prds/M07_RAG.md",
-      "stored_path": "/root/newman/backend_data/knowledge/doc_xxx_M07_RAG.md",
-      "size_bytes": 12456,
-      "content_type": "text/markdown",
-      "parser": "text",
-      "chunk_count": 12,
-      "page_count": null,
-      "imported_at": "2026-04-08T09:00:00+00:00"
-    }
-  ]
-}
-```
-
-说明：
-
-- 前端如需展示“最近上传或引用文件”“文档解析状态”，可直接基于该接口返回的结构化字段渲染。
-- 若前端需要打开某个知识文件正文，可结合 `stored_path` 调用 `GET /api/workspace/files?path=...`。
-
-## 8.3 上传知识文档
-
-`POST /api/knowledge/documents/upload`
-
-请求类型：
+返回完整文件响应。适合图片、PDF、二进制文件或下载。
+
+### `GET /api/workspace/upload-content?path=...&download=false`
+
+读取允许目录内的上传文件。
+
+### `GET /api/workspace/attachment-content?path=...&download=false`
+
+读取允许目录内的附件文件。
+
+允许根包括：
+
+- `backend_data/uploads/chat`
+- `<workspace>/user_uploads`
+- `<workspace>/parser_outputs`
+
+## 9. 审计与 Usage
+
+### `GET /api/audit/{session_id}`
+
+返回原始审计日志行。
+
+前端恢复 timeline 时优先使用：
 
 ```text
-multipart/form-data
+GET /api/sessions/{session_id}/events
 ```
 
-字段：
+### `GET /api/usage/summary`
 
-- `file`: 单个文件
+返回全局模型 usage 汇总。
 
-支持类型：
+查询参数：
 
-- 文本类：`.md`、`.txt`、`.json`、`.csv`、`.py`、`.yaml`、`.yml`、`.log`
-- 文档类：`.pdf`、`.docx`、`.pptx`、`.xlsx`
-- 图片类：`.jpg`、`.jpeg`、`.png`
+- `days`：默认 `7`，范围 `1..366`
+- `tz`：默认 `Asia/Shanghai`
+- `model`：可选
+- `recent_limit`：默认 `7`，范围 `1..100`
+- `include_estimated`：默认 `false`
 
-说明：
+返回维度包括：
 
-- 文档类会执行“解析 -> 切块 -> embedding -> PostgreSQL + Chroma 入库”
-- 图片类会先调用 `models.multimodal` 解析，再以文本摘要形式入库
-- 文档元数据、chunk 映射、搜索统计和引用记录存 PostgreSQL
-- 向量索引存 Chroma 持久化目录
-- 检索命中后会为 Top-N 结果记录 citation usage，便于后续统计与溯源
+- `totals`
+- `by_day`
+- `by_model`
+- `by_request_kind`
+- `by_session`
+- `recent_records`
 
-## 8.4 搜索知识库
+## 10. 插件、工具与 Skill
 
-`POST /api/knowledge/search`
+### Plugins
 
-请求体：
+| Method | Path | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/plugins` | 获取插件列表 |
+| `POST` | `/api/plugins/import` | 从本地路径导入插件 |
+| `POST` | `/api/plugins/rescan` | 重新扫描插件 |
+| `GET` | `/api/plugins/{plugin_name}` | 获取插件详情 |
+| `POST` | `/api/plugins/{plugin_name}/enable` | 启用插件 |
+| `POST` | `/api/plugins/{plugin_name}/disable` | 禁用插件 |
+| `PUT` | `/api/plugins/{plugin_name}` | 更新插件 manifest |
+| `DELETE` | `/api/plugins/{plugin_name}` | 删除插件 |
+
+### Tools
+
+| Method | Path | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/tools` | 获取工具列表 |
+| `GET` | `/api/tools/{tool_name}` | 获取工具详情 |
+| `POST` | `/api/tools/rescan` | 重新扫描工具生态 |
+
+当前内置工具从 `backend/tools/impl/` 动态发现；插件和 MCP 可额外挂载工具。
+
+### Skills
+
+| Method | Path | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/skills` | 获取 Skill 列表 |
+| `POST` | `/api/skills/import` | 从本地路径导入 Skill |
+| `POST` | `/api/skills/upload` | 上传并安装 Skill |
+| `GET` | `/api/skills/{skill_name}` | 获取 Skill 详情 |
+| `PUT` | `/api/skills/{skill_name}` | 更新 Skill |
+| `DELETE` | `/api/skills/{skill_name}` | 删除 Skill |
+
+## 11. MCP 接口
+
+### `GET /api/mcp/servers`
+
+返回 MCP server 配置与连接状态。
+
+### `POST /api/mcp/servers`
+
+创建或更新 MCP server。
+
+请求体使用 `MCPServerConfig`。
+
+### `DELETE /api/mcp/servers/{server_name}`
+
+删除 MCP server。
+
+### `POST /api/mcp/servers/{server_name}/reconnect`
+
+重连 MCP server。
+
+### `GET /api/mcp/resources`
+
+返回 MCP resources 与 server 状态。
+
+## 12. Multi-agent 接口
+
+### `GET /api/multiagent/runs/{run_id}`
+
+获取 multi-agent run 详情和任务列表。
+
+### `GET /api/multiagent/tasks/{task_id}`
+
+获取子任务详情。
+
+### `POST /api/multiagent/runs/{run_id}/cancel`
+
+取消整个 run。
 
 ```json
 {
-  "query": "混合检索",
-  "limit": 3
+  "reason": "user_requested"
 }
 ```
 
-返回结果字段包含：
+### `POST /api/multiagent/tasks/{task_id}/cancel`
 
-- `lexical_score`
-- `vector_score`
-- `rerank_score`
-- `chunk_id`
-- `chunk_index`
-- `page_number`
-- `location_label`
-- `citation`
-
-`citation` 结构示例：
+取消单个子任务。
 
 ```json
 {
-  "document_id": "doc_xxx",
-  "title": "M07_RAG.md",
-  "stored_path": "/root/newman/backend_data/knowledge/doc_xxx_M07_RAG.md",
-  "chunk_id": "doc_xxx_3",
-  "chunk_index": 3,
-  "page_number": 5,
-  "location_label": "page 5",
-  "snippet": "关键片段预览文本..."
+  "reason": "user_requested"
 }
 ```
 
----
+## 13. Scheduler 接口
 
-## 九、插件、Tool 与 Skill 接口
+### `GET /api/scheduler/tasks`
 
-## 9.1 获取插件列表
+返回定时任务列表。
 
-`GET /api/plugins`
+### `GET /api/scheduler/tasks/{task_id}/runs`
 
-响应示例：
+返回任务运行记录。
 
-```json
-{
-  "plugins": [
-    {
-      "name": "example-plugin",
-      "version": "1.0.0",
-      "description": "Example Phase 3 plugin with a sample skill, hooks, and inline MCP server.",
-      "enabled": true,
-      "plugin_path": "/root/newman/plugins/example-plugin",
-      "skill_count": 1,
-      "hook_count": 5,
-      "mcp_server_count": 1
-    }
-  ],
-  "errors": [
-    {
-      "plugin_path": "/root/newman/plugins/broken-plugin",
-      "plugin_name": "broken-plugin",
-      "message": "Hook handler not found: hooks/missing.py"
-    }
-  ]
-}
-```
+查询参数：
 
-说明：
+- `limit`：默认 `20`，范围 `1..100`
 
-- `plugins` 是已成功加载的插件
-- `errors` 是扫描时发现但未能加载的插件校验错误
-- 后端会在每轮新消息开始前自动感知 `plugins/`、`skills/` 和 `backend/tools/` 目录变化，并在下一轮重建生态
+### `GET /api/scheduler/alerts`
 
-## 9.2 获取插件详情
+返回调度告警。
 
-`GET /api/plugins/{plugin_name}`
+### `POST /api/scheduler/tasks`
 
-响应示例：
+创建任务。
 
 ```json
 {
-  "plugin": {
-    "name": "example-plugin",
-    "version": "1.0.0",
-    "description": "Example plugin",
-    "enabled": true,
-    "plugin_path": "/root/newman/plugins/example-plugin",
-    "skill_count": 1,
-    "hook_count": 2,
-    "mcp_server_count": 1,
-    "directory_path": "/root/newman/plugins/example-plugin",
-    "manifest_path": "/root/newman/plugins/example-plugin/plugin.yaml",
-    "manifest": {
-      "name": "example-plugin",
-      "version": "1.0.0",
-      "description": "Example plugin",
-      "enabled_by_default": true,
-      "skills": [],
-      "hooks": [],
-      "mcp_servers": [],
-      "required_permissions": [],
-      "ui": null
-    },
-    "manifest_content": "name: example-plugin\nversion: 1.0.0\n...",
-    "skill_paths": [
-      "/root/newman/plugins/example-plugin/skills/demo_skill"
-    ],
-    "hook_handlers": [
-      {
-        "event": "FileChanged",
-        "handler": "hooks/on_change.py",
-        "message": "",
-        "timeout_seconds": 5,
-        "path": "/root/newman/plugins/example-plugin/hooks/on_change.py"
-      }
-    ],
-    "tool_names": [],
-    "available": true
-  }
-}
-```
-
-## 9.3 导入插件
-
-`POST /api/plugins/import`
-
-请求体：
-
-```json
-{
-  "source_path": "imports/my_plugin"
-}
-```
-
-说明：
-
-- `source_path` 必须位于当前可读目录范围内
-- 目标文件夹内必须包含 `plugin.yaml`
-- 导入行为会把整个插件目录复制到 `plugins/`，然后立即重载插件生态
-
-## 9.4 更新插件 Manifest
-
-`PUT /api/plugins/{plugin_name}`
-
-请求体：
-
-```json
-{
-  "content": "name: example-plugin\nversion: 2.0.0\ndescription: Updated plugin\n"
-}
-```
-
-说明：
-
-- 当前接口更新的是目标插件的 `plugin.yaml` 完整内容
-- 其他插件文件仍建议通过文件工具或工作区文件接口维护
-- 更新成功后会立即重载插件生态
-
-## 9.5 删除插件
-
-`DELETE /api/plugins/{plugin_name}`
-
-响应示例：
-
-```json
-{
-  "deleted": true,
-  "plugin_name": "example-plugin"
-}
-```
-
-## 9.6 重新扫描插件
-
-`POST /api/plugins/rescan`
-
-返回结构与 `GET /api/plugins` 一致，额外包含：
-
-```json
-{
-  "reloaded": true
-}
-```
-
-## 9.7 启用 / 禁用插件
-
-`POST /api/plugins/{plugin_name}/enable`
-
-`POST /api/plugins/{plugin_name}/disable`
-
-说明：
-
-- 这两个接口都会返回最新的插件详情结构
-- 启停状态会写入插件状态存储，并触发运行时生态重载
-
-## 9.8 获取 Tool 列表
-
-`GET /api/tools`
-
-响应示例：
-
-```json
-{
-  "tools": [
-    {
-      "name": "read_file",
-      "description": "Read a small workspace file and return the entire contents as base64 in dataBase64. Use this only when you need the exact complete file bytes. If the file may be large or you only need part of a text file, use read_file_range instead.",
-      "risk_level": "low",
-      "requires_approval": false,
-      "timeout_seconds": 10,
-      "allowed_paths": [
-        "/data/newman/runtime_workspace",
-        "/root/newman/backend",
-        "/root/newman/docs"
-      ],
-      "source_type": "builtin",
-      "module": "backend.tools.impl.read_file",
-      "class_name": "ReadFileTool",
-      "file_path": "/root/newman/backend/tools/impl/read_file.py",
-      "file_access": "writable",
-      "managed": true,
-      "input_schema": {
-        "type": "object"
-      }
-    }
-  ]
-}
-```
-
-字段说明：
-
-- `source_type`
-  - `builtin`：内置工具，来自 `backend/tools/impl/`
-  - `mcp`：MCP 桥接工具
-  - `runtime`：其他运行时注册工具
-- `file_access` 表示该工具实现文件在当前权限模型中的访问级别
-- `managed = true` 表示该工具实现文件位于当前可维护范围内
-
-## 9.9 获取 Tool 详情
-
-`GET /api/tools/{tool_name}`
-
-返回结构与 `GET /api/tools` 中单个 `tool` 条目一致。
-
-## 9.10 重新扫描 Tool 生态
-
-`POST /api/tools/rescan`
-
-响应示例：
-
-```json
-{
-  "reloaded": true,
-  "tools": []
-}
-```
-
-说明：
-
-- 会触发运行时重建工具注册表
-- 当前内置 Tool 采用动态发现机制：`backend/tools/impl/` 下模块只要导出 `build_tools(context)`，重扫后即可注册
-
-## 9.11 获取 Skill 列表
-
-`GET /api/skills`
-
-响应示例：
-
-```json
-{
-  "skills": [
-    {
-      "name": "session_review",
-      "source": "system",
-      "plugin_name": null,
-      "path": "/root/newman/skills/session_review/SKILL.md",
-      "description": "Review what happened in a session and identify the best next step.",
-      "when_to_use": "Use when the user asks for a recap, retrospective, unblock plan, or next-step review of a session.",
-      "summary": "Review what happened in a session and identify the best next step."
-    }
-  ]
-}
-```
-
-说明：
-
-- 运行时里的 skill 是“一个目录”，不是单独一段文本；目录内必须有 `SKILL.md`，也可以包含 `scripts/`、`references/`、`templates/`、`assets/`、`requirements.txt`、`pyproject.toml` 等辅助资源。
-- 运行时会动态生成 `backend_data/memory/SKILLS_SNAPSHOT.md`
-- `SKILLS_SNAPSHOT.md` 只负责告诉模型“有哪些 skill 可用、什么时候该用”
-- 列表接口只返回 skill 元数据摘要，不会内联同目录下的脚本、模板、参考资料等辅助文件
-- `path` 指向 skill 的 `SKILL.md`；若需要 skill 目录根路径，请使用详情接口中的 `directory_path`
-- 具体 Skill 正文建议通过工作区文件或 `read_file` 按需读取
-- `backend_data/memory/USER.md` 会被后台稳定记忆抽取逻辑自动合并更新
-- 已启用插件中的 skill 会和平台 `skills/` 目录下的 skill 合并进入同一个 snapshot
-- 插件启停或 skill 文件变更后，下一轮 prompt 会使用最新 snapshot
-- 当前列表只返回“当前可用”的 skill：平台 skill + 已启用 plugin skill
-
-## 9.12 获取 Skill 详情
-
-`GET /api/skills/{skill_name}`
-
-响应示例：
-
-```json
-{
-  "skill": {
-    "name": "writer",
-    "source": "system",
-    "plugin_name": null,
-    "path": "/root/newman/skills/writer/SKILL.md",
-    "description": "Write and refine deliverables.",
-    "when_to_use": null,
-    "summary": "Write and refine deliverables.",
-    "content": "---\nname: writer\ndescription: Write and refine deliverables.\n---\n\n## Workflow\n...",
-    "readonly": false,
-    "available": true,
-    "tool_dependencies": ["read_file", "write_file"],
-    "usage_limits_summary": "- Do not modify unrelated files. - Only change what is required.",
-    "directory_path": "/root/newman/skills/writer"
-  }
-}
-```
-
-字段说明：
-
-- `readonly = true` 表示该 skill 来自 plugin 或其他只读来源，不能通过管理接口修改
-- `content` 仅返回该 skill 的 `SKILL.md` 文本，不会展开同目录下的 `scripts/`、`references/`、`templates/` 等文件
-- `tool_dependencies` 为根据 `SKILL.md` 内容提取出的工具依赖摘要
-- `usage_limits_summary` 为根据 `SKILL.md` 中的约束/限制段落提取出的简要说明
-- `directory_path` 为 skill 目录根路径；若要检查或编辑同目录下的脚本和参考文件，应基于这个目录进一步读取文件
-
-## 9.13 导入 Skill
-
-`POST /api/skills/import`
-
-请求体：
-
-```json
-{
-  "source_path": "imports/reviewer"
-}
-```
-
-说明：
-
-- `source_path` 必须位于当前可读目录范围内
-- 目标文件夹内必须包含 `SKILL.md`
-- 导入行为会把整个 skill 文件夹复制到平台 `skills/` 目录下，并立即刷新 snapshot
-- 复制范围不仅包含 `SKILL.md`，也包含同目录下的 `scripts/`、`references/`、`templates/`、依赖清单等资源文件
-- 当前没有单独的“创建空 skill”接口；新增 skill 的受支持方式是先准备一个合法 skill 目录，再通过本接口导入
-
-## 9.14 上传装载 Skill
-
-`POST /api/skills/upload`
-
-请求体：`multipart/form-data`
-
-- `files`：一个或多个文件；浏览器文件夹上传时可在 multipart filename 中保留相对路径
-- `skill_name`：可选，指定生成后的 skill id
-- `optimize_with_llm`：可选，默认 `true`；模型不可用时会回退到确定性装载
-
-支持上传格式：
-
-- Markdown：`.md`
-- Python 脚本：`.py`
-- 图片：`.jpg`、`.jpeg`、`.png`
-
-说明：
-
-- 一次上传会装载为一个平台 skill 文件夹
-- 上传内容会被整理为 `SKILL.md`、`references/`、`scripts/`、`assets/`
-- 若缺少 `SKILL.md`，装载器会基于 Markdown 内容生成入口文件并补齐 `name`、`description`、`when_to_use`
-- 若包含 Python 脚本，装载器会生成 `scripts/run_python.py` 和 `requirements.txt`，脚本运行时通过 skill-local `.venv` 隔离依赖
-- 导入完成后会立即刷新 snapshot
-
-响应示例：
-
-```json
-{
-  "skill": {
-    "name": "reviewer",
-    "path": "/root/newman/skills/reviewer/SKILL.md",
-    "directory_path": "/root/newman/skills/reviewer"
-  },
-  "import_report": {
-    "optimizer": "deterministic",
-    "file_count": 3,
-    "generated_files": ["scripts/run_python.py", "requirements.txt"],
-    "warnings": []
-  }
-}
-```
-
-## 9.15 更新 Skill
-
-`PUT /api/skills/{skill_name}`
-
-请求体：
-
-```json
-{
-  "content": "# Updated Skill\n\nUse `search_files` first."
-}
-```
-
-说明：
-
-- 只允许更新平台 `skills/` 目录中的 system skill
-- 当前该接口只会覆盖目标 skill 的 `SKILL.md` 内容，不会修改同目录下的脚本、模板、参考资料或依赖文件
-- 若目标 skill 为 plugin skill 或其他只读来源，接口会返回冲突错误
-
-## 9.16 删除 Skill
-
-`DELETE /api/skills/{skill_name}`
-
-响应示例：
-
-```json
-{
-  "deleted": true,
-  "skill_name": "reviewer"
-}
-```
-
-说明：
-
-- 只允许删除 system skill
-- 删除行为针对整个 skill 目录，而不只是删除 `SKILL.md`
-- plugin skill 或其他只读来源不能通过该接口删除
-
----
-
-## 十、MCP 接口
-
-当前实现已经支持 `inline`、`http_json`、`http_sse`、`stdio` 四种 bridge 传输，并把 MCP 工具注册进统一 `ToolRegistry`。MCP 资源也会被整理进运行时工具概览，供模型侧感知。
-
-当前仍未完成的部分：
-- 还没有接入官方 MCP Python SDK
-- `stdio` 采用的是 Newman 当前自定义的 newline-delimited JSON bridge，不是完整官方 MCP stdio 协议
-- `http_sse` 当前实现为兼容型 SSE 响应解析，不是长连接会话复用模型
-- 还没有单独的前端 MCP 管理页
-
-### 10.0 MCP Server 配置字段
-
-```json
-{
-  "name": "my-stdio-server",
-  "transport": "stdio",
-  "command": ["python"],
-  "args": ["-m", "demo_mcp_server"],
-  "env": {
-    "DEMO_MODE": "1"
-  },
-  "url": null,
-  "enabled": true,
-  "requires_approval": true,
-  "timeout_seconds": 20,
-  "headers": {},
-  "tools": [],
-  "resources": []
-}
-```
-
-字段说明：
-
-- `transport`
-  - `inline`：工具与资源直接写在配置里
-  - `http_json`：通过 HTTP JSON 拉取 `/tools`、`/resources`，并调用 `/invoke/{tool}`
-  - `http_sse`：通过 HTTP/SSE 响应解析同样的 `/tools`、`/resources`、`/invoke/{tool}`
-  - `stdio`：启动本地子进程，使用 newline-delimited JSON bridge 交互
-- `command + args`
-  - 仅 `stdio` 需要
-- `url`
-  - `http_json` / `http_sse` 需要
-- `requires_approval`
-  - 该 MCP Server 下所有工具默认是否进入统一审批流程
-- `tools`
-  - `inline` 模式可直接内嵌工具清单
-- `resources`
-  - `inline` 模式可直接内嵌资源清单
-
-最小可用样例：
-
-`inline`
-
-```json
-{
-  "name": "inline-demo",
-  "transport": "inline",
-  "enabled": true,
-  "requires_approval": false,
-  "tools": [
-    {
-      "name": "echo_text",
-      "description": "Return inline MCP output",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "text": {
-            "type": "string"
-          }
-        }
-      },
-      "risk_level": "low"
-    }
-  ],
-  "resources": [
-    {
-      "uri": "memory://inline/context",
-      "name": "inline-context",
-      "description": "Inline MCP resource",
-      "mime_type": "text/markdown",
-      "content": "# hello"
-    }
-  ]
-}
-```
-
-`http_json`
-
-```json
-{
-  "name": "remote-http-json",
-  "transport": "http_json",
-  "url": "http://127.0.0.1:9000/mcp",
-  "enabled": true,
-  "requires_approval": true,
-  "timeout_seconds": 20,
-  "headers": {
-    "Authorization": "Bearer demo-token"
-  }
-}
-```
-
-`stdio`
-
-```json
-{
-  "name": "local-stdio",
-  "transport": "stdio",
-  "command": ["python"],
-  "args": ["-m", "demo_mcp_server"],
-  "env": {
-    "DEMO_MODE": "1"
-  },
-  "enabled": true,
-  "requires_approval": false
-}
-```
-
-`http_sse`
-
-```json
-{
-  "name": "remote-http-sse",
-  "transport": "http_sse",
-  "url": "http://127.0.0.1:9100/mcp",
-  "enabled": true,
-  "requires_approval": true,
-  "timeout_seconds": 20
-}
-```
-
-## 10.1 获取 MCP Server 列表与状态
-
-`GET /api/mcp/servers`
-
-响应示例：
-
-```json
-{
-  "servers": [
-    {
-      "name": "my-inline",
-      "transport": "inline",
-      "url": null,
-      "command": [],
-      "args": [],
-      "env": {},
-      "enabled": true,
-      "requires_approval": false,
-      "timeout_seconds": 20,
-      "headers": {},
-      "tools": [
-        {
-          "name": "echo_text",
-          "description": "Return inline MCP output",
-          "input_schema": {
-            "type": "object",
-            "properties": {
-              "text": {
-                "type": "string"
-              }
-            }
-          },
-          "risk_level": "low"
-        }
-      ],
-      "resources": [
-        {
-          "uri": "memory://inline/context",
-          "name": "inline-context",
-          "description": "Inline MCP resource",
-          "mime_type": "text/markdown",
-          "content": "# hello"
-        }
-      ]
-    }
-  ],
-  "statuses": [
-    {
-      "name": "my-inline",
-      "transport": "inline",
-      "enabled": true,
-      "tool_count": 1,
-      "resource_count": 1,
-      "status": "connected",
-      "detail": "",
-      "last_checked_at": "2026-04-08T09:00:00+00:00"
-    }
-  ]
-}
-```
-
-## 10.2 创建或更新 MCP Server
-
-`POST /api/mcp/servers`
-
-请求体示例：
-
-```json
-{
-  "name": "my-inline",
-  "transport": "inline",
-  "command": [],
-  "args": [],
-  "env": {},
-  "url": null,
-  "enabled": true,
-  "requires_approval": false,
-  "timeout_seconds": 20,
-  "headers": {},
-  "tools": [
-    {
-      "name": "echo_text",
-      "description": "Return inline MCP output",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "text": {
-            "type": "string"
-          }
-        },
-        "required": ["text"]
-      },
-      "risk_level": "low"
-    }
-  ],
-  "resources": [
-    {
-      "uri": "memory://inline/context",
-      "name": "inline-context",
-      "description": "Inline MCP resource",
-      "mime_type": "text/markdown",
-      "content": "# hello"
-    }
-  ]
-}
-```
-
-响应示例：
-
-```json
-{
-  "server": {
-    "name": "my-inline",
-    "transport": "inline",
-    "url": null,
-    "command": [],
-    "args": [],
-    "env": {},
-    "enabled": true,
-    "requires_approval": false,
-    "timeout_seconds": 20,
-    "headers": {},
-    "tools": [],
-    "resources": []
-  },
-  "status": {
-    "name": "my-inline",
-    "transport": "inline",
-    "enabled": true,
-    "tool_count": 0,
-    "resource_count": 0,
-    "status": "connected",
-    "detail": "",
-    "last_checked_at": "2026-04-08T09:00:00+00:00"
-  }
-}
-```
-
-## 10.3 删除 MCP Server
-
-`DELETE /api/mcp/servers/{server_name}`
-
-响应示例：
-
-```json
-{
-  "deleted": true,
-  "server_name": "my-inline"
-}
-```
-
-## 10.4 重连 MCP Server
-
-`POST /api/mcp/servers/{server_name}/reconnect`
-
-响应示例：
-
-```json
-{
-  "server_name": "my-inline",
-  "status": {
-    "name": "my-inline",
-    "transport": "inline",
-    "enabled": true,
-    "tool_count": 1,
-    "resource_count": 1,
-    "status": "connected",
-    "detail": "",
-    "last_checked_at": "2026-04-08T09:00:00+00:00"
-  }
-}
-```
-
-## 10.5 获取 MCP 资源列表
-
-`GET /api/mcp/resources`
-
-响应示例：
-
-```json
-{
-  "resources": [
-    {
-      "server_name": "my-inline",
-      "transport": "inline",
-      "uri": "memory://inline/context",
-      "name": "inline-context",
-      "description": "Inline MCP resource",
-      "mime_type": "text/markdown",
-      "content": "# hello"
-    }
-  ],
-  "statuses": [
-    {
-      "name": "my-inline",
-      "transport": "inline",
-      "enabled": true,
-      "tool_count": 1,
-      "resource_count": 1,
-      "status": "connected",
-      "detail": "",
-      "last_checked_at": "2026-04-08T09:00:00+00:00"
-    }
-  ]
-}
-```
-
-说明：
-
-- MCP 工具会统一注册为 `mcp__{server_name}__{tool_name}`
-- `risk_level` 和 `requires_approval` 会进入统一 ToolRouter / Approval 流程
-- MCP 工具参数里出现路径类字段时，运行前会做 preflight 校验：只允许落在当前 `runtime workspace` 内；命中受保护路径也会直接拒绝
-- MCP 资源当前通过运行时工具概览暴露给模型，不单独作为前端 UI 区块展示
-- `http_json` / `http_sse` 默认约定以下端点：
-  - `GET /tools`
-  - `GET /resources`
-  - `POST /invoke/{tool_name}`
-- `stdio` 当前约定 newline-delimited JSON bridge：
-  - `tools.list`
-  - `resources.list`
-  - `tools.invoke`
-
----
-
-## 十一、Scheduler 接口
-
-## 11.1 获取任务列表
-
-`GET /api/scheduler/tasks`
-
-响应示例：
-
-```json
-{
-  "tasks": [
-    {
-      "task_id": "daily-report",
-      "name": "日报生成",
-      "cron": "0 18 * * 1-5",
-      "approval_mode": "auto_allow",
-      "action": {
-        "type": "session_message",
-        "prompt": "请根据今天的工作记录生成日报",
-        "session_id": "session-123"
-      },
-      "enabled": true,
-      "max_retries": 2,
-      "status": "pending",
-      "created_at": "2026-04-08T09:00:00+00:00",
-      "updated_at": "2026-04-08T09:00:00+00:00",
-      "last_run_at": null,
-      "next_run_at": "2026-04-08T18:00:00+00:00",
-      "last_error": "",
-      "run_count": 0
-    }
-  ]
-}
-```
-
-## 11.2 获取调度告警
-
-`GET /api/scheduler/alerts`
-
-响应示例：
-
-```json
-{
-  "alerts": [
-    {
-      "alert_id": "alt-001",
-      "task_id": "daily-report",
-      "task_name": "日报生成",
-      "severity": "error",
-      "message": "任务执行失败，已重试 2 次: session_message 任务必须提供 session_id",
-      "created_at": "2026-04-08T09:10:00+00:00",
-      "acknowledged": false
-    }
-  ]
-}
-```
-
-## 11.3 创建任务
-
-`POST /api/scheduler/tasks`
-
-请求体：
-
-```json
-{
-  "name": "phase4-check",
-  "cron": "*/30 * * * *",
+  "name": "每日总结",
+  "cron": "0 9 * * *",
+  "timezone": "Asia/Shanghai",
   "approval_mode": "auto_allow",
-  "action": {
-    "type": "background_task",
-    "prompt": "请总结今天的变更"
-  },
   "enabled": true,
-  "max_retries": 5
-}
-```
-
-说明：
-
-- `approval_mode` 可选，支持：
-  - `auto_allow`：无人值守任务命中 Level 2 / confirmable 审批时默认放行；仍会保留 Level 1、路径权限、protected path 等硬拒绝
-  - `manual`：无人值守任务命中审批时会快速失败，并记录 `approval_blocked`
-- Scheduler 任务未显式设置 `approval_mode` 时，默认按 `auto_allow` 执行
-
-## 11.4 启用任务
-
-`POST /api/scheduler/tasks/{task_id}/enable`
-
-## 11.5 禁用任务
-
-`POST /api/scheduler/tasks/{task_id}/disable`
-
-## 11.6 立即执行任务
-
-`POST /api/scheduler/tasks/{task_id}/run`
-
-## 11.7 删除任务
-
-`DELETE /api/scheduler/tasks/{task_id}`
-
-说明：
-
-- 当前实现使用内置轮询引擎，不依赖 APScheduler
-- 支持 `session_message` 和 `background_task`
-- 任务配置保存在 `backend_data/scheduler/tasks.json`
-- 调度失败会写入 `backend_data/scheduler/alerts.json`
-
----
-
-## 十二、Channels 接口
-
-当前 Channels 实现分两类：
-
-- `feishu`：主路径为官方 Python Channel SDK 长连接，Newman 能接收飞书消息、映射 Newman session，并通过 SDK 回复飞书。
-- `wecom`：当前仍为 webhook 基线。
-- legacy webhook：`POST /api/channels/{platform}/webhook` 仍保留，用于本地联调和早期兼容。
-
-飞书入站接入的用户向配置步骤不在本文重复维护，统一参考 [getting_started.md](getting_started.md#6-飞书接入)。
-
-## 12.1 获取 Channel 状态
-
-`GET /api/channels/status`
-
-响应示例：
-
-```json
-{
-  "channels": [
-    {
-      "platform": "feishu",
-      "enabled": true,
-      "transport": "channel_sdk",
-      "webhook_token_configured": false,
-      "app_configured": true,
-      "dependency_available": true,
-      "running": true,
-      "connected": true,
-      "connection_state": "connected",
-      "dedup_cache_size": 0
-    },
-    {
-      "platform": "wecom",
-      "enabled": true,
-      "webhook_token_configured": false
-    }
-  ]
-}
-```
-
-## 12.2 飞书 Channel SDK 自检
-
-`GET /api/channels/feishu/setup/status`
-
-返回飞书入站配置、SDK 长连接状态和最近错误。`ok=true` 表示 Newman 后端已经通过 Channel SDK 连上飞书。
-
-典型响应：
-
-```json
-{
-  "platform": "feishu",
-  "ok": true,
-  "reason": "ready",
-  "message": "Feishu channel is ready.",
-  "config": {
-    "enabled": true,
-    "transport": "channel_sdk",
-    "domain": "https://open.feishu.cn",
-    "default_turn_approval_mode": "auto_allow",
-    "require_mention_in_group": true,
-    "allowed_chat_ids_count": 0,
-    "allowed_user_open_ids_count": 0,
-    "reply_timeout_seconds": 20,
-    "dedup_ttl_seconds": 600
-  },
-  "status": {
-    "platform": "feishu",
-    "enabled": true,
-    "transport": "channel_sdk",
-    "app_configured": true,
-    "dependency_available": true,
-    "running": true,
-    "connected": true,
-    "connection_state": "connected",
-    "last_event_at": "2026-06-20T10:15:00+00:00",
-    "recent_event_preview": null,
-    "last_error": null,
-    "dedup_cache_size": 0
+  "max_retries": 5,
+  "source": "api",
+  "action": {
+    "type": "session_message",
+    "session_id": "session_id",
+    "content": "生成今天的项目摘要"
   }
 }
 ```
 
-常见 `reason`：
+`action.type` 支持：
 
-- `ready`：配置、依赖和长连接均可用。
-- `channel_disabled`：`channels.feishu.enabled=false`。
-- `transport_not_channel_sdk`：飞书 transport 不是 `channel_sdk`。
-- `missing_credentials`：缺少 `app_id` 或 `app_secret`。
-- `missing_dependency`：缺少 Python 包 `lark-channel-sdk`。
-- `starting`：transport 已启动但 SDK 尚未 ready。
-- `not_started`：配置存在但 transport 尚未运行。
+- `session_message`
+- `background_task`
 
-`POST /api/channels/feishu/setup/validate`
+### `PATCH /api/scheduler/tasks/{task_id}`
 
-请求体可选：
+更新任务。请求体字段均可选。
+
+### `POST /api/scheduler/tasks/{task_id}/enable`
+
+启用任务。
+
+### `POST /api/scheduler/tasks/{task_id}/disable`
+
+禁用任务。
+
+### `POST /api/scheduler/tasks/{task_id}/run`
+
+立即执行任务。
+
+### `DELETE /api/scheduler/tasks/{task_id}`
+
+删除任务。
+
+## 14. Channels 接口
+
+### `GET /api/channels/status`
+
+返回所有 Channel 状态。
+
+### `GET /api/channels/events/stream`
+
+返回 Channel 事件 SSE 流。
+
+### `GET /api/channels/feishu/setup/status`
+
+返回飞书 Channel 配置状态。
+
+### `POST /api/channels/feishu/setup/validate`
+
+校验飞书配置。
 
 ```json
 {
@@ -2446,19 +834,9 @@ multipart/form-data
 }
 ```
 
-触发一次连接探测，用于确认 `app_id` / `app_secret`、SDK 依赖和出站网络是否可用。
+### `POST /api/channels/feishu/setup/test`
 
-响应包含：
-
-- `ok`
-- `reason`
-- `message`
-- `snapshot`（当 SDK 能返回连接状态时）
-- `status`
-
-`POST /api/channels/feishu/setup/test`
-
-请求体可选：
+执行飞书接入测试。
 
 ```json
 {
@@ -2467,503 +845,205 @@ multipart/form-data
 }
 ```
 
-用于引导用户在飞书端发送一条测试消息，并等待 Newman 确认收到事件。
+### `POST /api/channels/{platform}/webhook`
 
-成功响应示例：
+legacy webhook 入口。`platform` 例如：
 
-```json
-{
-  "ok": true,
-  "reason": "event_received",
-  "message": "Inbound Feishu event received.",
-  "validation": {
-    "ok": true,
-    "reason": "running_transport"
-  },
-  "status": {
-    "platform": "feishu",
-    "ok": true,
-    "reason": "ready"
-  },
-  "timeout_seconds": 45,
-  "event": {
-    "message_id": "om_xxx",
-    "chat_id": "oc_xxx",
-    "sender_open_id": "ou_xxx",
-    "text_preview": "ping"
-  }
-}
-```
+- `feishu`
+- `wecom`
 
-若等待超时，`reason=event_timeout`；若验证失败且 `validate_first=true`，`reason=validation_failed`。
+当前推荐飞书优先使用 Channel SDK 长连接。
 
-## 12.3 Channel 事件流
+## 15. Runtime Location
 
-`GET /api/channels/events/stream`
+### `POST /api/runtime/location/resolve`
 
-返回 `text/event-stream`，用于前端订阅飞书入站产生的 channel 级事件。它不同于会话消息流：
-
-- 会话消息流：`POST /api/sessions/{session_id}/messages`，只覆盖用户主动发起的当前 turn。
-- Channel 事件流：覆盖飞书等外部渠道触发的后台消息，用于让前端在无需刷新页面的情况下看到新建/更新的飞书会话。
-
-事件仍使用统一 SSE 包装：
+把浏览器经纬度解析为城市级位置。
 
 ```json
 {
-  "event": "channel_message_received",
-  "data": {
-    "session_id": "session_xxx",
-    "platform": "feishu",
-    "transport": "channel_sdk",
-    "channel_user_id": "ou_xxx",
-    "channel_conversation_id": "oc_xxx",
-    "content": "请帮我总结今天的安排"
-  },
-  "ts": 1781949600000,
-  "request_id": "req_xxx"
+  "latitude": 31.2304,
+  "longitude": 121.4737
 }
 ```
 
-## 12.4 飞书 Webhook（legacy）
-
-`POST /api/channels/feishu/webhook`
-
-这是早期 webhook 基线接口；当前推荐飞书入站使用 `channels.feishu.transport=channel_sdk`。
-
-请求体示例：
+响应：
 
 ```json
 {
-  "event": {
-    "open_id": "u-1",
-    "chat_id": "c-1",
-    "text": "你好"
-  }
+  "resolved": true,
+  "city": "Shanghai",
+  "source": "browser_geolocation",
+  "precision": "city",
+  "captured_at_utc": "2026-07-05T10:00:00+00:00"
 }
 ```
 
-响应示例：
+## 16. Evolution 接口
+
+### `GET /api/evolution/runs`
+
+返回自进化运行列表。
+
+查询参数：
+
+- `limit`：可选
+
+### `GET /api/evolution/runs/{run_id}`
+
+返回自进化运行详情。
+
+### `POST /api/evolution/run`
+
+手动触发自进化。
 
 ```json
 {
-  "ok": true,
-  "response": {
-    "platform": "feishu",
-    "user_id": "u-1",
-    "session_id": "session_xxx",
-    "format": "text",
-    "content": "[mock] Newman 已收到你的消息：你好"
-  }
+  "session_id": "session_id",
+  "trigger": "manual"
 }
 ```
 
-## 12.5 企业微信 Webhook
+### `POST /api/evolution/runs/{run_id}/rollback`
 
-`POST /api/channels/wecom/webhook`
+回滚一次自进化运行。
 
-请求体示例：
+## 17. 当前路由总表
 
-```json
-{
-  "event": {
-    "from_user": "wx-user-1",
-    "chat_id": "room-a",
-    "content": "请给我今天的摘要"
-  }
-}
-```
+### System
 
-验签说明：
+| Method | Path |
+| --- | --- |
+| `GET` | `/healthz` |
+| `GET` | `/readyz` |
 
-- 若配置了 `channels.feishu.webhook_token` 或 `channels.wecom.webhook_token`
-- 可通过请求头 `x-newman-channel-token` 或 body 中的 `token` 字段传入
+### Auth / Bootstrap
 
----
+| Method | Path |
+| --- | --- |
+| `GET` | `/api/bootstrap/status` |
+| `POST` | `/api/bootstrap/setup` |
+| `GET` | `/api/auth/status` |
+| `POST` | `/api/auth/login` |
+| `POST` | `/api/auth/logout` |
+| `POST` | `/api/auth/regenerate-token` |
 
-## 十三、SSE 事件协议
+### Sessions / Messages
 
-### 统一格式
+| Method | Path |
+| --- | --- |
+| `POST` | `/api/sessions` |
+| `POST` | `/api/sessions/stream` |
+| `GET` | `/api/sessions` |
+| `GET` | `/api/sessions/{session_id}` |
+| `PATCH` | `/api/sessions/{session_id}` |
+| `DELETE` | `/api/sessions/{session_id}` |
+| `POST` | `/api/sessions/{session_id}/messages` |
+| `POST` | `/api/sessions/{session_id}/interrupt` |
+| `GET` | `/api/sessions/{session_id}/usage` |
+| `GET` | `/api/sessions/{session_id}/events` |
+| `POST` | `/api/sessions/{session_id}/compress` |
+| `POST` | `/api/sessions/{session_id}/restore-checkpoint` |
+| `PATCH` | `/api/sessions/{session_id}/collaboration-mode` |
+| `GET` | `/api/sessions/{session_id}/plan-draft` |
+| `PUT` | `/api/sessions/{session_id}/plan-draft` |
+| `GET` | `/api/sessions/{session_id}/multiagent-runs` |
 
-```json
-{
-  "event": "<event_type>",
-  "data": { "...": "..." },
-  "ts": 1741234567890,
-  "request_id": "req_xxx"
-}
-```
+### Approvals
 
-补充约定：
+| Method | Path |
+| --- | --- |
+| `GET` | `/api/sessions/{session_id}/pending-approval` |
+| `POST` | `/api/sessions/{session_id}/approve` |
+| `POST` | `/api/sessions/{session_id}/reject` |
+| `GET` | `/api/sessions/{session_id}/multiagent-approvals` |
+| `POST` | `/api/sessions/{session_id}/multiagent-approvals/{approval_request_id}/approve` |
+| `POST` | `/api/sessions/{session_id}/multiagent-approvals/{approval_request_id}/reject` |
 
-- 会话主消息流里的事件，`data.turn_id` 会标识该事件归属的 turn。
-- `assistant_delta` 只用于更新当前 turn 的流式回答槽位，不代表已持久化消息。
-- `final_response` 表示当前 turn 的回答文本已经完成，且会携带已持久化 assistant message 的 `message_id` / `created_at` 方便前端对账。
+### Config / Workspace
 
-### 当前已实现事件
+| Method | Path |
+| --- | --- |
+| `GET` | `/api/config/project` |
+| `PUT` | `/api/config/project` |
+| `GET` | `/api/config/env` |
+| `PUT` | `/api/config/env` |
+| `POST` | `/api/config/reload` |
+| `GET` | `/api/workspace/memory` |
+| `PUT` | `/api/workspace/memory/{memory_key}` |
+| `GET` | `/api/workspace/roots` |
+| `GET` | `/api/workspace/files` |
+| `GET` | `/api/workspace/file-content` |
+| `GET` | `/api/workspace/upload-content` |
+| `GET` | `/api/workspace/attachment-content` |
 
-- `session_created`
-- `thinking_delta`
-- `thinking_complete`
-- `commentary_delta`
-- `commentary_complete`
-- `answer_started`
-- `assistant_delta`
-- `attachment_received`
-- `attachment_processed`
-- `tool_call_started`
-- `tool_call_finished`
-- `tool_retry_scheduled`
-- `hook_triggered`
-- `plan_updated`
-- `tool_approval_request`
-- `tool_approval_resolved`
-- `tool_error_feedback`
-- `checkpoint_created`
-- `evolution_run_started`（保留事件名，当前后台自进化主要通过 REST 查询）
-- `evolution_run_completed`（保留事件名，当前后台自进化主要通过 REST 查询）
-- `turn_interrupted`
-- `final_response`
-- `stream_completed`
-- `error`
+### Ecosystem
 
-### 与前端 PRD 对齐说明
+| Method | Path |
+| --- | --- |
+| `GET` | `/api/plugins` |
+| `POST` | `/api/plugins/import` |
+| `POST` | `/api/plugins/rescan` |
+| `GET` | `/api/plugins/{plugin_name}` |
+| `POST` | `/api/plugins/{plugin_name}/enable` |
+| `POST` | `/api/plugins/{plugin_name}/disable` |
+| `PUT` | `/api/plugins/{plugin_name}` |
+| `DELETE` | `/api/plugins/{plugin_name}` |
+| `GET` | `/api/tools` |
+| `GET` | `/api/tools/{tool_name}` |
+| `POST` | `/api/tools/rescan` |
+| `GET` | `/api/skills` |
+| `POST` | `/api/skills/import` |
+| `POST` | `/api/skills/upload` |
+| `GET` | `/api/skills/{skill_name}` |
+| `PUT` | `/api/skills/{skill_name}` |
+| `DELETE` | `/api/skills/{skill_name}` |
 
-- `session_created` 已实现，但只出现在 `POST /api/sessions/stream` 的 SSE 中，不会出现在 `POST /api/sessions/{session_id}/messages` 的消息流里。
-- `thinking_delta` / `thinking_complete` 与 `commentary_delta` / `commentary_complete` 已实现，用于前端展示“当前思路”和“正在执行的短说明”。
-- `answer_started` 已实现，用于标记“当前子轮次开始进入正式回答阶段”；它适合作为 timeline 的“开始回答”节点来源，但不是回答完成信号。
-- 前端当前应以 `final_response` 作为“本轮回答结束”的主信号；`assistant_done` 还未单独实现。
-- `memory_updated` 还未实现为 SSE 事件。前端若要看到最新 Memory 内容，当前应通过 `GET /api/workspace/memory` 主动刷新。
-- 自进化运行当前不挂在某条 `/messages` SSE 流上；前端 Evolution Log 通过 `GET /api/evolution/runs` 主动刷新。
-- `turn_interrupted` 会由 `POST /api/sessions/{session_id}/interrupt` 持久化到审计日志和事件历史；若当前消息流仍处于活跃状态，也会实时推回同一条 `/messages` SSE 连接。
-- 为了支持“单 turn 单回答槽位”渲染，当前推荐前端同时消费三类数据：`assistant_delta` 的流式文本、`final_response` 的完成信号，以及 `GET /api/sessions/{session_id}` 返回的持久化 `assistant` 消息。
+### MCP / Multi-agent / Scheduler / Channels
 
-说明：
+| Method | Path |
+| --- | --- |
+| `GET` | `/api/mcp/servers` |
+| `POST` | `/api/mcp/servers` |
+| `DELETE` | `/api/mcp/servers/{server_name}` |
+| `POST` | `/api/mcp/servers/{server_name}/reconnect` |
+| `GET` | `/api/mcp/resources` |
+| `GET` | `/api/multiagent/runs/{run_id}` |
+| `GET` | `/api/multiagent/tasks/{task_id}` |
+| `POST` | `/api/multiagent/runs/{run_id}/cancel` |
+| `POST` | `/api/multiagent/tasks/{task_id}/cancel` |
+| `GET` | `/api/scheduler/tasks` |
+| `GET` | `/api/scheduler/tasks/{task_id}/runs` |
+| `GET` | `/api/scheduler/alerts` |
+| `POST` | `/api/scheduler/tasks` |
+| `PATCH` | `/api/scheduler/tasks/{task_id}` |
+| `POST` | `/api/scheduler/tasks/{task_id}/enable` |
+| `POST` | `/api/scheduler/tasks/{task_id}/disable` |
+| `POST` | `/api/scheduler/tasks/{task_id}/run` |
+| `DELETE` | `/api/scheduler/tasks/{task_id}` |
+| `GET` | `/api/channels/status` |
+| `GET` | `/api/channels/events/stream` |
+| `GET` | `/api/channels/feishu/setup/status` |
+| `POST` | `/api/channels/feishu/setup/validate` |
+| `POST` | `/api/channels/feishu/setup/test` |
+| `POST` | `/api/channels/{platform}/webhook` |
 
-- `tool_approval_request` 只会在通过前置审批后、需要用户人工确认时触发。
-- 若命中 Level 1 黑名单，后端会直接拒绝，不会发送 `tool_approval_request`。
-- `tool_error_feedback` 不仅用于工具执行失败，也用于 Provider 层的可恢复错误回灌。
-- `answer_started` 当前只会出现在“本 turn 已经发生过工具调用，且本次 provider 流真正开始输出正式回答”时；纯直接回答回合不会发送这个事件。
-- 若模型先吐出一段回答、随后又决定继续调工具，后端会发送 `assistant_delta` 且 `data.reset = true`，前端应清空之前的临时回答槽位并等待后续新的回答片段。
-- `tool_call_finished`、`tool_error_feedback` 和 fatal `error` 事件会携带结构化错误恢复字段：
-  `error_code`、`severity`、`risk_level`、`recovery_class`、`frontend_message`、`recommended_next_step`
-- 所有 SSE 事件当前都会附带 `request_id`，便于和 HTTP 请求、审计日志做关联。
-- 当前主消息流里的大多数 turn 级事件都会在 `data` 中携带 `turn_id`。
-- 消息流中的审计日志现在也按同一结构保存为完整事件包：`event`、`data`、`ts`、`request_id`
-- `GET /api/sessions/{session_id}/events` 会基于这些结构化审计事件返回前端可恢复的 timeline 数据
+### Audit / Usage / Runtime / Evolution
 
-### 事件示例
+| Method | Path |
+| --- | --- |
+| `GET` | `/api/audit/{session_id}` |
+| `GET` | `/api/usage/summary` |
+| `POST` | `/api/runtime/location/resolve` |
+| `GET` | `/api/evolution/runs` |
+| `GET` | `/api/evolution/runs/{run_id}` |
+| `POST` | `/api/evolution/run` |
+| `POST` | `/api/evolution/runs/{run_id}/rollback` |
 
-#### `answer_started`
+## 18. 当前边界
 
-```json
-{
-  "event": "answer_started",
-  "data": {
-    "turn_id": "turn_user_001",
-    "group_id": "turn_user_001:group:final",
-    "model": "gpt-5"
-  },
-  "ts": 1741234567890,
-  "request_id": "req_abc123"
-}
-```
-
-#### `assistant_delta`
-
-```json
-{
-  "event": "assistant_delta",
-  "data": {
-    "turn_id": "turn_user_001",
-    "content": "我先对照 PRD 和现有代码看一下。",
-    "delta": "我先对照 PRD 和现有代码看一下。",
-    "model": "gpt-5"
-  },
-  "ts": 1741234567890,
-  "request_id": "req_abc123"
-}
-```
-
-补充说明：
-
-- `delta` 是本次新增的流式片段；`content` 是当前 turn 临时回答槽位的完整累计文本
-- 若 `data.reset = true`，表示之前泄露出来的临时回答应被视为失效，前端应先清空这段回答，再等待新的回答流
-
-#### `attachment_received`
-
-```json
-{
-  "event": "attachment_received",
-  "data": {
-    "count": 1,
-    "files": [
-      {
-        "filename": "screen.png",
-        "content_type": "image/png"
-      }
-    ]
-  },
-  "ts": 1741234567890
-}
-```
-
-#### `attachment_processed`
-
-```json
-{
-  "event": "attachment_processed",
-  "data": {
-    "count": 1,
-    "files": [
-      {
-        "filename": "screen.png",
-        "summary": "图片中包含一个终端窗口，显示 PostgreSQL 已启动..."
-      }
-    ]
-  },
-  "ts": 1741234567890
-}
-```
-
-#### `checkpoint_created`
-
-```json
-{
-  "event": "checkpoint_created",
-  "data": {
-    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-    "checkpoint_id": "cp_xxx",
-    "summary": "## Current Progress\n- 已完成首轮接口排查。\n\n## Important Context\n- 用户要求不要在主区暴露技术术语。\n\n## What Remains To Be Done\n- 继续对齐 Trace Timeline 的聚合规则。",
-    "compression_level": "automatic",
-    "microcompact_count": 1
-  },
-  "ts": 1741234567890
-}
-```
-
-#### `hook_triggered`
-
-```json
-{
-  "event": "hook_triggered",
-  "data": {
-    "event": "SessionStart",
-    "message": "example-plugin: Example plugin observed a new session round.",
-    "context": {
-      "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-      "content": "请帮我总结当前工作区"
-    }
-  },
-  "ts": 1741234567890
-}
-```
-
-说明：
-
-- `hook_triggered` 既可能来自声明式 hook message，也可能来自可执行 hook handler 的标准输出
-- 当前已接入的 hook 生命周期包括：`SessionStart`、`PreToolUse`、`PostToolUse`、`SessionEnd`、`FileChanged`
-- 当 `write_file` 或 `edit_file` 成功写入文件后，会额外触发一次 `FileChanged`
-
-`FileChanged` 场景示例：
-
-```json
-{
-  "event": "hook_triggered",
-  "data": {
-    "event": "FileChanged",
-    "message": "example-plugin: Example hook noticed file change: /root/newman/README.md",
-    "context": {
-      "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-      "tool": "edit_file",
-      "path": "/root/newman/README.md"
-    }
-  },
-  "ts": 1741234567890
-}
-```
-
-#### `tool_error_feedback`
-
-```json
-{
-  "event": "tool_error_feedback",
-  "data": {
-    "tool": "provider:openai_compatible",
-    "category": "timeout_error",
-    "error_code": "NEWMAN-TOOL-001",
-    "severity": "warning",
-    "risk_level": "medium",
-    "recovery_class": "recoverable",
-    "frontend_message": "工具执行超时",
-    "summary": "OpenAI-compatible request timed out",
-    "retryable": true,
-    "attempt_count": 1,
-    "recommended_next_step": "Check whether the action is temporarily slow, then retry the smallest necessary step."
-  },
-  "ts": 1741234567890
-}
-```
-
-#### `tool_call_finished`
-
-失败场景下，`tool_call_finished.data` 也会包含相同的结构化错误恢复字段，示例：
-
-```json
-{
-  "event": "tool_call_finished",
-  "data": {
-    "tool_call_id": "call_xxx",
-    "tool": "fetch_url",
-    "success": false,
-    "category": "network_error",
-    "error_code": "NEWMAN-TOOL-008",
-    "severity": "warning",
-    "risk_level": "medium",
-    "recovery_class": "recoverable",
-    "frontend_message": "网络请求失败",
-    "recommended_next_step": "Wait briefly and retry once; if it still fails, reduce scope or switch strategy.",
-    "summary": "Request failed",
-    "duration_ms": 842,
-    "attempt_count": 3
-  },
-  "ts": 1741234567890
-}
-```
-
-#### `error`
-
-fatal 错误事件示例：
-
-```json
-{
-  "event": "error",
-  "data": {
-    "code": "NEWMAN-TOOL-009",
-    "message": "认证失败",
-    "summary": "openai_compatible authentication failed",
-    "tool": "provider:openai_compatible",
-    "category": "auth_error",
-    "severity": "error",
-    "risk_level": "critical",
-    "recovery_class": "fatal",
-    "retryable": false,
-    "recommended_next_step": "Stop this round, summarize the blocker clearly, and wait for user intervention or a configuration fix."
-  },
-  "ts": 1741234567890
-}
-```
-
-#### `tool_approval_request`
-
-```json
-{
-  "event": "tool_approval_request",
-  "data": {
-    "approval_request_id": "apr_xxx",
-    "tool": "terminal",
-    "arguments": {
-      "command": "echo hi > /tmp/x"
-    },
-    "reason": "terminal_mutation_or_unknown",
-    "summary": "命中 Level 2 风险规则，需人工审批",
-    "timeout_seconds": 120
-  },
-  "ts": 1741234567890
-}
-```
-
-#### `plan_updated`
-
-```json
-{
-  "event": "plan_updated",
-  "data": {
-    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-    "summary": "计划已更新，完成 1/3 步",
-    "plan": {
-      "explanation": "先确认代码结构，再改后端，最后更新前端和文档。",
-      "steps": [
-        {
-          "step": "检查运行时与工具注册点",
-          "status": "completed"
-        },
-        {
-          "step": "补齐后端工具与计划状态",
-          "status": "in_progress"
-        },
-        {
-          "step": "更新前端展示和 API 文档",
-          "status": "pending"
-        }
-      ],
-      "updated_at": "2026-04-03T09:30:00+00:00",
-      "current_step": "补齐后端工具与计划状态",
-      "progress": {
-        "total": 3,
-        "completed": 1,
-        "in_progress": 1,
-        "pending": 1
-      }
-    }
-  },
-  "ts": 1741234567890
-}
-```
-
-#### `stream_completed`
-
-```json
-{
-  "event": "stream_completed",
-  "data": {
-    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-    "ok": true
-  },
-  "ts": 1741234567890
-}
-```
-
-#### `final_response`（工具上限优雅降级）
-
-```json
-{
-  "event": "final_response",
-  "data": {
-    "session_id": "1c2030c74d144c40aef2b0e6f59718f5",
-    "turn_id": "turn_user_001",
-    "content": "已达到当前回合的工具调用上限，请输入“继续”继续处理。",
-    "finish_reason": "tool_limit_reached",
-    "message_id": "msg_asst_001",
-    "created_at": "2026-04-12T08:31:02+00:00"
-  },
-  "ts": 1741234567890,
-  "request_id": "req_abc123"
-}
-```
-
----
-
-## 十四、当前边界
-
-当前 Phase 4 已可用，但仍有边界：
-
-- 前端基于现有 Vite/React 工作台，不是 Next.js 架构
-- RAG 当前已按 `PostgreSQL + Chroma` 落地，但检索质量仍依赖 `models.embedding` 与 `models.reranker` 的真实可用性
-- 原生沙箱当前只适配 Linux（bubblewrap）；macOS / Windows 仍为待做
-- hook 当前支持声明式消息和 Python handler 子进程执行，但尚未完全接入与终端同等级别的严格沙箱
-- MCP 目前是 bridge 基线，不是完整官方 MCP 协议栈
-- Scheduler 当前使用内置 cron 解析与轮询执行
-- 飞书入站当前已接入 Channel SDK 长连接并可通过 SDK 回复；企微仍停留在 webhook 基线，legacy webhook 只返回标准化响应
-- 自进化当前只覆盖 `MEMORY.md` 和 Skill 目录；不会自动修改系统 prompt、权限配置、后端/前端代码或安装插件
-
-## 十五、前端联调待办
-
-以下是已知但尚未在当前 API / 前端联调中完全闭环的项：
-
-- `assistant_done` SSE 事件未实现，当前以前端消费 `final_response` 代替
-- `memory_updated` SSE 事件未实现，当前 Memory 仍以 REST 刷新为主
-- Evolution Log 已通过 REST 闭环，后台自进化暂不依赖消息流 SSE 推送
-- Evidence Drawer 的 `Trace / Tool IO / 引用` 三标签结构尚未定稿，当前前端右侧仍以摘要 + Raw JSON 为主
-- 刷新页面后，前端现已能恢复当前会话、工作区页、栏宽、最近选中的 trace，并尽量恢复待审批请求和最近一次可见的流式回答内容
-- 当前仍不支持真正的 SSE 断点续传；如果浏览器刷新时网络流被中断，页面只能恢复“最后一次可见状态”，不能继续复用原连接
-- 移动端工作台只保证可读和不崩布局，右侧抽屉滑层与输入栏吸附仍为待办
+- `server.host`、`server.port`、CORS 等监听层配置修改后需要重启进程才完全生效。
+- `thread_isolation` 只隔离上下文，不隔离文件系统；多个任务仍可能同时改同一工作区。
+- Channel webhook 是 legacy 入口；飞书推荐走 Channel SDK 长连接。
+- `context_usage` 是下一次请求预算估算，不是 provider 物理 context limit。
+- Linux 原生沙箱当前以 bubblewrap 为主；Windows/macOS 源码运行时的原生沙箱能力不是同一套实现。

@@ -1,4 +1,5 @@
 .codex
+.agents/
 .claude/
 .env
 .env.docker
@@ -21,6 +22,8 @@ outputs/
 backend/tests/
 plugins/*
 !plugins/.gitkeep
+!plugins/feishu-cli/
+!plugins/feishu-cli/**
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
@@ -43,3 +46,5 @@ test_runtimespace/
 skills/AOG-ai-daily-news/
 skills/newman-image-responses/
 docs/prds/
+docs/newman_multiagent_design.md
+docs/self_evolution.md

@@ -1,772 +1,631 @@
-# Newman 完整流程梳理
+# Newman 架构说明
 
-## 一、总览
+本文说明 Newman 的整体架构、核心模块和主要运行流程。它不是逐行实现说明，而是帮助开发者理解：
 
-```
-用户输入 / 飞书入站消息
+- 请求从哪里进入 Newman
+- Runtime 如何组织会话、Prompt、工具和模型调用
+- 文件、插件、技能、MCP、Scheduler、Channels 如何接入
+- 哪些状态会持久化，哪些只是运行时状态
+
+相关文档：
+
+- [API 文档](Newman_API_v1.md)
+- [上下文压缩说明](context_compression.md)
+- [飞书接入指南](feishu_cc_connect_codex_reusable_solution.md)
+
+## 1. 总体架构
+
+```text
+用户 / 前端 / 飞书 / Scheduler
         ↓
-API 路由 / ChannelService
+FastAPI Routes / ChannelService
         ↓
-Session 管理 → RunLoop 主循环 → Provider 调用 → 工具执行
-                                      ↓             ↑
-                               无 tool_calls 时判定收口
-                               有 tool_calls 时循环执行
+Session + Runtime State
         ↓
-SSE / 飞书 Channel SDK 回复 / 持久化 assistant message
+RunLoop
+        ├── PromptAssembler
+        ├── Provider
+        ├── ToolRouter / ToolOrchestrator
+        ├── ApprovalPolicy
+        ├── Sandbox
+        └── Hooks
+        ↓
+Session Store / Audit Log / Usage / Checkpoint / Evolution
 ```
 
----
+核心分层：
 
-## 二、启动阶段
+- **接口层**：FastAPI REST、SSE、飞书 Channel SDK、legacy webhook。
+- **运行时层**：`NewmanRuntime`、`RunLoop`、Prompt 拼装、工具编排、模型调用。
+- **能力层**：内置工具、插件、技能、MCP server、Scheduler、Channels。
+- **状态层**：sessions、audit logs、usage、checkpoints、memory、evolution runs。
+- **前端层**：React 工作台，通过 REST + SSE 展示会话、工具执行、审批、文件、配置和运行状态。
 
-### 2.1 应用初始化 (`api/app.py`)
+## 2. 主要代码入口
 
-> **触发时机**：`create_app()` 在 **uvicorn 启动时执行一次**，不是每次用户发言。后续所有请求共享同一个 `app.state.runtime` 实例。
+| 模块 | 作用 |
+| --- | --- |
+| `backend/api/app.py` | 创建 FastAPI app，挂载 runtime、scheduler、channels 和路由 |
+| `backend/runtime/run_loop.py` | 主运行时与单轮对话主循环 |
+| `backend/runtime/prompt_assembler.py` | 拼装系统上下文、历史消息、checkpoint 和工具说明 |
+| `backend/tools/` | 工具定义、路由、审批、执行和权限控制 |
+| `backend/plugin_runtime/` | 插件扫描、manifest、hooks、插件内 skill / MCP 配置 |
+| `backend/skill_runtime/` | Skill 注册与 `SKILLS_SNAPSHOT.md` 同步 |
+| `backend/mcp/` | MCP server 注册、连接、资源和工具适配 |
+| `backend/channels/` | 飞书 / 企业微信等外部渠道接入 |
+| `backend/scheduler/` | 定时任务、运行记录和告警 |
+| `backend/evolution/` | 自进化分析、文件操作、验证和回滚 |
+| `frontend/` | Web 工作台 |
 
-```python
-def create_app() -> FastAPI:
-    settings = get_settings()                          # 加载配置（一次性）
-    app.state.runtime = NewmanRuntime(settings)        # 初始化运行时（一次性）
-    app.state.scheduler = SchedulerEngine(...)         # 初始化定时任务（一次性）
-    app.state.channels = ChannelService(...)           # 初始化通道服务（一次性）
-    app.state.channel_events = ChannelEventBroker(...) # 外部渠道事件流（一次性）
-```
+## 3. 启动阶段
 
-`NewmanRuntime.__init__` 初始化所有核心组件：
+`create_app()` 在服务进程启动时执行一次，后续请求共享同一个 `app.state.runtime`。
 
-```
+启动时主要步骤：
+
+1. `get_settings()` 加载配置。
+2. 创建 `NewmanRuntime`。
+3. 创建 `SchedulerEngine`。
+4. 创建 `ChannelEventBroker`。
+5. 创建 `ChannelService`。
+6. 注册 FastAPI middleware 和 routes。
+7. startup 阶段执行：
+   - `runtime.reload_ecosystem()`
+   - `scheduler.refresh_schedule()`
+   - `scheduler.start()`
+   - `channels.start()`
+
+`NewmanRuntime` 初始化的核心组件：
+
+```text
 NewmanRuntime
-├── provider                 # LLM 提供商（OpenAI 兼容等）
-├── session_store            # Session 持久化存储
-├── thread_manager           # 会话生命周期管理
-├── checkpoints              # 上下文压缩 checkpoint 存储
-├── memory_extractor         # 用户偏好提取器（兼容旧 USER.md 流程）
-├── stable_context           # 稳定上下文加载器（Newman.md / USER.md / MEMORY.md / SKILLS_SNAPSHOT.md / TOOLS_SNAPSHOT.md）
-├── prompt_assembler         # Prompt 拼装器
-├── plugin_service           # 插件服务
-├── skill_registry           # 技能注册表
-├── evolution_store          # 自进化运行记录、快照与事件日志
-├── evolution_service        # 自进化分析、应用、验证与回滚
-├── hook_manager             # 钩子管理器
-├── mcp_registry             # MCP 服务器注册表
-├── registry                 # 工具注册表（ToolRegistry）
-├── router                   # 工具路由器（ToolRouter）
-├── orchestrator             # 工具编排器（ToolOrchestrator）
-└── exec_sandbox             # 沙箱（NativeSandbox / bwrap）
+├── provider              # LLM provider
+├── session_store         # 会话持久化
+├── thread_manager        # 会话创建、恢复、删除
+├── checkpoints           # 上下文压缩 checkpoint
+├── prompt_assembler      # Prompt 拼装
+├── registry              # ToolRegistry
+├── router                # ToolRouter
+├── orchestrator          # ToolOrchestrator
+├── approvals             # 工具审批状态
+├── plugin_service        # 插件服务
+├── skill_registry        # 技能注册表
+├── mcp_registry          # MCP server 注册表
+├── hook_manager          # 插件 hooks
+├── scheduler_store       # 定时任务存储
+├── subagent_manager      # 多 Agent 运行管理
+├── evolution_service     # 自进化
+└── exec_sandbox          # 终端沙箱
 ```
 
-ChannelService 初始化：
+## 4. 运行时生态加载
 
-```
-ChannelService
-├── FeishuChannelTransport   # 飞书官方 Python Channel SDK 长连接
-├── ChannelSessionStore      # 飞书 chat/user/date → Newman session 映射
-├── channel event broker     # 前端订阅 /api/channels/events/stream
-└── legacy webhook channels  # feishu/wecom webhook 基线
-```
+`reload_ecosystem()` 负责刷新插件、技能、工具和 MCP 能力。
 
-FastAPI 生命周期启动后会调用 `ChannelService.start()`，当 `channels.feishu.enabled=true` 且
-`transport=channel_sdk` 时，后端会建立飞书长连接。飞书用户发消息不走
-`POST /api/sessions/{session_id}/messages`，而是由 SDK 回调进入 `ChannelService.handle_transport_message()`。
+执行内容：
 
-启动时调用 `reload_ecosystem()`：
-1. `plugin_service.reload()` — 扫描 `plugins/` 目录
-2. `skill_registry.sync_snapshot()` — 生成 `SKILLS_SNAPSHOT.md`
-3. `_build_registry()` — 注册内置工具 + 插件 MCP 工具
-4. 创建 `ToolRouter`
+1. 扫描 `plugins/`。
+2. 同步 `skills/` 和插件内 skills。
+3. 生成 `SKILLS_SNAPSHOT.md`。
+4. 注册内置工具。
+5. 注册插件和 MCP 工具。
+6. 重建 `ToolRouter`。
 
-> **触发时机**：`create_app()` / `NewmanRuntime.__init__()` 只在 **服务进程启动时执行一次**（uvicorn 加载模块时）。之后不会重复。
+触发时机：
 
-### 2.2 `reload_ecosystem()` 触发时机
+- 服务启动时。
+- 每轮用户消息开始时。
+- 插件、skills、tools 目录被工具修改后。
+- 插件 / 工具 / skill 相关 API 执行 rescan、enable、disable、import、upload 后。
 
-`reload_ecosystem()` 是插件/技能/工具热加载的核心，执行上述 4 步。它有 **3 个触发点**：
+设计意图：
 
-```
-触发点 1：服务启动时（一次性）
-──────────────────────────────────
-  NewmanRuntime.__init__()
-  └── self.reload_ecosystem()              # run_loop.py:586
+- 本地新增或修改插件、技能后，不需要重启服务。
+- LLM 下一轮会看到新的 skill snapshot 和工具列表。
+- 工具执行中修改扩展目录时，可以在当前任务内热加载。
 
-触发点 2：每次用户发消息时
-──────────────────────────────────
-  handle_message()                         # run_loop.py:722
-  └── self.reload_ecosystem()              # run_loop.py:735  ← 每轮对话开头
+## 5. 输入入口
 
-触发点 3：工具执行导致文件变更时（热加载）
-──────────────────────────────────
-  run_loop.py:1059-1074
-  ├── write_file/edit_file 成功
-  │   └── 路径在 plugins/skills/tools 目录？ → reload_ecosystem()
-  └── terminal 成功
-      └── 命令修改了上述目录？ → reload_ecosystem()
-```
+Newman 有四类主要输入入口。
 
-**实际效果**：
+### 5.1 Web 前端
 
-| 场景 | 何时生效 |
-|------|---------|
-| 用户放一个新插件到 `plugins/` | 下次发言自动生效 |
-| 用户修改了 `SKILL.md` | 下次发言 LLM 看到更新后的技能快照 |
-| 中途通过 `write_file` 修改了插件/技能文件 | 当前轮次内热加载生效 |
-| 通过前端 API 启用/禁用插件 | 调用 `POST /api/plugins/{name}/enable` 后立即生效（API 内部调用 `reload_ecosystem()`） |
-
----
-
-## 三、输入入口
-
-### 3.1 创建会话
-
-```
-POST /api/sessions
-        │
-        ▼
-ThreadManager.create_or_restore()
-        │
-        ├── 新建 → SessionStore.create() → 返回 session_id
-        │           └── schedule_previous_session_evolution()  # 后台总结上一个会话并自动进化
-        └── 恢复 → SessionStore.get(session_id)
-```
-
-自进化不会阻塞创建会话响应。`mock` provider 下会跳过调度。
-
-### 3.2 前端发送消息（核心入口）
-
-```
+```text
 POST /api/sessions/{session_id}/messages
-        │
-        ▼
-send_message()
-        │
-        ├── 1. 检查是否已有任务在运行（409 冲突）
-        ├── 2. 检查定时任务是否占用该会话（409 冲突）
-        ├── 3. 解析请求体（content + attachments + approval_mode）
-        ├── 4. 创建 event_stream() 协程
-        │       │
-        │       ├── 保存附件 → AttachmentService.save_uploads()
-        │       ├── 分析附件 → attachment_service.analyze_attachments()
-        │       └── runtime.handle_message()  ←── 进入 RunLoop
-        │
-        └── 5. 返回 StreamingResponse (SSE)
-                │
-                └── 从 event_queue 中读取事件，推送给前端
+        ↓
+messages.send_message()
+        ↓
+runtime.handle_message()
+        ↓
+RunLoop
 ```
 
-### 3.3 飞书入站消息
+特点：
 
-飞书入站不经过前端消息 API。当前主路径是官方 Python Channel SDK：
+- 返回 `text/event-stream`。
+- 支持文本、图片和附件。
+- 支持本轮审批模式。
+- 同一 session 同时只允许一个活跃回合。
+- 前端通过 SSE 获取实时回答、工具事件、审批请求和最终结果。
 
-```
-飞书用户消息
-        │
-        ▼
-FeishuChannelTransport._handle_message()
-        │
-        ├── 1. 归一化 ChannelMessage
-        ├── 2. 按 event_id/message_id 去重
-        ├── 3. 群聊非 @ 消息、白名单外消息直接忽略
-        ├── 4. ChannelService.process_transport_message()
-        │       ├── 按 app_id/chat_id/sender_open_id/日期查找或创建 Newman session
-        │       ├── 防止同一飞书 session 并发运行多个 turn
-        │       └── runtime.handle_message(..., turn_approval_mode=auto_allow)
-        ├── 5. 超过短等待阈值时先通过 SDK 回复“已收到，正在处理”
-        └── 6. runtime 结束后通过 SDK 回复最终内容
-```
+### 5.2 飞书 Channel
 
-飞书入站还会写入 channel 级事件流：
-
-```
-GET /api/channels/events/stream
+```text
+飞书消息
+        ↓
+FeishuChannelTransport
+        ↓
+ChannelService
+        ↓
+runtime.handle_message()
+        ↓
+飞书回复
 ```
 
-这条 SSE 用于前端感知外部渠道产生的新会话或新消息；它不是普通会话 turn 的消息流。
+特点：
 
-### 3.4 SSE 事件流
+- 推荐使用官方 Python Channel SDK 长连接。
+- 不依赖公网 webhook。
+- ChannelService 负责用户、群、日期到 Newman session 的映射。
+- 飞书入站默认更偏向自动执行，避免任务卡在 Web 页面审批。
+- 外部渠道事件通过 `/api/channels/events/stream` 给前端感知。
 
-前端通过 SSE 接收实时事件，关键事件类型：
+### 5.3 Scheduler
 
-| 事件 | 含义 |
-|------|------|
-| `session_created` | 会话创建完成 |
-| `attachment_received` | 附件已接收 |
-| `attachment_processed` | 附件分析完成 |
-| `hook_triggered` | 钩子触发 |
-| `commentary_delta` | LLM 正在输出 commentary |
-| `commentary_complete` | commentary 输出完成 |
-| `assistant_delta` | LLM 正在输出候选回答 |
-| `answer_started` | 回答开始 |
-| `final_response` | 本轮最终 assistant message 已持久化 |
-| `turn_completed` | 本轮结束，携带 finish_reason / turn_outcome |
-| `tool_call_started` | 工具调用开始 |
-| `tool_call_arguments_delta` | 工具调用参数生成进度 |
-| `tool_call_output_delta` | 工具执行实时输出 |
-| `tool_call_finished` | 工具调用完成 |
-| `tool_approval_request` | 请求用户审批 |
-| `tool_approval_resolved` | 审批结果 |
-| `tool_retry_scheduled` | 工具重试计划 |
-| `skill_used` | 技能被使用 |
-| `plan_updated` | 计划更新 |
-| `collaboration_mode_changed` | 协作模式变更 |
-| `error` | 错误 |
-| `turn_interrupted` | 用户中断 |
-| `stream_completed` | 流结束 |
-
-补充：
-
-- `answer_started` 只表示已经开始释放正式回答候选，不是完成信号。
-- 若候选回答随后被判定为未完成，后端会发送 `assistant_delta` 且 `reset=true`，前端需要清空临时回答。
-- `final_response` 才是前端展示最终回答和对齐持久化 assistant message 的主信号。
-
----
-
-## 四、RunLoop 主循环
-
-### 4.1 入口：`handle_message()`
-
-```
-handle_message(session_id, content, emit, ...)
-        │
-        ├── 1. reload_ecosystem()           # 每轮重新加载插件/工具
-        ├── 2. 创建 user SessionMessage     # 写入用户消息
-        ├── 3. session_store.append_message()
-        ├── 4. 创建 SessionTask             # 本轮任务上下文
-        ├── 5. emit_hooks("SessionStart")   # 触发会话开始钩子
-        │
-        └── 6. 进入主循环 ─────────────────────────────────────┐
-                                                              │
-            ┌─────────────────────────────────────────────────┘
-            │
-            ▼
-    ┌──────────────────────────────────────┐
-    │  for _ in range(max_tool_depth):     │  ← 最多 N 轮工具调用
-    │                                      │
-    │  ┌─ 1. skill_registry.sync_snapshot  │
-    │  ├─ 2. _maybe_checkpoint()           │  ← 上下文压缩检查
-    │  ├─ 3. _assemble_task_messages()     │  ← 拼装 prompt
-    │  ├─ 4. _provider_tools_for_turn()    │  ← 获取可用工具列表
-    │  │                                  │
-    │  ├─ 5. _stream_provider_response()   │  ← 调用 LLM
-    │  │                                  │
-    │  ├─ 6. invalid tool call recovery    │  ← 模型调用不存在工具时回灌纠偏
-    │  │                                  │
-    │  ├─ 7. ensure commentary             │  ← 工具调用前补齐可见行动说明
-    │  │                                  │
-    │  ├─ 8. decide_turn_step()            │  ← 继续/结束/阻塞
-    │  ├─ 8.5 completion judge（可选）     │  ← 执行型任务的 finalize 再校验
-    │  │                                  │
-    │  ├─── [无工具调用] → finalize → return│
-    │  │                                  │
-    │  ├─ 9. 逐个执行工具调用              │
-    │  │   ├── 权限检查                    │
-    │  │   ├── 路由到工具                  │
-    │  │   ├── static_checks              │
-    │  │   ├── emit PreToolUse hook        │
-    │  │   ├── orchestrator.execute()      │
-    │  │   ├── emit PostToolUse hook       │
-    │  │   ├── FileChanged hook            │
-    │  │   └── 热加载检查                  │
-    │  │                                  │
-    │  └─ 8. 回到循环顶部                  │
-    │                                      │
-    └──────────────────────────────────────┘
+```text
+SchedulerEngine
+        ↓
+ScheduledTask.action
+        ↓
+session_message / background_task
+        ↓
+runtime.handle_message()
 ```
 
-### 4.2 Prompt 拼装：`_assemble_task_messages()`
+特点：
 
-```
-PromptAssembler.assemble()
-        │
-        ├── 1. stable_context.build(tools_overview)
-        │       ├── Newman.md          # 系统人设与规则
-        │       ├── USER.md            # 用户画像
-        │       ├── SKILLS_SNAPSHOT.md # 可用技能列表
-        │       └── tools_overview     # 工具描述 + 路径权限
-        │
-        ├── 2. COMMENTARY_SYSTEM_GUARDRAIL   # 工具/技能前必须有 commentary
-        ├── 3. TOOL_ACTION_SYSTEM_GUARDRAIL  # 需要继续动工具时不能假装 finalize
-        ├── 4. USER_INPUT_SYSTEM_GUARDRAIL   # 需要用户确认时必须走 request_user_input
-        ├── 5. collaboration_mode_prompt     # 协作模式（default/plan）
-        ├── 6. workflow_state_prompt         # 工作流状态
-        ├── 7. checkpoint summary            # 上下文压缩摘要
-        │
-        └── 8. 拼装历史消息
-                ├── system message  ← 上述所有内容合并
-                ├── assistant messages（含 tool_calls）
-                ├── tool messages
-                └── user messages
-```
+- 使用 cron + timezone 描述触发时间。
+- 任务可绑定已有 session，也可作为后台任务运行。
+- 会检查目标 session 是否已有活跃 Web 回合，避免同一 session 并发执行。
 
-### 4.3 LLM 调用：`_stream_provider_response()`
+### 5.4 管理 API
 
-```
-_stream_provider_response(assembled, tools, emit, ...)
-        │
-        ├── provider.chat_stream(messages, tools)  # 调用 LLM 流式 API
-        │       │
-        │       └── 流式返回 token
-        │           ├── content tokens      → emit("assistant_delta")
-        │           ├── thinking tokens     → 解析 <think> 标签
-        │           ├── commentary tokens   → emit("commentary_delta")
-        │           ├── tool_call_delta      → emit("tool_call_arguments_delta")
-        │           └── tool_call            → ProviderResponse.tool_calls
-        │
-        └── 返回 ProviderResponse
-                ├── content: str           # 最终回答
-                ├── commentary: str        # 过程说明
-                ├── thinking: str          # 思考过程
-                ├── tool_calls: list       # 工具调用列表
-                ├── invalid_tool_calls: list
-                ├── usage: TokenUsage      # token 用量
-                ├── provider_state: dict    # provider 特有状态，如 reasoning replay 字段
-                └── finish_reason: str     # 结束原因
+管理 API 不一定进入 RunLoop，例如：
+
+- Auth / Bootstrap
+- Config reload
+- Workspace 文件浏览
+- Plugins / Tools / Skills
+- MCP server 管理
+- Evolution run / rollback
+- Scheduler task 管理
+
+这些接口通常直接操作 runtime、store 或配置文件。
+
+## 6. 单轮 Web 消息流程
+
+```text
+用户发送消息
+        ↓
+解析 content / attachments / approval_mode / environment_context
+        ↓
+检查 session 是否已有活跃任务
+        ↓
+创建 SSE event queue
+        ↓
+保存附件并写入 user message metadata
+        ↓
+runtime.handle_message()
+        ↓
+持续 emit SSE 事件
+        ↓
+保存最终 assistant message
+        ↓
+stream_completed
 ```
 
----
+关键状态：
 
-## 五、工具执行流程
+- `active_message_runs`：进程内活跃任务表。
+- `request_id`：HTTP 请求追踪 ID。
+- `turn_id`：单轮对话 ID，用于聚合消息、工具和事件。
+- `approval_mode`：本轮工具审批策略。
+- `environment_context`：浏览器或前端传入的运行环境上下文。
 
-### 5.1 单个工具调用链
+## 7. RunLoop 主循环
 
-```
-tool_call (from LLM response)
-        │
-        ├── 1. skill_usage_payload_for_tool_call()
-        │       └── 检测是否在读取 SKILL.md（技能使用追踪）
-        │
-        ├── 2. emit("tool_call_started")
-        │
-        ├── 3. _tool_disallow_reason_for_task()
-        │       └── 检查工具是否被禁用
-        │
-        ├── 4. router.route(tool_name, arguments)
-        │       └── 从 ToolRegistry 获取工具实例
-        │
-        ├── 5. router.static_checks(tool, arguments)
-        │       │
-        │       ├── terminal 工具：
-        │       │   └── analyze_terminal_command()
-        │       │       ├── 解析命令中的路径
-        │       │       ├── classify_path() → writable/readable/protected/forbidden
-        │       │       └── 检测是否为 mutation 命令
-        │       │
-        │       ├── 文件工具（read_file/write_file/...）：
-        │       │   └── classify_path(path_policy, path)
-        │       │
-        │       └── MCP 工具：
-        │           └── validate_mcp_argument_paths()
-        │
-        ├── 6. emit("PreToolUse", hook)
-        │
-        ├── 7. orchestrator.execute(tool, arguments, ...)
-        │       │
-        │       ├── a. tool.validate_arguments()     # 参数校验
-        │       ├── b. approval_policy.evaluate()    # 审批策略
-        │       │       ├── "deny"  → 拒绝执行
-        │       │       ├── "ask"   → 请求用户审批
-        │       │       │              ├── emit("tool_approval_request")
-        │       │       │              ├── await approvals.wait()
-        │       │       │              └── emit("tool_approval_resolved")
-        │       │       └── "allow" → 直接执行
-        │       │
-        │       ├── c. tool.run_streaming(arguments, session_id, emit_output)
-        │       │       │
-        │       │       ├── 内置工具：直接执行
-        │       │       │   └── terminal → sandbox.execute_shell(command)
-        │       │       │       │
-        │       │       │       ├── bwrap 沙箱模式：
-        │       │       │       │   └── build_bwrap_command() → subprocess
-        │       │       │       │       ├── --unshare-net     （网络隔离）
-        │       │       │       │       ├── --ro-bind         （只读挂载）
-        │       │       │       │       ├── --bind            （可写挂载）
-        │       │       │       │       └── --tmpfs           （保护路径）
-        │       │       │       │
-        │       │       │       └── danger-full-access 模式：
-        │       │       │           └── 直接 subprocess
-        │       │       │
-        │       │       └── MCP 工具：通过 MCP 协议调用
-        │       │
-        │       └── d. 重试策略（RetryPolicy）
-        │               └── 失败时自动重试，emit("tool_retry_scheduled")
-        │
-        ├── 8. normalize_result(result)
-        │
-        ├── 9. result → SessionMessage（tool role）
-        │       └── _build_tool_session_message()
-        │           ├── content = stdout + stderr（terminal）或 stdout（其他）
-        │           └── metadata = { success, category, tool, ... }
-        │
-        ├── 10. emit("tool_call_finished")
-        │
-        ├── 11. emit("PostToolUse", hook)
-        │
-        ├── 12. 热加载检查
-        │       ├── write_file/edit_file 成功 → 检查路径是否在 plugins/skills/tools 目录
-        │       └── terminal 成功 → 检查命令是否修改了上述目录
-        │       └── 如果是 → reload_ecosystem()
-        │
-        └── 13. 失败处理 / 进度状态更新
-                ├── recovery_class == "recoverable" → 记录，继续循环
-                ├── recovery_class == "fatal"       → _finalize_fatal_tool_error()
-                └── turn_outcome == "awaiting_user"  → _finalize_awaiting_user_input()
+`runtime.handle_message()` 是对话执行入口。核心循环可以概括为：
+
+```text
+handle_message()
+        ↓
+写入 user message
+        ↓
+SessionStart hooks
+        ↓
+while tool_depth < max_tool_depth:
+    reload skill snapshot
+    maybe checkpoint compact
+    assemble prompt
+    build provider tool schemas
+    call provider stream
+    if invalid tool calls:
+        inject feedback and continue
+    if tool calls:
+        execute tools
+        append tool messages
+        continue
+    else:
+        decide final / continue / blocked / awaiting_user
+        break
+        ↓
+保存 assistant final message
+        ↓
+SessionEnd hooks
 ```
 
-`TurnProgressState` 现在会区分 3 类“成功”：
+RunLoop 的职责：
 
-- `diagnostic_success`：例如读错误日志、打印出报错行，只说明拿到了诊断信息，不会清除未解决失败状态
-- `progress_success`：例如 `write_file` / `edit_file` 成功，或者 `terminal` 明确写出了路径/文件，只说明任务在推进
-- `resolved_success`：例如产生 `output_files`，或 `request_user_input` 进入 `awaiting_user`，这时才会清除 `has_unresolved_recoverable_failure`
+- 控制模型调用和工具调用的循环。
+- 在工具调用前保证用户能看到可理解的行动说明。
+- 处理无效工具名、工具失败、审批等待、用户中断和工具上限。
+- 在最终回答前做完成度判断，避免模型只说“我去做”但没有真正完成。
+- 在长会话接近上下文上限时触发压缩。
 
----
+## 8. Prompt 组成
 
-## 六、Turn 决策：`decide_turn_step()`
+Prompt 由 `PromptAssembler` 拼装，通常包含：
 
-LLM 返回后，系统先做硬分支，再做收口判断：
+1. Stable Context
+   - `Newman.md`
+   - `USER.md`
+   - `MEMORY.md`
+   - `SKILLS_SNAPSHOT.md`
+   - `TOOLS_SNAPSHOT.md`
+2. 工具、技能和用户输入护栏。
+3. collaboration mode prompt。
+4. workflow state prompt。
+5. checkpoint summary。
+6. 当前模型可见的 session messages。
 
-```
-ProviderResponse
-        │
-        ├── 有 invalid_tool_calls？
-        │   └── YES → 注入 invalid_tool_call_feedback 后继续
-        │           ├── commentary/thinking/think 伪工具 → 下一轮禁用工具直接回答一次
-        │           └── 其他不存在工具 → 要求只使用当前可用工具
-        │
-        ├── 有 tool_calls？
-        │   └── YES → "continue"（继续执行工具）
-        │
-        └── NO → 这段文本只是候选 assistant 回答，必须判断是否允许收口
-                │
-                ├── final_answer_gate_reason()
-                │   ├── 空回答 → "empty_final_answer"
-                │   ├── 看起来像未完成的行动 → "incomplete_action_statement"
-                │   ├── 有未解决的工具失败且无完成信号 → "unresolved_tool_failure_without_result"
-                │   └── 通过 → None（有效回答）
-                │
-                ├── gate 通过 → tentative "finalize"
-                │   │
-                │   └── 若当前用户请求属于执行型任务
-                │       且本轮没有明确产物证据、回答里也没有可解析的本地附件
-                │       → 进入 LLM completion judge
-                │           ├── final    → finalize
-                │           ├── continue → 注入指令继续做，工具保持可用
-                │           ├── blocked  → finalize_blocked
-                │           └── ask_user → 下一轮必须调用 request_user_input
-                │
-                ├── gate 未通过 + 可恢复失败尚未耗尽
-                │   └── "continue" + recovery_instruction
-                │       └── 可以继续调用工具，但不要重复同一个已知失败动作
-                │
-                ├── gate 未通过 + 首次 finalization retry
-                │   └── "continue" + finalization_instruction
-                │       └── 工具仍然可用，不再强制 force_no_tools_next
-                │
-                └── gate 未通过 + 重试额度耗尽
-                    └── "finalize_blocked"（强制结束，标记为阻塞）
+注意：
+
+- `session.messages` 是完整 transcript。
+- 模型可见消息可能会跳过 checkpoint 已归档前缀。
+- 上下文压缩只改变 prompt 可见范围，不删除完整 transcript。
+- `context_usage` 衡量的是下一次请求的预计 prompt 占用，详见 [上下文压缩说明](context_compression.md)。
+
+## 9. Provider 调用
+
+RunLoop 调用 provider 的流式接口，输出会被拆成多类事件：
+
+```text
+provider.chat_stream(messages, tools)
+        ↓
+content tokens       -> assistant_delta
+commentary tokens    -> commentary_delta
+thinking tokens      -> 内部解析
+tool call deltas     -> tool_call_arguments_delta
+tool calls           -> 后续工具执行
+usage                -> usage store
+finish_reason        -> 终态判断
 ```
 
-当前完成判断仍是“确定性 gate + 可选 LLM judge”的组合：
+ProviderResponse 主要包含：
 
-- 确定性 gate 位于 `backend/runtime/turn_completion.py`，主要负责拦截空回答、明显行动说明和未解决工具失败。
-- LLM completion judge 位于 `backend/runtime/run_loop.py`，只在本地 gate 认为可 finalize 且用户请求看起来像执行型任务时触发。
-- judge 返回 `continue` / `ask_user` 时，后端会发送 `assistant_delta(reset=true)` 撤回已经流出的候选回答，再把反馈作为 system message 注入下一轮。
-- `answer_started` 只是候选回答开始，不代表已经完成；`final_response` 才代表最终 assistant message 已持久化。
+- `content`
+- `commentary`
+- `thinking`
+- `tool_calls`
+- `invalid_tool_calls`
+- `usage`
+- `provider_state`
+- `finish_reason`
 
----
+## 10. 工具执行架构
 
-## 七、终态分支
+工具执行由 `ToolRouter` 和 `ToolOrchestrator` 协作完成。
 
+```text
+tool_call
+        ↓
+ToolRouter.route()
+        ↓
+static checks
+        ↓
+PreToolUse hook
+        ↓
+ToolOrchestrator.execute()
+        ├── validate_arguments()
+        ├── ApprovalPolicy.evaluate()
+        ├── tool.run_streaming()
+        └── RetryPolicy
+        ↓
+normalize result
+        ↓
+append tool SessionMessage
+        ↓
+PostToolUse hook
+        ↓
+FileChanged hook / reload_ecosystem
 ```
-RunLoop 结束的 7 种方式：
 
-1. finalize（正常结束）
-   └── LLM 返回有效最终回答 → 保存 assistant message → emit("final_response") → emit("turn_completed") → emit("SessionEnd")
-                                      └── 达到 20 个 user turn 时后台 schedule_evolution("turn_interval")
+工具来源：
 
-2. finalize_blocked（收口被拦截）
-   └── LLM 连续返回无效回答，或 completion judge 判定当前已明确阻塞 → 输出阻塞信息
+- 内置工具：`backend/tools/impl/`
+- 插件 MCP 工具
+- 外部 MCP server 工具
 
-3. awaiting_user（等待用户输入）
-   └── 工具返回 turn_outcome=awaiting_user，或 completion judge 要求改走 request_user_input → 暂停等待
+工具执行前的安全控制：
 
-4. tool_limit（工具调用上限）
-   └── tool_depth >= max_tool_depth → 注入指令要求给出阶段性结论，finish_reason="tool_limit_reached"
+- 参数校验。
+- 路径权限检查。
+- 终端命令风险分析。
+- MCP 参数路径校验。
+- 审批策略。
+- 沙箱限制。
 
-5. fatal_tool_error（致命工具错误）
-   └── 工具返回 recovery_class="fatal" → 尝试无工具收口或使用 fallback 说明原因
+工具执行结果会写入：
 
-6. provider_error（LLM 提供商错误）
-   └── API 调用失败 → 保存 provider failure assistant message，并 emit("error")
+- SSE 事件。
+- session tool message。
+- audit log。
+- usage / retry / error metadata。
 
-7. context_irreducible（上下文不可压缩）
-   └── 上下文溢出且无法压缩 → 输出溢出提示
+## 11. 审批与沙箱
+
+审批策略按工具、命令风险和本轮 `approval_mode` 决定。
+
+常见结果：
+
+- `allow`：直接执行。
+- `ask`：发出 `tool_approval_request`，等待用户 approve / reject。
+- `deny`：直接拒绝执行。
+
+终端工具在 Linux 下优先走 bubblewrap 沙箱：
+
+```text
+terminal
+        ↓
+analyze_terminal_command()
+        ↓
+NativeSandbox / linux_bwrap
+        ↓
+subprocess
 ```
 
-所有正常终态都会持久化一条 `role="assistant"` 的 SessionMessage；工具调用过程中的行动说明则以
-`role="assistant"` 且 `metadata.tool_calls` 记录，用于下一轮 prompt 恢复工具协议，不作为最终回答展示。
+沙箱会根据配置挂载：
 
----
+- workspace 可写根。
+- 只读根。
+- protected roots。
+- 临时目录。
+- 网络隔离策略。
 
-## 八、Session 管理
+## 12. Turn 决策与终态
 
-### 8.1 数据模型
+模型返回后，RunLoop 会判断下一步：
 
+```text
+invalid tool call -> 注入反馈，继续
+有 tool_calls -> 执行工具，继续
+无 tool_calls -> 判断是否可以收口
 ```
-SessionRecord
-├── session_id: str
-├── title: str
-├── created_at / updated_at
-├── messages: list[SessionMessage]
-│       │
-│       ├── role: system | user | assistant | tool
-│       ├── content: str
-│       └── metadata: dict
-│           ├── turn_id          # 所属轮次
-│           ├── request_id       # 请求 ID
-│           ├── group_id         # 动作组 ID
-│           ├── tool_call_id     # 工具调用 ID
-│           ├── success          # 工具是否成功
-│           ├── category         # 结果分类
-│           ├── attachments      # 附件信息
-│           └── ...
-│
-└── metadata: dict
-    ├── plan                   # 执行计划
-    ├── collaboration_mode     # 协作模式
-    ├── checkpoint_active      # 是否有活跃 checkpoint
+
+最终可能进入：
+
+- `finalize`：正常完成。
+- `finalize_blocked`：明确阻塞后收口。
+- `awaiting_user`：等待用户补充输入。
+- `tool_limit`：达到工具调用上限，输出阶段性结果。
+- `fatal_tool_error`：工具致命失败后收口。
+- `provider_error`：模型调用失败。
+- `context_irreducible`：上下文无法继续压缩。
+
+前端展示上应以 `final_response` 为最终回答信号，`answer_started` 只表示候选回答开始。
+
+## 13. 状态与持久化
+
+主要持久化位置：
+
+| 数据 | 位置 |
+| --- | --- |
+| Session transcript | `backend_data/sessions/` |
+| Audit log | `backend_data/audit/{session_id}.log` |
+| Tool output archive | `backend_data/sessions/tool_outputs/` |
+| Memory | `backend_data/memory/` |
+| Checkpoint | session 相关 checkpoint 存储 |
+| Usage | PostgreSQL `model_usage_records` |
+| Scheduler | `backend_data/scheduler/` |
+| Channels | `backend_data/channels/` |
+| Evolution | `backend_data/evolution/` |
+| Plugin state | `backend_data/plugin_state.json` |
+
+`SessionMessage` 是核心 transcript 单位：
+
+```text
+SessionMessage
+├── id
+├── role: system | user | assistant | tool
+├── content
+├── created_at
+└── metadata
+    ├── turn_id
+    ├── request_id
+    ├── group_id
+    ├── tool_call_id
+    ├── approval_mode
+    ├── attachments
+    ├── success
+    ├── category
     └── ...
 ```
 
-### 8.2 持久化
+## 14. 插件、技能与 MCP
 
-- Session 文件：`backend_data/sessions/{date}_{session_id}.json`
-- 审计日志：`backend_data/audit/{session_id}.log`（每行一个 JSON 事件）
-- Checkpoint：与 session 同目录，压缩后的上下文摘要
-- Evolution：`backend_data/evolution/runs/*.json`、`snapshots/`、`events.jsonl`
+### 插件
 
-### 8.3 上下文压缩
+插件目录位于 `plugins/`。插件可提供：
 
-当消息过多导致上下文溢出时：
+- manifest。
+- hooks。
+- skills。
+- MCP server 配置。
+- UI 或其他资源。
 
-```
-_maybe_checkpoint()
-        │
-        ├── build_context_usage_snapshot()  # 计算当前上下文用量
-        │
-        ├── 用量 < 上限 → 跳过
-        │
-        └── 用量 >= 上限
-            │
-            ├── microcompact_session()  # 先压缩旧工具输出
-            ├── summarize_messages()  # LLM 总结历史消息
-            ├── 保留最近 N 个 segment
-            ├── 生成 CheckpointRecord（含摘要）
-            └── 后续 prompt 中注入 checkpoint summary
-```
+插件状态由后端记录，可通过 API 启用、禁用、重扫和删除。
 
----
+### 技能
 
-## 九、钩子系统
+Skill 会进入 `SKILLS_SNAPSHOT.md`，再注入 Stable Context。
 
-```
-Hook 生命周期：
-                        ┌─────────────────────────────┐
-                        │         SessionStart         │ ← 每轮对话开始
-                        └──────────────┬──────────────┘
-                                       │
-                        ┌──────────────▼──────────────┐
-                        │         PreToolUse           │ ← 工具执行前
-                        └──────────────┬──────────────┘
-                                       │
-                        ┌──────────────▼──────────────┐
-                        │     工具执行 (execute)       │
-                        └──────────────┬──────────────┘
-                                       │
-                        ┌──────────────▼──────────────┐
-                        │        PostToolUse           │ ← 工具执行后
-                        └──────────────┬──────────────┘
-                                       │
-                  ┌────────────────────┼────────────────────┐
-                  │                    │                    │
-        ┌─────────▼─────────┐ ┌────────▼────────┐ ┌────────▼────────┐
-        │    FileChanged     │ │  继续下一轮循环  │ │   SessionEnd    │
-        │ (文件变更时触发)    │ │                 │ │  (对话结束时)   │
-        └───────────────────┘ └─────────────────┘ └─────────────────┘
-```
+LLM 看到的是技能摘要和使用规则；当任务匹配某个 skill 时，需要先读取对应 `SKILL.md`，再按技能说明执行。
 
-钩子触发方式：
-- **静态消息**：`plugin.yaml` 中的 `message` 字段，直接注入事件流
-- **动态处理**：`handler` 指向的 Python 脚本，通过子进程执行，stdin 传入 JSON，stdout 读取输出
+### MCP
 
----
+MCP server 可来自：
 
-## 十、插件与技能
+- `backend_data/mcp` 配置。
+- 插件 manifest。
 
-### 10.1 插件加载
+MCP registry 负责连接 server、列出 resources、适配 MCP tools，并把工具注册到 ToolRegistry。
 
-```
-reload_ecosystem()
-        │
-        ├── PluginLoader.scan()
-        │   └── 遍历 plugins/ 目录
-        │       ├── 读取 plugin.yaml → PluginManifest
-        │       ├── 验证路径（skills/hooks/ui 是否存在）
-        │       └── 发现 skills/ 下的 SKILL.md
-        │
-        ├── PluginRegistry（启用/禁用状态）
-        │   └── backend_data/plugin_state.json
-        │
-        └── 注册 MCP 工具到 ToolRegistry
-```
+## 15. 自进化
 
-### 10.2 技能注入
+自进化用于把真实任务里的可复用经验沉淀到本地运行时。
 
-```
-Skill → SKILLS_SNAPSHOT.md → system prompt
+触发点：
 
-LLM 看到：
-  ## Skills
-  ### Available skills
-  - research_booster: Use this skill when... (file: /path/to/SKILL.md)
-  ### How to use skills
-  - 先读取 SKILL.md，再按指示执行
-```
+- 新 session 创建时，总结上一个非空 session。
+- 长会话累计到指定 user turn 数后，做增量总结。
+- 手动调用 evolution API。
 
----
+执行链路：
 
-## 十一、自进化
-
-### 11.1 触发点
-
-```
-新建 session
-  └── schedule_previous_session_evolution()
-        └── 后台总结上一个非空 session
-
-SessionEnd
-  └── 当前 session 用户 turn 数距离上次 evolution >= 20
-        └── schedule_evolution(trigger="turn_interval")
-```
-
-### 11.2 执行链路
-
-```
+```text
 EvolutionService.run_for_session()
-        │
-        ├── 构造 EvolutionContext
-        │   ├── trigger / session 元数据
-        │   ├── checkpoint summary
-        │   ├── 上次 evolution 后的消息 + 少量重叠上下文
-        │   ├── MEMORY.md / USER.md
-        │   ├── 最近 evolution run 摘要
-        │   └── skill 列表
-        │
-        ├── LLM 分析
-        │   ├── memory_updates
-        │   └── skill_update_requests
-        │
-        ├── 自动写 MEMORY.md
-        │
-        ├── 对每个 skill 读取目录文本文件
-        │   └── LLM 输出 file_operations
-        │
-        ├── 保存快照并应用文件操作
-        ├── parse / py_compile / reload_ecosystem 验证
-        ├── 失败自动回滚
-        └── 写入 backend_data/evolution/runs/{run_id}.json
+        ↓
+构造上下文：session、checkpoint、memory、skills、历史 evolution
+        ↓
+LLM 生成 memory_updates / skill_update_requests
+        ↓
+后端确定性应用文件操作
+        ↓
+保存快照和 diff
+        ↓
+验证 parse / py_compile / reload_ecosystem
+        ↓
+失败回滚，成功记录 run
 ```
 
-自进化不走工具审批，也不让模型直接调用工具改文件。模型只输出结构化计划和文件操作，真正落盘、验证、回滚由后端确定性执行。
+自进化不会让模型直接调用工具改文件；模型只产出结构化建议，落盘、验证和回滚由后端控制。
 
----
+## 16. Channels 架构
 
-## 十二、Channels 与飞书入站
+ChannelService 把外部消息转成 Newman 任务。
 
-### 12.1 飞书 Channel SDK 链路
-
-```
-FeishuChannelTransport
-        │
-        ├── start()
-        │   └── 官方 Python Channel SDK 建立长连接
-        │
-        ├── 收到 message event
-        │   ├── _normalize_message()
-        │   ├── dedup.try_record(event_id/message_id)
-        │   ├── 过滤群聊非 @ 消息
-        │   └── _on_message(ChannelMessage)
-        │
-        └── _send_response()
-            └── SDK send(..., reply_to=message_id)
+```text
+External Platform
+        ↓
+Transport
+        ↓
+ChannelService
+        ├── 去重
+        ├── 鉴权 / 白名单
+        ├── session 映射
+        ├── 并发保护
+        └── runtime.handle_message()
+        ↓
+Transport reply
 ```
 
-`ChannelService.process_transport_message()` 负责把飞书消息接入 Newman Runtime：
+飞书主链路：
 
-- session key 按 `feishu:{app_id}:{chat_id}:{sender_open_id}:{YYYY-MM-DD}` 聚合；
-- 同一个飞书 session 正在运行时，新消息会收到“上一个任务还在处理”；
-- 飞书入站默认使用 `default_turn_approval_mode=auto_allow`，避免卡在 Newman 页面审批；
-- 处理超过短等待阈值时，先回复“已收到，正在处理，完成后回复。”，最终结果再补发；
-- 异常时回复统一兜底文案，不把 traceback 暴露给飞书用户。
+- `FeishuChannelTransport.start()` 建立长连接。
+- 收到消息后归一化为 `ChannelMessage`。
+- 过滤群聊非 @ 消息和白名单外消息。
+- 根据 app、chat、sender、日期映射 session。
+- 调用 Runtime。
+- 超过短等待阈值时先回复“已收到，正在处理”。
+- 完成后回复最终结果。
 
-### 12.2 Channel 状态与事件
+## 17. 前端事件模型
 
+前端主要消费两类 SSE。
+
+### 会话 turn 流
+
+来自：
+
+```text
+POST /api/sessions/{session_id}/messages
 ```
-GET /api/channels/status
-GET /api/channels/feishu/setup/status
-POST /api/channels/feishu/setup/validate
-POST /api/channels/feishu/setup/test
+
+用于展示当前用户发起的一轮任务。
+
+常见事件：
+
+- `assistant_delta`
+- `commentary_delta`
+- `tool_call_started`
+- `tool_call_arguments_delta`
+- `tool_call_output_delta`
+- `tool_call_finished`
+- `tool_approval_request`
+- `plan_updated`
+- `attachment_received`
+- `attachment_processed`
+- `checkpoint_created`
+- `turn_interrupted`
+- `final_response`
+- `stream_completed`
+
+### 外部 Channel 事件流
+
+来自：
+
+```text
 GET /api/channels/events/stream
 ```
 
-`/api/channels/events/stream` 是外部渠道事件流，供前端感知飞书入站带来的会话变化；普通对话的
-turn 级事件仍走 `POST /api/sessions/{session_id}/messages` 返回的 SSE。
+用于感知飞书等外部渠道产生的新会话、新消息或状态变化。
 
----
+## 18. 典型 Web 时序
 
-## 十三、完整时序图
-
+```text
+用户
+ ↓
+前端 POST /messages
+ ↓
+API 创建 SSE worker
+ ↓
+RunLoop 写入 user message
+ ↓
+PromptAssembler 拼装 prompt
+ ↓
+Provider 流式返回
+ ↓
+如果有 tool_calls：
+    工具审批 / 执行 / 写入 tool message
+    回到 Provider 下一轮
+ ↓
+如果无 tool_calls：
+    completion gate / judge 判断是否可收口
+ ↓
+保存 assistant message
+ ↓
+发送 final_response
+ ↓
+发送 stream_completed
 ```
-用户                  前端                 API                 RunLoop              LLM               工具/沙箱
- │                    │                   │                    │                   │                    │
- │── 发送消息 ───────→│                   │                    │                   │                    │
- │                    │── POST /messages ─→│                    │                   │                    │
- │                    │                   │── handle_message()─→│                   │                    │
- │                    │                   │                    │── 创建 user msg ──→│                    │
- │                    │                   │                    │── SessionStart ───→│                    │
- │                    │                   │                    │── assemble prompt ─→│                    │
- │                    │                   │                    │── provider.chat_stream() ───────────────→│
- │                    │                   │                    │                   │                    │
- │                    │                   │                    │←──── streaming tokens ──────────────────│
- │                    │                   │←── SSE events ─────│                   │                    │
- │←── 实时显示 ───────│                   │                    │                   │                    │
- │                    │                   │                    │                   │                    │
- │                    │                   │                    │←──── response (content + tool_calls) ───│
- │                    │                   │                    │                   │                    │
- │                    │                   │                    │── decide_turn_step()                    │
- │                    │                   │                    │   (有 tool_calls?)  │                    │
- │                    │                   │                    │                   │                    │
- │                    │                   │                    │── 逐个执行工具 ─────────────────────────→│
- │                    │                   │                    │   ├── PreToolUse hook                    │
- │                    │                   │                    │   ├── orchestrator.execute()             │
- │                    │                   │                    │   │   ├── 参数校验                       │
- │                    │                   │                    │   │   ├── 审批策略                       │
- │                    │                   │                    │   │   └── tool.run_streaming() ─────────→│
- │                    │                   │                    │   │                   │←── result ──────│
- │                    │                   │                    │   ├── PostToolUse hook                   │
- │                    │                   │                    │   └── 保存到 session                    │
- │                    │                   │                    │                   │                    │
- │                    │                   │                    │── 回到循环顶部 ────→│                    │
- │                    │                   │                    │── assemble prompt ─→│                    │
- │                    │                   │                    │── provider.chat_stream() ───────────────→│
- │                    │                   │                    │                   │                    │
- │                    │                   │                    │←──── response (无 tool_calls) ───────────│
- │                    │                   │                    │                   │                    │
- │                    │                   │                    │── completion gate/judge                  │
- │                    │                   │                    │   ├── continue → 回到循环顶部             │
- │                    │                   │                    │   └── final                              │
- │                    │                   │                    │── 保存 assistant message                 │
- │                    │                   │←── final_response ──│                    │
- │                    │                   │←── turn_completed ──│                    │
- │                    │                   │                    │── SessionEnd hook ─→│                    │
- │                    │                   │                    │                   │                    │
- │                    │                   │←── stream_completed─│                   │                    │
- │                    │←── SSE complete ──│                    │                   │                    │
- │←── 显示最终回答 ───│                   │                    │                   │                    │
-```
+
+## 19. 关键边界
+
+- `create_app()` 和 `NewmanRuntime.__init__()` 是进程级初始化，不是每次请求执行。
+- `reload_ecosystem()` 会较频繁执行，但它只刷新扩展生态，不重建整个 FastAPI app。
+- `session.messages` 保留完整 transcript；上下文压缩只影响模型可见历史。
+- `thread_isolation` 只隔离上下文，不隔离文件系统。
+- 同一 session 同时只允许一个 Web 消息任务运行。
+- Scheduler、Channel 和 Web 都可能进入 Runtime，因此需要依赖 session busy check 降低并发冲突。
+- 终端沙箱主要面向 Linux；Windows/macOS 源码运行时不是同一套 native sandbox 能力。
+- `final_response` 是最终回答信号，`assistant_delta` 只是流式候选内容。
