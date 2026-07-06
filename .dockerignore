@@ -1,18 +1,25 @@
 .git/
 .codex
+.agents/
 .claude/
 
 .env
-.env.*
+.env.docker
+.env.local
 !.env.example
 !.env.docker.example
+
+.venv/
+venv/
+.cache/
+.tmp/
 
 backend_data/
 outputs/
 test_runtimespace/
 backend/tests/
 
-docs/
+docs/prds/
 ref/
 
 __pycache__/
@@ -23,13 +30,19 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.pid
 
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/*.tsbuildinfo
+*.tsbuildinfo
 
 **/.venv/
 skills/AOG-ai-daily-news/
 skills/newman-image-responses/
 *.log
+
+ecology_data_dictionary.csv
+ecology_data_dictionary.md
+ecology_query_semantic_layer.md

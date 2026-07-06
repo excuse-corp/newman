@@ -29,13 +29,6 @@ frontend/dist/
 frontend/.vite/
 *.tsbuildinfo
 
-# Temporary Docker ignores
-.dockerignore
-.env.docker*
-!.env.docker.example
-docker-compose*.yml
-docker/
-backend/sandbox/Dockerfile
 ecology_data_dictionary.csv
 ecology_data_dictionary.md
 ecology_query_semantic_layer.md

@@ -3,7 +3,6 @@ name: newman
 services:
   postgres:
     image: ${NEWMAN_DOCKER_REGISTRY:-docker.m.daocloud.io/library}/postgres:15.4
-    platform: ${NEWMAN_DOCKER_PLATFORM:-linux/amd64}
     environment:
       POSTGRES_DB: newman
       POSTGRES_USER: postgres
@@ -18,12 +17,10 @@ services:
     restart: unless-stopped
 
   backend:
-    platform: ${NEWMAN_DOCKER_PLATFORM:-linux/amd64}
     build:
       context: .
       dockerfile: docker/backend.Dockerfile
       args:
-        TARGETPLATFORM: ${NEWMAN_DOCKER_PLATFORM:-linux/amd64}
         DOCKER_REGISTRY: ${NEWMAN_DOCKER_REGISTRY:-docker.m.daocloud.io/library}
     env_file:
       - path: .env.docker
@@ -39,8 +36,8 @@ services:
       - ./test_runtimespace:/root/newman/test_runtimespace
       - ./backend/tools:/root/newman/backend/tools
       - ./docker/newman.yaml:/root/newman/newman.yaml:ro
-      - ${HOME}/.lark-cli:/root/.lark-cli
-      - ${HOME}/.local/share/lark-cli:/root/.local/share/lark-cli
+      - newman_lark_cli_config:/root/.lark-cli
+      - newman_lark_cli_data:/root/.local/share/lark-cli
     ports:
       - "${NEWMAN_BACKEND_PORT:-18005}:8005"
     extra_hosts:
@@ -57,12 +54,10 @@ services:
     restart: unless-stopped
 
   frontend:
-    platform: ${NEWMAN_DOCKER_PLATFORM:-linux/amd64}
     build:
       context: .
       dockerfile: docker/frontend.Dockerfile
       args:
-        TARGETPLATFORM: ${NEWMAN_DOCKER_PLATFORM:-linux/amd64}
         DOCKER_REGISTRY: ${NEWMAN_DOCKER_REGISTRY:-docker.m.daocloud.io/library}
     ports:
       - "${NEWMAN_FRONTEND_PORT:-17775}:80"
@@ -79,3 +74,5 @@ services:
 
 volumes:
   newman_postgres_data:
+  newman_lark_cli_config:
+  newman_lark_cli_data:

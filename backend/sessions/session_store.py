@@ -63,7 +63,7 @@ class SessionStore:
 
     def latest(self, exclude_session_ids: set[str] | None = None, require_messages: bool = False) -> SessionRecord | None:
         excluded = exclude_session_ids or set()
-        for session in self.list_records():
+        for session in self._iter_records_by_recent_file():
             if session.session_id in excluded:
                 continue
             if require_messages and not session.messages:
@@ -126,6 +126,22 @@ class SessionStore:
             for path in self.sessions_dir.glob("*.json")
             if not path.name.endswith("_checkpoint.json")
         ]
+
+    def _iter_records_by_recent_file(self):
+        seen_session_ids: set[str] = set()
+        paths = sorted(
+            self._all_session_paths(),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in paths:
+            record = SessionRecord.model_validate_json(path.read_text(encoding="utf-8"))
+            if record.session_id in seen_session_ids:
+                continue
+            seen_session_ids.add(record.session_id)
+            if record.metadata.get("subagent") is True:
+                continue
+            yield record
 
     def _existing_path_for(self, session_id: str) -> Path | None:
         preferred_matches = sorted(self.sessions_dir.glob(f"*_{session_id}.json"))

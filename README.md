@@ -111,7 +111,7 @@ docker compose build
 docker compose up -d
 ```
 
-Windows Docker Desktop 默认按 `linux/amd64` 构建，避免镜像代理偶发返回错误架构导致 `exec /bin/sh: exec format error`。如果镜像代理下载层时出现 `EOF`，可以在 PowerShell 中临时切换代理后重建：
+Docker 默认使用当前 Docker Desktop 可运行的原生平台构建，x64 机器通常是 `linux/amd64`，ARM 机器通常是 `linux/arm64`。如果镜像代理下载层时出现 `EOF`，可以在 PowerShell 中临时切换代理后重建：
 
 ```powershell
 $env:NEWMAN_DOCKER_REGISTRY="docker.1ms.run/library"
@@ -120,6 +120,12 @@ docker compose up -d
 ```
 
 可选镜像代理示例：`docker.m.daocloud.io/library`、`docker.1ms.run/library`；如果本机可直连 Docker Hub，也可以设为 `docker.io/library`。
+如果确实需要强制目标平台，例如在 ARM 机器上通过模拟层构建 amd64 镜像，可以临时设置：
+
+```powershell
+$env:DOCKER_DEFAULT_PLATFORM="linux/amd64"
+docker compose build --no-cache --pull
+```
 
 3. 默认访问地址。
 
@@ -149,8 +155,9 @@ NEWMAN_FRONTEND_PORT=7775 NEWMAN_BACKEND_PORT=8005 docker compose up -d --build
 Docker 模式注意事项：
 
 - 容器内访问宿主机服务时，不要写 `127.0.0.1`，应改用 `host.docker.internal`。
-- Docker 构建平台默认是 `linux/amd64`；如需覆盖，设置 `NEWMAN_DOCKER_PLATFORM` 后再执行 `docker compose build --no-cache`。
+- Docker 构建平台默认跟随 Docker Desktop / Docker Engine 的原生平台；如需覆盖，设置 `DOCKER_DEFAULT_PLATFORM` 后再执行 `docker compose build --no-cache`。
 - 后端会挂载 `backend_data/`、`plugins/`、`skills/`、`outputs/` 和 `backend/tools/`，便于保留本地数据和扩展能力。
+- `lark-cli` 登录态默认保存在 Docker named volume 中，不依赖 Windows PowerShell 的 `$HOME` 变量。
 - Docker 默认对外暴露的是 `17775 -> 80` 和 `18005 -> 8005`。
 
 ### 方案二：源码部署（macOS / Linux 推荐）
@@ -286,7 +293,7 @@ lark-cli auth login --recommend
 lark-cli auth status
 ```
 
-Docker 部署已挂载宿主机 `~/.lark-cli` 和 `~/.local/share/lark-cli`；如果要让 Newman 默认给固定飞书用户发 IM，可在 `.env` / `.env.docker` 设置 `NEWMAN_LARK_DEFAULT_IM_USER_ID`。如需默认使用应用身份发送，再设置 `NEWMAN_LARK_DEFAULT_IM_IDENTITY=bot`；显式传入的目标和身份始终优先。
+Docker 部署会把 `lark-cli` 登录态保存在 named volume 中；如果要让 Newman 默认给固定飞书用户发 IM，可在 `.env` / `.env.docker` 设置 `NEWMAN_LARK_DEFAULT_IM_USER_ID`。如需默认使用应用身份发送，再设置 `NEWMAN_LARK_DEFAULT_IM_IDENTITY=bot`；显式传入的目标和身份始终优先。
 
 ## 相关文档
 

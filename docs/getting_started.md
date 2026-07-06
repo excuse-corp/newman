@@ -91,7 +91,7 @@ docker compose build
 docker compose up -d
 ```
 
-Windows Docker Desktop 默认按 `linux/amd64` 构建，避免镜像代理偶发返回错误架构导致 `exec /bin/sh: exec format error`。如果构建时拉取镜像层出现 `EOF`，可以在 PowerShell 中临时切换镜像代理后重建：
+Docker 默认使用当前 Docker Desktop 可运行的原生平台构建，x64 机器通常是 `linux/amd64`，ARM 机器通常是 `linux/arm64`。如果构建时拉取镜像层出现 `EOF`，可以在 PowerShell 中临时切换镜像代理后重建：
 
 ```powershell
 $env:NEWMAN_DOCKER_REGISTRY="docker.1ms.run/library"
@@ -99,7 +99,12 @@ docker compose build --no-cache
 docker compose up -d
 ```
 
-可选镜像代理示例：`docker.m.daocloud.io/library`、`docker.1ms.run/library`；如果本机可直连 Docker Hub，也可以设为 `docker.io/library`。如需改目标平台，可设置 `NEWMAN_DOCKER_PLATFORM`，例如 `$env:NEWMAN_DOCKER_PLATFORM="linux/amd64"`。
+可选镜像代理示例：`docker.m.daocloud.io/library`、`docker.1ms.run/library`；如果本机可直连 Docker Hub，也可以设为 `docker.io/library`。如需强制目标平台，可设置 `DOCKER_DEFAULT_PLATFORM`，例如：
+
+```powershell
+$env:DOCKER_DEFAULT_PLATFORM="linux/amd64"
+docker compose build --no-cache --pull
+```
 
 默认地址：
 
@@ -270,7 +275,7 @@ Docker 镜像内已安装：
 - `lark-cli`，用于 Newman 主动操作飞书资源
 - `feishu-cli` 插件，位于 `plugins/feishu-cli`
 
-宿主机还需要安装并登录 `lark-cli`，仅当你要使用“Newman -> 飞书”出站能力时需要：
+源码部署时，宿主机还需要安装并登录 `lark-cli`，仅当你要使用“Newman -> 飞书”出站能力时需要：
 
 ```bash
 npx @larksuite/cli@latest install
@@ -279,11 +284,12 @@ lark-cli auth login --recommend
 lark-cli auth status
 ```
 
-Docker Compose 会把宿主机登录态挂载进容器：
+Docker 部署时，镜像内已安装 `lark-cli`，登录态保存在 Docker named volume 中。需要启用“Newman -> 飞书”出站能力时，在 backend 容器启动后进入容器登录：
 
-```text
-~/.lark-cli
-~/.local/share/lark-cli
+```bash
+docker compose exec backend lark-cli config init --new
+docker compose exec backend lark-cli auth login --recommend
+docker compose exec backend lark-cli auth status
 ```
 
 #### 源码部署
@@ -445,6 +451,8 @@ plugins/feishu-cli/skills/lark-cli/SKILL.md
 
 #### 第二步：安装并登录 lark-cli
 
+源码部署时，在宿主机执行：
+
 ```bash
 npx @larksuite/cli@latest install
 lark-cli config init --new
@@ -457,10 +465,13 @@ lark-cli auth status
 - `bot`：适合应用身份发送消息、操作应用可访问资源。
 - `user`：适合以当前用户身份访问用户有权限的资源。
 
-Docker 部署时，登录命令在宿主机执行即可，因为 Compose 已挂载：
+Docker 部署时，镜像内已安装 `lark-cli`，登录态保存在 named volume 中。在 backend 容器启动后执行：
 
-- `~/.lark-cli`
-- `~/.local/share/lark-cli`
+```bash
+docker compose exec backend lark-cli config init --new
+docker compose exec backend lark-cli auth login --recommend
+docker compose exec backend lark-cli auth status
+```
 
 #### 第三步：配置默认发消息目标（可选）
 
