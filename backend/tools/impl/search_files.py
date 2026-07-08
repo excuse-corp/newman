@@ -28,15 +28,44 @@ class SearchFilesTool(BaseTool):
             input_schema={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "path": {"type": "string", "default": "."},
-                    "glob": {"type": "string"},
-                    "regex": {"type": "boolean", "default": False},
-                    "case_sensitive": {"type": "boolean", "default": False},
-                    "max_results": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
-                    "show_hidden": {"type": "boolean", "default": False},
+                    "query": {
+                        "type": "string",
+                        "description": "Text to search for, or a regex pattern when regex=true. Use this exact key.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "default": ".",
+                        "description": "Readable directory or file path to search. Defaults to the workspace root.",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Optional file glob filter such as *.py or docs/*.md.",
+                    },
+                    "regex": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Whether query should be interpreted as a regular expression.",
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Whether matching should be case-sensitive.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 20,
+                        "description": "Maximum number of matching lines to return.",
+                    },
+                    "show_hidden": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Whether to search hidden files and directories.",
+                    },
                 },
                 "required": ["query"],
+                "additionalProperties": False,
             },
             risk_level="low",
             approval_behavior="safe",

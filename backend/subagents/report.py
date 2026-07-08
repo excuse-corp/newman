@@ -131,6 +131,13 @@ def aggregate_multiagent_report(
     )
 
 
+def aggregate_current_usage_summary(tasks: list[SubagentTask]) -> UsageSummary:
+    usage = UsageSummary()
+    for task in tasks:
+        usage = usage.add(task.usage_summary)
+    return usage
+
+
 def _iter_json_candidates(text: str) -> list[str]:
     candidates = [match.group(1).strip() for match in JSON_CODE_BLOCK_RE.finditer(text or "")]
     stripped = (text or "").strip()

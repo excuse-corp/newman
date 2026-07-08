@@ -13,7 +13,7 @@ from backend.runtime.result_normalizer import normalize_result
 from backend.sessions.models import SessionMessage, SessionRecord, utc_now
 from backend.sessions.session_store import SessionStore
 from backend.subagents.cancellation import CancellationRegistry
-from backend.subagents.events import tool_event_payload
+from backend.subagents.events import model_call_completed_payload, tool_event_payload
 from backend.subagents.locks import FileLockManager, FileLockTimeout, path_lock_key, workspace_mutation_lock_key
 from backend.subagents.models import FileChange, FileConflict, SubagentTask, TerminalCommand, UsageSummary
 from backend.subagents.report import AgentReportParseError, degraded_agent_report, parse_agent_report
@@ -202,7 +202,7 @@ class SubagentRunner:
         child.messages.append(repair_message)
         self.session_store.save(child)
 
-        response = await self._call_provider(child, task, is_repair=True)
+        response = await self._call_provider(child, task, is_repair=True, event_emitter=event_emitter)
         child.messages.append(
             self._assistant_message(
                 task,
@@ -240,6 +240,7 @@ class SubagentRunner:
                 tools=self._provider_tools(task),
                 is_repair=False,
                 is_wrapup=False,
+                event_emitter=event_emitter,
             )
             task.progress.completed_turns += 1
             if response.tool_calls:
@@ -273,7 +274,14 @@ class SubagentRunner:
         )
         child.messages.append(wrapup_message)
         self.session_store.save(child)
-        response = await self._call_provider(child, task, tools=[], is_repair=False, is_wrapup=True)
+        response = await self._call_provider(
+            child,
+            task,
+            tools=[],
+            is_repair=False,
+            is_wrapup=True,
+            event_emitter=event_emitter,
+        )
         task.progress.completed_turns += 1
         child.messages.append(
             self._assistant_message(
@@ -294,6 +302,7 @@ class SubagentRunner:
         tools: list[dict[str, object]] | None = None,
         is_repair: bool,
         is_wrapup: bool = False,
+        event_emitter: EventEmitter | None = None,
     ) -> ProviderResponse:
         messages = self._provider_messages(child)
         provider_tools = tools or []
@@ -317,7 +326,7 @@ class SubagentRunner:
 
             task.progress.tool_call_count += len(response.tool_calls)
             task.progress.last_event_at = utc_now()
-            self._record_usage(
+            usage_delta = self._record_usage(
                 task,
                 messages,
                 response,
@@ -325,6 +334,16 @@ class SubagentRunner:
                 is_repair=is_repair,
                 is_wrapup=is_wrapup,
                 estimated_input_tokens=estimated_input_tokens,
+            )
+            self.store.save_task(task)
+            await self._emit_model_call_completed_event(
+                event_emitter,
+                task,
+                usage_delta,
+                tool_schema_count=len(provider_tools),
+                is_repair=is_repair,
+                is_wrapup=is_wrapup,
+                finish_reason=response.finish_reason,
             )
             self._raise_if_cancelled(task)
             return response
@@ -615,15 +634,35 @@ class SubagentRunner:
             total_tokens=record.total_tokens,
             request_count=1,
         )
-        if usage.total_tokens <= 0 and estimated_input_tokens > 0:
-            usage = UsageSummary(
-                input_tokens=estimated_input_tokens,
-                output_tokens=0,
-                total_tokens=estimated_input_tokens,
-                request_count=1,
-            )
         task.usage_summary = task.usage_summary.add(usage)
         return usage
+
+    async def _emit_model_call_completed_event(
+        self,
+        event_emitter: EventEmitter | None,
+        task: SubagentTask,
+        usage_delta: UsageSummary,
+        *,
+        tool_schema_count: int,
+        is_repair: bool,
+        is_wrapup: bool,
+        finish_reason: str,
+    ) -> None:
+        if event_emitter is None:
+            return
+        payload = model_call_completed_payload(
+            task,
+            usage_delta=usage_delta.model_dump(mode="json"),
+            tool_schema_count=tool_schema_count,
+            is_repair=is_repair,
+            is_wrapup=is_wrapup,
+            finish_reason=finish_reason,
+            model=self.settings.provider.model,
+        )
+        try:
+            await event_emitter("multiagent_model_call_completed", payload)
+        except Exception:
+            return None
 
     def _ensure_child_session(self, task: SubagentTask) -> SessionRecord:
         try:

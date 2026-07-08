@@ -43,8 +43,14 @@ class TerminalTool(BaseTool):
             description="Execute a shell command inside the native sandbox.",
             input_schema={
                 "type": "object",
-                "properties": {"command": {"type": "string"}},
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command string to execute in the configured sandbox.",
+                    }
+                },
                 "required": ["command"],
+                "additionalProperties": False,
             },
             risk_level="high",
             timeout_seconds=sandbox.limits.timeout_seconds,

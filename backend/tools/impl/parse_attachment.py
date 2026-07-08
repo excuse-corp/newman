@@ -15,6 +15,8 @@ from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
 
 _ATTACHMENT_KINDS = ["image", "document", "spreadsheet", "presentation", "text", "json", "html"]
+_CONTENT_MODES = ["excerpt", "full", "none"]
+_FULL_CONTENT_DEFAULT_CHARS = 1_000_000
 
 
 class ParseAttachmentTool(BaseTool):
@@ -59,6 +61,25 @@ class ParseAttachmentTool(BaseTool):
                             },
                         },
                         "additionalProperties": False,
+                    },
+                    "content_mode": {
+                        "type": "string",
+                        "enum": _CONTENT_MODES,
+                        "default": "full",
+                        "description": (
+                            "How much parsed Markdown to include in stdout. Default 'full' returns parsed Markdown "
+                            "for reliable data analysis, reporting, full-document summarization, extraction, "
+                            "or verification tasks. Use 'excerpt' for quick lightweight inspection."
+                        ),
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": _FULL_CONTENT_DEFAULT_CHARS,
+                        "description": (
+                            "Maximum parsed Markdown characters to return when content_mode='full'. "
+                            "Defaults to 1000000. If truncated, use parsed_chunks_path or parsed_markdown_path for follow-up reads."
+                        ),
                     },
                 },
                 "additionalProperties": False,
@@ -136,7 +157,13 @@ class ParseAttachmentTool(BaseTool):
                 },
             )
 
-        excerpt = _read_excerpt(refreshed.parsed_markdown_path)
+        content_mode = _content_mode(arguments)
+        max_chars = _max_chars(arguments)
+        content_payload = _read_content_payload(
+            refreshed.parsed_markdown_path,
+            mode=content_mode,
+            max_chars=max_chars,
+        )
         cached = str(attachment_meta.get("analysis_status") or "").strip() == "parsed"
         action = "reuse" if cached else "parse"
         summary = f"已解析附件 {refreshed.filename}" if not cached else f"已返回附件 {refreshed.filename} 的缓存解析结果"
@@ -145,7 +172,7 @@ class ParseAttachmentTool(BaseTool):
             tool=self.meta.name,
             action=action,
             summary=summary,
-            stdout=_render_attachment_payload(refreshed, excerpt=excerpt),
+            stdout=_render_attachment_payload(refreshed, content_payload=content_payload),
             metadata={
                 "session_message_updates": [
                     {
@@ -278,6 +305,24 @@ def _coerce_positive_int(value: object) -> int | None:
     return normalized if normalized >= 1 else None
 
 
+def _content_mode(arguments: dict[str, Any]) -> str:
+    mode = str(arguments.get("content_mode") or "full").strip().casefold()
+    if mode not in _CONTENT_MODES:
+        return "full"
+    return mode
+
+
+def _max_chars(arguments: dict[str, Any]) -> int:
+    raw = arguments.get("max_chars")
+    if raw is None:
+        return _FULL_CONTENT_DEFAULT_CHARS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _FULL_CONTENT_DEFAULT_CHARS
+    return max(1, min(value, _FULL_CONTENT_DEFAULT_CHARS))
+
+
 def _candidate_payload(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "attachment_id": item.get("attachment_id"),
@@ -307,21 +352,64 @@ def _render_selector(selector: dict[str, Any]) -> str:
     return ", ".join(parts) or "{}"
 
 
-def _read_excerpt(path: Path | None) -> str:
+def _read_content_payload(path: Path | None, *, mode: str, max_chars: int) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "content_mode": mode,
+        "content_source": "parsed_markdown",
+    }
+    if mode == "none":
+        return payload
     if path is None or not path.exists() or not path.is_file():
-        return ""
+        payload["content_error"] = "parsed_markdown_path is unavailable"
+        return payload
     try:
         content = path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
-        return ""
+        payload["content_error"] = "failed to read parsed_markdown_path"
+        return payload
     if not content:
-        return ""
-    if len(content) <= ATTACHMENT_PROMPT_PER_FILE_CHARS:
-        return content
-    return content[: ATTACHMENT_PROMPT_PER_FILE_CHARS - 1].rstrip() + "…"
+        payload["content_char_count"] = 0
+        payload["content_returned_char_count"] = 0
+        payload["content_truncated"] = False
+        return payload
+
+    if mode == "full":
+        limit = max(1, max_chars)
+        rendered = content
+        truncated = False
+        if len(content) > limit:
+            rendered = content[: max(limit - 1, 1)].rstrip() + "…"
+            truncated = True
+        payload.update(
+            {
+                "content": rendered,
+                "content_char_count": len(content),
+                "content_returned_char_count": len(rendered),
+                "content_truncated": truncated,
+                "max_chars": limit,
+            }
+        )
+        return payload
+
+    limit = ATTACHMENT_PROMPT_PER_FILE_CHARS
+    excerpt = content
+    truncated = False
+    if len(content) > limit:
+        excerpt = content[: max(limit - 1, 1)].rstrip() + "…"
+        truncated = True
+    payload.update(
+        {
+            "content_excerpt": excerpt,
+            "content_char_count": len(content),
+            "content_returned_char_count": len(excerpt),
+            "content_truncated": truncated,
+            "max_chars": limit,
+        }
+    )
+    return payload
 
 
-def _render_attachment_payload(attachment, *, excerpt: str) -> str:
+def _render_attachment_payload(attachment, *, content_payload: dict[str, Any] | None = None, excerpt: str | None = None) -> str:
     payload: dict[str, Any] = {
         "attachment_id": attachment.attachment_id,
         "filename": attachment.filename,
@@ -341,7 +429,9 @@ def _render_attachment_payload(attachment, *, excerpt: str) -> str:
         payload["parsed_structure_path"] = str(attachment.parsed_structure_path)
     if getattr(attachment, "parsed_chunks_path", None) is not None:
         payload["parsed_chunks_path"] = str(attachment.parsed_chunks_path)
-    if excerpt:
+    if content_payload:
+        payload.update(content_payload)
+    elif excerpt:
         payload["content_excerpt"] = excerpt
     if attachment.analysis_error:
         payload["analysis_error"] = attachment.analysis_error

@@ -34,6 +34,19 @@ class ActiveSessionRun:
     detached: bool = False
 
 
+def active_session_run_payload(active_run: ActiveSessionRun | None) -> dict[str, object] | None:
+    if active_run is None or active_run.worker.done():
+        return None
+    return {
+        "session_id": active_run.session_id,
+        "request_id": active_run.request_id,
+        "turn_id": active_run.turn_id,
+        "approval_mode": active_run.approval_mode,
+        "detached": active_run.detached,
+        "interrupted": active_run.interrupted,
+    }
+
+
 @router.post("/{session_id}/messages")
 async def send_message(session_id: str, request: Request):
     runtime = request.app.state.runtime
@@ -180,6 +193,9 @@ async def send_message(session_id: str, request: Request):
                     continue
         finally:
             stream_closed = True
+            if active_run is not None and not worker.done():
+                active_run.detached = True
+                active_run.event_queue = None
             detached = active_run.detached if active_run is not None else False
             if not detached or worker.done():
                 if not worker.done():

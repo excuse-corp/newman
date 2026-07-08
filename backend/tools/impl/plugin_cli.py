@@ -149,6 +149,10 @@ class PluginCLICommandTool(BaseTool):
     ) -> ToolExecutionResult:
         args = _coerce_args(arguments)
         preflight_metadata: dict[str, Any] = {}
+        args, stdin_text, stdin_metadata = _materialize_lark_im_send_stdin_payload(
+            args,
+            arguments.get("stdin"),
+        )
         args, default_im_metadata = _apply_default_lark_im_send_options(args, self.command.env)
         default_im_user_id = default_im_metadata.get("user_id")
         default_im_identity = default_im_metadata.get("identity")
@@ -156,6 +160,7 @@ class PluginCLICommandTool(BaseTool):
             preflight_metadata["plugin_cli_default_im_user_id"] = default_im_user_id
         if default_im_identity is not None:
             preflight_metadata["plugin_cli_default_im_identity"] = default_im_identity
+        preflight_metadata.update(stdin_metadata)
         preflight_error = await self._run_preflight(args, session_id=session_id, metadata=preflight_metadata)
         if preflight_error is not None:
             preflight_error.tool = self.meta.name
@@ -167,7 +172,6 @@ class PluginCLICommandTool(BaseTool):
         if confirm and self.command.confirmation_flag:
             argv.append(self.command.confirmation_flag)
 
-        stdin_text = arguments.get("stdin")
         result = await self.sandbox.execute_argv(
             argv,
             emit_output=emit_output,
@@ -363,6 +367,28 @@ def _apply_default_lark_im_send_options(
             metadata["identity"] = default_identity
 
     return resolved_args, metadata
+
+
+def _materialize_lark_im_send_stdin_payload(
+    args: list[str],
+    stdin_text: object,
+) -> tuple[list[str], object, dict[str, str]]:
+    if not _is_lark_im_messages_send_invocation(args) or not isinstance(stdin_text, str) or not stdin_text:
+        return args, stdin_text, {}
+
+    resolved_args = list(args)
+    lowered = [item.strip().lower() for item in resolved_args]
+    for flag in ("--markdown", "--text"):
+        try:
+            index = lowered.index(flag)
+        except ValueError:
+            continue
+        value_index = index + 1
+        if value_index < len(resolved_args) and resolved_args[value_index].strip() == "-":
+            resolved_args[value_index] = stdin_text
+            return resolved_args, None, {"plugin_cli_stdin_payload_materialized": flag}
+
+    return args, stdin_text, {}
 
 
 def _uses_explicit_user_identity(args: list[str]) -> bool:

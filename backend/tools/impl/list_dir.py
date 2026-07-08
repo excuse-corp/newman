@@ -24,12 +24,37 @@ class ListDirectoryTool(BaseTool):
             input_schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "default": "."},
-                    "recursive": {"type": "boolean", "default": False},
-                    "max_depth": {"type": "integer", "minimum": 1, "maximum": 6, "default": 2},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 400, "default": 120},
-                    "show_hidden": {"type": "boolean", "default": False},
+                    "path": {
+                        "type": "string",
+                        "default": ".",
+                        "description": "Readable directory path to list. Defaults to the workspace root.",
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Whether to recursively list child directories.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 6,
+                        "default": 2,
+                        "description": "Maximum recursion depth when recursive=true.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 400,
+                        "default": 120,
+                        "description": "Maximum number of entries to return.",
+                    },
+                    "show_hidden": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Whether to include hidden files and directories.",
+                    },
                 },
+                "additionalProperties": False,
             },
             risk_level="low",
             approval_behavior="safe",

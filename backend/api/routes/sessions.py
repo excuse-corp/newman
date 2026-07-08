@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from uuid import uuid4
 
+from backend.api.routes.messages import active_session_run_payload
 from backend.api.routes.subagents import list_multiagent_runs_payload
 from backend.api.sse.event_emitter import format_sse
 from backend.memory.compressor import (
@@ -108,11 +109,14 @@ async def list_sessions(request: Request):
 async def get_session(session_id: str, request: Request):
     runtime = request.app.state.runtime
     session = runtime.session_store.get(session_id)
+    active_runs = getattr(request.app.state, "active_message_runs", None)
+    active_run = active_runs.get(session_id) if isinstance(active_runs, dict) else None
     checkpoint = runtime.checkpoints.get(session_id)
     plan_draft = get_plan_draft(session)
     approved_plan = get_approved_plan(session)
     return {
         "session": session,
+        "active_run": active_session_run_payload(active_run),
         "plan": session.metadata.get("plan"),
         "collaboration_mode": get_collaboration_mode(session).model_dump(mode="json"),
         "plan_draft": plan_draft.model_dump(mode="json") if plan_draft else None,

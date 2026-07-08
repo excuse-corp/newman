@@ -166,6 +166,8 @@ def microcompact_session(
     for message in session.messages:
         if message.id not in compactable_ids or message.role != "tool":
             continue
+        if _should_preserve_tool_output(message):
+            continue
         replacement = _build_microcompact_tool_content(message)
         if not replacement or replacement == message.content:
             continue
@@ -179,6 +181,11 @@ def microcompact_session(
         message.content = replacement
         compacted_count += 1
     return compacted_count
+
+
+def _should_preserve_tool_output(message: SessionMessage) -> bool:
+    tool_name = message.metadata.get("tool")
+    return tool_name == "parse_attachment"
 
 
 async def summarize_messages(

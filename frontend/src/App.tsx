@@ -180,8 +180,18 @@ type SessionRecordDetail = {
   metadata: Record<string, unknown>;
 };
 
+type ActiveSessionRunRecord = {
+  session_id: string;
+  request_id?: string | null;
+  turn_id?: string | null;
+  approval_mode?: string | null;
+  detached?: boolean;
+  interrupted?: boolean;
+};
+
 type SessionDetailResponse = {
   session: SessionRecordDetail;
+  active_run?: ActiveSessionRunRecord | null;
   plan?: SessionPlanPayload;
   collaboration_mode?: {
     mode: CollaborationModeName;
@@ -1241,6 +1251,33 @@ function readUsageTokenCount(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
 }
 
+function readMultiagentUsageSummary(value: unknown): MultiAgentUsageSummary | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  return {
+    input_tokens: readUsageTokenCount(raw.input_tokens),
+    output_tokens: readUsageTokenCount(raw.output_tokens),
+    total_tokens: readUsageTokenCount(raw.total_tokens),
+    request_count: readUsageTokenCount(raw.request_count),
+    cost_usd: typeof raw.cost_usd === "number" && Number.isFinite(raw.cost_usd) ? raw.cost_usd : null,
+  };
+}
+
+function addMultiagentUsageSummary(left: MultiAgentUsageSummary, right: MultiAgentUsageSummary): MultiAgentUsageSummary {
+  return {
+    input_tokens: left.input_tokens + right.input_tokens,
+    output_tokens: left.output_tokens + right.output_tokens,
+    total_tokens: left.total_tokens + right.total_tokens,
+    request_count: left.request_count + right.request_count,
+    cost_usd:
+      left.cost_usd == null && right.cost_usd == null
+        ? null
+        : Number(left.cost_usd ?? 0) + Number(right.cost_usd ?? 0),
+  };
+}
+
 function readUsageTurnId(record: SessionUsageRecord) {
   if (record.request_kind === "subagent_turn") {
     const parentTurnId = record.metadata?.parent_turn_id;
@@ -1308,6 +1345,23 @@ function formatTurnDuration(durationMs: number | null | undefined) {
   const hours = Math.floor(minutes / 60);
   const remainderMinutes = minutes % 60;
   return `${hours}h${padTimePart(remainderMinutes)}m${padTimePart(seconds)}s`;
+}
+
+function computeMultiagentElapsedMs(
+  startedAt: string | null | undefined,
+  completedAt: string | null | undefined,
+  nowMs: number
+) {
+  if (!startedAt) {
+    return null;
+  }
+  const startedMs = Date.parse(startedAt);
+  if (!Number.isFinite(startedMs)) {
+    return null;
+  }
+  const completedMs = completedAt ? Date.parse(completedAt) : NaN;
+  const endMs = Number.isFinite(completedMs) ? completedMs : nowMs;
+  return Math.max(0, endMs - startedMs);
 }
 
 function makeAttachmentId(seed: string, index: number) {
@@ -3099,6 +3153,40 @@ function readMultiagentTaskId(event: SessionEventPayload) {
   return typeof value === "string" && value ? value : null;
 }
 
+function applyMultiagentModelCallCompletedToDetail(
+  detail: MultiAgentRunDetailResponse,
+  event: SessionEventPayload
+): MultiAgentRunDetailResponse {
+  if (event.event !== "multiagent_model_call_completed") {
+    return detail;
+  }
+  const taskId = readMultiagentTaskId(event);
+  const taskUsageSummary = readMultiagentUsageSummary(event.data.task_usage_summary);
+  if (!taskId || !taskUsageSummary || !detail.tasks.some((task) => task.task_id === taskId)) {
+    return detail;
+  }
+  const tasks = detail.tasks.map((task) =>
+    task.task_id === taskId
+      ? {
+          ...task,
+          usage_summary: taskUsageSummary,
+        }
+      : task
+  );
+  const runUsage = tasks.reduce(
+    (current, task) => addMultiagentUsageSummary(current, task.usage_summary),
+    { input_tokens: 0, output_tokens: 0, total_tokens: 0, request_count: 0, cost_usd: null } as MultiAgentUsageSummary
+  );
+  return {
+    ...detail,
+    run: {
+      ...detail.run,
+      usage_summary: runUsage,
+    },
+    tasks,
+  };
+}
+
 function resolveNextSelectedMultiagentTaskId(tasks: MultiAgentTaskRecord[], currentTaskId: string | null) {
   if (currentTaskId && tasks.some((task) => task.task_id === currentTaskId)) {
     return currentTaskId;
@@ -3277,6 +3365,19 @@ function describeMultiagentTimelineEvent(event: SessionEventPayload) {
     return activity
       ? `${name} · ${formatMultiagentStatusLabel(status as MultiAgentTaskStatus)} · ${activity}`
       : `${name} · ${formatMultiagentStatusLabel(status as MultiAgentTaskStatus)}`;
+  }
+  if (event.event === "multiagent_model_call_completed") {
+    const name = typeof event.data.agent_name === "string" ? event.data.agent_name : "subagent";
+    const usageDelta = readMultiagentUsageSummary(event.data.usage_delta);
+    const phase =
+      event.data.is_report_repair === true
+        ? "修复报告"
+        : event.data.is_wrapup_turn === true
+          ? "收尾调用"
+          : "模型调用";
+    return usageDelta && usageDelta.total_tokens > 0
+      ? `${name} · ${phase}完成 · +${usageDelta.total_tokens.toLocaleString("zh-CN")} tokens`
+      : `${name} · ${phase}完成`;
   }
   if (event.event === "multiagent_approval_queued") {
     const nestedEvent = typeof event.data.event === "string" ? event.data.event : "tool_approval_request";
@@ -3772,6 +3873,16 @@ function closePlanSteps(plan: SessionPlanPayload): SessionPlanPayload {
 
 function eventMarksTurnFinalized(event: SessionEventPayload) {
   return event.event === "turn_completed" || event.event === "final_response";
+}
+
+function eventMarksUnrecoverableStreamFailure(event: SessionEventPayload) {
+  if (event.event !== "stream_error" && event.event !== "stream_completed") {
+    return false;
+  }
+  if (event.event === "stream_completed") {
+    return event.data.ok === false;
+  }
+  return event.data.will_retry !== true && event.data.will_transport_fallback !== true;
 }
 
 function eventMarksTaskCompleted(event: SessionEventPayload) {
@@ -5618,7 +5729,7 @@ function buildChatTurns(
     );
   });
 
-  return turns;
+  return filterOrphanDuplicateTurns(turns);
 }
 
 function matchLiveTurnEvent(event: SessionEventPayload, liveTurn: LiveTurnState) {
@@ -5635,6 +5746,34 @@ function matchLiveTurnEvent(event: SessionEventPayload, liveTurn: LiveTurnState)
   return false;
 }
 
+function settleRunningThinkingNodesOnFailure(nodes: TimelineNode[], failureEvent: SessionEventPayload) {
+  if (!eventMarksUnrecoverableStreamFailure(failureEvent)) {
+    return nodes;
+  }
+  let changed = false;
+  const settled = nodes.map((node) => {
+    if (!isRunningThinkingNode(node)) {
+      return node;
+    }
+    changed = true;
+    const primaryText = "模型连接失败，已停止生成";
+    return {
+      ...node,
+      state: "failed" as TimelineNodeState,
+      primaryText,
+      detail: {
+        ...node.detail,
+        text: primaryText,
+        summary: primaryText,
+      },
+    };
+  });
+  if (changed) {
+    return settled;
+  }
+  return [...nodes, applyTurnIdToNode(buildThinkingNode(failureEvent.ts, "模型连接失败，已停止生成", "failed", "当前思路"), "")];
+}
+
 function buildLiveTurn(liveTurn: LiveTurnState, sessionEvents: SessionEventPayload[]): ChatTurn {
   const turnId = liveTurn.serverTurnId ?? liveTurn.localId;
   const turnEvents = sessionEvents.filter((event) => matchLiveTurnEvent(event, liveTurn));
@@ -5644,18 +5783,22 @@ function buildLiveTurn(liveTurn: LiveTurnState, sessionEvents: SessionEventPaylo
     [],
     liveTurn.userMessage.content
   ).map((node) => applyTurnIdToNode(node, turnId));
+  const terminalFailureEvent = [...turnEvents].reverse().find(eventMarksUnrecoverableStreamFailure) ?? null;
+  const settledTimeline = terminalFailureEvent
+    ? settleRunningThinkingNodesOnFailure(timeline, terminalFailureEvent).map((node) => applyTurnIdToNode(node, turnId))
+    : timeline;
   const thinkingTs = parseTimestamp(liveTurn.userMessage.createdAt) ?? Date.now();
-  const hasRunningThinking = timeline.some(isRunningThinkingNode);
-  const hasAnswerStart = timeline.some((node) => node.kind === "answer_start");
+  const hasRunningThinking = settledTimeline.some(isRunningThinkingNode);
+  const hasAnswerStart = settledTimeline.some((node) => node.kind === "answer_start");
   const shouldShowThinking =
     liveTurn.status === "running" &&
     (liveTurn.answer.phase === "waiting" || liveTurn.answer.phase === "streaming") &&
     !hasRunningThinking &&
     !hasAnswerStart;
-  const syntheticThinkingCopy = timeline.length > 0 ? "模型正在准备下一步" : null;
+  const syntheticThinkingCopy = settledTimeline.length > 0 ? "模型正在准备下一步" : null;
   const nextTimeline = shouldShowThinking
-    ? [...timeline, applyTurnIdToNode(buildThinkingNode(thinkingTs, syntheticThinkingCopy, "running", timeline.length > 0 ? "等待模型输出" : "当前思路"), turnId)]
-    : timeline;
+    ? [...settledTimeline, applyTurnIdToNode(buildThinkingNode(thinkingTs, syntheticThinkingCopy, "running", settledTimeline.length > 0 ? "等待模型输出" : "当前思路"), turnId)]
+    : settledTimeline;
 
   return {
     id: turnId,
@@ -5706,7 +5849,67 @@ function turnMatchesLiveTurn(turn: ChatTurn, liveTurn: LiveTurnState | null) {
   if (liveTurn.requestId && turn.requestId === liveTurn.requestId) {
     return true;
   }
+  if (turnLooksLikeLiveTurn(turn, liveTurn)) {
+    return true;
+  }
   return false;
+}
+
+function normalizeTurnContent(value: string) {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function turnAttachmentKey(attachments: ChatAttachment[]) {
+  return attachments.map((attachment) => attachment.id || attachment.filename).join("|");
+}
+
+function turnLooksLikeLiveTurn(turn: ChatTurn, liveTurn: LiveTurnState) {
+  const persistedContent = normalizeTurnContent(turn.userMessage.content);
+  const liveContent = normalizeTurnContent(liveTurn.userMessage.content);
+  if (!persistedContent || persistedContent !== liveContent) {
+    return false;
+  }
+  if (turnAttachmentKey(turn.userMessage.attachments) !== turnAttachmentKey(liveTurn.userMessage.attachments)) {
+    return false;
+  }
+
+  const persistedTs = parseTimestamp(turn.userMessage.createdAt);
+  const liveTs = parseTimestamp(liveTurn.userMessage.createdAt);
+  if (persistedTs === null || liveTs === null) {
+    return false;
+  }
+  return Math.abs(persistedTs - liveTs) <= 60_000;
+}
+
+function filterOrphanDuplicateTurns(turns: ChatTurn[]) {
+  return turns.filter((turn, index) => {
+    const nextTurn = turns[index + 1];
+    if (!nextTurn || turn.answer || turn.timeline.length > 0 || turn.status !== "running") {
+      return true;
+    }
+    const content = normalizeTurnContent(turn.userMessage.content);
+    if (!content || content !== normalizeTurnContent(nextTurn.userMessage.content)) {
+      return true;
+    }
+    return turnAttachmentKey(turn.userMessage.attachments) !== turnAttachmentKey(nextTurn.userMessage.attachments);
+  });
+}
+
+function buildComposerSubmissionKey(
+  sessionId: string | null,
+  content: string,
+  attachments: ComposerAttachment[],
+  awaitingRequestId: string | null
+) {
+  const attachmentKey = attachments
+    .map((attachment) => `${attachment.filename}:${attachment.sizeBytes}:${attachment.contentType}`)
+    .join("|");
+  return JSON.stringify({
+    sessionId: sessionId || "__new_session__",
+    content: normalizeTurnContent(content),
+    attachmentKey,
+    awaitingRequestId,
+  });
 }
 
 function hasSystemMetaNode(turn: ChatTurn) {
@@ -5990,6 +6193,7 @@ function App({ onLogout }: AppProps) {
   const [multiagentSummaryExpanded, setMultiagentSummaryExpanded] = useState(false);
   const [multiagentRunDetailsById, setMultiagentRunDetailsById] = useState<Record<string, MultiAgentRunDetailResponse>>({});
   const [multiagentDetailLoading, setMultiagentDetailLoading] = useState(false);
+  const [multiagentElapsedNowMs, setMultiagentElapsedNowMs] = useState(() => Date.now());
   const [multiagentApprovals, setMultiagentApprovals] = useState<MultiAgentPendingApproval[]>([]);
   const [multiagentApprovalActionId, setMultiagentApprovalActionId] = useState<string | null>(null);
   const [multiagentApprovalError, setMultiagentApprovalError] = useState<string | null>(null);
@@ -6039,6 +6243,7 @@ function App({ onLogout }: AppProps) {
   const stoppingSessionIdsRef = useRef<string[]>([]);
   const previousWorkspaceSidePanelOpenRef = useRef(false);
   const activeMessageControllersRef = useRef<Record<string, AbortController>>({});
+  const composerSubmissionInFlightRef = useRef<string | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const lastComposerPlanFocusRef = useRef<string | null>(null);
   const attachmentPreviewUrlsRef = useRef<string[]>([]);
@@ -7275,6 +7480,7 @@ function App({ onLogout }: AppProps) {
       }
 
       const dedupedEvents = dedupeSessionEvents(nextEvents);
+      setSessionRunning(sessionId, Boolean(detail.active_run));
       setActiveSessionDetail(detail.session);
       setActivePlan(closePlanIfTaskCompletedSeen(detail.plan ?? null, dedupedEvents));
       setActiveCollaborationMode(detail.collaboration_mode ?? null);
@@ -7493,6 +7699,7 @@ function App({ onLogout }: AppProps) {
     let cancelled = false;
     let controller: AbortController | null = null;
     let inFlight = false;
+    let refreshTimer: number | null = null;
 
     const refreshWorkspace = async () => {
       const sessionId = activeSessionIdRef.current;
@@ -7500,7 +7707,8 @@ function App({ onLogout }: AppProps) {
         cancelled ||
         inFlight ||
         document.visibilityState === "hidden" ||
-        (sessionId && (runningSessionIdsRef.current.includes(sessionId) || stoppingSessionIdsRef.current.includes(sessionId)))
+        (sessionId && stoppingSessionIdsRef.current.includes(sessionId)) ||
+        (sessionId && runningSessionIdsRef.current.includes(sessionId) && activeMessageControllersRef.current[sessionId])
       ) {
         return;
       }
@@ -7524,15 +7732,23 @@ function App({ onLogout }: AppProps) {
     };
 
     window.addEventListener("visibilitychange", handleVisibilityChange);
+    if (runningSessionIds.includes(activeSessionId)) {
+      refreshTimer = window.setInterval(() => {
+        void refreshWorkspace();
+      }, 5000);
+    }
 
     return () => {
       cancelled = true;
       if (controller) {
         controller.abort();
       }
+      if (refreshTimer !== null) {
+        window.clearInterval(refreshTimer);
+      }
       window.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [activeSessionId, apiBase]);
+  }, [activeSessionId, apiBase, runningSessionIds]);
 
   useEffect(() => {
     const source = new EventSource(`${apiBase}/api/channels/events/stream`, { withCredentials: true });
@@ -7673,6 +7889,20 @@ function App({ onLogout }: AppProps) {
     }
     void loadMultiagentRunDetail(selectedMultiagentRunId, { silent: true });
   }, [activePage, selectedMultiagentRunId, multiagentRunDetailsById]);
+
+  useEffect(() => {
+    const detail = selectedMultiagentRunId ? multiagentRunDetailsById[selectedMultiagentRunId] ?? null : null;
+    const hasActiveMultiagentRun =
+      detail &&
+      (isMultiagentRunActive(detail.run.status) || detail.tasks.some((task) => isMultiagentTaskActive(task.status)));
+    if (!multiagentDrawerOpen || !hasActiveMultiagentRun) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setMultiagentElapsedNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [multiagentDrawerOpen, multiagentRunDetailsById, selectedMultiagentRunId]);
 
   useEffect(() => {
     if (!pendingComposerMode) {
@@ -8198,6 +8428,15 @@ ${markup}
   const selectedMultiagentRunStopping = selectedMultiagentRunDetail
     ? isMultiagentRunStopping(selectedMultiagentRunDetail.run)
     : false;
+  const selectedMultiagentRunElapsedLabel = selectedMultiagentRunDetail
+    ? (formatTurnDuration(
+        computeMultiagentElapsedMs(
+          selectedMultiagentRunDetail.run.started_at,
+          selectedMultiagentRunDetail.run.completed_at,
+          multiagentElapsedNowMs
+        )
+      ) ?? "--")
+    : "--";
   const selectedMultiagentTaskStopping = selectedMultiagentTask
     ? isMultiagentTaskStopping(selectedMultiagentTask)
     : false;
@@ -8760,9 +8999,6 @@ ${markup}
       return;
     }
     const controller = activeMessageControllersRef.current[sessionId];
-    if (!controller) {
-      return;
-    }
 
     setSessionStopping(sessionId, true);
     setPendingApproval(null);
@@ -8774,7 +9010,7 @@ ${markup}
         method: "POST"
       });
       delete activeMessageControllersRef.current[sessionId];
-      controller.abort();
+      controller?.abort();
       resetLiveSessionEventQueue(sessionId);
       setLiveSessionEventsBySession((current) => {
         const interruptedTurnId = data.turn_id ?? null;
@@ -8849,6 +9085,11 @@ ${markup}
     const initialSessionId = activeSessionId || null;
     if ((!trimmed && submittedAttachments.length === 0) || (initialSessionId && runningSessionIds.includes(initialSessionId))) return;
     const awaitedRequestAtSubmit = activeAwaitingUserInput?.requestId ?? null;
+    const submissionKey = buildComposerSubmissionKey(initialSessionId, trimmed, submittedAttachments, awaitedRequestAtSubmit);
+    if (composerSubmissionInFlightRef.current === submissionKey) {
+      return;
+    }
+    composerSubmissionInFlightRef.current = submissionKey;
     const desiredCollaborationMode = pendingComposerMode ?? currentCollaborationMode;
 
     setChatError(null);
@@ -9070,6 +9311,18 @@ ${markup}
                   setSelectedMultiagentRunId(runId);
                 }
               }
+              if (payload.event === "multiagent_model_call_completed" && runId) {
+                setMultiagentRunDetailsById((current) => {
+                  const detail = current[runId];
+                  if (!detail) {
+                    return current;
+                  }
+                  return {
+                    ...current,
+                    [runId]: applyMultiagentModelCallCompletedToDetail(detail, payload),
+                  };
+                });
+              }
               if (payload.event === "multiagent_approval_queued") {
                 setMultiagentDrawerOpen(true);
                 void loadSessionMultiagentApprovals(sessionId, undefined, { silent: true });
@@ -9081,7 +9334,11 @@ ${markup}
               ) {
                 void loadSessionMultiagentApprovals(sessionId, undefined, { silent: true });
               }
-              if (payload.event !== "multiagent_tool_event" && payload.event !== "multiagent_approval_queued") {
+              if (
+                payload.event !== "multiagent_tool_event" &&
+                payload.event !== "multiagent_approval_queued" &&
+                payload.event !== "multiagent_model_call_completed"
+              ) {
                 void loadSessionMultiagentRuns(sessionId, undefined, { silent: true, preferredRunId: runId });
               }
             }
@@ -9138,8 +9395,13 @@ ${markup}
             };
           }
 
-          if (payload.event === "error") {
-            const message = typeof payload.data.message === "string" ? payload.data.message : "消息流执行失败";
+          if (payload.event === "error" || eventMarksUnrecoverableStreamFailure(payload)) {
+            const message =
+              typeof payload.data.message === "string" && payload.data.message
+                ? payload.data.message
+                : typeof payload.data.summary === "string" && payload.data.summary
+                  ? payload.data.summary
+                  : "消息流执行失败";
             return {
               ...nextTurn,
               status: "failed",
@@ -9232,6 +9494,9 @@ ${markup}
       }
     } finally {
       finishStreamingState();
+      if (composerSubmissionInFlightRef.current === submissionKey) {
+        composerSubmissionInFlightRef.current = null;
+      }
     }
   };
 
@@ -10453,9 +10718,15 @@ ${markup}
                   </div>
                 </div>
                 <div className="multiagent-summary-compact">
-                  <div className="multiagent-stat-cell emphasis">
+                  <div className="multiagent-stat-row">
+                    <div className="multiagent-stat-cell emphasis">
                     <span className="multiagent-stat-label">当前 token</span>
                     <strong>{selectedMultiagentRunDetail.run.usage_summary.total_tokens.toLocaleString("zh-CN")}</strong>
+                    </div>
+                    <div className="multiagent-stat-cell emphasis">
+                      <span className="multiagent-stat-label">工作时长</span>
+                      <strong>{selectedMultiagentRunElapsedLabel}</strong>
+                    </div>
                   </div>
                   <div className="multiagent-subagent-list-head">
                     <span className="multiagent-stat-label">Subagent 列表</span>

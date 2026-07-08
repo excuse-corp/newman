@@ -17,8 +17,35 @@ Generate a self-contained HTML analysis report with a polished editorial design.
 - **禁止臆造数据、观点、现象、案例、引语。** 所有内容必须来自实际检索到的来源。
 - **不确定的信息标注「待核实」或直接省略**，不要编造看似合理的内容。
 - **数据必须标注来源**（年份、机构、链接），不能只写数字不写出处。
+- **涉及数值计算时必须二次确认计算正确性。** 先区分来源原始数值与自行推导数值，再用独立步骤复算推导结果；必要时把公式、口径、单位换算、分母分子和中间值写入 `calculation_checks.md`。
+- **关键计算必须分步校验。** 对增长率、占比、同比/环比、CAGR、均值、中位数、加总、差值、倍数、指数化等指标，至少检查：原始数据是否一致、单位是否统一、公式是否适用、四舍五入口径是否影响结论。
+- **计算结果不得只凭直觉生成。** 如果无法复算或来源数据不足，标注「待核算」并避免把该结果作为核心结论。
 - **引用标注使用上标编号** `[1]`，对应底部参考文献列表中的完整链接。
 - **当多个来源说法不一致时**，列出不同观点并分别标注来源，不要自行取舍。
+
+### 1.1 数值计算复核（MUST FOLLOW）
+
+当报告包含任何自行计算、换算或汇总的数值时，必须执行以下复核流程：
+
+1. **记录输入值**
+   - 在 `research_notes.md` 或 `calculation_checks.md` 中列出用于计算的原始数值、单位、时间范围、来源编号和定位信息。
+   - 不同来源的同名指标不可直接混用；若口径不同，先说明差异或放弃合并计算。
+
+2. **分步计算**
+   - 对复杂指标拆成可检查步骤，例如：先统一单位 → 计算分子/分母 → 得到未四舍五入结果 → 再按报告展示口径取整。
+   - 对 CAGR、渗透率、利润率、市场份额、增速贡献、结构占比等容易出错的指标，必须保留公式和中间值。
+
+3. **独立复算**
+   - 用第二遍独立计算验证结果；可使用计算器、脚本、表格公式或手工分步复算。
+   - 若两次计算不一致，回到原始数据检查单位、时间口径、负数/百分号、四舍五入和缺失值处理，不得直接选择较合理的结果。
+
+4. **结论前检查**
+   - 检查数值是否落在合理范围内，例如占比是否超过 100%、增长率方向是否与原始数值一致、总分项是否能大致相加。
+   - 报告正文中展示的推导数值要能追溯到 `calculation_checks.md` 或对应证据包。
+
+5. **披露口径**
+   - 正文或脚注中说明必要的计算口径，例如“按公开披露数值测算”“按人民币口径换算”“由于四舍五入，合计可能存在尾差”。
+   - 对关键结论依赖的计算，应在表格或注释中展示公式或关键中间值，避免只有最终数字。
 
 ### 2. 信息收集三通道
 
@@ -32,16 +59,19 @@ Generate a self-contained HTML analysis report with a polished editorial design.
 
 ### 附件全量读取要求（MUST FOLLOW）
 
-`parse_attachment` 的 `stdout` 只保证返回附件元数据和一段 `content_excerpt`，不能把它当成全量正文。生成报告时，只要用户上传了附件，就必须按下面流程拿到完整解析内容：
+生成报告时，只要用户上传了附件，就必须按下面流程拿到完整解析内容。`parse_attachment` 默认返回 `content_mode: "full"`，不能只依赖 `content_excerpt`。
 
 1. **逐个附件调用 `parse_attachment`**
    - 优先使用当前回合附件元数据里的 `attachment_id`。
    - 如果没有明确 `attachment_id`，使用 `selector.order_index`、`selector.kind`、`selector.kind_index` 或 `selector.filename` 定位。
    - 多个附件必须逐个解析，不要只解析第一个附件。
+   - 报告、分析、统计、完整总结类任务使用默认 `content_mode: "full"`；只有快速探查时才显式改用 `content_mode: "excerpt"`。
 
 2. **读取解析产物路径，而不是只读 excerpt**
    - `parse_attachment` 成功后，解析返回 JSON。
-   - 如果返回 `parsed_markdown_path`，必须用 `read_file` 读取该 Markdown 文件的完整内容。
+   - 如果返回 `content` 且 `content_truncated=false`，可直接把该字段作为附件完整解析 Markdown。
+   - 如果只返回 `content_excerpt`，或返回 `content_truncated=true`，必须继续读取解析产物路径。
+   - 如果返回 `parsed_markdown_path`，用 `read_file` 或 `read_file_range` 读取该 Markdown 文件内容。
    - 如果返回 `parsed_chunks_path`，说明附件解析器生成了结构化 chunks；当 Markdown 过长或需要分段定位时，读取 chunks JSON，并按 chunk 顺序建立材料索引。
    - 如果返回 `parsed_structure_path`，用于表格、幻灯片、PDF 结构化分析时读取结构信息。
    - 如果返回 `parsed_html_path`，仅在需要保留原始 HTML/富文本结构时读取。
@@ -116,8 +146,8 @@ Generate a self-contained HTML analysis report with a polished editorial design.
 ### Phase 1: 信息收集 (Information Gathering)
 
 1. **解析用户上传的文件**（如有）
-   - 使用 `parse_attachment` 逐个解析附件
-   - 解析后读取 `parsed_markdown_path` 获取附件全量 Markdown
+   - 使用 `parse_attachment` 逐个解析附件，分析/报告类任务使用默认 `content_mode: "full"`
+   - 解析后优先使用返回的完整 `content`；若截断，再读取 `parsed_markdown_path` 或 `parsed_chunks_path` 获取附件全量 Markdown
    - 对超长附件读取 `parsed_chunks_path`，建立 chunk 级材料索引
    - 提取关键数据、观点、引用，并记录附件文件名、章节/页码/表名/slide 或 chunk 定位
 
@@ -134,6 +164,7 @@ Generate a self-contained HTML analysis report with a polished editorial design.
    - 将收集到的信息整理为结构化笔记
    - 每条信息标注来源编号和 URL
    - 保存到临时文件 `research_notes.md`
+   - 若涉及自行计算、换算、汇总或指标推导，同步创建 `calculation_checks.md`，记录原始输入、公式、中间值、复算结果和口径说明
    - 对超长来源额外保存 `chunk_index.md` 和 `evidence/` 分 section 证据包
 
 ### Phase 2: 大纲确认 (Outline Confirmation)
@@ -150,6 +181,7 @@ Generate a self-contained HTML analysis report with a polished editorial design.
 2. **逐个 section 生成内容：**
    - 根据大纲和收集的信息，生成该 section 的 HTML 片段
    - 只读取该 section 对应的 evidence 文件和必要原文 chunk
+   - 若该 section 使用计算结果，先读取并核对对应 `calculation_checks.md` 条目；没有复核记录的关键计算不得写入正文
    - 使用模板组件（callout、table、metric-grid 等）
    - 每个事实性陈述标注引用 `[n]`
    - 写入 `sections/0X_sectionname.html`
@@ -161,8 +193,9 @@ Generate a self-contained HTML analysis report with a polished editorial design.
 2. 替换头部占位符（`{{TITLE}}`, `{{SUBTITLE}}`, `{{META}}`）
 3. 将所有 section 片段按顺序拼接
 4. 生成参考文献列表（`footer .sources`）
-5. 写入最终 HTML 文件
-6. 向用户确认完成，提供文件路径
+5. 复查全文数值：确认所有计算值均有来源输入、公式或复核记录；尾差和口径限制已说明
+6. 写入最终 HTML 文件
+7. 向用户确认完成，提供文件路径
 
 ## Citation System
 
@@ -226,6 +259,7 @@ The template provides these reusable HTML components:
 - Use inline styles within `<style>` tag
 - Keep the HTML semantic and accessible
 - **Do not fabricate any data, quotes, or claims**
+- **Do not publish unverified derived numbers; all calculated metrics must be double-checked**
 - **Every factual claim must have a citation with a working link**
 - **When in doubt, omit rather than invent**
 

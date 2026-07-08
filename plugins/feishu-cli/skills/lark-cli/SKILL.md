@@ -32,6 +32,8 @@ In Newman, use the plugin tools instead of calling `terminal` directly.
 - Use `lark_cli.stdin` for large JSON or text payloads instead of shell quoting.
 - For `im +messages-send`, explicit `--chat-id`/`--user-id` and explicit `--as bot|user` always win.
 - If the user asks to send a Feishu message without naming a recipient or identity, do not ask only to discover defaults and do not search `.env`. Call `lark_cli` with the message content; Newman may inject configured defaults (`NEWMAN_LARK_DEFAULT_IM_USER_ID`, `NEWMAN_LARK_DEFAULT_IM_IDENTITY`).
+- `NEWMAN_LARK_DEFAULT_IM_IDENTITY` is an IM-send default only. Do not apply it to Base, Drive, Docs, Sheets, Wiki, Calendar, or other user resources.
+- For Base / Bitable operations, prefer explicit `--as user`. If a Base operation using bot identity fails with permission or access errors, retry the Base operation with `--as user` and follow `lark-shared` user OAuth recovery if the user token or scope is missing.
 - If `lark_cli` returns a missing target or missing identity validation error, then ask the user for the missing value.
 - If a write command requires confirmation, ask the user first, then retry with `confirm=true`.
 - Do not assume plugin-local skill files are authoritative; always treat `lark_cli_skill` as the source of truth for Lark guidance.

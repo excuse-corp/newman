@@ -16,12 +16,15 @@ RunStatus = Literal[
     "running",
     "waiting_file_lock",
     "waiting_approval",
+    "waiting_user_decision",
     "completed",
     "partial",
     "failed",
     "cancelled",
     "timed_out",
 ]
+FailureDecisionPolicy = Literal["ask_user", "continue", "abort"]
+FailureDecisionAction = Literal["retry_failed", "continue", "abort"]
 TaskStatus = Literal[
     "pending",
     "running",
@@ -191,8 +194,13 @@ class MultiAgentRun(BaseModel):
     run_mode: RunMode = "sync"
     return_strategy: ReturnStrategy = "wait_all"
     context_policy: ContextPolicy = "fresh"
+    on_subagent_failure: FailureDecisionPolicy = "ask_user"
     status: RunStatus = "pending"
     task_ids: list[str] = Field(default_factory=list)
+    pending_failure_task_ids: list[str] = Field(default_factory=list)
+    failure_decision_requested_at: str | None = None
+    failure_decision: FailureDecisionAction | None = None
+    failure_decision_resolved_at: str | None = None
     usage_summary: UsageSummary = Field(default_factory=UsageSummary)
     started_at: str = Field(default_factory=utc_now)
     cancel_requested_at: str | None = None

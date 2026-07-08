@@ -25,22 +25,39 @@ class EditFileTool(BaseTool):
             input_schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {
+                        "type": "string",
+                        "description": "File path under an allowed writable root. Use this exact key.",
+                    },
                     "edits": {
                         "type": "array",
                         "minItems": 1,
+                        "description": "One or more exact string replacements to apply in order.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "old_text": {"type": "string", "minLength": 1},
-                                "new_text": {"type": "string"},
-                                "replace_all": {"type": "boolean", "default": False},
+                                "old_text": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "Exact existing text to replace. Must match the file content.",
+                                },
+                                "new_text": {
+                                    "type": "string",
+                                    "description": "Replacement text to write in place of old_text.",
+                                },
+                                "replace_all": {
+                                    "type": "boolean",
+                                    "default": False,
+                                    "description": "Set true only when all matches of old_text should be replaced.",
+                                },
                             },
                             "required": ["old_text", "new_text"],
+                            "additionalProperties": False,
                         },
                     },
                 },
                 "required": ["path", "edits"],
+                "additionalProperties": False,
             },
             risk_level="high",
             timeout_seconds=20,

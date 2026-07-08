@@ -3,11 +3,10 @@ from __future__ import annotations
 from typing import Any
 from pathlib import Path
 
-from backend.attachments.service import ATTACHMENT_PROMPT_PER_FILE_CHARS, ATTACHMENT_PROMPT_TOTAL_CHARS
-
 from backend.sessions.models import SessionMessage
 
 
+ATTACHMENT_CONTEXT_FULL_TOTAL_CHARS = 1_000_000
 _EMPTY_USER_TEXT = "（用户未输入文本，仅上传了附件）"
 _FAILED_PARSE_HINT = "附件解析失败，当前不能将该附件内容视为已成功读取。"
 _ATTACHMENT_METADATA_HINT = (
@@ -16,13 +15,13 @@ _ATTACHMENT_METADATA_HINT = (
     "不要直接猜测附件内容，也不要直接读取原始上传文件。"
 )
 _PARSE_CONTEXT_HINT = (
-    "以下附件已经由系统完成解析，并作为当前可用上下文提供给你。"
+    "以下附件已经由系统完成解析，并默认以全文模式作为当前可用上下文提供给你。"
     "对图片附件，不要再说你看不到图片；对文档附件，不要再说你无法读取附件。"
     "如果用户当前问题只是阅读、总结、提取、核对或回答附件现有内容，并且这些解析结果已经足够，你必须直接回答。"
     "禁止为了理解该附件再次调用 search_files、list_dir、read_file、read_file_range 去重新查找或读取上传附件。"
     "不要把附件文件名当作检索关键词。"
     "优先使用下方解析结果回答，不要再去读取原始上传文件。"
-    "只有在这里提供的解析结果仍不足以完成任务时，才考虑补充读取解析后的 Markdown 文件。"
+    "只有在这里明确标记解析内容被截断时，才继续按 parsed_chunks_path 或 parsed_markdown_path 补读解析后的 Markdown。"
 )
 _ATTACHMENT_EDIT_TERMS = (
     "编辑",
@@ -294,6 +293,9 @@ def _attachment_handling_hints(original: str, attachments: list[dict[str, Any]])
         ]
     return [
         "当任务只是阅读、总结、提取、核对或回答附件现有内容时，优先使用 attachment_id 精确调用 parse_attachment。"
+        "如果任务涉及数据分析、报告生成、统计汇总、完整总结、跨页/跨表核对或需要覆盖全量材料，"
+        "parse_attachment 默认会返回 content_mode='full' 的完整解析正文，不要只依赖 content_excerpt。"
+        "如果返回 content_truncated=true，再按 parsed_chunks_path 或 parsed_markdown_path 分段补读。"
         "如果用户说“第一个附件”，对应 order_index；如果说“第一张图/第一个图片附件”，对应 kind=image 且看 kind_index。",
     ]
 
@@ -405,7 +407,7 @@ def _parsed_attachment_blocks(summary_items: list[Any], attachments: list[dict[s
     if not summary_items:
         return []
 
-    remaining_budget = ATTACHMENT_PROMPT_TOTAL_CHARS
+    remaining_budget = ATTACHMENT_CONTEXT_FULL_TOTAL_CHARS
     blocks: list[str] = []
     truncated_any = False
 
@@ -415,7 +417,7 @@ def _parsed_attachment_blocks(summary_items: list[Any], attachments: list[dict[s
         markdown_path = summary_item.get("markdown_path")
         if not isinstance(markdown_path, str) or not markdown_path.strip():
             continue
-        parsed = _read_parsed_attachment_excerpt(Path(markdown_path), remaining_budget)
+        parsed = _read_parsed_attachment_content(Path(markdown_path), remaining_budget)
         if parsed is None:
             continue
         excerpt, consumed_chars, truncated = parsed
@@ -432,12 +434,12 @@ def _parsed_attachment_blocks(summary_items: list[Any], attachments: list[dict[s
     if not blocks:
         return []
     if truncated_any:
-        blocks.insert(0, "以下仅注入适配当前轮上下文预算的附件解析片段。")
+        blocks.insert(0, "以下附件解析正文已按全文模式注入，但总内容超过上下文安全预算，末尾已截断。必须继续按 parsed_chunks_path 或 parsed_markdown_path 补读未覆盖内容。")
         blocks.insert(1, "")
     return blocks
 
 
-def _read_parsed_attachment_excerpt(path: Path, remaining_budget: int) -> tuple[str, int, bool] | None:
+def _read_parsed_attachment_content(path: Path, remaining_budget: int) -> tuple[str, int, bool] | None:
     if remaining_budget <= 0 or not path.exists() or not path.is_file():
         return None
     try:
@@ -446,7 +448,7 @@ def _read_parsed_attachment_excerpt(path: Path, remaining_budget: int) -> tuple[
         return None
     if not content:
         return None
-    limit = max(0, min(ATTACHMENT_PROMPT_PER_FILE_CHARS, remaining_budget))
+    limit = max(0, remaining_budget)
     if limit <= 0:
         return None
     if len(content) <= limit:

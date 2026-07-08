@@ -103,7 +103,7 @@
 
 1. 读取上下文
 2. 查找相关文件或信息
-3. 如果涉及附件正文、截图、表格或文档内容，优先使用 `parse_attachment`
+3. 如果涉及附件正文、截图、表格或文档内容，优先使用 `parse_attachment`；该工具默认返回 `content_mode: "full"` 的解析正文。若返回 `content_truncated=true`，继续按 `parsed_chunks_path` 或 `parsed_markdown_path` 分段补读，不要只依赖 `content_excerpt`
 4. 必要时读取技能说明
 5. 再决定是否执行命令、联网请求或其他高风险动作
 

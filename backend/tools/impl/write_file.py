@@ -27,11 +27,27 @@ class WriteFileTool(BaseTool):
             input_schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                    "overwrite": {"type": "boolean", "default": True},
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "File path under an allowed writable root. Use this exact key; do not use "
+                            "filename or file_path."
+                        ),
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "Entire file content to write as a string. Use this exact key; do not use body or text."
+                        ),
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Whether to overwrite an existing file. Defaults to true.",
+                    },
                 },
                 "required": ["path", "content"],
+                "additionalProperties": False,
             },
             risk_level="high",
             timeout_seconds=15,
