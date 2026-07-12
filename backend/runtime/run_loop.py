@@ -84,7 +84,7 @@ from backend.tools.permission_context import PermissionContext
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import ToolRouter, analyze_terminal_command
 from backend.tools.result import ToolExecutionResult
-from backend.tools.workspace_fs import build_path_access_policy, resolve_requested_path
+from backend.tools.workspace_fs import build_path_access_policy, classify_path, resolve_requested_path
 from backend.sandbox.native_sandbox import NativeSandbox
 from backend.sandbox.resource_limits import ResourceLimits
 from backend.usage.recorder import ModelRequestContext, record_model_usage
@@ -92,6 +92,27 @@ from backend.usage.store import PostgresModelUsageStore
 
 
 EventEmitter = Callable[[str, dict], Awaitable[None]]
+
+PREVIEWABLE_OUTPUT_SUFFIXES = {
+    ".csv",
+    ".doc",
+    ".docx",
+    ".htm",
+    ".html",
+    ".jpeg",
+    ".jpg",
+    ".json",
+    ".md",
+    ".pdf",
+    ".png",
+    ".ppt",
+    ".pptx",
+    ".svg",
+    ".txt",
+    ".webp",
+    ".xls",
+    ".xlsx",
+}
 
 
 def _format_path_roots(paths) -> list[str]:
@@ -2588,7 +2609,7 @@ class NewmanRuntime:
         items.reverse()
         return items
 
-    def _current_turn_output_artifacts(self, task: SessionTask, *, limit: int = 6) -> list[dict[str, object]]:
+    def _current_turn_output_artifacts(self, task: SessionTask, *, limit: int | None = None) -> list[dict[str, object]]:
         artifacts: list[dict[str, object]] = []
         for message in reversed(task.session.messages):
             if message.role != "tool":
@@ -2611,7 +2632,7 @@ class NewmanRuntime:
                         "content_type": item.get("content_type"),
                     }
                 )
-                if len(artifacts) >= limit:
+                if limit is not None and len(artifacts) >= limit:
                     artifacts.reverse()
                     return artifacts
         artifacts.reverse()
@@ -4228,7 +4249,7 @@ class NewmanRuntime:
                     raw_path = raw_item.get("path")
                     if not isinstance(raw_path, str) or not raw_path.strip():
                         continue
-                    if not self._is_session_output_file(task, Path(raw_path)):
+                    if not self._is_attachable_generated_file(task, Path(raw_path)):
                         continue
                     attachment = self._build_file_attachment(
                         Path(raw_path),
@@ -4244,7 +4265,7 @@ class NewmanRuntime:
             raw_path = metadata.get("path")
             if not isinstance(raw_path, str) or not raw_path.strip():
                 continue
-            if not self._is_session_output_file(task, Path(raw_path)):
+            if not self._is_attachable_generated_file(task, Path(raw_path)):
                 continue
             attachment = self._build_file_attachment(
                 Path(raw_path),
@@ -4364,6 +4385,25 @@ class NewmanRuntime:
             policy.output_root,
             task.session.session_id,
         )
+
+    def _is_attachable_generated_file(self, task: SessionTask, path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        if not resolved.exists() or not resolved.is_file():
+            return False
+        if self._is_session_output_file(task, resolved):
+            return True
+        policy = build_path_access_policy(self.settings)
+        try:
+            resolved.relative_to(policy.output_root.resolve())
+            return False
+        except ValueError:
+            pass
+        if resolved.suffix.lower() not in PREVIEWABLE_OUTPUT_SUFFIXES:
+            return False
+        return classify_path(policy, resolved) in {"readable", "writable"}
 
     def _build_assistant_message(
         self,

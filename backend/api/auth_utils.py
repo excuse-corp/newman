@@ -22,6 +22,7 @@ BOOTSTRAP_KEY_FILENAME = "setup-key.txt"
 ADMIN_TOKEN_ENV_KEY = "NEWMAN_AUTH__ADMIN_TOKEN"
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._~-]{16,256}$")
 STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+AUTH_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365 * 10
 
 
 @dataclass(frozen=True)
@@ -134,7 +135,7 @@ def set_auth_cookie(response: Response, request: Request, settings: AppConfig, t
         httponly=True,
         secure=secure,
         samesite=settings.auth.cookie_samesite,
-        max_age=settings.auth.session_ttl_hours * 3600,
+        max_age=AUTH_COOKIE_MAX_AGE_SECONDS,
         path="/",
     )
 

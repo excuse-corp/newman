@@ -180,8 +180,8 @@ async def list_session_multiagent_runs(session_id: str, request: Request, turn_i
 
 
 @router.get("/{session_id}/events")
-async def get_session_events(session_id: str, request: Request, limit: int = 200):
-    if limit <= 0:
+async def get_session_events(session_id: str, request: Request, limit: int | None = None):
+    if limit is not None and limit <= 0:
         raise ValueError("limit 必须大于 0")
 
     audit_path = request.app.state.settings.paths.audit_dir / f"{session_id}.log"
@@ -202,7 +202,7 @@ async def get_session_events(session_id: str, request: Request, limit: int = 200
         payload.setdefault("ts", 0)
         payloads.append(payload)
 
-    if limit:
+    if limit is not None:
         payloads = payloads[-limit:]
     return {"session_id": session_id, "events": payloads}
 

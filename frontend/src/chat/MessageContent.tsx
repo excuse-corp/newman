@@ -29,6 +29,14 @@ export type HtmlPreviewPayload = {
   streaming?: boolean;
   initialView?: "preview" | "code";
   language?: string | null;
+  kind?: string | null;
+  contentType?: string | null;
+  extension?: string | null;
+  previewMode?: string | null;
+  previewUrl?: string | null;
+  downloadUrl?: string | null;
+  sizeBytes?: number | null;
+  summary?: string | null;
 };
 
 type MessageContentProps = {
@@ -315,6 +323,36 @@ function isHtmlAttachment(attachment: ChatAttachment) {
   return attachment.kind === "html" || attachment.contentType.toLowerCase() === "text/html" || extension === ".html" || extension === ".htm";
 }
 
+function inferAttachmentKind(attachment: ChatAttachment) {
+  const extension = (attachment.extension ?? `.${attachment.filename.split(".").pop() ?? ""}`).toLowerCase();
+  const contentType = attachment.contentType.toLowerCase();
+  if (isHtmlAttachment(attachment)) return "html";
+  if (attachment.kind === "image" || contentType.startsWith("image/")) return "image";
+  if (extension === ".pdf" || contentType === "application/pdf") return "pdf";
+  if (extension === ".md" || extension === ".markdown") return "markdown";
+  if (extension === ".txt" || extension === ".log" || contentType.startsWith("text/")) return "text";
+  if (extension === ".doc" || extension === ".docx") return "docx";
+  if (extension === ".ppt" || extension === ".pptx") return "pptx";
+  if (extension === ".xls" || extension === ".xlsx" || extension === ".csv") return "xlsx";
+  return "file";
+}
+
+function inferAttachmentPreviewMode(attachment: ChatAttachment, language: string | null) {
+  const kind = inferAttachmentKind(attachment);
+  if (kind === "html") return "html";
+  if (kind === "image") return "image";
+  if (kind === "pdf") return "pdf";
+  if (kind === "markdown") return "code";
+  if (kind === "text" || language) return "code";
+  if (kind === "xlsx") return "table";
+  if (kind === "pptx") return "slides";
+  return "unsupported";
+}
+
+function shouldFetchAttachmentTextForPreview(previewMode: string) {
+  return previewMode === "html" || previewMode === "code" || previewMode === "markdown" || previewMode === "text";
+}
+
 function inferAttachmentPreviewLanguage(attachment: ChatAttachment) {
   return (
     inferLanguageFromPath(attachment.path) ??
@@ -341,7 +379,9 @@ function AttachmentFileCard({
   const cardTitle = attachment.filename;
   const isHtml = isHtmlAttachment(attachment);
   const previewLanguage = isHtml ? "html" : inferAttachmentPreviewLanguage(attachment);
-  const canPreviewAttachment = Boolean(href && onOpenHtmlPreview && previewLanguage);
+  const previewKind = inferAttachmentKind(attachment);
+  const previewMode = inferAttachmentPreviewMode(attachment, previewLanguage);
+  const canPreviewAttachment = Boolean(href && onOpenHtmlPreview);
   const downloadHref = attachment.path ? buildAttachmentUrl(apiBase, attachment, { download: true }) : href;
 
   const previewAttachment = async () => {
@@ -351,19 +391,30 @@ function AttachmentFileCard({
     setPreviewLoading(true);
     setPreviewError(null);
     try {
-      const response = await fetch(href, { credentials: "include" });
-      if (!response.ok) {
-        throw new Error(`预览加载失败：${response.status}`);
+      let content = "";
+      if (shouldFetchAttachmentTextForPreview(previewMode)) {
+        const response = await fetch(href, { credentials: "include" });
+        if (!response.ok) {
+          throw new Error(`预览加载失败：${response.status}`);
+        }
+        content = await response.text();
       }
-      const html = await response.text();
       onOpenHtmlPreview({
-        content: html,
+        content,
         title: attachment.filename,
         source: "write_file",
         path: attachment.path,
         streaming: false,
-        initialView: isHtml ? "preview" : "code",
-        language: previewLanguage,
+        initialView: shouldFetchAttachmentTextForPreview(previewMode) && !isHtml ? "code" : "preview",
+        language: previewLanguage ?? undefined,
+        kind: previewKind,
+        contentType: attachment.contentType,
+        extension: attachment.extension,
+        previewMode,
+        previewUrl: href,
+        downloadUrl: downloadHref,
+        sizeBytes: attachment.sizeBytes,
+        summary: attachment.summary,
       });
     } catch (error) {
       setPreviewError(error instanceof Error ? error.message : "预览加载失败");
@@ -434,7 +485,7 @@ function AttachmentGallery({
     <div className={joinClassNames("chat-attachment-grid", tone === "assistant" && "assistant")} aria-label={ariaLabel}>
       {attachments.map((attachment) => {
         const src = buildAttachmentUrl(apiBase, attachment);
-        if (!isImageAttachment(attachment)) {
+        if (!isImageAttachment(attachment) || (tone === "assistant" && onOpenHtmlPreview)) {
           return (
             <AttachmentFileCard
               key={attachment.id}

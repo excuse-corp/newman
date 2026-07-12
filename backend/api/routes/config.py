@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from backend.api.runtime_reload import reload_project_runtime
+from backend.api.auth_utils import get_admin_token, set_auth_cookie
+from backend.api.runtime_reload import _build_reload_warnings, reload_project_runtime
 from backend.config.loader import (
     get_project_config_path,
     get_project_dotenv_path,
-    parse_dotenv_content,
     read_project_config_text,
     read_project_dotenv_text,
     resolve_project_root,
@@ -87,14 +87,8 @@ async def update_project_config(payload: UpdateProjectConfigRequest, request: Re
 async def update_project_dotenv(payload: UpdateProjectDotenvRequest, request: Request):
     root = _project_root(request)
     path = get_project_dotenv_path(str(root))
-    previous_values = parse_dotenv_content(path.read_text(encoding="utf-8")) if path.exists() else {}
-    next_values = parse_dotenv_content(payload.content)
     next_settings = validate_project_dotenv_content(payload.content, str(root))
     path.write_text(payload.content, encoding="utf-8")
-    for key in previous_values:
-        if key not in next_values:
-            os.environ.pop(key, None)
-    os.environ.update(next_values)
     warnings = _build_reload_warnings(request.app.state.settings, next_settings)
     return {
         "saved": True,
@@ -111,12 +105,17 @@ async def reload_project_config(request: Request):
     root = _project_root(request)
     warnings = await reload_project_runtime(request.app, root)
     next_settings = request.app.state.settings
-    return {
+    response = JSONResponse({
         "reloaded": True,
         "path": str(get_project_config_path(str(root))),
         "effective_workspace": str(next_settings.paths.workspace),
         "warnings": warnings,
-    }
+    })
+    if getattr(request.state, "auth_method", None) == "cookie":
+        admin_token = get_admin_token(next_settings)
+        if admin_token:
+            set_auth_cookie(response, request, next_settings, admin_token)
+    return response
 
 
 def _project_root(request: Request) -> Path:

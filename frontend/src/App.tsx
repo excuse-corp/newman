@@ -12,9 +12,11 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import ArtifactPanel from "./artifacts/ArtifactPanel";
+import { htmlPreviewToArtifact } from "./artifacts/types";
 import logo from "./assets/newman-logo.png";
 import MessageContent, { type ChatAttachment, type HtmlPreviewPayload } from "./chat/MessageContent";
-import { escapeCodeHtml, highlightCode, inferLanguageFromPath } from "./chat/codeHighlight";
+import { highlightCode, inferLanguageFromPath } from "./chat/codeHighlight";
 import AutomationsPage from "./pages/AutomationsPage";
 import EvolutionPage from "./pages/EvolutionPage";
 import UsageDashboard from "./pages/UsageDashboard";
@@ -2331,59 +2333,6 @@ function RefreshSmallIcon({ className }: { className?: string }) {
   );
 }
 
-function EyePanelIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={1.25}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden="true"
-    >
-      <path d="M1.65 8c1.52-2.39 3.64-3.6 6.35-3.6S12.83 5.61 14.35 8c-1.52 2.39-3.64 3.6-6.35 3.6S3.17 10.39 1.65 8Z" />
-      <circle cx="8" cy="8" r="2.05" />
-    </svg>
-  );
-}
-
-function CodePanelIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={1.35}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden="true"
-    >
-      <path d="M6.35 4.25 3 8l3.35 3.75" />
-      <path d="m9.65 4.25 3.35 3.75-3.35 3.75" />
-    </svg>
-  );
-}
-
-function ClosePanelIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={1.45}
-      strokeLinecap="round"
-      className={className}
-      aria-hidden="true"
-    >
-      <path d="M4 4 12 12" />
-      <path d="M12 4 4 12" />
-    </svg>
-  );
-}
-
 type MessageHoverShellProps = {
   shellClassName: "user" | "assistant";
   align: "start" | "end";
@@ -2606,14 +2555,6 @@ function buildHtmlPreviewTitleFromMarkup(markup: string, fallback = "HTML 实时
   }
 
   return fallback;
-}
-
-function patchHtmlPreviewMarkupForSandbox(markup: string) {
-  return markup
-    .replace(/\b(?:window|self|globalThis)\s*\.\s*parent\s*\.\s*document\b/g, "document")
-    .replace(/\b(?:window|self|globalThis)\s*\.\s*top\s*\.\s*document\b/g, "document")
-    .replace(/\bparent\s*\.\s*document\b/g, "document")
-    .replace(/\btop\s*\.\s*document\b/g, "document");
 }
 
 function isHtmlWriteFileEventData(eventData: Record<string, unknown>) {
@@ -7438,7 +7379,6 @@ function App({ onLogout }: AppProps) {
       let nextEvents: SessionEventPayload[] = [];
       try {
         const eventsUrl = new URL(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/events`);
-        eventsUrl.searchParams.set("limit", "2000");
         const events = await fetchJson<SessionEventsResponse>(eventsUrl.toString(), { signal });
         nextEvents = events.events
           .map((event) => normalizeSessionEventPayload(event))
@@ -8293,67 +8233,8 @@ function App({ onLogout }: AppProps) {
   const htmlPreviewPanelStyle = {
     "--html-preview-width": `${effectiveHtmlPreviewWidth}px`
   } as CSSProperties;
-  const normalizedHtmlPreviewContent = useMemo(() => {
-    if (!htmlPreview) {
-      return "";
-    }
-
-    if (htmlPreview.initialView === "code") {
-      const escapedCode = escapeCodeHtml(htmlPreview.content.trimEnd());
-      return `<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-      body {
-        margin: 0;
-        background: #fffaf3;
-        color: #2d2722;
-        font: 13px/1.65 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      }
-      pre {
-        box-sizing: border-box;
-        min-height: 100vh;
-        margin: 0;
-        padding: 18px 20px;
-        white-space: pre-wrap;
-        overflow-wrap: anywhere;
-      }
-    </style>
-  </head>
-  <body>
-    <pre>${escapedCode || " "}</pre>
-  </body>
-</html>`;
-    }
-
-    const markup = patchHtmlPreviewMarkupForSandbox(htmlPreview.content.trim());
-    if (!markup) {
-      return "";
-    }
-
-    if (/<html[\s>]/i.test(markup) || /<!doctype html/i.test(markup)) {
-      return markup;
-    }
-
-    return `<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-  </head>
-  <body>
-${markup}
-  </body>
-    </html>`;
-  }, [htmlPreview]);
-  const htmlPreviewCode = htmlPreview?.content ?? "";
-  const htmlPreviewCodeHighlight = useMemo(
-    () => highlightCode(htmlPreviewCode, htmlPreview?.language ?? "html"),
-    [htmlPreviewCode, htmlPreview?.language]
-  );
-  const htmlPreviewBadge = htmlPreview?.saveStatus === "failed" ? "HTML 未保存" : htmlPreview?.initialView === "code" ? "CODE" : "HTML";
+  const activeArtifact = useMemo(() => (htmlPreview ? htmlPreviewToArtifact(htmlPreview) : null), [htmlPreview]);
+  const artifactPreviewView = htmlPreviewView === "code" ? "source" : "preview";
   const openHtmlPreview = (payload: HtmlPreviewPayload) => {
     setHtmlPreview(payload);
     setHtmlPreviewView(payload.initialView ?? "preview");
@@ -11645,90 +11526,21 @@ ${markup}
               )}
             </div>
 
-            <aside
+            <ArtifactPanel
               ref={htmlPreviewPanelRef}
-              className={`html-preview-panel ${htmlPreview ? "open" : ""}`}
-              aria-label="HTML 预览面板"
-            >
-              {htmlPreview && !isHtmlPreviewFloating ? (
-                <div
-                  className="html-preview-resize-handle"
-                  onPointerDown={(event) => {
-                    event.preventDefault();
-                    setDragging("html-preview");
-                  }}
-                  role="separator"
-                  aria-orientation="vertical"
-                  aria-label="调整 HTML 预览宽度"
-                />
-              ) : null}
-              <div className="html-preview-panel-inner">
-                <div className="html-preview-frame-topbar">
-                  <div className="html-preview-frame-topbar-main">
-                    <span className="html-preview-frame-badge">{htmlPreviewBadge}</span>
-                    <span className="html-preview-frame-title">
-                      {htmlPreview?.streaming ? "生成中 · " : htmlPreview?.saveStatus === "failed" ? "写入失败 · " : ""}
-                      {htmlPreview?.title ?? "HTML 实时预览"}
-                    </span>
-                  </div>
-                  <div className="html-preview-frame-actions">
-                    <div className="html-preview-view-toggle" role="group" aria-label="HTML 查看模式">
-                      <button
-                        type="button"
-                        className={htmlPreviewView === "preview" ? "active" : ""}
-                        onClick={() => setHtmlPreviewView("preview")}
-                        aria-pressed={htmlPreviewView === "preview"}
-                        title="预览模式"
-                      >
-                        <EyePanelIcon className="html-preview-view-toggle-icon" />
-                        <span>预览</span>
-                      </button>
-                      <button
-                        type="button"
-                        className={htmlPreviewView === "code" ? "active" : ""}
-                        onClick={() => setHtmlPreviewView("code")}
-                        aria-pressed={htmlPreviewView === "code"}
-                        title="代码模式"
-                      >
-                        <CodePanelIcon className="html-preview-view-toggle-icon" />
-                        <span>代码</span>
-                      </button>
-                    </div>
-                    <button
-                      type="button"
-                      className="html-preview-panel-close"
-                      onClick={() => {
-                        setHtmlPreview(null);
-                        setHtmlPreviewView("preview");
-                      }}
-                      aria-label="关闭 HTML 预览"
-                    >
-                      <ClosePanelIcon className="html-preview-panel-close-icon" />
-                    </button>
-                  </div>
-                </div>
-                <div className={`html-preview-frame-stage ${htmlPreviewView === "code" ? "code-mode" : "preview-mode"}`}>
-                  {htmlPreview && htmlPreviewView === "preview" ? (
-                    <iframe
-                      key={`${htmlPreview.path ?? htmlPreview.title}:${htmlPreview.streaming ? "streaming" : "complete"}`}
-                      className="html-preview-iframe"
-                      title={htmlPreview.title}
-                      srcDoc={normalizedHtmlPreviewContent}
-                      sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
-                      referrerPolicy="no-referrer"
-                    />
-                  ) : null}
-                  {htmlPreview && htmlPreviewView === "code" ? (
-                    <pre className="chat-code-block-pre html-preview-code">
-                      <code
-                        className={htmlPreviewCodeHighlight.language ? `language-${htmlPreviewCodeHighlight.language}` : undefined}
-                        dangerouslySetInnerHTML={{ __html: htmlPreviewCodeHighlight.html || "&nbsp;" }}
-                      />
-                    </pre>
-                  ) : null}
-                </div>
-              </div>
-            </aside>
+              artifact={activeArtifact}
+              view={artifactPreviewView}
+              onViewChange={(view) => setHtmlPreviewView(view === "source" ? "code" : "preview")}
+              onClose={() => {
+                setHtmlPreview(null);
+                setHtmlPreviewView("preview");
+              }}
+              showResizeHandle={Boolean(htmlPreview && !isHtmlPreviewFloating)}
+              onResizeStart={(event) => {
+                event.preventDefault();
+                setDragging("html-preview");
+              }}
+            />
 
             {renderMultiagentDrawer()}
           </div>
