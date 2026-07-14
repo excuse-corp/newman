@@ -4,6 +4,7 @@ import asyncio
 import json
 import mimetypes
 import re
+import shutil
 from time import monotonic
 from json import JSONDecodeError
 from pathlib import Path
@@ -4192,6 +4193,8 @@ class NewmanRuntime:
         summary: str = "",
         seen_paths: set[str],
         source: str = "assistant_output",
+        task: SessionTask | None = None,
+        snapshot_to_current_turn: bool = False,
     ) -> dict[str, object] | None:
         try:
             resolved = path.resolve()
@@ -4199,6 +4202,9 @@ class NewmanRuntime:
             return None
         if not resolved.exists() or not resolved.is_file():
             return None
+
+        if snapshot_to_current_turn and task is not None:
+            resolved = self._snapshot_generated_file_for_current_turn(task, resolved)
 
         path_key = str(resolved)
         if path_key in seen_paths:
@@ -4229,6 +4235,24 @@ class NewmanRuntime:
             "analysis_status": "completed",
         }
 
+    def _snapshot_generated_file_for_current_turn(self, task: SessionTask, path: Path) -> Path:
+        if not task.turn_id:
+            return path
+        policy = build_path_access_policy(self.settings)
+        if not is_within_session_output_dir(path, policy.output_root, task.session.session_id):
+            return path
+        if is_within_turn_output_dir(path, policy.output_root, task.session.session_id, task.turn_id):
+            return path
+
+        target_dir = turn_output_dir(policy.output_root, task.session.session_id, task.turn_id)
+        target = target_dir / path.name
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            return target.resolve()
+        except OSError:
+            return path
+
     def _build_turn_output_file_attachments(
         self,
         task: SessionTask,
@@ -4255,6 +4279,8 @@ class NewmanRuntime:
                         Path(raw_path),
                         summary=str(raw_item.get("summary") or metadata.get("summary") or "生成文件"),
                         seen_paths=seen_paths,
+                        task=task,
+                        snapshot_to_current_turn=True,
                     )
                     if attachment is not None:
                         attachments.append(attachment)
@@ -4271,6 +4297,8 @@ class NewmanRuntime:
                 Path(raw_path),
                 summary=str(metadata.get("summary") or "生成文件"),
                 seen_paths=seen_paths,
+                task=task,
+                snapshot_to_current_turn=True,
             )
             if attachment is not None:
                 attachments.append(attachment)

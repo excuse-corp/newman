@@ -32,6 +32,14 @@ def _content_disposition(disposition: str, filename: str) -> str:
     return f"{disposition}; filename*=UTF-8''{quote(filename)}"
 
 
+def _set_file_response_cache_headers(response: FileResponse) -> FileResponse:
+    """Prevent browsers from reusing a response after an output file is replaced in place."""
+    response.headers["cache-control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["pragma"] = "no-cache"
+    response.headers["expires"] = "0"
+    return response
+
+
 class UpdateMemoryRequest(BaseModel):
     content: str = Field(..., min_length=0)
 
@@ -124,7 +132,7 @@ async def get_workspace_file_content(request: Request, path: str, download: bool
         raise ValueError("path 必须指向文件")
 
     media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-    response = FileResponse(target, media_type=media_type)
+    response = _set_file_response_cache_headers(FileResponse(target, media_type=media_type))
     disposition = "attachment" if download else "inline"
     response.headers["content-disposition"] = _content_disposition(disposition, target.name)
     return response
@@ -163,7 +171,7 @@ def _build_attachment_file_response(request: Request, path: str, *, download: bo
         raise ValueError("path 必须指向文件")
 
     media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-    response = FileResponse(target, media_type=media_type)
+    response = _set_file_response_cache_headers(FileResponse(target, media_type=media_type))
     disposition = "attachment" if download else "inline"
     response.headers["content-disposition"] = _content_disposition(disposition, target.name)
     return response

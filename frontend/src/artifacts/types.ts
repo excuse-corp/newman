@@ -44,6 +44,7 @@ export type Artifact = {
   content?: string;
   language?: string | null;
   source?: HtmlPreviewPayload["source"];
+  cacheKey?: string | null;
   previewUrl?: string | null;
   downloadUrl?: string | null;
   summary?: string | null;
@@ -57,10 +58,11 @@ export type Artifact = {
 export type ArtifactPreviewPayload = Artifact;
 
 function buildArtifactId(payload: HtmlPreviewPayload) {
+  const cacheKey = payload.cacheKey ? `:${payload.cacheKey}` : "";
   if (payload.path) {
-    return `path:${payload.path}`;
+    return `path:${payload.path}${cacheKey}`;
   }
-  const seed = `${payload.title}:${payload.content.length}:${payload.content.slice(0, 80)}`;
+  const seed = `${payload.title}:${payload.content.length}:${payload.content.slice(0, 80)}${cacheKey}`;
   let hash = 0;
   for (let index = 0; index < seed.length; index += 1) {
     hash = (hash * 31 + seed.charCodeAt(index)) >>> 0;
@@ -138,6 +140,7 @@ export function htmlPreviewToArtifact(
     content: payload.content,
     language: payload.language ?? "html",
     source: payload.source,
+    cacheKey: payload.cacheKey,
     previewUrl: payload.previewUrl,
     downloadUrl: payload.downloadUrl,
     summary: payload.summary,
@@ -168,6 +171,7 @@ export function artifactToHtmlPreviewPayload(artifact: Artifact): HtmlPreviewPay
     downloadUrl: artifact.downloadUrl,
     sizeBytes: artifact.sizeBytes,
     summary: artifact.summary,
+    cacheKey: artifact.cacheKey,
     toolCallId: artifact.toolCallId,
     saveStatus: artifact.saveStatus,
   };

@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -8,6 +9,7 @@ import {
   type ChangeEvent,
   type ClipboardEvent,
   type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
 import ReactMarkdown from "react-markdown";
@@ -1459,7 +1461,14 @@ function parseMessageAttachments(value: unknown): ChatAttachment[] {
       "extension" in item && typeof item.extension === "string" && item.extension ? item.extension : getAttachmentExtension(filename);
     return [
       {
-        id: makeAttachmentId("path" in item && typeof item.path === "string" ? item.path : filename, index),
+        id:
+          "attachment_id" in item && typeof item.attachment_id === "string" && item.attachment_id
+            ? item.attachment_id
+            : makeAttachmentId("path" in item && typeof item.path === "string" ? item.path : filename, index),
+        cacheKey:
+          "attachment_id" in item && typeof item.attachment_id === "string" && item.attachment_id
+            ? item.attachment_id
+            : null,
         filename,
         contentType,
         source: "source" in item && typeof item.source === "string" ? item.source : null,
@@ -1541,6 +1550,7 @@ function buildOutputAttachmentsFromEvents(events: SessionEventPayload[], session
       contentType?: string | null;
       summary?: string | null;
       workspaceRelativePath?: string | null;
+      cacheKey?: string | null;
     },
   ) => {
     if (!path || seen.has(path)) {
@@ -1552,6 +1562,7 @@ function buildOutputAttachmentsFromEvents(events: SessionEventPayload[], session
     const contentType = data.contentType && data.contentType.trim() ? data.contentType : inferAttachmentContentType(filename, extension);
     attachments.push({
       id: makeAttachmentId(path, index),
+      cacheKey: data.cacheKey ?? null,
       filename,
       contentType,
       source: "assistant_output",
@@ -1598,6 +1609,7 @@ function buildOutputAttachmentsFromEvents(events: SessionEventPayload[], session
               ? event.data.summary
               : "生成文件",
         workspaceRelativePath,
+        cacheKey: `${event.request_id ?? "event"}:${event.ts}:${fileIndex}`,
       });
     });
     if (hasExplicitOutputFiles) {
@@ -1618,6 +1630,7 @@ function buildOutputAttachmentsFromEvents(events: SessionEventPayload[], session
       contentType: typeof event.data.content_type === "string" ? event.data.content_type : null,
       summary: typeof event.data.summary === "string" ? event.data.summary : "生成文件",
       workspaceRelativePath: null,
+      cacheKey: `${event.request_id ?? "event"}:${event.ts}:${index}`,
     });
   });
   return attachments;
@@ -6146,6 +6159,7 @@ function App({ onLogout }: AppProps) {
   const [planModeUpdating, setPlanModeUpdating] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
   const [composerDraftsBySession, setComposerDraftsBySession] = useState<Record<string, ComposerDraft>>({});
+  const [composerTextPresenceBySession, setComposerTextPresenceBySession] = useState<Record<string, boolean>>({});
   const [pendingComposerMode, setPendingComposerMode] = useState<CollaborationModeName | null>(null);
   const [turnApprovalMode, setTurnApprovalMode] = useState<TurnApprovalMode>(() => {
     const stored = window.localStorage.getItem(TURN_APPROVAL_MODE_STORAGE_KEY);
@@ -6178,6 +6192,8 @@ function App({ onLogout }: AppProps) {
   const skillUploadFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillUploadFolderInputRef = useRef<HTMLInputElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const composerDraftValuesRef = useRef<Record<string, string>>({});
+  const composerTextPresenceRef = useRef<Record<string, boolean>>({});
   const composerPlanTrayListRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
   const runningSessionIdsRef = useRef<string[]>([]);
@@ -6208,8 +6224,10 @@ function App({ onLogout }: AppProps) {
 
   const composerDraftKey = activeSessionId || UNASSIGNED_COMPOSER_DRAFT_KEY;
   const activeComposerDraft = composerDraftsBySession[composerDraftKey] ?? { value: "", attachments: [] };
-  const composerValue = activeComposerDraft.value;
+  const composerValue = composerDraftValuesRef.current[composerDraftKey] ?? activeComposerDraft.value;
   const composerAttachments = activeComposerDraft.attachments;
+  const composerHasText = composerTextPresenceBySession[composerDraftKey] ?? Boolean(composerValue.trim());
+  composerTextPresenceRef.current[composerDraftKey] = composerHasText;
   const sendingMessage = runningSessionIds.length > 0;
   const stoppingMessage = stoppingSessionIds.length > 0;
 
@@ -6235,9 +6253,22 @@ function App({ onLogout }: AppProps) {
 
   const setComposerValue = (valueOrUpdater: string | ((currentValue: string) => string)) => {
     const key = activeSessionIdRef.current || UNASSIGNED_COMPOSER_DRAFT_KEY;
+    const currentValue = composerDraftValuesRef.current[key] ?? composerDraftsBySession[key]?.value ?? "";
+    const nextValue = typeof valueOrUpdater === "function" ? valueOrUpdater(currentValue) : valueOrUpdater;
+    composerDraftValuesRef.current[key] = nextValue;
+    if (key === (activeSessionIdRef.current || UNASSIGNED_COMPOSER_DRAFT_KEY) && composerTextareaRef.current) {
+      composerTextareaRef.current.value = nextValue;
+    }
+    const hasText = Boolean(nextValue.trim());
+    composerTextPresenceRef.current[key] = hasText;
+    setComposerTextPresenceBySession((current) =>
+      current[key] === hasText ? current : { ...current, [key]: hasText }
+    );
     setComposerDraftsBySession((current) => {
       const draft = current[key] ?? { value: "", attachments: [] };
-      const nextValue = typeof valueOrUpdater === "function" ? valueOrUpdater(draft.value) : valueOrUpdater;
+      if (draft.value === nextValue) {
+        return current;
+      }
       return {
         ...current,
         [key]: {
@@ -6245,6 +6276,48 @@ function App({ onLogout }: AppProps) {
           value: nextValue
         }
       };
+    });
+  };
+
+  const updateComposerInputValue = (value: string) => {
+    const key = activeSessionIdRef.current || UNASSIGNED_COMPOSER_DRAFT_KEY;
+    composerDraftValuesRef.current[key] = value;
+    const hasText = Boolean(value.trim());
+    if (composerTextPresenceRef.current[key] !== hasText) {
+      composerTextPresenceRef.current[key] = hasText;
+      setComposerTextPresenceBySession((current) => ({ ...current, [key]: hasText }));
+    }
+
+    const persistedValue = composerDraftsBySession[key]?.value ?? "";
+    if (value.startsWith("/") || persistedValue.startsWith("/")) {
+      setComposerDraftsBySession((current) => {
+        const draft = current[key] ?? { value: "", attachments: [] };
+        return draft.value === value
+          ? current
+          : {
+              ...current,
+              [key]: {
+                ...draft,
+                value,
+              },
+            };
+      });
+    }
+  };
+
+  const commitComposerInputValue = (key: string, value: string) => {
+    composerDraftValuesRef.current[key] = value;
+    setComposerDraftsBySession((current) => {
+      const draft = current[key] ?? { value: "", attachments: [] };
+      return draft.value === value
+        ? current
+        : {
+            ...current,
+            [key]: {
+              ...draft,
+              value,
+            },
+          };
     });
   };
 
@@ -6266,6 +6339,18 @@ function App({ onLogout }: AppProps) {
   };
 
   const clearComposerDraftForSession = (sessionId: string) => {
+    delete composerDraftValuesRef.current[sessionId];
+    delete composerTextPresenceRef.current[sessionId];
+    setComposerTextPresenceBySession((current) => {
+      if (!(sessionId in current)) {
+        return current;
+      }
+      const { [sessionId]: _removed, ...remaining } = current;
+      return remaining;
+    });
+    if ((activeSessionIdRef.current || UNASSIGNED_COMPOSER_DRAFT_KEY) === sessionId && composerTextareaRef.current) {
+      composerTextareaRef.current.value = "";
+    }
     setComposerDraftsBySession((current) => {
       if (!current[sessionId]) {
         return current;
@@ -8235,10 +8320,21 @@ function App({ onLogout }: AppProps) {
   } as CSSProperties;
   const activeArtifact = useMemo(() => (htmlPreview ? htmlPreviewToArtifact(htmlPreview) : null), [htmlPreview]);
   const artifactPreviewView = htmlPreviewView === "code" ? "source" : "preview";
-  const openHtmlPreview = (payload: HtmlPreviewPayload) => {
+  const openHtmlPreview = useCallback((payload: HtmlPreviewPayload) => {
     setHtmlPreview(payload);
     setHtmlPreviewView(payload.initialView ?? "preview");
-  };
+  }, []);
+  const changeArtifactPreviewView = useCallback((view: "preview" | "source") => {
+    setHtmlPreviewView(view === "source" ? "code" : "preview");
+  }, []);
+  const closeArtifactPreview = useCallback(() => {
+    setHtmlPreview(null);
+    setHtmlPreviewView("preview");
+  }, []);
+  const startArtifactResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDragging("html-preview");
+  }, []);
   const multiagentDrawerStyle = useMemo(
     () =>
       ({
@@ -8959,7 +9055,8 @@ function App({ onLogout }: AppProps) {
   };
 
   const submitComposer = async (submission?: { content?: string; attachments?: ComposerAttachment[]; clearComposer?: boolean }) => {
-    const submittedContent = submission?.content ?? composerValue;
+    const activeDraftKey = activeSessionIdRef.current || UNASSIGNED_COMPOSER_DRAFT_KEY;
+    const submittedContent = submission?.content ?? composerDraftValuesRef.current[activeDraftKey] ?? composerValue;
     const submittedAttachments = submission?.attachments ?? composerAttachments;
     const shouldClearComposer = submission?.clearComposer ?? !submission;
     const trimmed = submittedContent.trim();
@@ -9641,7 +9738,7 @@ function App({ onLogout }: AppProps) {
 
     if (
       event.key === "Backspace" &&
-      !composerValue &&
+      !event.currentTarget.value &&
       composerModeTokenMode !== null &&
       !isSendingInActiveSession &&
       !isStoppingInActiveSession &&
@@ -10188,7 +10285,7 @@ function App({ onLogout }: AppProps) {
       .filter(Boolean)
       .join(" ");
     const inputClassName = variant === "hero" ? "composer-input composer-input-hero" : "composer-input";
-    const isComposerEmpty = !composerValue.trim() && composerAttachments.length === 0;
+    const isComposerEmpty = !composerHasText && composerAttachments.length === 0;
     const showContextMeter = !isHero;
     const showStopTrigger = isSendingInActiveSession;
     const composerInputDisabled = isStoppingInActiveSession;
@@ -10244,14 +10341,18 @@ function App({ onLogout }: AppProps) {
               ) : null}
 
               <textarea
+                key={composerDraftKey}
                 ref={composerTextareaRef}
                 className={inputClassName}
-                value={composerValue}
-                onChange={(event) => setComposerValue(event.target.value)}
+                defaultValue={composerValue}
+                onChange={(event) => updateComposerInputValue(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
                 onPaste={handleComposerPaste}
                 onFocus={() => setComposerFocused(true)}
-                onBlur={() => setComposerFocused(false)}
+                onBlur={(event) => {
+                  commitComposerInputValue(composerDraftKey, event.currentTarget.value);
+                  setComposerFocused(false);
+                }}
                 aria-label="message composer"
                 placeholder={composerPlaceholder}
                 rows={3}
@@ -11530,16 +11631,10 @@ function App({ onLogout }: AppProps) {
               ref={htmlPreviewPanelRef}
               artifact={activeArtifact}
               view={artifactPreviewView}
-              onViewChange={(view) => setHtmlPreviewView(view === "source" ? "code" : "preview")}
-              onClose={() => {
-                setHtmlPreview(null);
-                setHtmlPreviewView("preview");
-              }}
+              onViewChange={changeArtifactPreviewView}
+              onClose={closeArtifactPreview}
               showResizeHandle={Boolean(htmlPreview && !isHtmlPreviewFloating)}
-              onResizeStart={(event) => {
-                event.preventDefault();
-                setDragging("html-preview");
-              }}
+              onResizeStart={startArtifactResize}
             />
 
             {renderMultiagentDrawer()}

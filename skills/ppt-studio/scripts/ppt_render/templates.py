@@ -76,7 +76,7 @@ def cover_pro(data, theme):
     # subtitle with rule
     els.append(line(MARGIN, 320, 90, 3, theme["secondary"]))
     els.append(text(MARGIN + 105, 308, 500, 30, data.get("subtitle", ""),
-                    size=18, color=theme["secondary"], font=theme["fontBody"],
+                    size=20, color=theme["secondary"], font=theme["fontBody"],
                     valign="middle"))
     # bottom stats bar
     bar_y = CANVAS_H - 70
@@ -117,7 +117,7 @@ def section_break(data, theme):
                     bold=True))
     if data.get("subtitle"):
         els.append(text(MARGIN, 330, 600, 40, data["subtitle"],
-                        size=18, color=theme["secondary"], font=theme["fontBody"]))
+                        size=20, color=theme["secondary"], font=theme["fontBody"]))
     return els
 
 
@@ -174,11 +174,11 @@ def card_grid(data, theme):
         pad = 20
         els.append(oval(cx + pad, cy + pad, 14, 14, theme["secondary"]))
         els.append(text(cx + pad, cy + pad + 26, card_w - pad * 2, 30,
-                        c.get("heading", ""), size=15, color=theme["text_dark"],
+                        c.get("heading", ""), size=17, color=theme["text_dark"],
                         font=theme["fontHeading"], bold=True))
         els.append(text(cx + pad, cy + pad + 60, card_w - pad * 2,
                         card_h - pad - 86, c.get("text", ""),
-                        size=11, color=theme["text_body"], font=theme["fontBody"],
+                        size=13, color=theme["text_body"], font=theme["fontBody"],
                         line_height=1.6))
     els += _page_badge(theme, data.get("page"))
     return els
@@ -212,10 +212,10 @@ def icon_list(data, theme):
         tx = MARGIN + circ + 18
         tw = CANVAS_W - tx - MARGIN
         els.append(text(tx, center_y - 22, tw, 24, it.get("label", ""),
-                        size=14, color=theme["text_dark"], font=theme["fontHeading"],
+                        size=16, color=theme["text_dark"], font=theme["fontHeading"],
                         bold=True, valign="middle"))
         els.append(text(tx, center_y + 4, tw, 20, it.get("description", ""),
-                        size=11, color=theme["text_body"], font=theme["fontBody"],
+                        size=13, color=theme["text_body"], font=theme["fontBody"],
                         valign="top"))
     els += _page_badge(theme, data.get("page"))
     return els
@@ -247,7 +247,7 @@ def kpi_dashboard(data, theme):
                         size=44, color=theme["accent"], font=theme["fontHeading"],
                         bold=True, align="center", valign="middle"))
         els.append(text(kx, kpi_y + 76, kpi_w, 24, k.get("label", ""),
-                        size=11, color=theme["secondary"], font=theme["fontBody"],
+                        size=13, color=theme["secondary"], font=theme["fontBody"],
                         align="center", valign="middle"))
 
     # detail cards
@@ -263,12 +263,12 @@ def kpi_dashboard(data, theme):
             els.append(line(dx, det_y, det_w, 3, theme["secondary"]))
             pad = 18
             els.append(text(dx + pad, det_y + pad, det_w - pad * 2, 28,
-                            det.get("heading", ""), size=14,
+                            det.get("heading", ""), size=16,
                             color=theme["text_dark"], font=theme["fontHeading"],
                             bold=True))
             els.append(text(dx + pad, det_y + pad + 34, det_w - pad * 2,
                             det_h - pad - 52, det.get("text", ""),
-                            size=11, color=theme["text_body"],
+                            size=13, color=theme["text_body"],
                             font=theme["fontBody"], line_height=1.6))
     els += _page_badge(theme, data.get("page"))
     return els
@@ -347,10 +347,10 @@ def structured_content(data, theme):
         sy = sec_top + i * sec_h
         els.append(oval(card_x + 28, sy + 4, 12, 12, theme["secondary"]))
         els.append(text(card_x + 52, sy, card_w - 90, 24,
-                        sec.get("heading", ""), size=13, color=theme["text_dark"],
+                        sec.get("heading", ""), size=15, color=theme["text_dark"],
                         font=theme["fontHeading"], bold=True))
         els.append(text(card_x + 52, sy + 26, card_w - 90, sec_h - 34,
-                        sec.get("text", ""), size=11, color=theme["text_body"],
+                        sec.get("text", ""), size=13, color=theme["text_body"],
                         font=theme["fontBody"], line_height=1.55))
     # bottom bar
     if bottom:
@@ -405,10 +405,10 @@ def grid_content(data, theme):
                     lc.get("number", ""), size=30, color=theme["secondary"],
                     font=theme["fontHeading"], bold=True))
     els.append(text(MARGIN + 18, area_top + 62, left_w - 36, 30,
-                    lc.get("heading", ""), size=15, color=theme["text_dark"],
+                    lc.get("heading", ""), size=17, color=theme["text_dark"],
                     font=theme["fontHeading"], bold=True))
     els.append(text(MARGIN + 18, area_top + 96, left_w - 36, area_h - 110,
-                    lc.get("content", ""), size=11, color=theme["text_body"],
+                    lc.get("content", ""), size=13, color=theme["text_body"],
                     font=theme["fontBody"], line_height=1.6))
     # right cards
     rcs = data.get("right_cards", [])
@@ -419,16 +419,16 @@ def grid_content(data, theme):
         ry = area_top + i * (rc_h + rgap)
         els.append(rect(right_x, ry, right_w, rc_h, theme["bg_light"]))
         els.append(text(right_x + 16, ry + 12, right_w - 32, 26,
-                        rc.get("heading", ""), size=13, color=theme["text_dark"],
+                        rc.get("heading", ""), size=15, color=theme["text_dark"],
                         font=theme["fontHeading"], bold=True))
         items = rc.get("items", [])
         iy = ry + 42
         for it in items:
             els.append(text(right_x + 16, iy, 110, 20, it.get("label", ""),
-                            size=10, color=theme["text_dark"],
+                            size=12, color=theme["text_dark"],
                             font=theme["fontHeading"], bold=True))
             els.append(text(right_x + 130, iy, right_w - 146, 20,
-                            it.get("text", ""), size=10, color=theme["text_body"],
+                            it.get("text", ""), size=12, color=theme["text_body"],
                             font=theme["fontBody"]))
             iy += 24
     # bottom bar
@@ -450,6 +450,59 @@ def grid_content(data, theme):
 # end
 # ══════════════════════════════════════════════════════════
 
+def two_column(data, theme):
+    """Two-column layout: left content card + right image placeholder."""
+    els = _title_bar(theme, data.get("title", ""))
+    left_card = data.get("left_card", {})
+    right_cards = data.get("right_cards", [])
+    # left content area
+    left_w = 480
+    left_x = MARGIN
+    left_y = 120
+    left_h = 240
+    els.append(rect(left_x, left_y, left_w, left_h, "FFFFFF"))
+    els.append(line(left_x, left_y, 4, 3, theme["secondary"]))
+    if left_card.get("heading"):
+        els.append(text(left_x + 18, left_y + 16, left_w - 36, 28,
+                        left_card["heading"], size=17, color=theme["text_dark"],
+                        font=theme["fontHeading"], bold=True))
+    if left_card.get("content"):
+        els.append(text(left_x + 18, left_y + 50, left_w - 36, left_h - 64,
+                        left_card["content"], size=13, color=theme["text_body"],
+                        font=theme["fontBody"], line_height=1.7))
+    # right image placeholder
+    right_x = left_x + left_w + 20
+    right_w = CANVAS_W - right_x - MARGIN
+    right_y = left_y
+    right_h = left_h
+    els.append(rect(right_x, right_y, right_w, right_h, theme["bg_light"]))
+    els.append(rect(right_x + 4, right_y + 4, right_w - 8, right_h - 8, "FFFFFF"))
+    els.append(text(right_x, right_y + right_h // 2 - 12, right_w, 24,
+                    "[ 图片占位符 ]", size=16, color=theme["secondary"],
+                    font=theme["fontBody"], align="center", valign="middle"))
+    # right cards below image
+    if right_cards:
+        card_y = right_y + right_h + 16
+        card_h = (CANVAS_H - card_y - 60) // max(len(right_cards), 1)
+        for i, rc in enumerate(right_cards):
+            ry = card_y + i * card_h
+            els.append(rect(right_x, ry, right_w, card_h - 8, theme["bg_light"]))
+            els.append(text(right_x + 16, ry + 12, right_w - 32, 26,
+                            rc.get("heading", ""), size=15, color=theme["text_dark"],
+                            font=theme["fontHeading"], bold=True))
+            items = rc.get("items", [])
+            iy = ry + 42
+            for it in items:
+                els.append(text(right_x + 16, iy, 110, 20, it.get("label", ""),
+                                size=12, color=theme["text_dark"],
+                                font=theme["fontHeading"], bold=True))
+                els.append(text(right_x + 130, iy, right_w - 146, 20,
+                                it.get("text", ""), size=12, color=theme["text_body"],
+                                font=theme["fontBody"]))
+                iy += 24
+    els += _page_badge(theme, data.get("page"))
+    return els
+
 def end(data, theme):
     els = [rect(0, 0, CANVAS_W, CANVAS_H, theme["primary"])]
     els.append(rect(CANVAS_W - 260, CANVAS_H - 160, 260, 160,
@@ -461,11 +514,11 @@ def end(data, theme):
     els.append(line(CANVAS_W / 2 - 30, 272, 60, 2, theme["secondary"]))
     if data.get("subtitle"):
         els.append(text(80, 290, CANVAS_W - 160, 30, data["subtitle"],
-                        size=16, color=theme["secondary"], font=theme["fontBody"],
+                        size=18, color=theme["secondary"], font=theme["fontBody"],
                         align="center"))
     if data.get("contact"):
         els.append(text(80, 340, CANVAS_W - 160, 24, data["contact"],
-                        size=12, color=theme["secondary"], font=theme["fontBody"],
+                        size=14, color=theme["secondary"], font=theme["fontBody"],
                         align="center"))
     return els
 
@@ -484,5 +537,6 @@ TEMPLATES = {
     "big_statement_minimal": big_statement_minimal,
     "structured_content": structured_content,
     "grid_content": grid_content,
+    "two_column": two_column,
     "end": end,
 }

@@ -1,4 +1,4 @@
-import { Children, isValidElement, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
+import { Children, isValidElement, memo, useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
@@ -7,6 +7,7 @@ import { highlightCode, inferLanguageFromPath } from "./codeHighlight";
 
 export type ChatAttachment = {
   id: string;
+  cacheKey?: string | null;
   filename: string;
   contentType: string;
   source?: string | null;
@@ -37,6 +38,7 @@ export type HtmlPreviewPayload = {
   downloadUrl?: string | null;
   sizeBytes?: number | null;
   summary?: string | null;
+  cacheKey?: string | null;
 };
 
 type MessageContentProps = {
@@ -212,6 +214,10 @@ function buildAttachmentUrl(apiBase: string, attachment: ChatAttachment, options
     `${apiBase}${useAttachmentContentRoute ? "/api/workspace/attachment-content" : "/api/workspace/file-content"}`,
   );
   url.searchParams.set("path", attachment.path);
+  const cacheKey = attachment.cacheKey || attachment.id;
+  if (cacheKey) {
+    url.searchParams.set("v", cacheKey);
+  }
   if (options?.download) {
     url.searchParams.set("download", "true");
   }
@@ -349,6 +355,36 @@ function inferAttachmentPreviewMode(attachment: ChatAttachment, language: string
   return "unsupported";
 }
 
+function canRenderAttachmentPreview(previewMode: string) {
+  return previewMode === "html" || previewMode === "code" || previewMode === "pdf" || previewMode === "image";
+}
+
+function normalizeAttachmentPath(attachment: ChatAttachment) {
+  return (attachment.workspaceRelativePath || attachment.path || "").replace(/\\/g, "/");
+}
+
+function attachmentDirectory(attachment: ChatAttachment) {
+  const path = normalizeAttachmentPath(attachment);
+  const separatorIndex = path.lastIndexOf("/");
+  return separatorIndex >= 0 ? path.slice(0, separatorIndex) : "";
+}
+
+function findCompanionHtmlPreview(attachment: ChatAttachment, attachments: ChatAttachment[]) {
+  if (inferAttachmentKind(attachment) !== "pptx") {
+    return null;
+  }
+  const directory = attachmentDirectory(attachment);
+  return (
+    attachments.find((candidate) => {
+      if (!isHtmlAttachment(candidate) || candidate.id === attachment.id) {
+        return false;
+      }
+      const filename = candidate.filename.toLowerCase();
+      return filename === "preview.html" && (!directory || attachmentDirectory(candidate) === directory);
+    }) ?? null
+  );
+}
+
 function shouldFetchAttachmentTextForPreview(previewMode: string) {
   return previewMode === "html" || previewMode === "code" || previewMode === "markdown" || previewMode === "text";
 }
@@ -365,27 +401,31 @@ function AttachmentFileCard({
   apiBase,
   attachment,
   href,
+  companionPreviewAttachment,
   onOpenHtmlPreview,
   tone = "user",
 }: {
   apiBase: string;
   attachment: ChatAttachment;
   href: string | null;
+  companionPreviewAttachment?: ChatAttachment | null;
   onOpenHtmlPreview?: (payload: HtmlPreviewPayload) => void;
   tone?: "assistant" | "user";
 }) {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const cardTitle = attachment.filename;
-  const isHtml = isHtmlAttachment(attachment);
-  const previewLanguage = isHtml ? "html" : inferAttachmentPreviewLanguage(attachment);
+  const effectivePreviewAttachment = companionPreviewAttachment ?? attachment;
+  const previewHref = companionPreviewAttachment ? buildAttachmentUrl(apiBase, companionPreviewAttachment) : href;
+  const isHtml = isHtmlAttachment(effectivePreviewAttachment);
+  const previewLanguage = isHtml ? "html" : inferAttachmentPreviewLanguage(effectivePreviewAttachment);
   const previewKind = inferAttachmentKind(attachment);
-  const previewMode = inferAttachmentPreviewMode(attachment, previewLanguage);
-  const canPreviewAttachment = Boolean(href && onOpenHtmlPreview);
+  const previewMode = companionPreviewAttachment ? "html" : inferAttachmentPreviewMode(attachment, previewLanguage);
+  const canPreviewAttachment = Boolean(previewHref && onOpenHtmlPreview && canRenderAttachmentPreview(previewMode));
   const downloadHref = attachment.path ? buildAttachmentUrl(apiBase, attachment, { download: true }) : href;
 
-  const previewAttachment = async () => {
-    if (!href || !onOpenHtmlPreview || previewLoading) {
+  const openAttachmentPreview = async () => {
+    if (!previewHref || !onOpenHtmlPreview || previewLoading) {
       return;
     }
     setPreviewLoading(true);
@@ -393,7 +433,7 @@ function AttachmentFileCard({
     try {
       let content = "";
       if (shouldFetchAttachmentTextForPreview(previewMode)) {
-        const response = await fetch(href, { credentials: "include" });
+        const response = await fetch(previewHref, { credentials: "include", cache: "no-store" });
         if (!response.ok) {
           throw new Error(`预览加载失败：${response.status}`);
         }
@@ -411,8 +451,9 @@ function AttachmentFileCard({
         contentType: attachment.contentType,
         extension: attachment.extension,
         previewMode,
-        previewUrl: href,
+        previewUrl: previewHref,
         downloadUrl: downloadHref,
+        cacheKey: effectivePreviewAttachment.cacheKey || effectivePreviewAttachment.id,
         sizeBytes: attachment.sizeBytes,
         summary: attachment.summary,
       });
@@ -445,7 +486,7 @@ function AttachmentFileCard({
           <button
             type="button"
             className="chat-attachment-file-action"
-            onClick={() => void previewAttachment()}
+            onClick={() => void openAttachmentPreview()}
             disabled={previewLoading}
           >
             {previewLoading ? "预览中" : "预览"}
@@ -486,12 +527,14 @@ function AttachmentGallery({
       {attachments.map((attachment) => {
         const src = buildAttachmentUrl(apiBase, attachment);
         if (!isImageAttachment(attachment) || (tone === "assistant" && onOpenHtmlPreview)) {
+          const companionPreview = findCompanionHtmlPreview(attachment, attachments);
           return (
             <AttachmentFileCard
               key={attachment.id}
               apiBase={apiBase}
               attachment={attachment}
               href={src}
+              companionPreviewAttachment={companionPreview}
               onOpenHtmlPreview={onOpenHtmlPreview}
               tone={tone}
             />
@@ -855,7 +898,7 @@ function MarkdownImage({
   );
 }
 
-export default function MessageContent({
+function MessageContent({
   apiBase,
   variant,
   content,
@@ -868,20 +911,24 @@ export default function MessageContent({
   const hasAttachments = attachments.length > 0;
   const [preview, setPreview] = useState<AttachmentPreviewState>(null);
   const [failedAttachmentIds, setFailedAttachmentIds] = useState<string[]>([]);
-  const renderedAssistantContent =
-    variant === "assistant" && deferCodeBlocksUntilComplete ? stripFencedCodeBlocksForStreaming(content) : content;
-  const referencedImageSources = variant === "assistant" ? collectContentImageSources(content) : new Set<string>();
-  const assistantLooseAttachments =
-    variant === "assistant"
-      ? attachments.filter((attachment) => {
-          const candidates = [
-            attachment.path ? normalizeImageSourceForMatch(attachment.path) : "",
-            attachment.workspaceRelativePath ? normalizeImageSourceForMatch(attachment.workspaceRelativePath) : "",
-            normalizeImageSourceForMatch(attachment.filename),
-          ].filter(Boolean);
-          return !candidates.some((candidate) => referencedImageSources.has(candidate));
-        })
-      : EMPTY_ATTACHMENTS;
+  const renderedAssistantContent = useMemo(
+    () => (variant === "assistant" && deferCodeBlocksUntilComplete ? stripFencedCodeBlocksForStreaming(content) : content),
+    [content, deferCodeBlocksUntilComplete, variant],
+  );
+  const assistantLooseAttachments = useMemo(() => {
+    if (variant !== "assistant") {
+      return EMPTY_ATTACHMENTS;
+    }
+    const referencedImageSources = collectContentImageSources(content);
+    return attachments.filter((attachment) => {
+      const candidates = [
+        attachment.path ? normalizeImageSourceForMatch(attachment.path) : "",
+        attachment.workspaceRelativePath ? normalizeImageSourceForMatch(attachment.workspaceRelativePath) : "",
+        normalizeImageSourceForMatch(attachment.filename),
+      ].filter(Boolean);
+      return !candidates.some((candidate) => referencedImageSources.has(candidate));
+    });
+  }, [attachments, content, variant]);
 
   useEffect(() => {
     setFailedAttachmentIds((current) => {
@@ -971,3 +1018,5 @@ export default function MessageContent({
     </>
   );
 }
+
+export default memo(MessageContent);

@@ -1,4 +1,4 @@
-import { forwardRef, type PointerEventHandler } from "react";
+import { forwardRef, memo, useMemo, type PointerEventHandler } from "react";
 import { escapeCodeHtml, highlightCode } from "../chat/codeHighlight";
 import type { Artifact, ArtifactView } from "./types";
 
@@ -176,7 +176,7 @@ function renderArtifactPreview(artifact: Artifact, normalizedHtmlContent: string
   if (artifact.previewMode === "html" || (artifact.content && artifact.kind === "html")) {
     return (
       <iframe
-        key={`${artifact.sourcePath ?? artifact.id}:${artifact.streaming ? "streaming" : "complete"}`}
+        key={`${artifact.id}:${artifact.streaming ? "streaming" : "complete"}`}
         className="html-preview-iframe"
         title={artifact.title}
         srcDoc={normalizedHtmlContent}
@@ -209,12 +209,21 @@ const ArtifactPanel = forwardRef<HTMLElement, ArtifactPanelProps>(function Artif
   onResizeStart,
   showResizeHandle = false,
 }: ArtifactPanelProps, ref) {
-  const normalizedHtmlContent = normalizeArtifactHtmlContent(artifact);
   const sourceCode = artifact?.content ?? "";
-  const sourceHighlight = highlightCode(sourceCode, artifact?.language ?? (artifact?.kind === "html" ? "html" : "plaintext"));
   const showPreview = view === "preview";
   const hasSource = Boolean(sourceCode);
   const showSource = view === "source" && hasSource;
+  const normalizedHtmlContent = useMemo(
+    () => (showPreview ? normalizeArtifactHtmlContent(artifact) : ""),
+    [artifact, showPreview],
+  );
+  const sourceHighlight = useMemo(
+    () =>
+      showSource
+        ? highlightCode(sourceCode, artifact?.language ?? (artifact?.kind === "html" ? "html" : "plaintext"))
+        : { html: "", language: null },
+    [artifact?.kind, artifact?.language, showSource, sourceCode],
+  );
 
   return (
     <aside
@@ -295,4 +304,4 @@ const ArtifactPanel = forwardRef<HTMLElement, ArtifactPanelProps>(function Artif
   );
 });
 
-export default ArtifactPanel;
+export default memo(ArtifactPanel);
