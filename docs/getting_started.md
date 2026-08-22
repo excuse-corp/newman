@@ -42,9 +42,9 @@ macOS / Linux 源码部署需要：
 - 飞书里给 Newman 发消息：需要飞书自建应用的 `app_id` / `app_secret`，并开启机器人和长连接事件。
 - Newman 主动操作飞书资源：还需要安装并授权官方 `lark-cli`，仓库内置 `plugins/feishu-cli` 插件负责把 Newman 连接到 `lark-cli`。
 
-如果要使用 Google / 联网搜索工具，还需要：
+如果要使用 AnySearch 联网搜索 skill，还需要：
 
-- `SERPAPI_API_KEY`
+- `ANYSEARCH_API_KEY`
 
 ## 2. Docker 部署（Windows 推荐）
 
@@ -72,10 +72,10 @@ NEWMAN_MODELS_MULTIMODAL_ENDPOINT=https://api.openai.com/v1
 NEWMAN_MODELS_MULTIMODAL_API_KEY=your_api_key_here
 ```
 
-如果要启用 Google / 联网搜索，再补：
+如果要启用 AnySearch 联网搜索 skill，再补：
 
 ```dotenv
-SERPAPI_API_KEY=your_serpapi_api_key_here
+ANYSEARCH_API_KEY=your_anysearch_api_key_here
 ```
 
 如果 endpoint 在宿主机本地，容器内不要写 `127.0.0.1`，改用：
@@ -166,10 +166,10 @@ NEWMAN_MODELS_MULTIMODAL_ENDPOINT=https://api.openai.com/v1
 NEWMAN_MODELS_MULTIMODAL_API_KEY=your_api_key_here
 ```
 
-如果要启用 Google / 联网搜索，再补：
+如果要启用 AnySearch 联网搜索 skill，再补：
 
 ```dotenv
-SERPAPI_API_KEY=your_serpapi_api_key_here
+ANYSEARCH_API_KEY=your_anysearch_api_key_here
 ```
 
 ### 3.4 启动

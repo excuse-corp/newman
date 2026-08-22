@@ -28,6 +28,7 @@ from backend.memory.compressor import (
 from backend.memory.memory_extract import MemoryExtractor
 from backend.memory.stable_context import StableContextLoader
 from backend.plugin_runtime.service import PluginService
+from backend.plugin_runtime.draft_service import PluginDraftService
 from backend.providers.base import ProviderError, ProviderResponse, TokenUsage, ToolCall, ToolCallDelta
 from backend.providers.multimodal import MultimodalAnalyzer
 from backend.providers.factory import build_provider
@@ -585,12 +586,6 @@ def _build_single_tool_action_brief(tool_call: ToolCall, prefix: str, task: Sess
     tool_name = tool_call.name
     arguments = tool_call.arguments
 
-    if tool_name == "google_search":
-        query = _read_action_argument(arguments, "q", "query")
-        if query:
-            return f"{prefix}搜索「{_compact_action_value(query)}」相关资料，确认可引用的信息来源。"
-        return f"{prefix}搜索相关网页资料，确认可引用的信息来源。"
-
     if tool_name in {"search_files", "grep"}:
         query = _read_action_argument(arguments, "query", "pattern")
         path = _format_action_path_for_task(_read_action_argument(arguments, "path"), task)
@@ -646,15 +641,6 @@ def _build_single_tool_action_brief(tool_call: ToolCall, prefix: str, task: Sess
 def _build_multi_tool_action_brief(tool_calls: list[ToolCall], prefix: str) -> str:
     tool_names = [tool_call.name for tool_call in tool_calls]
     unique_tool_names = list(dict.fromkeys(tool_names))
-    if unique_tool_names == ["google_search"]:
-        queries = [
-            query
-            for tool_call in tool_calls
-            if (query := _read_action_argument(tool_call.arguments, "q", "query")) is not None
-        ]
-        if len(queries) >= 2:
-            return f"{prefix}用多个关键词搜索公开资料，交叉确认可引用的信息来源。"
-        return f"{prefix}并行搜索公开资料，确认可引用的信息来源。"
     if len(unique_tool_names) <= 2:
         labels = " 和 ".join(unique_tool_names)
     else:
@@ -707,10 +693,9 @@ def _repair_schema_value(value: object, schema: object) -> object:
         known_properties = properties if isinstance(properties, dict) else {}
         repaired: dict[str, object] = {}
 
-        if schema.get("additionalProperties") is not False:
-            for key, item in source.items():
-                if key not in known_properties:
-                    repaired[key] = item
+        for key, item in source.items():
+            if key not in known_properties:
+                repaired[key] = item
 
         for key, child_schema in known_properties.items():
             if key in source:
@@ -760,6 +745,34 @@ def _repair_schema_value(value: object, schema: object) -> object:
         if isinstance(default, (int, float)) and not isinstance(default, bool):
             return default
         return 0
+
+    return value
+
+
+def _strip_unknown_schema_properties(value: object, schema: object) -> object:
+    if not isinstance(schema, dict):
+        return value
+
+    schema_type = schema.get("type")
+    if schema_type == "object" or (
+        not schema_type and any(key in schema for key in ("properties", "required", "additionalProperties"))
+    ):
+        if not isinstance(value, dict):
+            return value
+        properties = schema.get("properties")
+        known_properties = properties if isinstance(properties, dict) else {}
+        if schema.get("additionalProperties") is False:
+            keys = [key for key in value if key in known_properties]
+        else:
+            keys = list(value.keys())
+        return {
+            key: _strip_unknown_schema_properties(value[key], known_properties.get(key, {}))
+            for key in keys
+        }
+
+    if schema_type == "array" and isinstance(value, list):
+        items_schema = schema.get("items") if isinstance(schema.get("items"), dict) else {}
+        return [_strip_unknown_schema_properties(item, items_schema) for item in value]
 
     return value
 
@@ -834,6 +847,10 @@ class NewmanRuntime:
             settings.paths.skills_dir,
             settings.paths.data_dir / "plugin_state.json",
             project_root=self.project_root,
+        )
+        self.plugin_draft_service = PluginDraftService(
+            self.plugin_service,
+            settings.paths.data_dir / "plugin_drafts",
         )
         self.skill_registry = SkillRegistry(self.plugin_service, settings.paths.memory_dir)
         self.evolution_store = EvolutionStore(settings.paths.evolution_dir)
@@ -1134,6 +1151,7 @@ class NewmanRuntime:
             mcp_registry=self.mcp_registry,
             subagent_manager=self.subagent_manager,
             plugin_service=self.plugin_service,
+            plugin_draft_service=self.plugin_draft_service,
         )
         tool_context = self.tool_context
         registry = ToolRegistry()
@@ -1261,6 +1279,27 @@ class NewmanRuntime:
                 continue
             if invalid_tool_action == "finalized":
                 return
+
+            if response.tool_calls:
+                for tool_call in response.tool_calls:
+                    try:
+                        arguments_bytes = len(json.dumps(tool_call.arguments, ensure_ascii=False).encode("utf-8"))
+                    except (TypeError, ValueError):
+                        arguments_bytes = 0
+                    summary = _build_tool_argument_progress_summary(tool_call.name, arguments_bytes)
+                    await turn_emit(
+                        "tool_call_arguments_delta",
+                        {
+                            "group_id": group_id,
+                            "tool_call_id": tool_call.id,
+                            "tool": tool_call.name,
+                            "arguments_bytes": arguments_bytes,
+                            "summary": summary,
+                            "summary_text": summary,
+                            "model": response.model or self.settings.provider.model,
+                            "phase": "tool_intent_ready",
+                        },
+                    )
 
             response = await self._ensure_tool_response_commentary(
                 task,
@@ -1648,6 +1687,7 @@ class NewmanRuntime:
         parser = ThinkTagStreamParser()
         commentary_visible = False
         commentary_complete_pending = False
+        thinking_complete_emitted = False
         answer_visible = False
         answer_started_emitted = False
         defer_answer_visibility = bool(tools)
@@ -1729,6 +1769,32 @@ class NewmanRuntime:
                 },
             )
 
+        async def emit_thinking_delta(delta: str) -> None:
+            nonlocal thinking_complete_emitted
+            thinking_parts.append(delta)
+            thinking_complete_emitted = False
+            await emit(
+                "thinking_delta",
+                {
+                    "content": "".join(thinking_parts),
+                    "delta": delta,
+                    "model": self.settings.provider.model,
+                },
+            )
+
+        async def emit_thinking_complete_if_needed() -> None:
+            nonlocal thinking_complete_emitted
+            if thinking_complete_emitted or not thinking_parts:
+                return
+            thinking_complete_emitted = True
+            await emit(
+                "thinking_complete",
+                {
+                    "content": "".join(thinking_parts),
+                    "model": self.settings.provider.model,
+                },
+            )
+
         def deferred_answer_release_ready() -> bool:
             raw = "".join(deferred_answer_deltas).strip()
             if not raw:
@@ -1776,6 +1842,7 @@ class NewmanRuntime:
             nonlocal answer_visible, answer_started_emitted, commentary_complete_pending, tool_signal_seen
             if tool_signal_seen:
                 return
+            await emit_thinking_complete_if_needed()
             tool_signal_seen = True
             preserve_answer = tool_name == "request_user_input"
             leaked_answer = "" if preserve_answer else self._recover_tool_preamble_commentary("".join(content_parts))
@@ -1886,24 +1953,10 @@ class NewmanRuntime:
                 await emit_answer_delta(event.text)
                 return
             if event.kind == "thinking" and event.text:
-                thinking_parts.append(event.text)
-                await emit(
-                    "thinking_delta",
-                    {
-                        "content": "".join(thinking_parts),
-                        "delta": event.text,
-                        "model": self.settings.provider.model,
-                    },
-                )
+                await emit_thinking_delta(event.text)
                 return
             if event.kind == "thinking_complete":
-                await emit(
-                    "thinking_complete",
-                    {
-                        "content": "".join(thinking_parts),
-                        "model": self.settings.provider.model,
-                    },
-                )
+                await emit_thinking_complete_if_needed()
                 return
             if event.kind == "commentary" and event.text:
                 commentary_parts.append(event.text)
@@ -1919,10 +1972,14 @@ class NewmanRuntime:
                 if first_chunk_at is None:
                     first_chunk_at = now
                 last_chunk_at = now
-                if chunk.type == "text" and chunk.delta:
+                if chunk.type == "thinking" and chunk.delta:
+                    await emit_thinking_delta(chunk.delta)
+                elif chunk.type == "text" and chunk.delta:
+                    await emit_thinking_complete_if_needed()
                     for event in parser.feed(chunk.delta):
                         await consume_parse_event(event)
                 elif chunk.type == "tool_call_delta" and chunk.tool_call_delta:
+                    await emit_thinking_complete_if_needed()
                     delta = chunk.tool_call_delta
                     if not delta.arguments_delta:
                         zero_arg_tool_delta_count += 1
@@ -1943,6 +2000,7 @@ class NewmanRuntime:
                     await prepare_for_tool_signal(resolved_name)
                     await emit_tool_argument_progress(chunk.tool_call_delta)
                 elif chunk.type == "tool_call" and chunk.tool_call:
+                    await emit_thinking_complete_if_needed()
                     if self._is_invalid_provider_tool_call(chunk.tool_call):
                         invalid_tool_call_indexes.add(len(tool_calls) + len(invalid_tool_calls))
                         invalid_tool_calls.append(chunk.tool_call)
@@ -1995,6 +2053,7 @@ class NewmanRuntime:
             raise
         for event in parser.flush():
             await consume_parse_event(event)
+        await emit_thinking_complete_if_needed()
         await flush_deferred_answer(force=True)
         await flush_commentary(force=bool(tool_calls))
         thinking = "\n\n".join(
@@ -3742,7 +3801,8 @@ class NewmanRuntime:
         repaired = _repair_schema_value(parsed_arguments, tool.meta.input_schema)
         if not isinstance(repaired, dict):
             return None
-        if tool.validate_arguments(repaired) is not None:
+        validation_candidate = _strip_unknown_schema_properties(repaired, tool.meta.input_schema)
+        if tool.validate_arguments(validation_candidate) is not None:
             return None
         return repaired
 

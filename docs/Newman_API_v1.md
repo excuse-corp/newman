@@ -140,7 +140,7 @@ SSE payload 里也会带 `request_id`。
   "primary_model": "gpt-4.1-mini",
   "share_primary_for_multimodal": true,
   "multimodal_model": "gpt-4.1",
-  "serpapi_api_key": "",
+  "anysearch_api_key": "",
   "feishu_app_id": "",
   "feishu_app_secret": "",
   "login_after_setup": true
@@ -691,6 +691,24 @@ GET /api/sessions/{session_id}/events
 | `GET` | `/api/skills/{skill_name}` | 获取 Skill 详情 |
 | `PUT` | `/api/skills/{skill_name}` | 更新 Skill |
 | `DELETE` | `/api/skills/{skill_name}` | 删除 Skill |
+
+### Plugin Drafts
+
+Plugin Drafts 用于通过自然语言 `request` 或结构化 `PluginSpec` 生成、校验并审批 Newman 插件。MVP 仅支持插件内 Skill 和 CLI wrapper commands；草稿安装后默认 disabled。自然语言入口默认生成 Skill 型插件；只有需求中显式给出 `工具名` / `命令` 等字段时才会生成 CLI wrapper。
+
+| Method | Path | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/plugin-drafts` | 获取插件草稿列表 |
+| `POST` | `/api/plugin-drafts` | 创建插件草稿，可传 `request` 或 `spec`，可选自动生成并校验 |
+| `GET` | `/api/plugin-drafts/{draft_id}` | 获取草稿详情 |
+| `GET` | `/api/plugin-drafts/{draft_id}/review` | 刷新并获取安装前审计报告 |
+| `POST` | `/api/plugin-drafts/{draft_id}/validate` | 校验草稿包和安全规则 |
+| `POST` | `/api/plugin-drafts/{draft_id}/approve` | 明确审批草稿安装 |
+| `POST` | `/api/plugin-drafts/{draft_id}/install` | 安装已审批草稿，默认禁用插件 |
+| `POST` | `/api/plugin-drafts/{draft_id}/reject` | 拒绝草稿 |
+| `POST` | `/api/plugin-drafts/{draft_id}/rollback` | 回滚已安装草稿 |
+
+草稿详情中的 `review` 包含安装目标、已存在插件冲突、文件变更、环境变量、CLI wrapper、确认步骤和安全提示，用于 UI 在审批/安装前展示可审计信息。
 
 ## 11. MCP 接口
 

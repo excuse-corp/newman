@@ -542,6 +542,7 @@ type TimelineNode = {
   time: string;
   primaryText: string;
   secondaryItems: TimelineSecondaryItem[];
+  thinkingContent?: string | null;
   approval?: ApprovalNodePayload | null;
   detail: TraceEntry;
 };
@@ -764,6 +765,113 @@ type PluginLoadError = {
 type PluginsResponse = {
   plugins: PluginRecord[];
   errors: PluginLoadError[];
+};
+
+type PluginDraftStatus =
+  | "draft"
+  | "generated"
+  | "validated"
+  | "awaiting_approval"
+  | "approved"
+  | "installed_disabled"
+  | "rejected"
+  | "validation_failed"
+  | "install_failed"
+  | "rolled_back";
+
+type PluginDraftRecord = {
+  draft_id: string;
+  status: PluginDraftStatus;
+  created_at: string;
+  updated_at: string;
+  plugin_name: string;
+  source_request: string | null;
+  spec: {
+    name: string;
+    version: string;
+    description: string;
+    skills: Array<{
+      name: string;
+      description: string;
+      when_to_use: string;
+      body_markdown: string;
+    }>;
+    commands: Array<{
+      tool_name: string;
+      executable: string;
+      description: string;
+      approval_behavior: "safe" | "confirmable";
+      timeout_seconds: number;
+      readonly_prefixes: string[][];
+      readable_roots: string[];
+      writable_roots: string[];
+      env: Record<string, string>;
+    }>;
+    environment: Array<{
+      name: string;
+      required: boolean;
+      secret: boolean;
+      description: string;
+    }>;
+  };
+  package_path: string | null;
+  package_files: string[];
+  manifest_content: string | null;
+  validation: {
+    ok: boolean;
+    errors: string[];
+    warnings: string[];
+    checks: string[];
+  } | null;
+  risk: {
+    level: "low" | "medium" | "high" | "critical";
+    reasons: string[];
+    requires_user_confirmation: boolean;
+    blocked: boolean;
+  } | null;
+  review: {
+    install_target: string | null;
+    conflicts: string[];
+    skills: string[];
+    commands: Array<{
+      tool_name: string;
+      executable: string;
+      approval_behavior: "safe" | "confirmable";
+      env_keys: string[];
+      readable_roots: string[];
+      writable_roots: string[];
+    }>;
+    environment: string[];
+    file_changes: Array<{
+      path: string;
+      status: "added" | "modified" | "deleted" | "unchanged";
+      size_bytes: number | null;
+      sha256: string | null;
+    }>;
+    required_confirmations: string[];
+    safety_notes: string[];
+  } | null;
+  error: string | null;
+  installed_path: string | null;
+};
+
+type PluginDraftForm = {
+  requestText: string;
+  name: string;
+  version: string;
+  description: string;
+  skillName: string;
+  skillDescription: string;
+  skillWhenToUse: string;
+  skillBody: string;
+  commandToolName: string;
+  commandExecutable: string;
+  commandDescription: string;
+  commandApproval: "safe" | "confirmable";
+};
+
+type PluginDraftsResponse = {
+  drafts: PluginDraftRecord[];
 };
 
 type ProjectConfigResponse = {
@@ -1175,6 +1283,67 @@ function readEnvValue(content: string, key: string) {
     }
   }
   return "";
+}
+
+function pluginDraftStatusLabel(status: PluginDraftStatus) {
+  const labels: Record<PluginDraftStatus, string> = {
+    draft: "草稿",
+    generated: "已生成",
+    validated: "已校验",
+    awaiting_approval: "待审批",
+    approved: "已审批",
+    installed_disabled: "已安装停用",
+    rejected: "已拒绝",
+    validation_failed: "校验失败",
+    install_failed: "安装失败",
+    rolled_back: "已回滚",
+  };
+  return labels[status] ?? status;
+}
+
+function pluginDraftStatusTone(status: PluginDraftStatus) {
+  if (status === "awaiting_approval" || status === "approved") return "accent";
+  if (status === "validation_failed" || status === "install_failed" || status === "rejected") return "danger";
+  if (status === "installed_disabled") return "success";
+  return "subtle";
+}
+
+function pluginDraftRiskLabel(level: NonNullable<PluginDraftRecord["risk"]>["level"]) {
+  if (level === "critical") return "Critical";
+  if (level === "high") return "High";
+  if (level === "medium") return "Medium";
+  return "Low";
+}
+
+function pluginDraftActionBusy(actionId: string | null, draft: PluginDraftRecord, action: string) {
+  return actionId === `${draft.draft_id}:${action}`;
+}
+
+function pluginDraftConfirmationLabel(value: string) {
+  if (value === "approve_draft") return "审批草稿";
+  if (value === "install_disabled") return "安装后停用";
+  if (value === "enable_plugin_before_cli_use") return "启用后暴露 CLI";
+  return value;
+}
+
+function pluginDraftFileStatusLabel(value: "added" | "modified" | "deleted" | "unchanged") {
+  if (value === "added") return "新增";
+  if (value === "modified") return "修改";
+  if (value === "deleted") return "删除";
+  return "未变";
+}
+
+function summarizePluginDraftFileChanges(draft: PluginDraftRecord) {
+  const counts = { added: 0, modified: 0, deleted: 0, unchanged: 0 };
+  draft.review?.file_changes.forEach((item) => {
+    counts[item.status] += 1;
+  });
+  return [
+    counts.added ? `${counts.added} 新增` : null,
+    counts.modified ? `${counts.modified} 修改` : null,
+    counts.deleted ? `${counts.deleted} 删除` : null,
+    counts.unchanged ? `${counts.unchanged} 未变` : null,
+  ].filter(Boolean).join(" · ") || "暂无文件变更";
 }
 
 type AppProps = {
@@ -1778,12 +1947,6 @@ const TOOL_SEMANTIC_MAP: Record<
   list_files: { label: "list_files", cardType: "file", runningText: "我先整理一下文件列表", completedText: "文件列表我已经拿到了" },
   search_files: { label: "search_files", cardType: "search", runningText: "我先检索一下相关文件", completedText: "相关文件我已经找到了" },
   grep: { label: "grep", cardType: "search", runningText: "我先搜索一下文件内容", completedText: "匹配内容我已经找到了" },
-  google_search: {
-    label: "google_search",
-    cardType: "search",
-    runningText: "我先搜索相关网页资料",
-    completedText: "网页搜索结果我已经拿到了"
-  },
   fetch_url: { label: "fetch_url", cardType: "network", runningText: "我先看一下网页资料", completedText: "网页资料我已经取回来了" },
   terminal: { label: "terminal", cardType: "terminal", runningText: "我先运行一条命令确认情况", completedText: "命令我已经执行完了" },
   write_file: { label: "write_file", cardType: "file", runningText: "我先创建对应文件", completedText: "文件我已经创建好了" },
@@ -2773,9 +2936,6 @@ function resolveProgressPrimaryText(
     if (toolName === "search_files" || toolName === "grep") {
       return target ? `我先检索 ${target}，定位相关内容` : semantic.runningText;
     }
-    if (toolName === "google_search") {
-      return target ? `我先搜索 ${target}，确认可引用的信息来源` : semantic.runningText;
-    }
     if (toolName === "list_dir" || toolName === "list_files") {
       return target ? `我先查看 ${target} 的结构` : semantic.runningText;
     }
@@ -2818,9 +2978,6 @@ function resolveProgressPrimaryText(
   }
   if (toolName === "list_dir" || toolName === "list_files") {
     return target ? `已确认 ${target} 的结构` : semantic.completedText;
-  }
-  if (toolName === "google_search") {
-    return target ? `已拿到 ${target} 的搜索结果` : semantic.completedText;
   }
   if (toolName === "update_plan") {
     return "执行步骤我已经整理好了";
@@ -4186,6 +4343,42 @@ function summarizeThinkingContent(content: string | null | undefined, state: Tim
   return compactString(firstSentence, 56);
 }
 
+function readTimelineThinkingContent(node: TimelineNode) {
+  const content = node.thinkingContent ?? (node.kind === "thinking" ? node.detail.output : null);
+  return typeof content === "string" ? content.trim() : "";
+}
+
+function mergeThinkingContentIntoNode(targetNode: TimelineNode, content: string | null | undefined) {
+  const normalizedContent = typeof content === "string" ? content.trim() : "";
+  if (!normalizedContent) {
+    return;
+  }
+  const existingContent = typeof targetNode.thinkingContent === "string" ? targetNode.thinkingContent.trim() : "";
+  if (!existingContent || normalizedContent.startsWith(existingContent)) {
+    targetNode.thinkingContent = normalizedContent;
+    return;
+  }
+  if (existingContent.includes(normalizedContent)) {
+    return;
+  }
+  targetNode.thinkingContent = `${existingContent}\n\n${normalizedContent}`;
+}
+
+function buildThinkingPreviewLines(content: string, maxLines = 3) {
+  const lines: string[] = [];
+  const sourceLines = content.replace(/\r\n/g, "\n").split("\n");
+  sourceLines.forEach((line) => {
+    const normalized = line.replace(/\s+/g, " ").trim();
+    if (!normalized) {
+      return;
+    }
+    for (let index = 0; index < normalized.length; index += 72) {
+      lines.push(normalized.slice(index, index + 72));
+    }
+  });
+  return lines.slice(-maxLines);
+}
+
 function buildThinkingNode(
   ts: number,
   content: string | null = null,
@@ -4214,6 +4407,25 @@ function buildThinkingNode(
       output: content,
     }
   };
+}
+
+function attachThinkingContentToNode(
+  nodes: TimelineNode[],
+  thinkingNodeId: string | null,
+  targetNode: TimelineNode
+) {
+  if (!thinkingNodeId || thinkingNodeId === targetNode.id) {
+    return thinkingNodeId;
+  }
+  const thinkingIndex = nodes.findIndex((node) => node.id === thinkingNodeId && node.kind === "thinking");
+  if (thinkingIndex === -1) {
+    return thinkingNodeId;
+  }
+  const thinkingNode = nodes[thinkingIndex];
+  const content = readTimelineThinkingContent(thinkingNode);
+  mergeThinkingContentIntoNode(targetNode, content);
+  nodes.splice(thinkingIndex, 1);
+  return null;
 }
 
 function buildAnswerStartNode(event: SessionEventPayload): TimelineNode {
@@ -4574,6 +4786,7 @@ function preserveNodeIdentity(existingNode: TimelineNode, nextNode: TimelineNode
     ...nextNode,
     id: existingNode.id,
     approval: nextNode.approval ?? existingNode.approval ?? null,
+    thinkingContent: nextNode.thinkingContent ?? existingNode.thinkingContent ?? null,
     detail: {
       ...nextNode.detail,
       id: existingNode.id
@@ -4668,6 +4881,7 @@ function buildTimelineNodes(
       return existingNode;
     }
     const nextNode = buildProgressGroupNode(groupId, event, primaryText);
+    thinkingNodeId = attachThinkingContentToNode(nodes, thinkingNodeId, nextNode);
     nodes.push(nextNode);
     progressNodeByGroupId.set(groupId, nextNode);
     return nextNode;
@@ -4729,14 +4943,18 @@ function buildTimelineNodes(
     }
 
     if (event.event === "thinking_delta" || event.event === "thinking_complete") {
-      const content = typeof eventData.content === "string" ? eventData.content : "";
+      const content = typeof eventData.content === "string" ? eventData.content : typeof eventData.delta === "string" ? eventData.delta : "";
+      if (!content && event.event === "thinking_complete") {
+        return;
+      }
       const nextNode = buildThinkingNode(
         event.ts,
         content,
         event.event === "thinking_complete" ? "completed" : "running",
         "当前思路"
       );
-      const existingNodeId = thinkingNodeId ?? nodes.find((node) => node.kind === "thinking")?.id ?? null;
+      const existingNodeId =
+        thinkingNodeId ?? [...nodes].reverse().find((node) => node.kind === "thinking")?.id ?? null;
       const existing = existingNodeId ? findNodeById(nodes, existingNodeId) : null;
       if (existing) {
         const updatedNode = preserveNodeIdentity(existing.node, nextNode);
@@ -4753,6 +4971,7 @@ function buildTimelineNodes(
     if (event.event === "answer_started") {
       settleAllProviderRecoveryItems(progressNodeByGroupId.values(), event, "completed", "主模型连接已恢复，已继续生成回复。");
       const nextNode = buildAnswerStartNode(event);
+      thinkingNodeId = attachThinkingContentToNode(nodes, thinkingNodeId, nextNode);
       nodes.push(nextNode);
       answerStartNodeId = nextNode.id;
       return;
@@ -4830,6 +5049,7 @@ function buildTimelineNodes(
       const existingNode = progressNodeByGroupId.get(groupId) ?? null;
       const primaryText = resolveProgressNodePrimaryText(existingNode, event.event, commentary);
       const node = ensureProgressNode(groupId, event, primaryText);
+      thinkingNodeId = attachThinkingContentToNode(nodes, thinkingNodeId, node);
       settleProviderRecoveryItem(node, event, "completed", "主模型连接已恢复，继续执行。");
       refreshProgressGroupNode(node, event, primaryText, commentary);
       return;
@@ -4899,13 +5119,21 @@ function buildTimelineNodes(
       if (!groupId) {
         return;
       }
-      const node = progressNodeByGroupId.get(groupId) ?? null;
-      if (node) {
-        settleProviderRecoveryItem(node, event, "completed", "主模型连接已恢复，继续执行。");
-        const item = buildToolSecondaryItem(node.id, event, "running", null, userPrompt);
-        upsertProgressSecondaryItem(node, item);
-        refreshProgressGroupNode(node, event, node.primaryText, item.detail.summary);
-      }
+      const summary =
+        (typeof eventData.summary === "string" && eventData.summary.trim()) ||
+        (typeof eventData.summary_text === "string" && eventData.summary_text.trim()) ||
+        resolveProgressPrimaryText(
+          typeof eventData.tool === "string" ? eventData.tool : null,
+          "running",
+          eventData,
+          null,
+          userPrompt
+        );
+      const node = ensureProgressNode(groupId, event, summary);
+      settleProviderRecoveryItem(node, event, "completed", "主模型连接已恢复，继续执行。");
+      const item = buildToolSecondaryItem(node.id, event, "running", null, userPrompt);
+      upsertProgressSecondaryItem(node, item);
+      refreshProgressGroupNode(node, event, node.primaryText, item.detail.summary);
       toolCallToGroupId.set(toolCallId, groupId);
       return;
     }
@@ -5743,15 +5971,16 @@ function buildLiveTurn(liveTurn: LiveTurnState, sessionEvents: SessionEventPaylo
     : timeline;
   const thinkingTs = parseTimestamp(liveTurn.userMessage.createdAt) ?? Date.now();
   const hasRunningThinking = settledTimeline.some(isRunningThinkingNode);
+  const hasThinkingNode = settledTimeline.some((node) => node.kind === "thinking");
   const hasAnswerStart = settledTimeline.some((node) => node.kind === "answer_start");
   const shouldShowThinking =
     liveTurn.status === "running" &&
-    (liveTurn.answer.phase === "waiting" || liveTurn.answer.phase === "streaming") &&
+    liveTurn.answer.phase === "waiting" &&
+    !hasThinkingNode &&
     !hasRunningThinking &&
     !hasAnswerStart;
-  const syntheticThinkingCopy = settledTimeline.length > 0 ? "模型正在准备下一步" : null;
   const nextTimeline = shouldShowThinking
-    ? [...settledTimeline, applyTurnIdToNode(buildThinkingNode(thinkingTs, syntheticThinkingCopy, "running", settledTimeline.length > 0 ? "等待模型输出" : "当前思路"), turnId)]
+    ? [...settledTimeline, applyTurnIdToNode(buildThinkingNode(thinkingTs, null, "running", "当前思路"), turnId)]
     : settledTimeline;
 
   return {
@@ -6126,6 +6355,24 @@ function App({ onLogout }: AppProps) {
   const [instanceTokenRotating, setInstanceTokenRotating] = useState(false);
   const [latestRegeneratedAdminToken, setLatestRegeneratedAdminToken] = useState<string | null>(null);
   const [pluginBusyName, setPluginBusyName] = useState<string | null>(null);
+  const [pluginDrafts, setPluginDrafts] = useState<PluginDraftRecord[]>([]);
+  const [pluginDraftsLoading, setPluginDraftsLoading] = useState(false);
+  const [pluginDraftActionId, setPluginDraftActionId] = useState<string | null>(null);
+  const [pluginDraftFormOpen, setPluginDraftFormOpen] = useState(false);
+  const [pluginDraftForm, setPluginDraftForm] = useState<PluginDraftForm>({
+    requestText: "",
+    name: "",
+    version: "0.1.0",
+    description: "",
+    skillName: "",
+    skillDescription: "",
+    skillWhenToUse: "",
+    skillBody: "# Workflow\n\n1. ",
+    commandToolName: "",
+    commandExecutable: "",
+    commandDescription: "",
+    commandApproval: "safe",
+  });
   const [leftWidth, setLeftWidth] = useState(() => readStoredNumber("newman-left-rail-width", 220, LEFT_MIN, LEFT_MAX));
   const [leftRailCollapsed, setLeftRailCollapsed] = useState(false);
   const [htmlPreviewWidth, setHtmlPreviewWidth] = useState(() =>
@@ -6137,6 +6384,7 @@ function App({ onLogout }: AppProps) {
   const [dragging, setDragging] = useState<null | "left" | "html-preview" | "multiagent-drawer">(null);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [expandedTimelineIds, setExpandedTimelineIds] = useState<Record<string, boolean>>({});
+  const [expandedThinkingIds, setExpandedThinkingIds] = useState<Record<string, boolean>>({});
   const [multiagentDrawerOpen, setMultiagentDrawerOpen] = useState(false);
   const [multiagentRuns, setMultiagentRuns] = useState<SessionMultiagentRunsResponse["runs"]>([]);
   const [multiagentLoading, setMultiagentLoading] = useState(false);
@@ -8260,6 +8508,7 @@ function App({ onLogout }: AppProps) {
       if (signal?.aborted) return;
       setPlugins(data.plugins);
       setPluginErrors(data.errors);
+      await loadPluginDrafts(signal);
     } catch (error) {
       if (signal?.aborted) return;
       setPluginsError(error instanceof Error ? error.message : "插件列表加载失败");
@@ -8267,6 +8516,20 @@ function App({ onLogout }: AppProps) {
       if (!signal?.aborted) {
         setPluginsLoading(false);
       }
+    }
+  }
+
+  async function loadPluginDrafts(signal?: AbortSignal) {
+    setPluginDraftsLoading(true);
+    try {
+      const data = await fetchJson<PluginDraftsResponse>(`${apiBase}/api/plugin-drafts`, { signal });
+      if (signal?.aborted) return;
+      setPluginDrafts(data.drafts);
+    } catch (error) {
+      if (signal?.aborted) return;
+      setPluginsError(error instanceof Error ? error.message : "插件草稿加载失败");
+    } finally {
+      if (!signal?.aborted) setPluginDraftsLoading(false);
     }
   }
 
@@ -9780,6 +10043,75 @@ function App({ onLogout }: AppProps) {
     }));
   };
 
+  const isThinkingExpanded = (node: TimelineNode) => Boolean(expandedThinkingIds[node.id]);
+
+  const toggleThinkingNode = (node: TimelineNode) => {
+    setExpandedThinkingIds((current) => ({
+      ...current,
+      [node.id]: !current[node.id]
+    }));
+  };
+
+  const renderTimelineThinkingToggle = (node: TimelineNode) => {
+    const thinkingContent = readTimelineThinkingContent(node);
+    if (!thinkingContent) {
+      return null;
+    }
+    const expanded = isThinkingExpanded(node);
+    const panelId = `timeline-thinking-panel-${node.id}`;
+    return (
+      <button
+        type="button"
+        className={`timeline-thinking-toggle ${expanded ? "expanded" : ""}`}
+        onClick={() => toggleThinkingNode(node)}
+        aria-label={expanded ? "收起思考内容" : "展开思考内容"}
+        aria-expanded={expanded}
+        aria-controls={panelId}
+      >
+        <ChevronStrokeIcon className="timeline-thinking-toggle-icon" />
+      </button>
+    );
+  };
+
+  const renderTimelinePrimaryTitle = (node: TimelineNode, primaryText = node.primaryText) => (
+    <div className="timeline-primary-title-row">
+      <p className="timeline-primary-text">{primaryText}</p>
+      {renderTimelineThinkingToggle(node)}
+    </div>
+  );
+
+  const renderTimelineThinkingDetail = (node: TimelineNode) => {
+    const thinkingContent = readTimelineThinkingContent(node);
+    const expanded = isThinkingExpanded(node);
+    if (!thinkingContent || !expanded) {
+      return null;
+    }
+    return (
+      <div
+        id={`timeline-thinking-panel-${node.id}`}
+        className="timeline-thinking-detail expanded"
+      >
+        <pre>{thinkingContent}</pre>
+      </div>
+    );
+  };
+
+  const renderStandaloneThinkingSummary = (node: TimelineNode) => {
+    if (!readTimelineThinkingContent(node)) {
+      return null;
+    }
+    const title = node.state === "failed" ? node.primaryText : "思考已完成";
+    return (
+      <div className="standalone-thinking-summary">
+        <div className="timeline-primary-title-row">
+          <p className="timeline-primary-text">{title}</p>
+          {renderTimelineThinkingToggle(node)}
+        </div>
+        {renderTimelineThinkingDetail(node)}
+      </div>
+    );
+  };
+
   const toggleSessionMenu = (sessionId: string) => {
     setOpenSessionMenuId((currentId) => (currentId === sessionId ? null : sessionId));
   };
@@ -10236,6 +10568,105 @@ function App({ onLogout }: AppProps) {
       setPluginsError(error instanceof Error ? error.message : "插件重扫失败");
     } finally {
       setPluginsLoading(false);
+    }
+  };
+
+  const createPluginDraft = async () => {
+    const form = pluginDraftForm;
+    const requestText = form.requestText.trim();
+    if (!requestText) {
+      if (!form.name.trim()) {
+        setPluginsError("请填写插件名称，或直接输入自然语言需求");
+        return;
+      }
+      if (!form.skillName.trim() && !form.commandToolName.trim()) {
+        setPluginsError("至少填写一个 Skill 名称或 CLI Tool 名称");
+        return;
+      }
+      if (form.commandToolName.trim() && !form.commandExecutable.trim()) {
+        setPluginsError("CLI Tool 需要填写可执行命令");
+        return;
+      }
+    }
+    setPluginDraftActionId("new");
+    setPluginsError(null);
+    setPluginsNotice(null);
+    try {
+      const payload = requestText
+        ? {
+            request: requestText,
+            generate: true,
+          }
+        : {
+            spec: {
+              name: form.name.trim(),
+              version: form.version.trim() || "0.1.0",
+              description: form.description.trim(),
+              skills: form.skillName.trim()
+                ? [
+                    {
+                      name: form.skillName.trim(),
+                      description: form.skillDescription.trim() || "Plugin workflow guidance.",
+                      when_to_use: form.skillWhenToUse.trim() || "Use when the request matches this plugin workflow.",
+                      body_markdown: form.skillBody.trim() || "# Workflow\n\nFollow the plugin workflow.",
+                    },
+                  ]
+                : [],
+              commands: form.commandToolName.trim()
+                ? [
+                    {
+                      tool_name: form.commandToolName.trim(),
+                      executable: form.commandExecutable.trim(),
+                      description: form.commandDescription.trim(),
+                      approval_behavior: form.commandApproval,
+                      timeout_seconds: 30,
+                      readonly_prefixes: [],
+                      readable_roots: [],
+                      writable_roots: [],
+                      env: {},
+                    },
+                  ]
+                : [],
+              environment: [],
+            },
+            generate: true,
+          };
+
+      const data = await fetchJson<{ draft: PluginDraftRecord }>(`${apiBase}/api/plugin-drafts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      setPluginDrafts((current) => [data.draft, ...current.filter((item) => item.draft_id !== data.draft.draft_id)]);
+      setPluginDraftFormOpen(false);
+      setPluginsNotice(`已生成插件草稿 ${data.draft.plugin_name}`);
+    } catch (error) {
+      setPluginsError(error instanceof Error ? error.message : "插件草稿生成失败");
+    } finally {
+      setPluginDraftActionId(null);
+    }
+  };
+
+  const runPluginDraftAction = async (draft: PluginDraftRecord, action: "validate" | "approve" | "install" | "reject" | "rollback") => {
+    if (action === "approve" && !window.confirm(`确认审批插件草稿「${draft.plugin_name}」吗？安装后仍保持停用。`)) return;
+    if (action === "install" && !window.confirm(`确认安装插件「${draft.plugin_name}」吗？安装后默认停用，需要再手动启用。`)) return;
+    if (action === "rollback" && !window.confirm(`确认回滚插件「${draft.plugin_name}」吗？`)) return;
+    setPluginDraftActionId(`${draft.draft_id}:${action}`);
+    setPluginsError(null);
+    setPluginsNotice(null);
+    try {
+      const payload = action === "approve" ? { confirm: true } : undefined;
+      const data = await fetchJson<{ draft: PluginDraftRecord }>(`${apiBase}/api/plugin-drafts/${encodeURIComponent(draft.draft_id)}/${action}`, {
+        method: "POST",
+        ...(payload ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) } : {}),
+      });
+      setPluginDrafts((current) => current.map((item) => (item.draft_id === draft.draft_id ? data.draft : item)));
+      if (action === "install" || action === "rollback") await loadPluginsWorkspace();
+      setPluginsNotice(action === "install" ? `插件 ${draft.plugin_name} 已安装并停用` : `草稿 ${draft.plugin_name} 已${action === "validate" ? "校验" : action === "approve" ? "审批" : action === "reject" ? "拒绝" : "回滚"}`);
+    } catch (error) {
+      setPluginsError(error instanceof Error ? error.message : "插件草稿操作失败");
+    } finally {
+      setPluginDraftActionId(null);
     }
   };
 
@@ -11299,11 +11730,19 @@ function App({ onLogout }: AppProps) {
                           const showAnswerBubble = shouldRenderAnswerBubble(turn) && (!awaitingInput || showAwaitingInputInAnswer);
                           const assistantCopyValue =
                             turn.answer?.content.trim() ? turn.answer.content : turn.answer?.phase === "failed" ? answerCopy : null;
-                          const visibleThinkingNode = turn.timeline.find(
-                            (node) => node.kind === "thinking" && node.state === "running" && turn.isLive
-                          );
-                          const hasVisibleThinkingNode = Boolean(visibleThinkingNode);
                           const visibleTimelineNodes = turn.timeline.filter((node) => node.kind !== "thinking");
+                          const completedThinkingNode = [...turn.timeline]
+                            .reverse()
+                            .find((node) => node.kind === "thinking" && readTimelineThinkingContent(node)) ?? null;
+                          const runningThinkingNode = [...turn.timeline]
+                            .reverse()
+                            .find((node) => node.kind === "thinking" && node.state === "running" && turn.isLive) ?? null;
+                          const streamingThinkingNode =
+                            !showAnswerBubble && turn.isLive ? runningThinkingNode ?? completedThinkingNode ?? null : null;
+                          const standaloneThinkingNode =
+                            visibleTimelineNodes.length === 0 && !streamingThinkingNode ? completedThinkingNode ?? null : null;
+                          const visibleThinkingNode = streamingThinkingNode;
+                          const hasVisibleThinkingNode = Boolean(visibleThinkingNode);
                           const shouldShowTimelineStack = visibleTimelineNodes.length > 0 || hasVisibleThinkingNode;
                           return (
                             <div key={turn.id} className={`turn-block ${turn.isLive ? "live" : ""}`}>
@@ -11379,13 +11818,15 @@ function App({ onLogout }: AppProps) {
 
                                           <div className="timeline-primary-copy">
                                             <div className="timeline-approval-primary">
-                                              <p className="timeline-primary-text">{node.primaryText}</p>
+                                              {renderTimelinePrimaryTitle(node)}
                                               {!showPendingActions ? (
                                                 <span className={`timeline-approval-status-tag state-${node.state}`}>
                                                   {buildApprovalStateLabel(node.state)}
                                                 </span>
                                               ) : null}
                                             </div>
+
+                                            {renderTimelineThinkingDetail(node)}
 
                                             {showPendingActions ? (
                                               <div className="timeline-approval-action-row">
@@ -11475,7 +11916,9 @@ function App({ onLogout }: AppProps) {
                                         </div>
 
                                         <div className="timeline-primary-copy">
-                                          <p className="timeline-primary-text">{node.primaryText}</p>
+                                          {renderTimelinePrimaryTitle(node)}
+
+                                          {renderTimelineThinkingDetail(node)}
 
                                           {node.secondaryItems.length > 0 ? (
                                             <button
@@ -11559,59 +12002,96 @@ function App({ onLogout }: AppProps) {
                                     );
                                   })}
 
-                                  {visibleThinkingNode ? (
-                                    <article className="timeline-node timeline-thinking-node" aria-label="Thinking">
-                                      <div
-                                        className={`timeline-primary-marker rail-only ${
-                                          visibleTimelineNodes.length > 0 ? "has-head" : ""
-                                        }`}
-                                      />
+                                  {visibleThinkingNode
+                                    ? (() => {
+                                        const thinkingContent = readTimelineThinkingContent(visibleThinkingNode);
+                                        const previewLines = buildThinkingPreviewLines(thinkingContent);
+                                        const isLiveThinkingPreview = !showAnswerBubble && turn.isLive;
+                                        const isPreparingNextSignal = isLiveThinkingPreview && visibleThinkingNode.state === "completed";
+                                        const thinkingStatusWord = isPreparingNextSignal ? "preparing" : "thinking";
+                                        return (
+                                          <article
+                                            className={`timeline-node timeline-thinking-node state-${visibleThinkingNode.state}`}
+                                            aria-label={isLiveThinkingPreview ? "Thinking" : "思考内容"}
+                                          >
+                                            <div
+                                              className={`timeline-primary-marker rail-only ${
+                                                visibleTimelineNodes.length > 0 ? "has-head" : ""
+                                              }`}
+                                            />
 
-                                      <div className="timeline-primary-copy timeline-thinking-copy">
-                                        <div className="thinking-logo-row">
-                                          <img src={logo} alt="" className="thinking-inline-logo" />
-                                          <div className="thinking-inline-copy">
-                                            <span className="thinking-inline-word">thinking</span>
-                                            <span className="thinking-inline-dots" aria-hidden="true">
-                                              <span className="thinking-inline-dot dot-one">.</span>
-                                              <span className="thinking-inline-dot dot-two">.</span>
-                                              <span className="thinking-inline-dot dot-three">.</span>
-                                            </span>
-                                          </div>
-                                        </div>
-                                      </div>
-                                    </article>
-                                  ) : null}
+                                            <div className={`timeline-primary-copy timeline-thinking-copy ${isLiveThinkingPreview ? "streaming" : "collapsed"}`}>
+                                              {isLiveThinkingPreview ? (
+                                                <>
+                                                  <div className="thinking-logo-row">
+                                                    <img src={logo} alt="" className="thinking-inline-logo" />
+                                                    <div className="thinking-inline-copy">
+                                                      <span className="thinking-inline-word">{thinkingStatusWord}</span>
+                                                      <span className="thinking-inline-dots" aria-hidden="true">
+                                                        <span className="thinking-inline-dot dot-one">.</span>
+                                                        <span className="thinking-inline-dot dot-two">.</span>
+                                                        <span className="thinking-inline-dot dot-three">.</span>
+                                                      </span>
+                                                    </div>
+                                                  </div>
+                                                  {previewLines.length > 0 ? (
+                                                    <div className="timeline-thinking-preview" aria-live="polite">
+                                                      {previewLines.map((line, lineIndex) => (
+                                                        <span key={`${visibleThinkingNode.id}:preview:${lineIndex}`} className="timeline-thinking-preview-line">
+                                                          {line}
+                                                        </span>
+                                                      ))}
+                                                    </div>
+                                                  ) : null}
+                                                </>
+                                              ) : (
+                                                <>
+                                                  {renderTimelinePrimaryTitle(
+                                                    visibleThinkingNode,
+                                                    visibleThinkingNode.state === "completed" ? "思考已完成" : visibleThinkingNode.primaryText
+                                                  )}
+                                                  {renderTimelineThinkingDetail(visibleThinkingNode)}
+                                                </>
+                                              )}
+                                            </div>
+                                          </article>
+                                        );
+                                      })()
+                                    : null}
                                 </div>
                               ) : null}
 
-                              {showAnswerBubble ? (
-                                <div className="trace-row">
+                              {standaloneThinkingNode || showAnswerBubble ? (
+                                <div className={`trace-row ${standaloneThinkingNode ? "standalone-thinking-row" : ""}`}>
                                   <MessageHoverShell
                                     shellClassName="assistant"
                                     align="start"
                                     timestamp={turn.answer?.createdAt ?? turn.userMessage.createdAt}
-                                    copyValue={showAssistantMessageMeta ? assistantCopyValue : null}
+                                    copyValue={showAnswerBubble && showAssistantMessageMeta ? assistantCopyValue : null}
                                     copyLabel="回复"
-                                    showMeta={showAssistantMessageMeta && Boolean(turn.answer)}
+                                    showMeta={showAnswerBubble && showAssistantMessageMeta && Boolean(turn.answer)}
                                     turnUsage={turn.usage}
                                     durationMs={turn.durationMs}
                                   >
-                                    <div className="trace-bubble wide final answer-bubble">
-                                      {awaitingInput ? (
-                                        renderAwaitingUserInputCard(awaitingInput, turn)
-                                      ) : (
-                                        <MessageContent
-                                          apiBase={apiBase}
-                                          variant="assistant"
-                                          content={answerCopy}
-                                          attachments={turn.answer?.attachments ?? []}
-                                          className="trace-copy"
-                                          onOpenHtmlPreview={openHtmlPreview}
-                                          deferCodeBlocksUntilComplete={turn.isLive && turn.status === "running"}
-                                        />
-                                      )}
-                                    </div>
+                                    {standaloneThinkingNode ? renderStandaloneThinkingSummary(standaloneThinkingNode) : null}
+
+                                    {showAnswerBubble ? (
+                                      <div className="trace-bubble wide final answer-bubble">
+                                        {awaitingInput ? (
+                                          renderAwaitingUserInputCard(awaitingInput, turn)
+                                        ) : (
+                                          <MessageContent
+                                            apiBase={apiBase}
+                                            variant="assistant"
+                                            content={answerCopy}
+                                            attachments={turn.answer?.attachments ?? []}
+                                            className="trace-copy"
+                                            onOpenHtmlPreview={openHtmlPreview}
+                                            deferCodeBlocksUntilComplete={turn.isLive && turn.status === "running"}
+                                          />
+                                        )}
+                                      </div>
+                                    ) : null}
                                   </MessageHoverShell>
                                 </div>
                               ) : null}
@@ -12361,6 +12841,298 @@ function App({ onLogout }: AppProps) {
                       </div>
                     </div>
                   </article>
+
+                  <article className="workspace-card settings-card system-settings-panel wide">
+                    <div className="workspace-card-head">
+                      <div>
+                        <h3>插件制作</h3>
+                        <p>用自然语言生成插件草稿，人工复核 manifest、风险和文件后再安装。</p>
+                      </div>
+                      <div className="workspace-inline-actions">
+                        <button
+                          type="button"
+                          className="workspace-secondary-button"
+                          onClick={() => void loadPluginDrafts()}
+                          disabled={pluginDraftsLoading}
+                        >
+                          {pluginDraftsLoading ? "刷新中..." : "刷新草稿"}
+                        </button>
+                        <button
+                          type="button"
+                          className="workspace-primary-button"
+                          onClick={() => {
+                            setPluginDraftFormOpen((current) => !current);
+                            setPluginsError(null);
+                            setPluginsNotice(null);
+                          }}
+                        >
+                          {pluginDraftFormOpen ? "收起制作器" : "新建插件草稿"}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="workspace-card-body">
+                      {pluginDraftFormOpen ? (
+                        <div className="plugin-draft-builder">
+                          <div className="workspace-detail-block">
+                            <span className="workspace-field-label">自然语言需求</span>
+                            <textarea
+                              className="workspace-editor plugin-draft-request"
+                              value={pluginDraftForm.requestText}
+                              onChange={(event) => {
+                                setPluginDraftForm((current) => ({ ...current, requestText: event.target.value }));
+                                setPluginsError(null);
+                              }}
+                              placeholder={
+                                "例如：创建一个飞书审批插件，帮助我查询待审批事项并总结处理建议。\n如果需要 CLI，请显式写：工具名: jira_view / 命令: jira issue view / JIRA_TOKEN 从环境变量读取"
+                              }
+                              spellCheck={false}
+                            />
+                          </div>
+
+                          <div className="plugin-draft-advanced-grid" aria-label="结构化补充字段">
+                            <input
+                              className="workspace-text-input"
+                              value={pluginDraftForm.name}
+                              onChange={(event) => setPluginDraftForm((current) => ({ ...current, name: event.target.value }))}
+                              placeholder="插件名（无自然语言时必填）"
+                            />
+                            <input
+                              className="workspace-text-input"
+                              value={pluginDraftForm.version}
+                              onChange={(event) => setPluginDraftForm((current) => ({ ...current, version: event.target.value }))}
+                              placeholder="版本，例如 0.1.0"
+                            />
+                            <input
+                              className="workspace-text-input"
+                              value={pluginDraftForm.skillName}
+                              onChange={(event) => setPluginDraftForm((current) => ({ ...current, skillName: event.target.value }))}
+                              placeholder="Skill 名称"
+                            />
+                            <input
+                              className="workspace-text-input"
+                              value={pluginDraftForm.commandToolName}
+                              onChange={(event) => setPluginDraftForm((current) => ({ ...current, commandToolName: event.target.value }))}
+                              placeholder="CLI Tool 名称"
+                            />
+                            <input
+                              className="workspace-text-input plugin-draft-wide-input"
+                              value={pluginDraftForm.description}
+                              onChange={(event) => setPluginDraftForm((current) => ({ ...current, description: event.target.value }))}
+                              placeholder="插件描述"
+                            />
+                            <input
+                              className="workspace-text-input plugin-draft-wide-input"
+                              value={pluginDraftForm.commandExecutable}
+                              onChange={(event) => setPluginDraftForm((current) => ({ ...current, commandExecutable: event.target.value }))}
+                              placeholder="可执行命令，例如 jira 或 gh"
+                            />
+                            <select
+                              className="workspace-text-input"
+                              value={pluginDraftForm.commandApproval}
+                              onChange={(event) =>
+                                setPluginDraftForm((current) => ({
+                                  ...current,
+                                  commandApproval: event.target.value === "confirmable" ? "confirmable" : "safe",
+                                }))
+                              }
+                            >
+                              <option value="safe">safe</option>
+                              <option value="confirmable">confirmable</option>
+                            </select>
+                          </div>
+
+                          <div className="workspace-inline-actions plugin-draft-submit-row">
+                            <button
+                              type="button"
+                              className="workspace-secondary-button"
+                              onClick={() => setPluginDraftFormOpen(false)}
+                              disabled={pluginDraftActionId === "new"}
+                            >
+                              取消
+                            </button>
+                            <button
+                              type="button"
+                              className="workspace-primary-button"
+                              onClick={() => void createPluginDraft()}
+                              disabled={pluginDraftActionId === "new"}
+                            >
+                              {pluginDraftActionId === "new" ? "生成中..." : "生成并校验"}
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {pluginDraftsLoading && pluginDrafts.length === 0 ? <div className="workspace-empty">正在加载插件草稿...</div> : null}
+                      {!pluginDraftsLoading && pluginDrafts.length === 0 ? <div className="workspace-empty">还没有插件草稿。</div> : null}
+
+                      {pluginDrafts.length > 0 ? (
+                        <div className="plugin-draft-list">
+                          {pluginDrafts.map((draft) => {
+                            const statusTone = pluginDraftStatusTone(draft.status);
+                            const riskLevel = draft.risk?.level ?? "low";
+                            const canValidate = draft.status === "generated" || draft.status === "validation_failed";
+                            const canApprove = draft.status === "awaiting_approval";
+                            const canInstall = draft.status === "approved";
+                            const canRollback = draft.status === "installed_disabled";
+                            const canReject = !["installed_disabled", "rejected", "rolled_back"].includes(draft.status);
+
+                            return (
+                              <article key={draft.draft_id} className="plugin-draft-card">
+                                <div className="plugin-draft-card-head">
+                                  <div className="plugin-draft-title-block">
+                                    <div className="plugin-draft-title-row">
+                                      <strong>{draft.plugin_name}</strong>
+                                      <span className={`workspace-pill ${statusTone}`}>{pluginDraftStatusLabel(draft.status)}</span>
+                                      <span className={`workspace-pill risk-${riskLevel}`}>Risk {pluginDraftRiskLabel(riskLevel)}</span>
+                                    </div>
+                                    <p>{draft.spec.description || draft.source_request || "暂无描述"}</p>
+                                  </div>
+                                  <div className="plugin-draft-actions">
+                                    {canValidate ? (
+                                      <button
+                                        type="button"
+                                        className="workspace-secondary-button"
+                                        onClick={() => void runPluginDraftAction(draft, "validate")}
+                                        disabled={pluginDraftActionBusy(pluginDraftActionId, draft, "validate")}
+                                      >
+                                        {pluginDraftActionBusy(pluginDraftActionId, draft, "validate") ? "校验中..." : "校验"}
+                                      </button>
+                                    ) : null}
+                                    {canApprove ? (
+                                      <button
+                                        type="button"
+                                        className="workspace-primary-button"
+                                        onClick={() => void runPluginDraftAction(draft, "approve")}
+                                        disabled={pluginDraftActionBusy(pluginDraftActionId, draft, "approve")}
+                                      >
+                                        {pluginDraftActionBusy(pluginDraftActionId, draft, "approve") ? "审批中..." : "审批"}
+                                      </button>
+                                    ) : null}
+                                    {canInstall ? (
+                                      <button
+                                        type="button"
+                                        className="workspace-primary-button"
+                                        onClick={() => void runPluginDraftAction(draft, "install")}
+                                        disabled={pluginDraftActionBusy(pluginDraftActionId, draft, "install")}
+                                      >
+                                        {pluginDraftActionBusy(pluginDraftActionId, draft, "install") ? "安装中..." : "安装"}
+                                      </button>
+                                    ) : null}
+                                    {canRollback ? (
+                                      <button
+                                        type="button"
+                                        className="workspace-danger-button"
+                                        onClick={() => void runPluginDraftAction(draft, "rollback")}
+                                        disabled={pluginDraftActionBusy(pluginDraftActionId, draft, "rollback")}
+                                      >
+                                        {pluginDraftActionBusy(pluginDraftActionId, draft, "rollback") ? "回滚中..." : "回滚"}
+                                      </button>
+                                    ) : null}
+                                    {canReject ? (
+                                      <button
+                                        type="button"
+                                        className="workspace-secondary-button"
+                                        onClick={() => void runPluginDraftAction(draft, "reject")}
+                                        disabled={pluginDraftActionBusy(pluginDraftActionId, draft, "reject")}
+                                      >
+                                        {pluginDraftActionBusy(pluginDraftActionId, draft, "reject") ? "处理中..." : "拒绝"}
+                                      </button>
+                                    ) : null}
+                                  </div>
+                                </div>
+
+                                <div className="plugin-draft-meta-row">
+                                  <span>{draft.spec.skills.length} Skills</span>
+                                  <span>{draft.spec.commands.length} CLI</span>
+                                  <span>{draft.package_files.length} files</span>
+                                  <span>更新 {formatDateTime(draft.updated_at)}</span>
+                                </div>
+
+                                {draft.source_request ? (
+                                  <p className="workspace-row-copy plugin-draft-source">需求：{draft.source_request}</p>
+                                ) : null}
+
+                                {draft.error ? <div className="workspace-alert error">{draft.error}</div> : null}
+
+                                {draft.review?.conflicts.length ? (
+                                  <div className="workspace-alert error">
+                                    {draft.review.conflicts.join("；")}
+                                  </div>
+                                ) : null}
+
+                                {draft.validation?.warnings.length ? (
+                                  <div className="plugin-draft-warning-list">
+                                    {draft.validation.warnings.map((warning) => (
+                                      <span key={warning}>{warning}</span>
+                                    ))}
+                                  </div>
+                                ) : null}
+
+                                {draft.review ? (
+                                  <div className="plugin-draft-review">
+                                    <div className="plugin-draft-review-grid">
+                                      <div>
+                                        <span className="workspace-field-label">安装目标</span>
+                                        <p className="plugin-draft-review-path" title={draft.review.install_target || ""}>
+                                          {draft.review.install_target || "未生成"}
+                                        </p>
+                                      </div>
+                                      <div>
+                                        <span className="workspace-field-label">文件变更</span>
+                                        <p className="plugin-draft-review-copy">{summarizePluginDraftFileChanges(draft)}</p>
+                                      </div>
+                                    </div>
+
+                                    <div className="plugin-draft-review-chip-row">
+                                      {draft.review.required_confirmations.map((item) => (
+                                        <span key={item}>{pluginDraftConfirmationLabel(item)}</span>
+                                      ))}
+                                      {draft.review.environment.map((item) => (
+                                        <span key={item}>ENV {item}</span>
+                                      ))}
+                                      {draft.review.commands.map((command) => (
+                                        <span key={command.tool_name}>
+                                          CLI {command.tool_name} · {command.approval_behavior}
+                                        </span>
+                                      ))}
+                                    </div>
+
+                                    {draft.review.safety_notes.length ? (
+                                      <div className="plugin-draft-note-list">
+                                        {draft.review.safety_notes.map((note) => (
+                                          <span key={note}>{note}</span>
+                                        ))}
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                ) : null}
+
+                                <details className="plugin-draft-preview">
+                                  <summary>Manifest、文件与 diff 预览</summary>
+                                  <div className="plugin-draft-preview-grid">
+                                    <pre>{draft.manifest_content || "暂无 manifest"}</pre>
+                                    <div className="plugin-draft-file-list">
+                                      {draft.review?.file_changes.length ? null : draft.package_files.length === 0 ? <span>暂无文件</span> : null}
+                                      {draft.review?.file_changes.length
+                                        ? draft.review.file_changes.map((file) => (
+                                            <span key={`${file.status}:${file.path}`} className={`file-${file.status}`}>
+                                              {pluginDraftFileStatusLabel(file.status)} · {file.path}
+                                            </span>
+                                          ))
+                                        : draft.package_files.map((file) => (
+                                        <span key={file}>{file}</span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </details>
+                              </article>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
+                  </article>
                 </div>
               ) : null}
 
@@ -12408,7 +13180,7 @@ function App({ onLogout }: AppProps) {
                         <p className="workspace-copy">
                           当前运行时会合并项目根目录 <code>.env</code>、<code>~/.newman/.env</code> 和进程环境变量；
                           更高优先级依次为 <code>进程环境变量 &gt; ~/.newman/.env &gt; 项目 .env</code>，且只有{" "}
-                          <code>NEWMAN_*</code> 键会参与主配置装配。像 <code>SERPAPI_API_KEY</code> 这类集成密钥也可以放在这里，由运行时直接读取。
+                          <code>NEWMAN_*</code> 键会参与主配置装配。<code>ANYSEARCH_API_KEY</code> 会提供给已安装的 AnySearch skill 使用。
                         </p>
                       </div>
 
@@ -12521,7 +13293,7 @@ function App({ onLogout }: AppProps) {
                               <span className="workspace-field-label">说明</span>
                               <p className="workspace-copy">
                                 这里直接编辑项目根目录 <code>.env</code>。常用形式例如 <code>NEWMAN_SERVER_PORT=8010</code>、
-                                <code>SERPAPI_API_KEY=xxx</code> 或 <code>NEWMAN_CHANNELS__FEISHU__APP_ID=cli_xxx</code>。
+                                <code>ANYSEARCH_API_KEY=as_sk_xxx</code> 或 <code>NEWMAN_CHANNELS__FEISHU__APP_ID=cli_xxx</code>。
                               </p>
                             </div>
                             <div className="workspace-detail-block">

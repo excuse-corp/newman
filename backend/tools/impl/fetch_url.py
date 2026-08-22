@@ -75,12 +75,13 @@ class FetchUrlTool(BaseTool):
         self.meta = ToolMeta(
             name="fetch_url",
             description=(
-                "Fetch a URL over HTTP(S), follow redirects, and return the extracted main text of the page "
-                "with reduced HTML noise."
+                "Fetch the extracted main text from one specific, already-known HTTP(S) URL. Use only when the "
+                "user supplied the URL or a prior search returned it; do not use this tool to discover pages or "
+                "answer a broad web-search question."
             ),
             input_schema={
                 "type": "object",
-                "properties": {"url": {"type": "string"}},
+                "properties": {"url": {"type": "string", "description": "A specific, already-known HTTP(S) URL."}},
                 "required": ["url"],
                 "additionalProperties": False,
             },

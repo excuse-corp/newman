@@ -130,6 +130,8 @@ class OpenAICompatibleProvider(BaseProvider):
                         usage = _parse_usage(data.get("usage", {})) if isinstance(data.get("usage"), dict) else None
                         _record_stream_debug_sample(self.config, choice, delta, stream_debug_samples)
                         _accumulate_response_provider_state(self.config, delta, provider_state)
+                        if reasoning_delta := _extract_reasoning_delta(self.config, delta):
+                            yield ProviderChunk(type="thinking", delta=reasoning_delta, finish_reason=choice.get("finish_reason"))
                         if content := delta.get("content"):
                             saw_content = True
                             yield ProviderChunk(type="text", delta=str(content), finish_reason=choice.get("finish_reason"))
@@ -581,6 +583,28 @@ def _accumulate_response_provider_state(config: ModelConfig, delta: dict[str, An
             state[field] = existing + str(value or "")
         else:
             state[field] = str(value or "")
+
+
+def _extract_reasoning_delta(config: ModelConfig, delta: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for field in _reasoning_response_fields(config):
+        if field not in delta:
+            continue
+        value = delta.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, (int, float, bool)):
+            parts.append(str(value))
+        elif isinstance(value, list):
+            parts.extend(str(item) for item in value if item is not None)
+        elif isinstance(value, dict):
+            for key in ("content", "text", "reasoning_content", "reasoning", "thinking", "thought"):
+                nested = value.get(key)
+                if nested is not None:
+                    parts.append(str(nested))
+    return "".join(parts)
 
 
 def _parse_usage(usage_raw: dict[str, Any]) -> TokenUsage:

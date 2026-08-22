@@ -24,7 +24,7 @@ export default function SetupPage({ onConfigured }: SetupPageProps) {
   const [multimodalEndpoint, setMultimodalEndpoint] = useState("");
   const [multimodalApiKey, setMultimodalApiKey] = useState("");
   const [multimodalModel, setMultimodalModel] = useState("");
-  const [serpapiApiKey, setSerpapiApiKey] = useState("");
+  const [anysearchApiKey, setAnysearchApiKey] = useState("");
   const [feishuAppId, setFeishuAppId] = useState("");
   const [feishuAppSecret, setFeishuAppSecret] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -83,7 +83,7 @@ export default function SetupPage({ onConfigured }: SetupPageProps) {
           multimodal_endpoint: sharePrimaryForMultimodal ? undefined : trimmedMultimodalEndpoint,
           multimodal_api_key: sharePrimaryForMultimodal ? undefined : trimmedMultimodalApiKey,
           multimodal_model: trimmedMultimodalModel || undefined,
-          serpapi_api_key: serpapiApiKey.trim() || undefined,
+          anysearch_api_key: anysearchApiKey.trim() || undefined,
           feishu_app_id: trimmedFeishuAppId || undefined,
           feishu_app_secret: trimmedFeishuAppSecret || undefined,
           login_after_setup: true,
@@ -241,21 +241,21 @@ export default function SetupPage({ onConfigured }: SetupPageProps) {
             <div className="setup-section-head">
               <span className="setup-section-label">Extras</span>
               <span className="setup-section-rule" aria-hidden="true" />
-              <span className="setup-section-meta">SerpApi · 飞书</span>
+              <span className="setup-section-meta">AnySearch · 飞书</span>
             </div>
 
             <div className="setup-field">
               <div className="setup-field-row">
-                <label htmlFor="setup-serpapi-key">SerpApi key</label>
+                <label htmlFor="setup-anysearch-key">AnySearch API key</label>
                 <span className="setup-field-flag">optional</span>
               </div>
               <input
-                id="setup-serpapi-key"
+                id="setup-anysearch-key"
                 type="password"
                 className="setup-input"
-                value={serpapiApiKey}
-                onChange={(event) => setSerpapiApiKey(event.target.value)}
-                placeholder="用于联网搜索"
+                value={anysearchApiKey}
+                onChange={(event) => setAnysearchApiKey(event.target.value)}
+                placeholder="as_sk_..."
                 autoComplete="off"
                 spellCheck={false}
               />

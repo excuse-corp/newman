@@ -13,10 +13,12 @@ from backend.config.schema import AppConfig
 
 
 CONFIG_ENV_PREFIX = "NEWMAN_"
+INTEGRATION_ENV_KEYS = ("ANYSEARCH_API_KEY",)
 LOGGER = logging.getLogger("newman.config")
 DISPLAY_LOGGER = logging.getLogger("uvicorn.error")
 SENSITIVE_MARKERS = {"api_key", "token", "secret", "password"}
 _LAST_SETTINGS_REPORT: "ConfigLoadReport | None" = None
+_MANAGED_INTEGRATION_ENV: dict[str, str] = {}
 PROJECT_CONFIG_TEMPLATE = """# Newman project config
 # This file is the project deployment config generated during initialization.
 # backend/config/defaults.yaml provides the built-in baseline template and fallback values.
@@ -242,6 +244,25 @@ def _read_dotenv(path: Path) -> dict[str, str]:
     return parse_dotenv_content(path.read_text(encoding="utf-8"))
 
 
+def _hydrate_integration_environment(root: Path) -> None:
+    """Expose project-managed integration keys to local skill runtimes."""
+    dotenv_values = _read_dotenv(root / ".env")
+    dotenv_values.update(_read_dotenv(Path.home() / ".newman" / ".env"))
+    for key in INTEGRATION_ENV_KEYS:
+        configured_value = dotenv_values.get(key, "").strip()
+        current_value = os.environ.get(key)
+        managed_value = _MANAGED_INTEGRATION_ENV.get(key)
+        is_managed_value = current_value == managed_value
+        if current_value and not is_managed_value and current_value != configured_value:
+            continue
+        if configured_value:
+            os.environ[key] = configured_value
+            _MANAGED_INTEGRATION_ENV[key] = configured_value
+        elif is_managed_value:
+            os.environ.pop(key, None)
+            _MANAGED_INTEGRATION_ENV.pop(key, None)
+
+
 def parse_dotenv_content(content: str) -> dict[str, str]:
     values: dict[str, str] = {}
     for raw_line in content.splitlines():
@@ -455,6 +476,7 @@ def validate_project_dotenv_content(content: str, project_root: str | None = Non
 def get_settings(project_root: str | None = None) -> AppConfig:
     global _LAST_SETTINGS_REPORT
     root = resolve_project_root(project_root)
+    _hydrate_integration_environment(root)
     settings, report = _load_settings_uncached(root)
     _LAST_SETTINGS_REPORT = report
 

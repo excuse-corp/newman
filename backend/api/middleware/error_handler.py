@@ -12,6 +12,10 @@ def install_error_handlers(app: FastAPI) -> None:
     async def handle_not_found(request: Request, exc: FileNotFoundError) -> JSONResponse:
         return api_error_response(request, status_code=404, kind="not_found", message=str(exc))
 
+    @app.exception_handler(FileExistsError)
+    async def handle_exists(request: Request, exc: FileExistsError) -> JSONResponse:
+        return api_error_response(request, status_code=409, kind="conflict", message=str(exc))
+
     @app.exception_handler(RequestValidationError)
     async def handle_validation(request: Request, exc: RequestValidationError) -> JSONResponse:
         return api_error_response(request, status_code=422, kind="validation", message="请求参数校验失败", details=exc.errors())

@@ -19,6 +19,7 @@ from backend.api.routes.evolution import router as evolution_router
 from backend.api.routes.mcp import router as mcp_router
 from backend.api.routes.messages import router as messages_router
 from backend.api.routes.plugins import router as plugins_router
+from backend.api.routes.plugin_drafts import router as plugin_drafts_router
 from backend.api.routes.runtime_location import router as runtime_location_router
 from backend.api.routes.scheduler import router as scheduler_router
 from backend.api.routes.sessions import router as sessions_router
@@ -71,6 +72,7 @@ def create_app() -> FastAPI:
     app.include_router(config_router)
     app.include_router(workspace_router)
     app.include_router(plugins_router)
+    app.include_router(plugin_drafts_router)
     app.include_router(skills_router)
     app.include_router(tools_router)
     app.include_router(runtime_location_router)

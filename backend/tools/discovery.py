@@ -10,6 +10,7 @@ from backend.tools.base import BaseTool
 if TYPE_CHECKING:
     from backend.mcp.registry import MCPRegistry
     from backend.plugin_runtime.service import PluginService
+    from backend.plugin_runtime.draft_service import PluginDraftService
     from backend.providers.multimodal import MultimodalAnalyzer
     from backend.sandbox.native_sandbox import NativeSandbox
     from backend.scheduler.scheduler_engine import SchedulerEngine
@@ -30,6 +31,7 @@ class BuiltinToolContext:
     mcp_registry: "MCPRegistry | None" = None
     subagent_manager: "MultiAgentManager | None" = None
     plugin_service: "PluginService | None" = None
+    plugin_draft_service: "PluginDraftService | None" = None
 
 
 def load_builtin_tools(context: BuiltinToolContext) -> list[BaseTool]:

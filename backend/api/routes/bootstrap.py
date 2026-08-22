@@ -26,7 +26,7 @@ class BootstrapSetupRequest(BaseModel):
     multimodal_endpoint: str | None = Field(default=None, max_length=512, description="多模态模型 endpoint")
     multimodal_api_key: str | None = Field(default=None, max_length=512, description="多模态模型 API key")
     multimodal_model: str | None = Field(default=None, max_length=256, description="多模态模型名称")
-    serpapi_api_key: str | None = Field(default=None, max_length=512, description="SerpApi key")
+    anysearch_api_key: str | None = Field(default=None, max_length=512, description="AnySearch key")
     feishu_app_id: str | None = Field(default=None, max_length=256, description="飞书应用 app_id")
     feishu_app_secret: str | None = Field(default=None, max_length=512, description="飞书应用 app_secret")
     login_after_setup: bool = True
@@ -104,9 +104,9 @@ def _build_bootstrap_env_updates(payload: BootstrapSetupRequest) -> dict[str, st
             }
         )
 
-    serpapi_api_key = (payload.serpapi_api_key or "").strip()
-    if serpapi_api_key:
-        updates["SERPAPI_API_KEY"] = serpapi_api_key
+    anysearch_api_key = (payload.anysearch_api_key or "").strip()
+    if anysearch_api_key:
+        updates["ANYSEARCH_API_KEY"] = anysearch_api_key
 
     feishu_app_id = (payload.feishu_app_id or "").strip()
     feishu_app_secret = (payload.feishu_app_secret or "").strip()
