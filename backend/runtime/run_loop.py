@@ -5,6 +5,7 @@ import json
 import mimetypes
 import re
 import shutil
+import sys
 from time import monotonic
 from json import JSONDecodeError
 from pathlib import Path
@@ -88,7 +89,14 @@ from backend.tools.router import ToolRouter, analyze_terminal_command
 from backend.tools.result import ToolExecutionResult
 from backend.tools.workspace_fs import build_path_access_policy, classify_path, resolve_requested_path
 from backend.sandbox.native_sandbox import NativeSandbox
+from backend.sandbox.linux_landlock import LinuxLandlockProvider
+from backend.sandbox.macos_seatbelt import MacOSSeatbeltProvider
+from backend.sandbox.native_provider import NativeSandboxProvider
+from backend.sandbox.models import SandboxPolicy
+from backend.sandbox.process import SandboxProcessRunner
+from backend.sandbox.registry import SandboxProviderRegistry
 from backend.sandbox.resource_limits import ResourceLimits
+from backend.sandbox.windows_acl import WindowsAclProvider
 from backend.usage.recorder import ModelRequestContext, record_model_usage
 from backend.usage.store import PostgresModelUsageStore
 
@@ -884,6 +892,8 @@ class NewmanRuntime:
         self.router = ToolRouter(self.registry, settings)
         self.orchestrator = ToolOrchestrator(settings, self.approvals)
         self.exec_sandbox: NativeSandbox | None = None
+        self.sandbox_process_runner: SandboxProcessRunner | None = None
+        self.sandbox_provider_registry = SandboxProviderRegistry()
         self.evolution_service = EvolutionService(
             settings=settings,
             provider=self.provider,
@@ -901,6 +911,59 @@ class NewmanRuntime:
 
     def close(self) -> None:
         self.mcp_registry.close()
+
+    def sandbox_health(self) -> dict[str, object] | None:
+        if self.exec_sandbox is None:
+            return None
+        if not self.settings.sandbox.enabled:
+            return self.exec_sandbox.health().__dict__
+
+        policy = self._deployment_sandbox_policy()
+        provider = self.sandbox_provider_registry.select(self.settings.sandbox.backend)
+        provider_health = provider.probe(policy)
+        return {
+            "configured": True,
+            "enabled": self.settings.sandbox.enabled,
+            "deployment_profile": self.settings.deployment_profile,
+            "backend": self.settings.sandbox.backend,
+            "selected_backend": provider_health.backend,
+            "mode": self.settings.sandbox.mode,
+            "platform": sys.platform,
+            "platform_supported": provider_health.file_enforcement != "unsupported",
+            "available": provider_health.available,
+            "network_access": self.settings.sandbox.network_access,
+            "file_enforcement": provider_health.file_enforcement,
+            "network_enforcement": provider_health.network_enforcement,
+            "process_enforcement": provider_health.process_enforcement,
+            "process_visibility_enforcement": provider_health.process_visibility_enforcement,
+            "process_lifecycle_enforcement": provider_health.process_lifecycle_enforcement,
+            "resource_enforcement": provider_health.resource_enforcement,
+            "probe_ok": provider_health.available,
+            "probe_error": provider_health.detail,
+            "provider_detail": provider_health.detail,
+            "allow_partial_enforcement": self.settings.sandbox.allow_partial_enforcement,
+        }
+
+    def _deployment_sandbox_policy(self) -> SandboxPolicy:
+        path_policy = getattr(self.exec_sandbox, "path_policy", None)
+        if path_policy is None:
+            path_policy = build_path_access_policy(self.settings)
+        workspace = Path(getattr(self.exec_sandbox, "workspace", self.settings.paths.workspace)).resolve()
+        return SandboxPolicy(
+            mode=self.settings.sandbox.mode,
+            workspace_root=workspace,
+            cwd=workspace,
+            readable_roots=tuple(path.resolve() for path in getattr(path_policy, "readable_roots", ())),
+            writable_roots=tuple(path.resolve() for path in getattr(path_policy, "writable_roots", ())),
+            protected_roots=tuple(path.resolve() for path in getattr(path_policy, "protected_roots", ())),
+            network_access=self.settings.sandbox.network_access,
+            require_network_isolation=self.settings.sandbox.require_network_isolation,
+            require_process_isolation=self.settings.sandbox.require_process_isolation,
+            allow_partial_enforcement=self.settings.sandbox.allow_partial_enforcement,
+            env_allowlist=tuple(self.settings.sandbox.env_allowlist),
+            timeout_seconds=self.settings.sandbox.timeout,
+            output_limit_bytes=self.settings.sandbox.output_limit_bytes,
+        )
 
     def reload_ecosystem(self) -> None:
         self.plugin_service.reload()
@@ -1142,9 +1205,29 @@ class NewmanRuntime:
             extra_readable_roots=plugin_readable_roots,
         )
         self.exec_sandbox = sandbox
+        self.sandbox_provider_registry = SandboxProviderRegistry(
+            [
+                NativeSandboxProvider(sandbox),
+                LinuxLandlockProvider(),
+                MacOSSeatbeltProvider(
+                    seatbelt_exec=self.settings.sandbox.provider_path,
+                    probe_timeout_seconds=self.settings.sandbox.probe_timeout_ms / 1000,
+                ),
+                WindowsAclProvider(
+                    helper_path=self.settings.sandbox.provider_path,
+                    probe_timeout_seconds=self.settings.sandbox.probe_timeout_ms / 1000,
+                ),
+            ]
+        )
+        configured_provider = self.sandbox_provider_registry.select(self.settings.sandbox.backend)
+        runner_provider = configured_provider if getattr(configured_provider, "name", "") != "linux_bwrap" else None
+        self.sandbox_process_runner = SandboxProcessRunner(sandbox, provider=runner_provider)
+        self.mcp_registry.set_sandbox(sandbox)
+        self.hook_manager.set_sandbox(sandbox)
         self.tool_context = BuiltinToolContext(
             path_policy=path_policy,
             sandbox=sandbox,
+            sandbox_runner=self.sandbox_process_runner,
             session_store=self.session_store,
             multimodal_analyzer=self.multimodal_analyzer,
             scheduler_store=self.scheduler_store,

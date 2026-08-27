@@ -33,8 +33,9 @@ class _FileSnapshot:
 
 
 class TerminalTool(BaseTool):
-    def __init__(self, sandbox: NativeSandbox, path_policy: PathAccessPolicy | None = None):
+    def __init__(self, sandbox: NativeSandbox, path_policy: PathAccessPolicy | None = None, sandbox_runner=None):
         self.sandbox = sandbox
+        self.sandbox_runner = sandbox_runner
         self.policy = path_policy
         self._writable_roots = list(path_policy.writable_roots) if path_policy else []
         allowed = [str(p) for p in self._writable_roots] if self._writable_roots else []
@@ -101,11 +102,18 @@ class TerminalTool(BaseTool):
             turn_output_dir.mkdir(parents=True, exist_ok=True)
         output_candidates_before = _collect_output_candidates(command, self.policy, turn_output_dir=turn_output_dir)
         before = _snapshot_files(output_candidates_before)
-        result = await self.sandbox.execute_shell(
-            command,
-            emit_output=emit_output,
-            force_unsandboxed=force_unsandboxed,
-        )
+        if self.sandbox_runner is not None and not force_unsandboxed:
+            result = await self.sandbox_runner.run_shell_tool_result(
+                command,
+                _sandbox_policy_for_terminal(self.sandbox, self.policy),
+                emit_output=emit_output,
+            )
+        else:
+            result = await self.sandbox.execute_shell(
+                command,
+                emit_output=emit_output,
+                force_unsandboxed=force_unsandboxed,
+            )
         result.tool = self.meta.name
         result.action = command
         result = _enrich_file_not_found(result, self._writable_roots)
@@ -308,4 +316,29 @@ def _looks_like_filesystem_token(token: str, workspace: Path) -> bool:
 
 
 def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
-    return [TerminalTool(context.sandbox, context.path_policy)]
+    return [TerminalTool(context.sandbox, context.path_policy, sandbox_runner=getattr(context, "sandbox_runner", None))]
+
+
+def _sandbox_policy_for_terminal(sandbox: NativeSandbox, path_policy: PathAccessPolicy | None):
+    from backend.sandbox.models import SandboxPolicy
+
+    workspace = Path(getattr(sandbox, "workspace", Path.cwd())).resolve()
+    config = getattr(sandbox, "config", None)
+    readable_roots = tuple(Path(path).resolve() for path in getattr(path_policy, "readable_roots", ()))
+    writable_roots = tuple(Path(path).resolve() for path in getattr(path_policy, "writable_roots", ()))
+    protected_roots = tuple(Path(path).resolve() for path in getattr(path_policy, "protected_roots", ()))
+    return SandboxPolicy(
+        mode=getattr(config, "mode", "workspace-write"),
+        workspace_root=workspace,
+        cwd=workspace,
+        readable_roots=readable_roots,
+        writable_roots=writable_roots,
+        protected_roots=protected_roots,
+        network_access=getattr(config, "network_access", False),
+        require_network_isolation=getattr(config, "require_network_isolation", True),
+        require_process_isolation=getattr(config, "require_process_isolation", True),
+        allow_partial_enforcement=getattr(config, "allow_partial_enforcement", False),
+        env_allowlist=tuple(getattr(config, "env_allowlist", ("PATH", "LANG", "LC_*"))),
+        timeout_seconds=getattr(getattr(sandbox, "limits", None), "timeout_seconds", None),
+        output_limit_bytes=getattr(config, "output_limit_bytes", None),
+    )

@@ -1,0 +1,12 @@
+# Newman source deployment profile for Linux hosts.
+# This is the full sandbox path when bubblewrap/user namespaces are available.
+
+sandbox:
+  enabled: true
+  backend: "linux_bwrap"
+  mode: "workspace-write"
+  network_access: true
+  require_network_isolation: false
+  require_process_isolation: true
+  allow_partial_enforcement: false
+  provider_path: null

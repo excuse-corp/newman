@@ -30,6 +30,7 @@ async def get_pending_approval(session_id: str, request: Request):
             "tool": approval.tool_name,
             "arguments": approval.arguments,
             "reason": approval.reason,
+            "metadata": approval.metadata,
             "timeout_seconds": timeout_seconds,
             "remaining_seconds": remaining,
         },
@@ -161,6 +162,7 @@ def _serialize_multiagent_approval(approval, task: dict[str, str], timeout_secon
         "tool": approval.tool_name,
         "arguments": approval.arguments,
         "reason": approval.reason,
+        "metadata": approval.metadata,
         "timeout_seconds": timeout_seconds,
         "remaining_seconds": remaining,
     }

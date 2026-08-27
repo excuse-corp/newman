@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 import threading
 from pathlib import Path
@@ -12,16 +11,30 @@ from uuid import uuid4
 import httpx
 
 from backend.mcp.models import MCPResourceSpec, MCPServerConfig, MCPToolSpec
+from backend.sandbox.environment import sanitize_environment
+from backend.sandbox.native_sandbox import NativeSandbox, SandboxUnavailableError
 
 
 class MCPClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, error_code: str = "", metadata: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.metadata = metadata or {}
 
 
 class StdioSession:
-    def __init__(self, server: MCPServerConfig, workspace: Path | None = None):
+    def __init__(
+        self,
+        server: MCPServerConfig,
+        workspace: Path | None = None,
+        sandbox: NativeSandbox | None = None,
+    ):
         self.server = server
         self.workspace = workspace.resolve() if workspace is not None else None
+        self.sandbox = sandbox
+        self.sandboxed = False
+        self.filtered_env: list[str] = []
+        self.sandbox_metadata: dict[str, object] = {}
         self._process: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
 
@@ -73,8 +86,55 @@ class StdioSession:
         command = [*self.server.command, *self.server.args]
         if not command:
             raise MCPClientError(f"MCP stdio server {self.server.name} missing command")
-        environment = dict(os.environ)
-        environment.update(self.server.env)
+        cwd = self.workspace or Path.cwd()
+        readable_roots = _command_readable_roots(command)
+        if self.sandbox is not None:
+            try:
+                command, environment, cwd, self.sandboxed, self.filtered_env = self.sandbox.prepare_argv(
+                    command,
+                    env=self.server.env,
+                    cwd=cwd,
+                    mode="read-only",
+                    network_access=False,
+                    extra_readable_roots=readable_roots,
+                )
+                self.sandbox_metadata = self.sandbox.execution_metadata(
+                    sandboxed=self.sandboxed,
+                    mode="read-only",
+                    cwd=cwd,
+                    network_access=False,
+                    runner_started=True,
+                    extra_readable_roots=readable_roots,
+                    provider_detail="stdio MCP",
+                )
+            except SandboxUnavailableError as exc:
+                raise MCPClientError(
+                    f"MCP stdio server {self.server.name} sandbox unavailable [{exc.code}]: {exc.detail}",
+                    error_code=exc.code,
+                    metadata={
+                        "sandboxed": False,
+                        "sandbox_transport": "stdio",
+                        "sandbox_error_code": exc.code,
+                        "sandbox_runner_failed": exc.code in {"SANDBOX_UNAVAILABLE", "SANDBOX_PROBE_FAILED"},
+                    },
+                ) from exc
+        else:
+            environment, self.filtered_env = sanitize_environment(
+                self.server.env,
+                workspace=self.workspace,
+            )
+            self.sandbox_metadata = {
+                "sandboxed": False,
+                "sandbox_transport": "stdio",
+                "backend": "none",
+                "mode": "read-only",
+                "file_enforcement": "unsupported",
+                "network_enforcement": "unsupported",
+                "process_enforcement": "unsupported",
+                "resource_enforcement": "unsupported",
+                "runner_started": True,
+                "runner_failed": False,
+            }
         if self.workspace is not None:
             environment.setdefault("NEWMAN_RUNTIME_WORKSPACE", str(self.workspace))
         self._process = subprocess.Popen(
@@ -85,16 +145,51 @@ class StdioSession:
             text=True,
             bufsize=1,
             env=environment,
-            cwd=str(self.workspace) if self.workspace is not None else None,
+            cwd=str(cwd),
         )
         return self._process
 
 
 class MCPClient:
-    def __init__(self, server: MCPServerConfig, workspace: Path | None = None):
+    def __init__(
+        self,
+        server: MCPServerConfig,
+        workspace: Path | None = None,
+        sandbox: NativeSandbox | None = None,
+    ):
         self.server = server
-        self._stdio: StdioSession | None = StdioSession(server, workspace) if server.transport == "stdio" else None
+        self.workspace = workspace
+        self.sandbox = sandbox
+        self._stdio: StdioSession | None = (
+            StdioSession(server, workspace, sandbox) if server.transport == "stdio" else None
+        )
         self.signature = server.model_dump_json()
+
+    def set_sandbox(self, sandbox: NativeSandbox | None) -> None:
+        if self.sandbox is sandbox:
+            return
+        self.close()
+        self.sandbox = sandbox
+        self._stdio = StdioSession(self.server, self.workspace, sandbox) if self.server.transport == "stdio" else None
+
+    def execution_metadata(self) -> dict[str, object]:
+        if self.server.transport in {"http_json", "http_sse"}:
+            return {
+                "sandboxed": False,
+                "sandbox_transport": self.server.transport,
+                "sandbox_backend": "remote",
+                "sandbox_file_enforcement": "unsupported",
+                "sandbox_network_enforcement": "unsupported",
+                "sandbox_process_enforcement": "unsupported",
+            }
+        if self._stdio is None:
+            return {"sandboxed": False, "sandbox_transport": self.server.transport}
+        return {
+            **self._stdio.sandbox_metadata,
+            "sandboxed": self._stdio.sandboxed,
+            "sandbox_env_filtered": list(self._stdio.filtered_env),
+            "sandbox_transport": self.server.transport,
+        }
 
     def close(self) -> None:
         if self._stdio is not None:
@@ -189,3 +284,21 @@ class MCPClient:
         if not isinstance(data, dict):
             raise MCPClientError(f"MCP SSE server {self.server.name} returned non-object payload")
         return data
+
+
+def _command_readable_roots(command: list[str]) -> list[Path]:
+    roots: list[Path] = []
+    for value in command:
+        path = Path(value)
+        if not path.is_absolute() or not path.exists():
+            continue
+        roots.append(path if path.is_dir() else path.parent)
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        resolved = root.resolve()
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(resolved)
+    return deduped

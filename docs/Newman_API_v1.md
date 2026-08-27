@@ -81,15 +81,29 @@ SSE payload 里也会带 `request_id`。
   "ok": true,
   "version": "0.6.0",
   "provider": "openai_compatible",
+  "deployment_profile": "none",
   "sandbox_enabled": true,
   "sandbox": {
+    "configured": true,
     "enabled": true,
+    "deployment_profile": "none",
     "backend": "linux_bwrap",
+    "selected_backend": "linux_bwrap",
     "mode": "workspace-write",
     "platform": "linux",
     "platform_supported": true,
     "available": true,
-    "network_access": false
+    "network_access": false,
+    "file_enforcement": "full",
+    "network_enforcement": "full",
+    "process_enforcement": "full",
+    "process_visibility_enforcement": "full",
+    "process_lifecycle_enforcement": "full",
+    "resource_enforcement": "partial",
+    "probe_ok": true,
+    "probe_error": "",
+    "provider_detail": "",
+    "allow_partial_enforcement": false
   },
   "tools": ["read_file", "search_files", "terminal", "update_plan"],
   "plugins_enabled": 1,
@@ -97,6 +111,8 @@ SSE payload 里也会带 `request_id`。
   "channels_enabled": 1
 }
 ```
+
+`deployment_profile` 是当前加载的部署 profile；`macos_source_online` 会启用 macOS Seatbelt partial sandbox 并允许沙箱内命令联网。`sandbox.backend` 是配置值，`sandbox.selected_backend` 是 runtime provider registry 实际选择并 probe 的后端。`file_enforcement`、`network_enforcement`、`process_enforcement`、`process_visibility_enforcement`、`process_lifecycle_enforcement`、`resource_enforcement` 分别报告 `full|partial|unsupported`。当 `sandbox.enabled=false`、functional probe 失败或 policy 禁止 partial enforcement 时，`sandbox.available=false`，并通过 `probe_error` / `provider_detail` 说明原因；受限模式不会因为 runner 不可用而自动裸跑本地命令。
 
 ### `GET /readyz`
 

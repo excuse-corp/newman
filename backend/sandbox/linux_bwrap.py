@@ -98,26 +98,33 @@ def _build_bwrap_base_args(
         "--die-with-parent",
         "--unshare-user",
         "--unshare-pid",
+        "--tmpfs",
+        "/",
     ]
+    prepared_targets: set[str] = {"/"}
     if not network_access:
         args.append("--unshare-net")
 
     for root in _resolve_read_roots(readable_roots):
+        _ensure_target_parent_dirs(args, root, prepared_targets)
         args.extend(["--ro-bind", str(root), str(root)])
 
     network_mounts = _resolve_network_read_mounts(readable_roots) if network_access else []
     if network_mounts:
-        args.extend(["--dir", "/etc"])
+        _ensure_target_dir(args, Path("/etc"), prepared_targets)
         for source, target in network_mounts:
+            _ensure_target_parent_dirs(args, target, prepared_targets)
             args.extend(["--ro-bind", str(source), str(target)])
 
     args.extend(["--proc", "/proc", "--dev", "/dev"])
 
     if mode == "workspace-write":
         for writable_root in writable_roots:
+            _ensure_target_parent_dirs(args, writable_root, prepared_targets)
             args.extend(["--bind", str(writable_root), str(writable_root)])
 
     for protected_root in _resolve_protected_roots(protected_roots):
+        _ensure_target_parent_dirs(args, protected_root, prepared_targets)
         if protected_root.is_dir():
             args.extend(["--tmpfs", str(protected_root)])
         else:
@@ -127,8 +134,31 @@ def _build_bwrap_base_args(
     return args
 
 
+def _ensure_target_parent_dirs(args: list[str], target: Path, prepared: set[str]) -> None:
+    parent = target if target == Path("/") else target.parent
+    for path in reversed(parent.parents):
+        _ensure_target_dir(args, path, prepared)
+    _ensure_target_dir(args, parent, prepared)
+
+
+def _ensure_target_dir(args: list[str], target: Path, prepared: set[str]) -> None:
+    if target == Path("/"):
+        return
+    key = str(target)
+    if key in prepared:
+        return
+    args.extend(["--perms", "0555", "--dir", key])
+    prepared.add(key)
+
+
 def _resolve_read_roots(readable_roots: list[Path]) -> list[Path]:
-    fixed_roots: list[Path] = [*(path.resolve() for path in readable_roots), *FIXED_READ_ROOTS]
+    # Keep fixed roots in their original spelling. `/bin` and `/lib` are
+    # commonly symlinks into `/usr`; mounting only their resolved targets can
+    # hide the interpreter paths needed by dynamically linked executables.
+    fixed_roots: list[Path] = [
+        *(path.resolve() for path in readable_roots if path.exists()),
+        *(path for path in FIXED_READ_ROOTS if path.exists()),
+    ]
     deduped: list[Path] = list(fixed_roots)
     for entry in os.environ.get("PATH", "").split(":"):
         if not entry:

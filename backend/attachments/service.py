@@ -12,6 +12,7 @@ from starlette.datastructures import UploadFile
 from backend.attachments.models import ParsedAttachment, SavedAttachment, utc_now
 from backend.attachments.parser import parse_attachment
 from backend.providers.base import ProviderError
+from backend.sandbox.native_sandbox import NativeSandbox
 
 
 MAX_ATTACHMENTS_PER_TURN = 10
@@ -29,9 +30,10 @@ ATTACHMENT_PROMPT_PER_FILE_CHARS = 4_000
 
 
 class AttachmentService:
-    def __init__(self, workspace_root: Path, multimodal_analyzer) -> None:
+    def __init__(self, workspace_root: Path, multimodal_analyzer, sandbox: NativeSandbox | None = None) -> None:
         self.workspace_root = workspace_root.resolve()
         self.multimodal_analyzer = multimodal_analyzer
+        self.sandbox = sandbox
 
     async def save_uploads(self, session_id: str, turn_id: str, uploads: list[UploadFile]) -> list[SavedAttachment]:
         self._validate_upload_count(uploads)
@@ -192,7 +194,7 @@ class AttachmentService:
             if attachment.extension in IMAGE_SUFFIXES or attachment.analysis_status == "parsed":
                 continue
             try:
-                parsed = parse_attachment(attachment.path)
+                parsed = parse_attachment(attachment.path, sandbox=self.sandbox)
             except Exception as exc:
                 attachment.analysis_status = "failed"
                 attachment.summary = f"附件解析失败：{str(exc) or exc.__class__.__name__}"

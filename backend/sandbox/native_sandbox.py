@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import hashlib
+import json
+import subprocess
 import sys
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping
+from uuid import uuid4
 
 from backend.config.schema import SandboxConfig
 from backend.sandbox.linux_bwrap import build_bwrap_argv, build_bwrap_command, resolve_bwrap_executable
+from backend.sandbox.environment import sanitize_environment
 from backend.sandbox.resource_limits import ResourceLimits
 from backend.sandbox.workspace_mount import resolve_workspace
 from backend.tools.base import ToolOutputEmitter
@@ -19,22 +23,39 @@ from backend.tools.workspace_fs import PathAccessPolicy, coerce_path_access_poli
 
 READ_CHUNK_SIZE = 2048
 STREAM_TRUNCATED_NOTICE = "\n...[输出已截断]\n"
-SANDBOX_PERMISSION_DENIED_PATTERNS = (
-    "read-only file system",
-    "operation not permitted",
-    "permission denied",
+BWRAP_RUNNER_ERROR_PREFIXES = (
+    "bwrap: can't find source path",
+    "bwrap: creating new namespace failed",
+    "bwrap: setting up uid map",
+    "bwrap: execvp",
+    "bwrap: setting up user namespace",
 )
 
 
 @dataclass(frozen=True)
 class SandboxHealth:
+    configured: bool
     enabled: bool
     backend: str
+    selected_backend: str
     mode: str
     platform: str
     platform_supported: bool
     available: bool
     network_access: bool
+    file_enforcement: str = "unsupported"
+    network_enforcement: str = "unsupported"
+    process_enforcement: str = "unsupported"
+    resource_enforcement: str = "unsupported"
+    probe_ok: bool | None = None
+    probe_error: str = ""
+
+
+class SandboxUnavailableError(RuntimeError):
+    def __init__(self, code: str, detail: str):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
 
 
 @dataclass
@@ -103,30 +124,253 @@ class NativeSandbox:
         self.path_policy = coerce_path_access_policy(path_policy or workspace)
         self.extra_readable_roots = tuple(Path(path).resolve() for path in (extra_readable_roots or ()))
         self.platform = sys.platform
-        self._bwrap_executable = resolve_bwrap_executable() if self.platform == "linux" else None
+        self._bwrap_executable = (
+            resolve_bwrap_executable()
+            if self.platform == "linux" and self.config.backend in {"auto", "linux_bwrap"}
+            else None
+        )
+        self._probe_result: tuple[bool, str] | None = None
 
     def health(self) -> SandboxHealth:
         if not self.config.enabled:
             return SandboxHealth(
+                configured=True,
                 enabled=False,
                 backend=self.config.backend,
+                selected_backend="none",
                 mode=self.config.mode,
                 platform=self.platform,
                 platform_supported=self.platform == "linux",
-                available=True,
+                available=False,
                 network_access=self.config.network_access,
+                probe_ok=None,
+                probe_error="sandbox disabled",
             )
         platform_supported = self.platform == "linux"
-        available = platform_supported and self._bwrap_executable is not None
+        probe_ok = False
+        probe_error = ""
+        if platform_supported and self._bwrap_executable is not None:
+            probe_ok, probe_error = self._functional_probe()
+        available = platform_supported and self._bwrap_executable is not None and probe_ok and self.config.mode != "danger-full-access"
+        selected_backend = "linux_bwrap" if platform_supported and self._bwrap_executable is not None else "none"
+        file_enforcement = "full" if available else "unsupported"
+        network_enforcement = "full" if available else "unsupported"
+        process_enforcement = "full" if available else "unsupported"
+        resource_enforcement = "partial" if available else "unsupported"
         return SandboxHealth(
+            configured=True,
             enabled=self.config.enabled,
             backend=self.config.backend,
+            selected_backend=selected_backend,
             mode=self.config.mode,
             platform=self.platform,
             platform_supported=platform_supported,
             available=available,
             network_access=self.config.network_access,
+            file_enforcement=file_enforcement,
+            network_enforcement=network_enforcement,
+            process_enforcement=process_enforcement,
+            resource_enforcement=resource_enforcement,
+            probe_ok=probe_ok,
+            probe_error=probe_error,
         )
+
+    def _functional_probe(self) -> tuple[bool, str]:
+        if self._probe_result is not None:
+            return self._probe_result
+        if self._bwrap_executable is None:
+            self._probe_result = (False, "bwrap executable not found")
+            return self._probe_result
+
+        try:
+            readable_roots = self._resolve_readable_roots()
+            writable_roots = self._resolve_writable_roots()
+            argv = build_bwrap_command(
+                bwrap_executable=self._bwrap_executable,
+                workspace=self.workspace,
+                readable_roots=readable_roots,
+                writable_roots=writable_roots,
+                protected_roots=self._resolve_protected_roots(),
+                mode=self.config.mode,
+                network_access=self.config.network_access,
+                command="true",
+            )
+            env, _filtered = sanitize_environment(
+                allowlist=self.config.env_allowlist,
+                workspace=self.workspace,
+            )
+            completed = subprocess.run(
+                argv,
+                cwd=str(self.workspace),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self.config.probe_timeout_ms / 1000,
+                check=False,
+                text=True,
+            )
+        except subprocess.TimeoutExpired:
+            self._probe_result = (False, "functional probe timed out")
+        except OSError as exc:
+            self._probe_result = (False, str(exc))
+        else:
+            if completed.returncode == 0:
+                self._probe_result = (True, "")
+            else:
+                detail = (completed.stderr or completed.stdout or "probe exited non-zero").strip()
+                self._probe_result = (False, detail[:500])
+        return self._probe_result
+
+    def prepare_argv(
+        self,
+        argv: Iterable[str],
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+        mode: str | None = None,
+        network_access: bool | None = None,
+        extra_readable_roots: Iterable[Path] | None = None,
+        extra_writable_roots: Iterable[Path] | None = None,
+    ) -> tuple[list[str], dict[str, str], Path, bool, list[str]]:
+        """Build an exact argv/env/cwd tuple for a local child process.
+
+        Long-lived processes such as stdio MCP servers cannot use
+        ``execute_argv`` because their pipes remain open across requests. They
+        still go through this same confinement path.
+        """
+
+        command_argv = [str(item) for item in argv]
+        if not command_argv:
+            raise SandboxUnavailableError("SANDBOX_INVALID_POLICY", "缺少可执行命令")
+        prepared_env, filtered_env = sanitize_environment(
+            env,
+            allowlist=self.config.env_allowlist,
+            workspace=self.workspace,
+        )
+        effective_cwd = (cwd or self.workspace).resolve()
+        if not effective_cwd.exists() or not effective_cwd.is_dir():
+            raise SandboxUnavailableError("SANDBOX_INVALID_POLICY", f"cwd 不存在或不是目录: {effective_cwd}")
+        effective_mode = mode or self.config.mode
+        effective_network = self.config.network_access if network_access is None else network_access
+        if not self.config.enabled or effective_mode == "danger-full-access":
+            return command_argv, prepared_env, effective_cwd, False, filtered_env
+        if self.platform != "linux" or self._bwrap_executable is None:
+            raise SandboxUnavailableError("SANDBOX_UNAVAILABLE", "当前平台或 bwrap 不支持受限本地进程")
+        probe_ok, probe_error = self._functional_probe()
+        if not probe_ok:
+            raise SandboxUnavailableError("SANDBOX_PROBE_FAILED", probe_error or "bwrap functional probe failed")
+
+        readable_roots = self._resolve_readable_roots(extra_readable_roots)
+        writable_roots = self._resolve_writable_roots(extra_writable_roots, mode=effective_mode)
+        if not _path_is_within_any(effective_cwd, [*readable_roots, *writable_roots]):
+            raise SandboxUnavailableError("SANDBOX_INVALID_POLICY", f"cwd 不在沙箱可见目录内: {effective_cwd}")
+
+        wrapped = build_bwrap_argv(
+            bwrap_executable=self._bwrap_executable,
+            workspace=effective_cwd,
+            readable_roots=readable_roots,
+            writable_roots=writable_roots,
+            protected_roots=self._resolve_protected_roots(),
+            mode=effective_mode,
+            network_access=effective_network,
+            argv=command_argv,
+        )
+        return wrapped, prepared_env, effective_cwd, True, filtered_env
+
+    def execution_metadata(
+        self,
+        *,
+        sandboxed: bool,
+        mode: str | None = None,
+        cwd: Path | None = None,
+        network_access: bool | None = None,
+        runner_started: bool = False,
+        runner_failed: bool = False,
+        sandbox_denied: bool = False,
+        sandbox_escalated: bool = False,
+        extra_readable_roots: Iterable[Path] | None = None,
+        extra_writable_roots: Iterable[Path] | None = None,
+        invocation_id: str | None = None,
+        provider_detail: str = "",
+    ) -> dict[str, object]:
+        effective_mode = mode or self.config.mode
+        effective_network = self.config.network_access if network_access is None else network_access
+        backend = self.config.backend if sandboxed else ("none" if effective_mode == "danger-full-access" else self.config.backend)
+        policy_hash = self._policy_hash(
+            mode=effective_mode,
+            cwd=cwd or self.workspace,
+            network_access=effective_network,
+            extra_readable_roots=extra_readable_roots,
+            extra_writable_roots=extra_writable_roots,
+        )
+        if sandboxed:
+            file_enforcement = "full"
+            network_enforcement = "full"
+            process_enforcement = "full"
+        else:
+            file_enforcement = "unsupported"
+            network_enforcement = "unsupported"
+            process_enforcement = "unsupported"
+        return {
+            "sandboxed": sandboxed,
+            "backend": backend,
+            "mode": effective_mode,
+            "sandbox_backend": backend,
+            "sandbox_mode": effective_mode,
+            "file_enforcement": file_enforcement,
+            "network_enforcement": network_enforcement,
+            "process_enforcement": process_enforcement,
+            "resource_enforcement": "partial" if sandboxed else "unsupported",
+            "runner_started": runner_started,
+            "runner_failed": runner_failed,
+            "sandbox_runner_failed": runner_failed,
+            "sandbox_denied": sandbox_denied,
+            "sandbox_escalated": sandbox_escalated,
+            "invocation_id": invocation_id or uuid4().hex,
+            "policy_hash": policy_hash,
+            "provider_detail": provider_detail or ("linux_bwrap" if sandboxed else "unsandboxed"),
+        }
+
+    def _policy_hash(
+        self,
+        *,
+        mode: str,
+        cwd: Path,
+        network_access: bool,
+        extra_readable_roots: Iterable[Path] | None = None,
+        extra_writable_roots: Iterable[Path] | None = None,
+    ) -> str:
+        readable_roots = _canonical_roots(
+            [
+                self.workspace,
+                self.path_policy.workspace,
+                self.path_policy.browse_root,
+                self.path_policy.output_root,
+                *self.path_policy.readable_roots,
+                *self.extra_readable_roots,
+                *(extra_readable_roots or ()),
+            ]
+        )
+        writable_inputs: list[Path] = []
+        if mode == "workspace-write":
+            writable_inputs.extend(self.path_policy.writable_roots)
+            for raw in self.config.writable_roots:
+                path = Path(raw)
+                writable_inputs.append((self.workspace / path) if not path.is_absolute() else path)
+            writable_inputs.extend(extra_writable_roots or ())
+        payload = {
+            "backend": self.config.backend,
+            "mode": mode,
+            "workspace": str(self.workspace.resolve()),
+            "cwd": str(Path(cwd).resolve()),
+            "network_access": network_access,
+            "allow_partial_enforcement": self.config.allow_partial_enforcement,
+            "readable_roots": readable_roots,
+            "writable_roots": _canonical_roots(writable_inputs),
+            "protected_roots": _canonical_roots(self.path_policy.protected_roots),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     async def execute_shell(
         self,
@@ -135,17 +379,21 @@ class NativeSandbox:
         *,
         force_unsandboxed: bool = False,
     ) -> ToolExecutionResult:
+        invocation_id = uuid4().hex
         if force_unsandboxed or not self.config.enabled or self.config.mode == "danger-full-access":
             result = await self._execute_direct(command, emit_output=emit_output)
-            result.metadata.update(
-                {
-                    "sandboxed": False,
-                    "sandbox_backend": self.config.backend,
-                    "sandbox_mode": "unsandboxed-retry" if force_unsandboxed else self.config.mode,
-                }
+            _merge_sandbox_metadata(
+                result,
+                self.execution_metadata(
+                    sandboxed=False,
+                    runner_started=True,
+                    sandbox_escalated=force_unsandboxed,
+                    invocation_id=invocation_id,
+                ),
             )
             if force_unsandboxed:
                 result.metadata["sandbox_escalated"] = True
+                result.metadata["sandbox_mode"] = "unsandboxed-retry"
             return result
 
         if self.platform != "linux":
@@ -154,51 +402,91 @@ class NativeSandbox:
                 tool="sandbox",
                 action="execute",
                 category="runtime_exception",
+                error_code="SANDBOX_UNAVAILABLE",
                 summary=f"当前平台暂未实现原生沙箱: {self.platform}",
                 metadata={
                     "sandboxed": False,
                     "sandbox_backend": self.config.backend,
                     "sandbox_mode": self.config.mode,
+                    "sandbox_runner_failed": True,
+                    "sandbox_error_code": "SANDBOX_UNAVAILABLE",
                 },
             )
-            return _mark_sandbox_escalation(
+            _merge_sandbox_metadata(
                 result,
-                reason="sandbox_unavailable",
-                summary="当前原生沙箱不可用，是否允许无沙箱重试一次？",
+                self.execution_metadata(
+                    sandboxed=False,
+                    runner_started=False,
+                    runner_failed=True,
+                    invocation_id=invocation_id,
+                    provider_detail=self.platform,
+                ),
             )
+            return result
         if self._bwrap_executable is None:
             result = ToolExecutionResult(
                 success=False,
                 tool="sandbox",
                 action="execute",
                 category="runtime_exception",
+                error_code="SANDBOX_UNAVAILABLE",
                 summary="未找到 bwrap，无法启用 Linux 原生沙箱",
                 metadata={
                     "sandboxed": False,
                     "sandbox_backend": self.config.backend,
                     "sandbox_mode": self.config.mode,
+                    "sandbox_runner_failed": True,
+                    "sandbox_error_code": "SANDBOX_UNAVAILABLE",
                 },
             )
-            return _mark_sandbox_escalation(
+            _merge_sandbox_metadata(
                 result,
-                reason="sandbox_unavailable",
-                summary="当前原生沙箱不可用，是否允许无沙箱重试一次？",
+                self.execution_metadata(
+                    sandboxed=False,
+                    runner_started=False,
+                    runner_failed=True,
+                    invocation_id=invocation_id,
+                    provider_detail="bwrap missing",
+                ),
             )
+            return result
 
-        result = await self._execute_bwrap(command, emit_output=emit_output)
-        result.metadata.update(
-            {
-                "sandboxed": True,
-                "sandbox_backend": self.config.backend,
-                "sandbox_mode": self.config.mode,
-            }
-        )
-        if _looks_like_sandbox_permission_denial(result):
-            _mark_sandbox_escalation(
-                result,
-                reason="sandbox_permission_denied",
-                summary="Linux 原生沙箱阻止了本次执行，是否允许无沙箱重试一次？",
+        probe_ok, probe_error = self._functional_probe()
+        if not probe_ok:
+            result = _sandbox_unavailable_result(
+                code="SANDBOX_PROBE_FAILED",
+                detail=probe_error or "bwrap functional probe failed",
+                backend=self.config.backend,
+                mode=self.config.mode,
             )
+            _merge_sandbox_metadata(
+                result,
+                self.execution_metadata(
+                    sandboxed=False,
+                    runner_started=False,
+                    runner_failed=True,
+                    invocation_id=invocation_id,
+                    provider_detail=probe_error or "probe failed",
+                ),
+            )
+            return result
+
+        _normalized_env, filtered_env = sanitize_environment(
+            allowlist=self.config.env_allowlist,
+            workspace=self.workspace,
+        )
+        result = await self._execute_bwrap(command, emit_output=emit_output)
+        _merge_sandbox_metadata(
+            result,
+            self.execution_metadata(
+                sandboxed=True,
+                runner_started=True,
+                runner_failed=bool(result.metadata.get("sandbox_runner_failed")),
+                invocation_id=invocation_id,
+                provider_detail="linux_bwrap",
+            ),
+            filtered_env=filtered_env,
+        )
         return result
 
     async def execute_argv(
@@ -212,6 +500,7 @@ class NativeSandbox:
         extra_readable_roots: Iterable[Path] | None = None,
         extra_writable_roots: Iterable[Path] | None = None,
     ) -> ToolExecutionResult:
+        invocation_id = uuid4().hex
         if not argv:
             return ToolExecutionResult(
                 success=False,
@@ -222,20 +511,28 @@ class NativeSandbox:
                 retryable=False,
             )
 
-        normalized_env = {**os.environ, **dict(env)} if env is not None else None
+        normalized_env, filtered_env = sanitize_environment(
+            env,
+            allowlist=self.config.env_allowlist,
+            workspace=self.workspace,
+        )
         stdin_bytes = stdin_text.encode("utf-8") if stdin_text is not None else None
 
         if force_unsandboxed or not self.config.enabled or self.config.mode == "danger-full-access":
             result = await self._execute_direct_argv(argv, emit_output=emit_output, env=normalized_env, stdin_bytes=stdin_bytes)
-            result.metadata.update(
-                {
-                    "sandboxed": False,
-                    "sandbox_backend": self.config.backend,
-                    "sandbox_mode": "unsandboxed-retry" if force_unsandboxed else self.config.mode,
-                }
+            _merge_sandbox_metadata(
+                result,
+                self.execution_metadata(
+                    sandboxed=False,
+                    runner_started=True,
+                    sandbox_escalated=force_unsandboxed,
+                    invocation_id=invocation_id,
+                ),
+                filtered_env=filtered_env,
             )
             if force_unsandboxed:
                 result.metadata["sandbox_escalated"] = True
+                result.metadata["sandbox_mode"] = "unsandboxed-retry"
             return result
 
         if self.platform != "linux":
@@ -244,36 +541,74 @@ class NativeSandbox:
                 tool="sandbox",
                 action="execute",
                 category="runtime_exception",
+                error_code="SANDBOX_UNAVAILABLE",
                 summary=f"当前平台暂未实现原生沙箱: {self.platform}",
                 metadata={
                     "sandboxed": False,
                     "sandbox_backend": self.config.backend,
                     "sandbox_mode": self.config.mode,
+                    "sandbox_runner_failed": True,
+                    "sandbox_error_code": "SANDBOX_UNAVAILABLE",
                 },
             )
-            return _mark_sandbox_escalation(
+            _merge_sandbox_metadata(
                 result,
-                reason="sandbox_unavailable",
-                summary="当前原生沙箱不可用，是否允许无沙箱重试一次？",
+                self.execution_metadata(
+                    sandboxed=False,
+                    runner_started=False,
+                    runner_failed=True,
+                    invocation_id=invocation_id,
+                    provider_detail=self.platform,
+                ),
             )
+            return result
         if self._bwrap_executable is None:
             result = ToolExecutionResult(
                 success=False,
                 tool="sandbox",
                 action="execute",
                 category="runtime_exception",
+                error_code="SANDBOX_UNAVAILABLE",
                 summary="未找到 bwrap，无法启用 Linux 原生沙箱",
                 metadata={
                     "sandboxed": False,
                     "sandbox_backend": self.config.backend,
                     "sandbox_mode": self.config.mode,
+                    "sandbox_runner_failed": True,
+                    "sandbox_error_code": "SANDBOX_UNAVAILABLE",
                 },
             )
-            return _mark_sandbox_escalation(
+            _merge_sandbox_metadata(
                 result,
-                reason="sandbox_unavailable",
-                summary="当前原生沙箱不可用，是否允许无沙箱重试一次？",
+                self.execution_metadata(
+                    sandboxed=False,
+                    runner_started=False,
+                    runner_failed=True,
+                    invocation_id=invocation_id,
+                    provider_detail="bwrap missing",
+                ),
             )
+            return result
+
+        probe_ok, probe_error = self._functional_probe()
+        if not probe_ok:
+            result = _sandbox_unavailable_result(
+                code="SANDBOX_PROBE_FAILED",
+                detail=probe_error or "bwrap functional probe failed",
+                backend=self.config.backend,
+                mode=self.config.mode,
+            )
+            _merge_sandbox_metadata(
+                result,
+                self.execution_metadata(
+                    sandboxed=False,
+                    runner_started=False,
+                    runner_failed=True,
+                    invocation_id=invocation_id,
+                    provider_detail=probe_error or "probe failed",
+                ),
+            )
+            return result
 
         result = await self._execute_bwrap_argv(
             argv,
@@ -283,19 +618,19 @@ class NativeSandbox:
             extra_readable_roots=extra_readable_roots,
             extra_writable_roots=extra_writable_roots,
         )
-        result.metadata.update(
-            {
-                "sandboxed": True,
-                "sandbox_backend": self.config.backend,
-                "sandbox_mode": self.config.mode,
-            }
+        _merge_sandbox_metadata(
+            result,
+            self.execution_metadata(
+                sandboxed=True,
+                runner_started=True,
+                runner_failed=bool(result.metadata.get("sandbox_runner_failed")),
+                extra_readable_roots=extra_readable_roots,
+                extra_writable_roots=extra_writable_roots,
+                invocation_id=invocation_id,
+                provider_detail="linux_bwrap",
+            ),
+            filtered_env=filtered_env,
         )
-        if _looks_like_sandbox_permission_denial(result):
-            _mark_sandbox_escalation(
-                result,
-                reason="sandbox_permission_denied",
-                summary="Linux 原生沙箱阻止了本次执行，是否允许无沙箱重试一次？",
-            )
         return result
 
     async def _execute_direct(
@@ -305,18 +640,25 @@ class NativeSandbox:
     ) -> ToolExecutionResult:
         proc: asyncio.subprocess.Process | None = None
         try:
+            env, filtered_env = sanitize_environment(
+                allowlist=self.config.env_allowlist,
+                workspace=self.workspace,
+            )
             proc = await asyncio.create_subprocess_shell(
                 command,
                 cwd=str(self.workspace),
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             if emit_output is not None:
-                return await self._stream_process_output(
+                result = await self._stream_process_output(
                     proc,
                     emit_output=emit_output,
                     timeout_summary="终端执行超时",
                 )
+                result.metadata["sandbox_env_filtered"] = filtered_env
+                return result
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.limits.timeout_seconds)
         except asyncio.TimeoutError:
             await _cleanup_process(proc)
@@ -332,7 +674,9 @@ class NativeSandbox:
             await _cleanup_process(proc)
             raise
 
-        return _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
+        result = _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
+        result.metadata["sandbox_env_filtered"] = filtered_env
+        return result
 
     async def _execute_direct_argv(
         self,
@@ -343,23 +687,33 @@ class NativeSandbox:
         stdin_bytes: bytes | None = None,
     ) -> ToolExecutionResult:
         proc: asyncio.subprocess.Process | None = None
+        filtered_env: list[str] = []
         try:
+            if env is None:
+                prepared_env, filtered_env = sanitize_environment(
+                    allowlist=self.config.env_allowlist,
+                    workspace=self.workspace,
+                )
+            else:
+                prepared_env = dict(env)
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=str(self.workspace),
-                env=dict(env) if env is not None else None,
+                env=prepared_env,
                 stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             if emit_output is not None:
                 stdin_task = _start_stdin_pump(proc, stdin_bytes)
-                return await self._stream_process_output(
+                result = await self._stream_process_output(
                     proc,
                     emit_output=emit_output,
                     timeout_summary="命令执行超时",
                     stdin_task=stdin_task,
                 )
+                result.metadata["sandbox_env_filtered"] = filtered_env
+                return result
             stdout, stderr = await asyncio.wait_for(proc.communicate(stdin_bytes), timeout=self.limits.timeout_seconds)
         except asyncio.TimeoutError:
             await _cleanup_process(proc)
@@ -375,31 +729,38 @@ class NativeSandbox:
             await _cleanup_process(proc)
             raise
 
-        return _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
+        result = _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
+        result.metadata["sandbox_env_filtered"] = filtered_env
+        return result
 
     async def _execute_bwrap(
         self,
         command: str,
         emit_output: ToolOutputEmitter | None = None,
     ) -> ToolExecutionResult:
-        readable_roots = self._resolve_readable_roots()
-        writable_roots = self._resolve_writable_roots()
-        protected_roots = self._resolve_protected_roots()
-        argv = build_bwrap_command(
-            bwrap_executable=self._bwrap_executable or "bwrap",
-            workspace=self.workspace,
-            readable_roots=readable_roots,
-            writable_roots=writable_roots,
-            protected_roots=protected_roots,
-            mode=self.config.mode,
-            network_access=self.config.network_access,
-            command=command,
-        )
         proc: asyncio.subprocess.Process | None = None
         try:
+            readable_roots = self._resolve_readable_roots()
+            writable_roots = self._resolve_writable_roots()
+            protected_roots = self._resolve_protected_roots()
+            argv = build_bwrap_command(
+                bwrap_executable=self._bwrap_executable or "bwrap",
+                workspace=self.workspace,
+                readable_roots=readable_roots,
+                writable_roots=writable_roots,
+                protected_roots=protected_roots,
+                mode=self.config.mode,
+                network_access=self.config.network_access,
+                command=command,
+            )
+            env, _filtered = sanitize_environment(
+                allowlist=self.config.env_allowlist,
+                workspace=self.workspace,
+            )
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=str(self.workspace),
+                env=dict(env) if env is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -408,6 +769,7 @@ class NativeSandbox:
                     proc,
                     emit_output=emit_output,
                     timeout_summary="Linux 原生沙箱执行超时",
+                    classify_bwrap=True,
                 )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.limits.timeout_seconds)
         except asyncio.TimeoutError:
@@ -423,8 +785,12 @@ class NativeSandbox:
         except asyncio.CancelledError:
             await _cleanup_process(proc)
             raise
+        except OSError as exc:
+            return _sandbox_runner_failure(exc)
 
-        return _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
+        return _classify_bwrap_result(
+            _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
+        )
 
     async def _execute_bwrap_argv(
         self,
@@ -436,21 +802,21 @@ class NativeSandbox:
         extra_readable_roots: Iterable[Path] | None = None,
         extra_writable_roots: Iterable[Path] | None = None,
     ) -> ToolExecutionResult:
-        readable_roots = self._resolve_readable_roots(extra_readable_roots)
-        writable_roots = self._resolve_writable_roots(extra_writable_roots)
-        protected_roots = self._resolve_protected_roots()
-        argv = build_bwrap_argv(
-            bwrap_executable=self._bwrap_executable or "bwrap",
-            workspace=self.workspace,
-            readable_roots=readable_roots,
-            writable_roots=writable_roots,
-            protected_roots=protected_roots,
-            mode=self.config.mode,
-            network_access=self.config.network_access,
-            argv=command_argv,
-        )
         proc: asyncio.subprocess.Process | None = None
         try:
+            readable_roots = self._resolve_readable_roots(extra_readable_roots)
+            writable_roots = self._resolve_writable_roots(extra_writable_roots)
+            protected_roots = self._resolve_protected_roots()
+            argv = build_bwrap_argv(
+                bwrap_executable=self._bwrap_executable or "bwrap",
+                workspace=self.workspace,
+                readable_roots=readable_roots,
+                writable_roots=writable_roots,
+                protected_roots=protected_roots,
+                mode=self.config.mode,
+                network_access=self.config.network_access,
+                argv=command_argv,
+            )
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=str(self.workspace),
@@ -466,6 +832,7 @@ class NativeSandbox:
                     emit_output=emit_output,
                     timeout_summary="Linux 原生沙箱执行超时",
                     stdin_task=stdin_task,
+                    classify_bwrap=True,
                 )
             stdout, stderr = await asyncio.wait_for(proc.communicate(stdin_bytes), timeout=self.limits.timeout_seconds)
         except asyncio.TimeoutError:
@@ -481,8 +848,12 @@ class NativeSandbox:
         except asyncio.CancelledError:
             await _cleanup_process(proc)
             raise
+        except OSError as exc:
+            return _sandbox_runner_failure(exc)
 
-        return _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
+        return _classify_bwrap_result(
+            _result_from_completed_process(proc.returncode, stdout, stderr, self.limits.output_limit_bytes)
+        )
 
     async def _stream_process_output(
         self,
@@ -491,6 +862,7 @@ class NativeSandbox:
         emit_output: ToolOutputEmitter,
         timeout_summary: str,
         stdin_task: asyncio.Task[None] | None = None,
+        classify_bwrap: bool = False,
     ) -> ToolExecutionResult:
         stdout_capture = _StreamCapture(self.limits.output_limit_bytes)
         stderr_capture = _StreamCapture(self.limits.output_limit_bytes)
@@ -526,7 +898,8 @@ class NativeSandbox:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-        return _result_from_stream_captures(return_code, stdout_capture, stderr_capture)
+        result = _result_from_stream_captures(return_code, stdout_capture, stderr_capture)
+        return _classify_bwrap_result(result) if classify_bwrap else result
 
     def _resolve_readable_roots(self, extra_roots: Iterable[Path] | None = None) -> list[Path]:
         roots = list(self.path_policy.readable_roots)
@@ -543,8 +916,13 @@ class NativeSandbox:
             deduped.append(root.resolve())
         return deduped
 
-    def _resolve_writable_roots(self, extra_roots: Iterable[Path] | None = None) -> list[Path]:
-        if self.config.mode != "workspace-write":
+    def _resolve_writable_roots(
+        self,
+        extra_roots: Iterable[Path] | None = None,
+        *,
+        mode: str | None = None,
+    ) -> list[Path]:
+        if (mode or self.config.mode) != "workspace-write":
             return []
         roots: list[Path] = []
         roots.extend(self.path_policy.writable_roots)
@@ -554,13 +932,18 @@ class NativeSandbox:
                 candidate = (self.workspace / candidate).resolve()
             else:
                 candidate = candidate.resolve()
-            if candidate.exists():
-                roots.append(candidate)
+            roots.append(candidate)
         if extra_roots is not None:
-            roots.extend(Path(path).resolve() for path in extra_roots if Path(path).exists())
+            roots.extend(Path(path).resolve() for path in extra_roots)
         deduped: list[Path] = []
         seen: set[str] = set()
         for root in roots:
+            root = root.resolve()
+            # bwrap rejects a bind source that does not exist. Materialize
+            # configured writable directories before constructing argv so a
+            # fresh workspace fails closed only for real policy errors.
+            if not root.exists():
+                root.mkdir(parents=True, exist_ok=True)
             key = str(root)
             if key in seen:
                 continue
@@ -611,18 +994,88 @@ def _result_from_stream_captures(
     )
 
 
-def _mark_sandbox_escalation(result: ToolExecutionResult, *, reason: str, summary: str) -> ToolExecutionResult:
-    result.metadata["sandbox_escalation_available"] = True
-    result.metadata["sandbox_escalation_reason"] = reason
-    result.metadata["sandbox_escalation_summary"] = summary
+def _sandbox_runner_failure(exc: OSError) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        success=False,
+        tool="sandbox",
+        action="execute",
+        category="runtime_exception",
+        error_code="SANDBOX_RUNNER_FAILED",
+        summary="沙箱 runner 启动失败，未执行无沙箱重试",
+        stderr=str(exc),
+        retryable=False,
+        metadata={
+            "sandbox_runner_failed": True,
+            "sandbox_error_code": "SANDBOX_RUNNER_FAILED",
+        },
+    )
+
+
+def _sandbox_unavailable_result(*, code: str, detail: str, backend: str, mode: str) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        success=False,
+        tool="sandbox",
+        action="execute",
+        category="runtime_exception",
+        error_code=code,
+        summary=detail,
+        retryable=False,
+        metadata={
+            "sandboxed": False,
+            "sandbox_backend": backend,
+            "sandbox_mode": mode,
+            "sandbox_runner_failed": True,
+            "sandbox_error_code": code,
+        },
+    )
+
+
+def _classify_bwrap_result(result: ToolExecutionResult) -> ToolExecutionResult:
+    if result.success:
+        return result
+    first_line = next((line.strip().lower() for line in result.stderr.splitlines() if line.strip()), "")
+    if any(first_line.startswith(prefix) for prefix in BWRAP_RUNNER_ERROR_PREFIXES):
+        result.error_code = "SANDBOX_RUNNER_FAILED"
+        result.retryable = False
+        result.metadata.update(
+            {
+                "sandbox_runner_failed": True,
+                "sandbox_error_code": "SANDBOX_RUNNER_FAILED",
+            }
+        )
     return result
 
 
-def _looks_like_sandbox_permission_denial(result: ToolExecutionResult) -> bool:
-    if result.success:
-        return False
-    detail = "\n".join(part for part in (result.summary, result.stderr) if part).lower()
-    return any(pattern in detail for pattern in SANDBOX_PERMISSION_DENIED_PATTERNS)
+def _merge_sandbox_metadata(
+    result: ToolExecutionResult,
+    base_metadata: Mapping[str, object],
+    *,
+    filtered_env: list[str] | None = None,
+) -> ToolExecutionResult:
+    existing = dict(result.metadata)
+    result.metadata = {**base_metadata, **existing}
+    if filtered_env is not None:
+        result.metadata["sandbox_env_filtered"] = filtered_env
+    if result.metadata.get("sandbox_runner_failed"):
+        result.metadata["runner_failed"] = True
+    if result.metadata.get("sandbox_error_code") and not result.error_code:
+        result.error_code = str(result.metadata["sandbox_error_code"])
+    return result
+
+
+def _canonical_roots(paths: Iterable[Path]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        try:
+            value = str(Path(raw).resolve())
+        except OSError:
+            value = str(Path(raw).absolute())
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return sorted(deduped)
 
 
 async def _cleanup_process(proc: asyncio.subprocess.Process | None) -> None:
@@ -701,3 +1154,14 @@ def _clip(text: str, limit: int) -> str:
     head = text[: limit // 3]
     tail = text[-limit // 3 :]
     return f"{head}\n...\n{tail}"
+
+
+def _path_is_within_any(path: Path, roots: Iterable[Path]) -> bool:
+    resolved = path.resolve()
+    for root in roots:
+        try:
+            resolved.relative_to(Path(root).resolve())
+            return True
+        except ValueError:
+            continue
+    return False

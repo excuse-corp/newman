@@ -22,7 +22,11 @@ _FULL_CONTENT_DEFAULT_CHARS = 1_000_000
 class ParseAttachmentTool(BaseTool):
     def __init__(self, context: BuiltinToolContext):
         self.session_store = context.session_store
-        self.attachment_service = AttachmentService(context.path_policy.workspace, context.multimodal_analyzer)
+        self.attachment_service = AttachmentService(
+            context.path_policy.workspace,
+            context.multimodal_analyzer,
+            sandbox=context.sandbox,
+        )
         self.meta = ToolMeta(
             name="parse_attachment",
             description=(

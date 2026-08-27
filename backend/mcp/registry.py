@@ -14,14 +14,16 @@ from backend.mcp.snapshot import (
     write_mcp_server_snapshots,
 )
 from backend.mcp.tool_adapter import MCPToolAdapter
+from backend.sandbox.native_sandbox import NativeSandbox
 from backend.tools.base import BaseTool
 
 
 class MCPRegistry:
-    def __init__(self, config_path: Path, workspace: Path | None = None):
+    def __init__(self, config_path: Path, workspace: Path | None = None, sandbox: NativeSandbox | None = None):
         self.store = MCPConfigStore(config_path)
         self.snapshot_dir = config_path.parent / "snapshots"
         self.workspace = workspace.resolve() if workspace is not None else None
+        self.sandbox = sandbox
         self._statuses: list[MCPServerStatus] = []
         self._resources: list[MCPResourceRecord] = []
         self._clients: dict[str, MCPClient] = {}
@@ -32,6 +34,13 @@ class MCPRegistry:
         for client in self._clients.values():
             client.close()
         self._clients.clear()
+
+    def set_sandbox(self, sandbox: NativeSandbox | None) -> None:
+        if self.sandbox is sandbox:
+            return
+        self.sandbox = sandbox
+        for client in self._clients.values():
+            client.set_sandbox(sandbox)
 
     def list_servers(self) -> list[MCPServerConfig]:
         return self.store.load()
@@ -187,7 +196,7 @@ class MCPRegistry:
             return existing
         if existing is not None:
             existing.close()
-        client = MCPClient(server, workspace=self.workspace)
+        client = MCPClient(server, workspace=self.workspace, sandbox=self.sandbox)
         self._clients[server.name] = client
         return client
 

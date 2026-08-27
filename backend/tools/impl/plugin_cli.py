@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.plugin_runtime.models import PluginCLIConfirmationProtocolConfig, ResolvedPluginCLICommand
+from backend.sandbox.models import SandboxPolicy, SandboxRunRequest
 from backend.sessions.models import SessionRecord
 from backend.tools.base import BaseTool, ToolMeta, ToolOutputEmitter
 from backend.tools.discovery import BuiltinToolContext
@@ -60,9 +61,10 @@ LARK_DEFAULT_IM_IDENTITY_ENV = "NEWMAN_LARK_DEFAULT_IM_IDENTITY"
 
 
 class PluginCLICommandTool(BaseTool):
-    def __init__(self, command: ResolvedPluginCLICommand, sandbox, session_store=None) -> None:
+    def __init__(self, command: ResolvedPluginCLICommand, sandbox, session_store=None, sandbox_runner=None) -> None:
         self.command = command
         self.sandbox = sandbox
+        self.sandbox_runner = sandbox_runner
         self.session_store = session_store
         properties: dict[str, Any] = {
             "args": {
@@ -172,13 +174,10 @@ class PluginCLICommandTool(BaseTool):
         if confirm and self.command.confirmation_flag:
             argv.append(self.command.confirmation_flag)
 
-        result = await self.sandbox.execute_argv(
+        result = await self._execute_argv(
             argv,
             emit_output=emit_output,
-            env=self.command.env,
             stdin_text=stdin_text if isinstance(stdin_text, str) else None,
-            extra_readable_roots=[Path(path) for path in self.command.readable_roots],
-            extra_writable_roots=[Path(path) for path in self.command.writable_roots],
         )
         result.tool = self.meta.name
         result.action = shlex.join(argv)
@@ -311,15 +310,36 @@ class PluginCLICommandTool(BaseTool):
         )
 
     async def _run_auth_status(self) -> ToolExecutionResult:
-        result = await self.sandbox.execute_argv(
+        result = await self._execute_argv(
             [self.command.executable, "auth", "status"],
-            env=self.command.env,
-            extra_readable_roots=[Path(path) for path in self.command.readable_roots],
-            extra_writable_roots=[Path(path) for path in self.command.writable_roots],
         )
         result.tool = self.meta.name
         result.action = "lark-cli auth status"
         return result
+
+    async def _execute_argv(
+        self,
+        argv: list[str],
+        *,
+        emit_output: ToolOutputEmitter | None = None,
+        stdin_text: str | None = None,
+    ) -> ToolExecutionResult:
+        if self.sandbox_runner is not None:
+            request = SandboxRunRequest(
+                argv=tuple(argv),
+                policy=_sandbox_policy_for_command(self.sandbox, self.command),
+                env=self.command.env,
+                stdin=stdin_text.encode("utf-8") if stdin_text is not None else None,
+            )
+            return await self.sandbox_runner.run_argv_tool_result(request, emit_output=emit_output)
+        return await self.sandbox.execute_argv(
+            argv,
+            emit_output=emit_output,
+            env=self.command.env,
+            stdin_text=stdin_text,
+            extra_readable_roots=[Path(path) for path in self.command.readable_roots],
+            extra_writable_roots=[Path(path) for path in self.command.writable_roots],
+        )
 
 
 def _coerce_args(arguments: dict[str, Any]) -> list[str]:
@@ -603,4 +623,36 @@ def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
     if sandbox is None:
         return []
     session_store = getattr(context, "session_store", None)
-    return [PluginCLICommandTool(command, sandbox, session_store=session_store) for command in service.enabled_cli_commands()]
+    sandbox_runner = getattr(context, "sandbox_runner", None)
+    return [
+        PluginCLICommandTool(command, sandbox, session_store=session_store, sandbox_runner=sandbox_runner)
+        for command in service.enabled_cli_commands()
+    ]
+
+
+def _sandbox_policy_for_command(sandbox, command: ResolvedPluginCLICommand) -> SandboxPolicy:
+    workspace = Path(getattr(sandbox, "workspace", Path.cwd())).resolve()
+    config = getattr(sandbox, "config", None)
+    path_policy = getattr(sandbox, "path_policy", None)
+    readable_roots = tuple(Path(path).resolve() for path in getattr(path_policy, "readable_roots", ())) + tuple(
+        Path(path).resolve() for path in command.readable_roots
+    )
+    writable_roots = tuple(Path(path).resolve() for path in getattr(path_policy, "writable_roots", ())) + tuple(
+        Path(path).resolve() for path in command.writable_roots
+    )
+    protected_roots = tuple(Path(path).resolve() for path in getattr(path_policy, "protected_roots", ()))
+    return SandboxPolicy(
+        mode=getattr(config, "mode", "workspace-write"),
+        workspace_root=workspace,
+        cwd=workspace,
+        readable_roots=readable_roots,
+        writable_roots=writable_roots,
+        protected_roots=protected_roots,
+        network_access=getattr(config, "network_access", False),
+        require_network_isolation=getattr(config, "require_network_isolation", True),
+        require_process_isolation=getattr(config, "require_process_isolation", True),
+        allow_partial_enforcement=getattr(config, "allow_partial_enforcement", False),
+        env_allowlist=tuple(getattr(config, "env_allowlist", ("PATH", "LANG", "LC_*"))),
+        timeout_seconds=command.timeout_seconds,
+        output_limit_bytes=getattr(config, "output_limit_bytes", None),
+    )

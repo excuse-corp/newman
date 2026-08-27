@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.auth_utils import announce_bootstrap_state
+from backend.api.health import build_healthz_payload
 from backend.api.middleware.auth import auth_middleware
 from backend.api.middleware.error_handler import install_error_handlers
 from backend.api.middleware.request_id import request_id_middleware
@@ -99,19 +100,13 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz")
     async def healthz():
-        runtime = app.state.runtime
-        sandbox_health = runtime.exec_sandbox.health() if runtime.exec_sandbox else None
-        return {
-            "ok": True,
-            "version": app.version,
-            "provider": settings.provider.type,
-            "sandbox_enabled": settings.sandbox.enabled,
-            "sandbox": sandbox_health.__dict__ if sandbox_health else None,
-            "tools": [tool.meta.name for tool in runtime.registry.list_tools()],
-            "plugins_enabled": len([item for item in runtime.plugin_service.list_plugins() if item.enabled]),
-            "scheduler_running": bool(app.state.scheduler._running),
-            "channels_enabled": len([item for item in app.state.channels.list_status() if item["enabled"]]),
-        }
+        return build_healthz_payload(
+            app_version=app.version,
+            settings=settings,
+            runtime=app.state.runtime,
+            scheduler=app.state.scheduler,
+            channels=app.state.channels,
+        )
 
     @app.get("/readyz")
     async def readyz():

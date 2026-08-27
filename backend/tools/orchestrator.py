@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from datetime import datetime, timezone
 from time import perf_counter
 from typing import Awaitable, Callable, Literal
 
@@ -16,17 +19,24 @@ from backend.tools.approval_policy import (
 from backend.tools.base import BaseTool
 from backend.tools.result import ToolExecutionResult
 from backend.tools.workspace_fs import build_path_access_policy
+from backend.sandbox.approval_tokens import EscalationTokenError, EscalationTokenStore
 
 
 EventEmitter = Callable[[str, dict], Awaitable[None]]
 
 
 class ToolOrchestrator:
-    def __init__(self, settings: AppConfig, approvals: ApprovalManager):
+    def __init__(
+        self,
+        settings: AppConfig,
+        approvals: ApprovalManager,
+        escalation_tokens: EscalationTokenStore | None = None,
+    ):
         self.settings = settings
         self.approvals = approvals
         self.retry_policy = RetryPolicy(settings.runtime)
         self.approval_policy = ApprovalPolicy(settings)
+        self.escalation_tokens = escalation_tokens or EscalationTokenStore()
 
     async def execute(
         self,
@@ -193,6 +203,7 @@ class ToolOrchestrator:
             arguments=arguments,
             reason=reason,
             turn_id=turn_id,
+            metadata={"approval_stage": "preflight"},
         )
         await emit(
             "tool_approval_request",
@@ -201,6 +212,7 @@ class ToolOrchestrator:
                 "tool": tool.meta.name,
                 "arguments": arguments,
                 "reason": approval_request.reason,
+                "metadata": approval_request.metadata,
                 "summary": request,
                 "timeout_seconds": self.settings.approval.timeout_seconds,
             },
@@ -322,6 +334,17 @@ class ToolOrchestrator:
             or "Linux 原生沙箱阻止了本次执行，是否允许无沙箱重试一次？"
         )
         reason = str(result.metadata.get("sandbox_escalation_reason") or "sandbox_escalation")
+        approval_metadata = _sandbox_escalation_metadata(
+            self.settings,
+            tool=tool,
+            display_arguments=display_arguments,
+            result=result,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            turn_id=turn_id,
+        )
+        approval_request_id: str | None = None
+        escalation_token_id: str | None = None
 
         if scheduler_run_mode == "unattended":
             return ToolExecutionResult(
@@ -329,6 +352,7 @@ class ToolOrchestrator:
                 tool=tool.meta.name,
                 action="approval",
                 category="permission_error",
+                error_code="SANDBOX_ESCALATION_DENIED_UNATTENDED",
                 summary="当前为无人值守定时任务，无法批准无沙箱重试",
                 retryable=False,
                 metadata={
@@ -336,10 +360,32 @@ class ToolOrchestrator:
                     "sandbox_escalation_available": True,
                     "sandbox_escalation_reason": reason,
                     "sandbox_escalation_summary": summary,
+                    "sandbox_escalation_denied": True,
+                    "sandbox_error_code": "SANDBOX_ESCALATION_DENIED_UNATTENDED",
+                    **approval_metadata,
                 },
             )
 
         if turn_approval_mode == "auto_allow":
+            if not self.settings.sandbox.allow_automatic_full_access:
+                return ToolExecutionResult(
+                    success=False,
+                    tool=tool.meta.name,
+                    action="approval",
+                    category="permission_error",
+                    error_code="SANDBOX_ESCALATION_DENIED",
+                    summary="auto_allow 不会自动批准沙箱升级；需要显式批准或部署配置 allow_automatic_full_access=true",
+                    retryable=False,
+                    metadata={
+                        "approval_stage": "sandbox_escalation",
+                        "sandbox_escalation_available": True,
+                        "sandbox_escalation_reason": reason,
+                        "sandbox_escalation_summary": summary,
+                        "sandbox_escalation_denied": True,
+                        "sandbox_error_code": "SANDBOX_ESCALATION_DENIED",
+                        **approval_metadata,
+                    },
+                )
             approved = True
         else:
             approval_request = self.approvals.create(
@@ -348,33 +394,78 @@ class ToolOrchestrator:
                 arguments=display_arguments,
                 reason=reason,
                 turn_id=turn_id,
+                metadata=approval_metadata,
             )
+            approval_request_id = approval_request.approval_request_id
+            expires_at_epoch = approval_request.created_at + self.settings.approval.timeout_seconds
+            expires_at = datetime.fromtimestamp(expires_at_epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+            approval_metadata.update(
+                {
+                    "approval_request_id": approval_request_id,
+                    "expires_at": expires_at,
+                    "expires_at_epoch": expires_at_epoch,
+                }
+            )
+            approval_request.metadata.update(approval_metadata)
+            token_bindings = _sandbox_token_bindings(approval_metadata, approval_request_id)
+            token = self.escalation_tokens.issue(
+                token_bindings,
+                ttl_seconds=self.settings.approval.timeout_seconds,
+                metadata={"approval_request_id": approval_request_id},
+            )
+            escalation_token_id = token.token_id
+            approval_metadata.update(
+                {
+                    "escalation_token_id": token.token_id,
+                    "escalation_token_expires_at": token.expires_at,
+                }
+            )
+            approval_request.metadata.update(approval_metadata)
             await emit(
                 "tool_approval_request",
                 {
-                    "approval_request_id": approval_request.approval_request_id,
+                    "approval_request_id": approval_request_id,
                     "tool": tool.meta.name,
                     "arguments": display_arguments,
                     "reason": approval_request.reason,
+                    "metadata": approval_request.metadata,
+                    **approval_request.metadata,
                     "summary": summary,
                     "timeout_seconds": self.settings.approval.timeout_seconds,
                 },
             )
+
+        if escalation_token_id is None:
+            token_bindings = _sandbox_token_bindings(approval_metadata, approval_request_id)
+            token = self.escalation_tokens.issue(
+                token_bindings,
+                ttl_seconds=self.settings.approval.timeout_seconds,
+                metadata={"approval_request_id": approval_request_id},
+            )
+            escalation_token_id = token.token_id
+            approval_metadata.update(
+                {
+                    "escalation_token_id": token.token_id,
+                    "escalation_token_expires_at": token.expires_at,
+                }
+            )
+
+        if approval_request_id:
             try:
                 approved = await self.approvals.wait(
-                    approval_request.approval_request_id,
+                    approval_request_id,
                     self.settings.approval.timeout_seconds,
                 )
             except asyncio.TimeoutError:
                 approved = False
             except asyncio.CancelledError:
-                self.approvals.discard(approval_request.approval_request_id)
+                self.approvals.discard(approval_request_id)
                 raise
-            self.approvals.discard(approval_request.approval_request_id, resolved_approved=approved)
+            self.approvals.discard(approval_request_id, resolved_approved=approved)
             await emit(
                 "tool_approval_resolved",
                 {
-                    "approval_request_id": approval_request.approval_request_id,
+                    "approval_request_id": approval_request_id,
                     "tool": tool.meta.name,
                     "approved": approved,
                 },
@@ -386,6 +477,7 @@ class ToolOrchestrator:
                 tool=tool.meta.name,
                 action="approval",
                 category="permission_error",
+                error_code="SANDBOX_ESCALATION_DENIED",
                 summary="用户拒绝或审批超时，未执行无沙箱重试",
                 retryable=False,
                 metadata={
@@ -393,6 +485,32 @@ class ToolOrchestrator:
                     "sandbox_escalation_available": True,
                     "sandbox_escalation_reason": reason,
                     "sandbox_escalation_summary": summary,
+                    "sandbox_escalation_denied": True,
+                    "sandbox_error_code": "SANDBOX_ESCALATION_DENIED",
+                    **approval_metadata,
+                },
+            )
+
+        try:
+            self.escalation_tokens.consume(
+                escalation_token_id or "",
+                _sandbox_token_bindings(approval_metadata, approval_request_id),
+            )
+        except EscalationTokenError as exc:
+            return ToolExecutionResult(
+                success=False,
+                tool=tool.meta.name,
+                action="approval",
+                category="permission_error",
+                error_code=exc.error_code,
+                summary="沙箱升级令牌无效，未执行无沙箱重试",
+                retryable=False,
+                metadata={
+                    "approval_stage": "sandbox_escalation",
+                    "sandbox_escalation_available": True,
+                    "sandbox_escalation_denied": True,
+                    "sandbox_error_code": exc.error_code,
+                    **approval_metadata,
                 },
             )
 
@@ -425,6 +543,8 @@ class ToolOrchestrator:
                 "sandbox_escalation_available": True,
                 "sandbox_escalation_reason": reason,
                 "sandbox_escalation_summary": summary,
+                "approval_request_id": approval_request_id,
+                **approval_metadata,
             }
         )
         if not escalated_result.success:
@@ -493,3 +613,57 @@ class ToolOrchestrator:
         result.duration_ms = int((perf_counter() - started) * 1000)
         result.attempt_count = attempt
         return result
+
+
+def _sandbox_escalation_metadata(
+    settings: AppConfig,
+    *,
+    tool: BaseTool,
+    display_arguments: dict,
+    result: ToolExecutionResult,
+    session_id: str,
+    tool_call_id: str | None,
+    turn_id: str | None,
+) -> dict[str, object]:
+    command = str(display_arguments.get("command") or "") if isinstance(display_arguments, dict) else ""
+    argv_sha256 = hashlib.sha256(command.encode("utf-8")).hexdigest() if command else _stable_payload_hash(display_arguments)
+    preview = command if command else json.dumps(display_arguments, ensure_ascii=False, sort_keys=True)
+    workspace_root = str(settings.paths.workspace.resolve())
+    writable_roots = [str(path.resolve()) for path in getattr(settings.permissions, "writable_paths", [])]
+    return {
+        "approval_stage": "sandbox_escalation",
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "tool_call_id": tool_call_id,
+        "tool_name": tool.meta.name,
+        "requested_mode": "danger-full-access",
+        "effective_mode_before": settings.sandbox.mode,
+        "argv_sha256": argv_sha256,
+        "command_preview": preview[:300],
+        "policy_hash": result.metadata.get("policy_hash"),
+        "sandbox_invocation_id": result.metadata.get("invocation_id"),
+        "workspace_root": workspace_root,
+        "writable_roots": writable_roots,
+    }
+
+
+def _sandbox_token_bindings(metadata: dict[str, object], approval_request_id: str | None) -> dict[str, object]:
+    """Return exactly the invocation fields that an escalation grant covers."""
+
+    return {
+        "approval_request_id": approval_request_id,
+        "session_id": metadata.get("session_id"),
+        "turn_id": metadata.get("turn_id"),
+        "tool_call_id": metadata.get("tool_call_id"),
+        "tool_name": metadata.get("tool_name"),
+        "argv_sha256": metadata.get("argv_sha256"),
+        "policy_hash": metadata.get("policy_hash"),
+        "sandbox_invocation_id": metadata.get("sandbox_invocation_id"),
+        "workspace_root": metadata.get("workspace_root"),
+        "writable_roots": metadata.get("writable_roots"),
+    }
+
+
+def _stable_payload_hash(payload: object) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

@@ -7,11 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from backend.plugin_runtime.service import PluginService
+from backend.sandbox.native_sandbox import NativeSandbox, SandboxUnavailableError
 
 
 class HookManager:
-    def __init__(self, plugin_service: PluginService):
+    def __init__(self, plugin_service: PluginService, sandbox: NativeSandbox | None = None):
         self.plugin_service = plugin_service
+        self.sandbox = sandbox
+
+    def set_sandbox(self, sandbox: NativeSandbox | None) -> None:
+        self.sandbox = sandbox
 
     def messages_for(self, event: str) -> list[str]:
         return self.plugin_service.hook_messages(event)
@@ -29,6 +34,8 @@ class HookManager:
                 event=event,
                 timeout_seconds=int(getattr(hook, "timeout_seconds", 5)),
                 context=context,
+                sandbox=self.sandbox,
+                readable_root=plugin.root_path,
             )
             if payload:
                 messages.extend(payload)
@@ -42,14 +49,30 @@ async def _run_hook_handler(
     event: str,
     timeout_seconds: int,
     context: dict[str, Any],
+    sandbox: NativeSandbox | None = None,
+    readable_root: Path | None = None,
 ) -> list[str]:
+    command = [sys.executable, str(hook_path)]
+    cwd = hook_path.parent
+    environment = None
+    if sandbox is not None:
+        try:
+            command, environment, cwd, _sandboxed, _filtered = sandbox.prepare_argv(
+                command,
+                cwd=cwd,
+                mode="read-only",
+                network_access=False,
+                extra_readable_roots=[path for path in (readable_root, hook_path.parent) if path is not None],
+            )
+        except SandboxUnavailableError as exc:
+            return [f"{plugin_name}: hook sandbox unavailable [{exc.code}]: {exc.detail}"]
     proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        str(hook_path),
+        *command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=str(hook_path.parent),
+        cwd=str(cwd),
+        env=environment,
     )
     payload = json.dumps({"event": event, "plugin": plugin_name, "context": context}, ensure_ascii=False).encode("utf-8")
     try:

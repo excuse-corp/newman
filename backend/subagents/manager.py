@@ -639,7 +639,11 @@ class MultiAgentManager:
         if on_subagent_failure not in VALID_FAILURE_POLICIES:
             errors.append(f"on_subagent_failure must be one of {sorted(VALID_FAILURE_POLICIES)}")
 
-        unsupported_fields = [field for field in ("run_timeout_seconds", "token_budget") if field in arguments]
+        unsupported_fields = [
+            field
+            for field in ("run_timeout_seconds", "sandbox_mode", "sandbox_permissions", "token_budget")
+            if field in arguments
+        ]
         if unsupported_fields:
             errors.append(f"unsupported multiagent fields: {', '.join(unsupported_fields)}")
 
@@ -734,6 +738,10 @@ class MultiAgentManager:
 
         if "task_timeout_seconds" in raw_agent:
             errors.append(f"{prefix}.task_timeout_seconds is not supported")
+        if "sandbox_mode" in raw_agent:
+            errors.append(f"{prefix}.sandbox_mode is not supported; subagents inherit the parent sandbox policy")
+        if "sandbox_permissions" in raw_agent:
+            errors.append(f"{prefix}.sandbox_permissions is not supported; subagents inherit the parent sandbox policy")
 
         max_turns = _positive_int(
             raw_agent.get("max_turns"),

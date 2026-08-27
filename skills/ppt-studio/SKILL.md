@@ -245,6 +245,6 @@ Use this skill to apply the uploaded workflow and bundled resources.
 
 ## Python Runtime
 
-- Run bundled Python scripts through `python scripts/run_python.py scripts/<script>.py` from the skill root.
+- Run bundled Python scripts through `python scripts/run_python.py scripts/<script>.py` from the skill root; the wrapper uses a skill-local virtualenv, temp/cache directories, and sanitized child environment.
 - The wrapper creates `<skill-root>/.venv`, installs `requirements.txt`, and runs the target script with the skill-local interpreter.
 - Do not commit or copy the generated `.venv` directory.

@@ -36,6 +36,14 @@ class PathAccessPolicy:
     readable_roots: tuple[Path, ...]
     writable_roots: tuple[Path, ...]
     protected_roots: tuple[Path, ...]
+    sandbox_mode: str = "workspace-write"
+
+
+class PathPolicyError(ValueError):
+    def __init__(self, message: str, *, error_code: str = "", sandbox_denied: bool = False) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.sandbox_denied = sandbox_denied
 
 
 def build_path_access_policy(settings: AppConfig) -> PathAccessPolicy:
@@ -48,6 +56,8 @@ def build_path_access_policy(settings: AppConfig) -> PathAccessPolicy:
     readable_paths = list(getattr(permissions, "readable_paths", []))
     writable_paths = list(getattr(permissions, "writable_paths", []))
     protected_paths = list(getattr(permissions, "protected_paths", []))
+    sandbox = getattr(settings, "sandbox", None)
+    sandbox_mode = str(getattr(sandbox, "mode", "workspace-write"))
     writable_roots = _dedupe_roots([output_root, *writable_paths])
     readable_roots = _dedupe_roots([workspace, browse_root, output_root, *writable_roots, *readable_paths])
     protected_roots = _dedupe_roots(protected_paths)
@@ -58,6 +68,7 @@ def build_path_access_policy(settings: AppConfig) -> PathAccessPolicy:
         readable_roots=tuple(readable_roots),
         writable_roots=tuple(writable_roots),
         protected_roots=tuple(protected_roots),
+        sandbox_mode=sandbox_mode,
     )
 
 
@@ -72,6 +83,7 @@ def coerce_path_access_policy(policy_or_workspace: PathAccessPolicy | Path) -> P
         readable_roots=(workspace,),
         writable_roots=(workspace,),
         protected_roots=(),
+        sandbox_mode="workspace-write",
     )
 
 
@@ -116,12 +128,14 @@ def ensure_readable_path(policy: PathAccessPolicy, raw_path: str | None = None) 
 
 
 def ensure_writable_path(policy: PathAccessPolicy, raw_path: str | None = None) -> Path:
+    if policy.sandbox_mode == "read-only":
+        raise PathPolicyError("当前沙箱为 read-only，禁止写入", error_code="SANDBOX_DENIED", sandbox_denied=True)
     target = resolve_writable_path(policy, raw_path)
     state = classify_path(policy, target)
     if state == "protected":
-        raise ValueError("path 位于受保护目录内")
+        raise PathPolicyError("path 位于受保护目录内", error_code="SANDBOX_DENIED", sandbox_denied=True)
     if state != "writable":
-        raise ValueError("path 不在允许写入的目录内")
+        raise PathPolicyError("path 不在允许写入的目录内", error_code="SANDBOX_DENIED", sandbox_denied=True)
     return target
 
 

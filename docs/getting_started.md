@@ -166,6 +166,22 @@ NEWMAN_MODELS_MULTIMODAL_ENDPOINT=https://api.openai.com/v1
 NEWMAN_MODELS_MULTIMODAL_API_KEY=your_api_key_here
 ```
 
+如果是在 macOS 上源码部署，并且希望沙箱内命令可以联网，把 `.env` 里的部署 profile 改成这一行即可：
+
+```dotenv
+NEWMAN_DEPLOY_PROFILE=macos_source_online
+```
+
+Linux 源码部署可使用：
+
+```dotenv
+NEWMAN_DEPLOY_PROFILE=linux_source_default
+```
+
+使用 `NEWMAN_DEPLOY_PROFILE` 时，保持 `.env.example` 中 `NEWMAN_SANDBOX_*` 高级覆盖项为注释状态；只有需要覆盖 profile 的单个字段时再打开。
+
+`macos_source_online` 会自动启用 `macos_seatbelt`，允许沙箱内命令联网，并关闭 macOS 不支持的强制进程隔离要求。
+
 如果要启用 AnySearch 联网搜索 skill，再补：
 
 ```dotenv
@@ -200,13 +216,15 @@ ANYSEARCH_API_KEY=your_anysearch_api_key_here
 Newman 配置优先级从高到低：
 
 1. 环境变量
-2. `~/.newman/config.yaml`
-3. 项目根目录 `newman.yaml`
-4. `backend/config/defaults.yaml`
+2. `deployment_profile` overlay（由 `NEWMAN_DEPLOY_PROFILE` 或 `deployment_profile` 选择）
+3. `~/.newman/config.yaml`
+4. 项目根目录 `newman.yaml`
+5. `backend/config/defaults.yaml`
 
 推荐分工：
 
 - `.env` / `.env.docker`：模型密钥、飞书密钥、endpoint、token 等敏感或易变配置。
+- `NEWMAN_DEPLOY_PROFILE`：一键选择宿主部署 profile，例如 `macos_source_online`。
 - `newman.yaml`：项目部署配置，例如端口、路径、权限、channel 开关。
 - `backend/config/defaults.yaml`：代码内置默认值，不按环境直接修改。
 
@@ -542,7 +560,7 @@ curl http://127.0.0.1:18005/api/plugins
 部署完成后，按顺序确认：
 
 - 前端能打开。
-- `GET /healthz` 返回 `ok=true`。
+- `GET /healthz` 返回 `ok=true`，并确认 `sandbox.selected_backend`、`sandbox.available=true`、`sandbox.probe_ok=true` 与各项 enforcement 符合预期，或明确知道当前部署已关闭 native sandbox。
 - `GET /readyz` 返回运行目录。
 - 新建对话能得到模型回复。
 - `GET /api/plugins` 能看到已启用插件。
@@ -560,7 +578,13 @@ curl http://127.0.0.1:18005/api/plugins
 - 端口是否正确。Docker 默认 `18005`，本地开发默认 `8005`。
 - `docker compose logs -f backend` 或 `backend_data/run/logs/backend.log` 中是否有启动错误。
 
-### 8.2 前端能打开，但对话没有回复
+### 8.2 沙箱显示不可用
+
+`/healthz` 中 `sandbox.available=false` 或 `sandbox.probe_ok=false` 表示 native sandbox 没有实际生效。Docker 默认关闭 native sandbox；如果需要隔离本机进程，先确认宿主支持对应 provider，再把 `sandbox.enabled` 打开。`linux_landlock` 只提供文件访问隔离；`macos_seatbelt` 只提供写入范围限制和可选禁网；`windows_acl` 只提供 partial 写入限制和进程树清理。受限模式下 runner 或 probe 不可用时 Newman 会 fail closed，不会自动裸跑命令。
+
+最小可用口径下，`linux_bwrap` 是唯一 full sandbox；`linux_landlock`、`macos_seatbelt`、`windows_acl` 都是显式 partial provider，必须设置 `allow_partial_enforcement=true` 并关闭不支持的强制隔离要求后才允许运行。macOS 源码部署优先用 `NEWMAN_DEPLOY_PROFILE=macos_source_online` 自动应用这些字段，并允许沙箱内命令联网。`windows_acl` 还需要配置 `sandbox.provider_path` 指向 `newman-sandbox-win.exe` helper。
+
+### 8.3 前端能打开，但对话没有回复
 
 检查：
 
@@ -568,7 +592,7 @@ curl http://127.0.0.1:18005/api/plugins
 - 后端日志中是否有模型服务连接错误。
 - 模型服务是否兼容 OpenAI Chat Completions 接口。
 
-### 8.3 飞书状态是 `missing_credentials`
+### 8.4 飞书状态是 `missing_credentials`
 
 `.env` / `.env.docker` 没有填：
 
@@ -579,7 +603,7 @@ NEWMAN_CHANNELS__FEISHU__APP_SECRET=
 
 填完后重启 backend 或执行配置 reload。
 
-### 8.4 飞书状态是 `missing_dependency`
+### 8.5 飞书状态是 `missing_dependency`
 
 当前 Python 环境缺少 `lark-channel-sdk`。
 
@@ -596,7 +620,7 @@ docker compose up -d
 python -m pip install -e ./backend
 ```
 
-### 8.5 飞书状态是 `connected=false`
+### 8.6 飞书状态是 `connected=false`
 
 检查：
 
@@ -606,7 +630,7 @@ python -m pip install -e ./backend
 - 是否订阅了长连接事件 `im.message.receive_v1`。
 - Newman 所在机器是否允许出站访问飞书开放平台。
 
-### 8.6 飞书群里发消息无反应
+### 8.7 飞书群里发消息无反应
 
 默认群聊需要 `@` 机器人。可以选择：
 
@@ -615,7 +639,7 @@ python -m pip install -e ./backend
 
 还需要确认应用在对应群聊可见，并且没有被 `ALLOWED_CHAT_IDS` 或 `ALLOWED_USER_OPEN_IDS` 白名单拦截。
 
-### 8.7 Newman 主动发飞书消息提示缺少目标或身份
+### 8.8 Newman 主动发飞书消息提示缺少目标或身份
 
 如果你希望 Newman 默认发给固定用户，检查：
 
@@ -634,7 +658,7 @@ lark-cli auth status
 
 至少有一个可用身份。
 
-### 8.8 `lark-cli auth status` 显示 user `needs_refresh`
+### 8.9 `lark-cli auth status` 显示 user `needs_refresh`
 
 如果 user 身份可用但 token 需要刷新，`lark-cli` 通常会在下一次 user API 调用时自动刷新。若刷新失败，重新执行：
 
@@ -642,7 +666,7 @@ lark-cli auth status
 lark-cli auth login --recommend
 ```
 
-### 8.9 Docker 容器里找不到宿主机服务
+### 8.10 Docker 容器里找不到宿主机服务
 
 容器内访问宿主机服务不要使用 `127.0.0.1`，应使用：
 

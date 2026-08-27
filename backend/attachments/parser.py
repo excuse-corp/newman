@@ -8,6 +8,7 @@ import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING
 
 from docx import Document as DocxDocument
 from docx.document import Document as DocxDocumentType
@@ -18,6 +19,9 @@ from pptx import Presentation
 from pypdf import PdfReader
 
 from backend.attachments.models import ParsedAttachment
+
+if TYPE_CHECKING:
+    from backend.sandbox.native_sandbox import NativeSandbox
 
 
 MARKDOWN_BYTE_LIMIT = 10 * 1024 * 1024
@@ -70,12 +74,12 @@ class _VisibleHTMLParser(HTMLParser):
         return text.strip()
 
 
-def parse_attachment(path: Path) -> ParsedAttachment:
+def parse_attachment(path: Path, sandbox: "NativeSandbox | None" = None) -> ParsedAttachment:
     suffix = path.suffix.lower()
     if suffix in {".doc", ".xls", ".ppt"}:
         with TemporaryDirectory(prefix="newman-attachment-convert-") as tmp:
-            converted = _convert_legacy_office_document(path, Path(tmp))
-            return parse_attachment(converted)
+            converted = _convert_legacy_office_document(path, Path(tmp), sandbox=sandbox)
+            return parse_attachment(converted, sandbox=sandbox)
 
     if suffix in {".txt", ".md"}:
         return _parse_textual_attachment(path)
@@ -636,7 +640,12 @@ def _read_slide_notes_text(slide) -> str:
         return ""
 
 
-def _convert_legacy_office_document(path: Path, output_dir: Path) -> Path:
+def _convert_legacy_office_document(
+    path: Path,
+    output_dir: Path,
+    *,
+    sandbox: "NativeSandbox | None" = None,
+) -> Path:
     target_extension = {
         ".doc": "docx",
         ".xls": "xlsx",
@@ -652,13 +661,33 @@ def _convert_legacy_office_document(path: Path, output_dir: Path) -> Path:
         str(path),
     ]
     try:
+        run_command = command
+        run_env = None
+        run_cwd = str(output_dir)
+        if sandbox is not None:
+            from backend.sandbox.native_sandbox import SandboxUnavailableError
+
+            try:
+                run_command, run_env, prepared_cwd, _sandboxed, _filtered = sandbox.prepare_argv(
+                    command,
+                    cwd=output_dir,
+                    mode="workspace-write",
+                    network_access=False,
+                    extra_readable_roots=[path.parent],
+                    extra_writable_roots=[output_dir],
+                )
+            except SandboxUnavailableError as exc:
+                raise ValueError(f"{path.name} 转换失败：Office 沙箱不可用 ({exc.code})") from exc
+            run_cwd = str(prepared_cwd)
         subprocess.run(
-            command,
+            run_command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True,
             text=True,
             timeout=120,
+            env=run_env,
+            cwd=run_cwd,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise ValueError(f"{path.name} 转换失败，无法解析旧版 Office 文件") from exc

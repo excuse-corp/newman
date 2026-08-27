@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 
 EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
+DeploymentProfile = Literal["none", "linux_source_default", "macos_source_online"]
 
 
 class ServerConfig(BaseModel):
@@ -87,12 +88,35 @@ class EvolutionConfig(BaseModel):
 
 class SandboxConfig(BaseModel):
     enabled: bool = True
-    backend: Literal["linux_bwrap"] = "linux_bwrap"
+    backend: Literal["auto", "linux_bwrap", "linux_landlock", "macos_seatbelt", "windows_acl", "none"] = "linux_bwrap"
     mode: Literal["read-only", "workspace-write", "danger-full-access"] = "workspace-write"
     network_access: bool = False
     writable_roots: list[str] = Field(default_factory=list)
     timeout: int = 30
     output_limit_bytes: int = 10_240
+    probe_timeout_ms: int = Field(default=5_000, ge=100, le=60_000)
+    allow_partial_enforcement: bool = False
+    require_network_isolation: bool = True
+    require_process_isolation: bool = True
+    provider_path: str | None = None
+    env_allowlist: list[str] = Field(default_factory=lambda: [
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_*",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "NEWMAN_RUNTIME_WORKSPACE",
+        "NEWMAN_PLUGIN_ROOT",
+        "NEWMAN_PLUGIN_NAME",
+        "NEWMAN_LARK_DEFAULT_IM_USER_ID",
+        "NEWMAN_LARK_DEFAULT_IM_IDENTITY",
+    ])
+    # Sandbox escalation is a security-sensitive deployment decision. It is
+    # deliberately opt-in even when the surrounding turn approval mode is
+    # auto_allow.
+    allow_automatic_full_access: bool = False
 
 
 class ApprovalConfig(BaseModel):
@@ -160,6 +184,7 @@ class ChannelsConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
+    deployment_profile: DeploymentProfile = "none"
     server: ServerConfig = Field(default_factory=ServerConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)

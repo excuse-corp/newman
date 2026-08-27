@@ -26,14 +26,17 @@ class MCPToolAdapter(BaseTool):
         try:
             body = await self.client.invoke_tool(self.spec, arguments)
         except MCPClientError as exc:
+            metadata = {**self.client.execution_metadata(), **exc.metadata}
             return ToolExecutionResult(
                 success=False,
                 tool=self.meta.name,
                 action="invoke",
                 category="network_error",
+                error_code=exc.error_code,
                 summary=f"MCP server {self.server.name} request failed: {exc}",
                 stderr=str(exc),
                 retryable=True,
+                metadata=metadata,
             )
         except Exception as exc:
             return ToolExecutionResult(
@@ -44,6 +47,7 @@ class MCPToolAdapter(BaseTool):
                 summary=f"MCP tool {self.spec.name} 执行异常: {exc}",
                 stderr=str(exc),
                 retryable=False,
+                metadata=self.client.execution_metadata(),
             )
 
         return ToolExecutionResult(
@@ -55,5 +59,8 @@ class MCPToolAdapter(BaseTool):
             stdout=str(body.get("stdout", "")),
             stderr=str(body.get("stderr", "")),
             retryable=bool(body.get("retryable", False)),
-            metadata=body.get("metadata", {}) if isinstance(body.get("metadata"), dict) else {},
+            metadata={
+                **self.client.execution_metadata(),
+                **(body.get("metadata", {}) if isinstance(body.get("metadata"), dict) else {}),
+            },
         )

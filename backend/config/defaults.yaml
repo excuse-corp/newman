@@ -3,6 +3,8 @@
 # Project-level newman.yaml should represent the actual deployed project config.
 # Model overrides and secrets are generally better placed in .env via NEWMAN_* variables.
 
+deployment_profile: "none"
+
 server:
   host: "0.0.0.0"
   port: 8005
@@ -82,6 +84,25 @@ sandbox:
   writable_roots: []
   timeout: 30
   output_limit_bytes: 10240
+  probe_timeout_ms: 5000
+  allow_partial_enforcement: false
+  require_network_isolation: true
+  require_process_isolation: true
+  provider_path: null
+  env_allowlist:
+    - "PATH"
+    - "HOME"
+    - "LANG"
+    - "LC_*"
+    - "TMPDIR"
+    - "TMP"
+    - "TEMP"
+    - "NEWMAN_RUNTIME_WORKSPACE"
+    - "NEWMAN_PLUGIN_ROOT"
+    - "NEWMAN_PLUGIN_NAME"
+    - "NEWMAN_LARK_DEFAULT_IM_USER_ID"
+    - "NEWMAN_LARK_DEFAULT_IM_IDENTITY"
+  allow_automatic_full_access: false
 
 approval:
   level1_blacklist:

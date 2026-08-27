@@ -184,6 +184,14 @@ cd /path/to/newman
 cp .env.example .env
 ```
 
+macOS 源码部署如果希望沙箱内命令可以联网，只需要在 `.env` 中改这一行：
+
+```dotenv
+NEWMAN_DEPLOY_PROFILE=macos_source_online
+```
+
+Linux 源码部署可使用 `NEWMAN_DEPLOY_PROFILE=linux_source_default`，或保持 `none` 后手动维护 `sandbox.*` 细项。使用 profile 时，不要同时启用 `.env` 里的 `NEWMAN_SANDBOX_*` 高级覆盖项，除非你明确要覆盖 profile。
+
 4. 启动整套服务。
 
 ```bash
@@ -220,14 +228,16 @@ cd /path/to/newman
 Newman 的配置优先级如下：
 
 1. 环境变量
-2. `~/.newman/config.yaml`
-3. 项目根目录 `newman.yaml`
-4. `backend/config/defaults.yaml`
+2. `deployment_profile` overlay（由 `NEWMAN_DEPLOY_PROFILE` 或 `deployment_profile` 选择）
+3. `~/.newman/config.yaml`
+4. 项目根目录 `newman.yaml`
+5. `backend/config/defaults.yaml`
 
 部署时通常这样分工：
 
 - `newman.yaml`：项目级部署配置
 - `.env` / `.env.docker`：模型、密钥、DSN、endpoint 这类敏感或易变配置
+- `NEWMAN_DEPLOY_PROFILE`：一键选择宿主部署 profile，例如 `macos_source_online`
 - `backend/config/defaults.yaml`：代码内置基线，不直接按环境改
 
 一个最常见的启动前检查清单：
@@ -235,7 +245,24 @@ Newman 的配置优先级如下：
 - `newman.yaml` 是否存在并符合当前环境
 - `.env` 或 `.env.docker` 是否填入真实模型配置
 - PostgreSQL 或 Docker 容器是否正常
-- `GET /healthz` 是否返回 `ok: true`
+- `GET /healthz` 是否返回 `ok: true`，并检查 `sandbox.selected_backend`、`sandbox.available`、`sandbox.probe_ok` 和各项 enforcement
+
+Docker 配置默认 `sandbox.enabled=false`，因为很多容器宿主没有开放 bwrap/unprivileged user namespace。此时 Newman 会在 `/healthz` 中把沙箱标记为 unavailable，而不是伪装成可用；需要本机执行隔离时，应先启用沙箱并确认 selected backend 的 functional probe 与 enforcement 符合预期。`linux_landlock`、`macos_seatbelt` 和 `windows_acl` 都是带边界的 partial 路径，不能替代 bwrap 的完整网络/PID 隔离。
+
+最小可用沙箱后端矩阵：
+
+| Backend | File | Network | Process/PID | 使用建议 |
+| --- | --- | --- | --- | --- |
+| `linux_bwrap` | `full` | `full` when `network_access=false` | `full` | Linux 默认推荐 |
+| `linux_landlock` | `full` | `unsupported` | `unsupported` | 仅在 `allow_partial_enforcement=true` 时作为文件隔离 fallback |
+| `macos_seatbelt` | `full` write-effect only | `full` when `network_access=false` | visibility `unsupported`, lifecycle `partial` | macOS only；private temp/home；需要 `allow_partial_enforcement=true` |
+| `windows_acl` | `partial` | `unsupported` | visibility `unsupported`, lifecycle `partial` | Windows only；需要 helper + `allow_partial_enforcement=true`，不能要求网络隔离 |
+
+源码部署可用 profile 简化沙箱配置：`NEWMAN_DEPLOY_PROFILE=linux_source_default` 会启用 Linux bwrap；`NEWMAN_DEPLOY_PROFILE=macos_source_online` 会启用 macOS Seatbelt，允许沙箱内命令联网，并自动设置 `allow_partial_enforcement=true`、`require_process_isolation=false`、`require_network_isolation=false`。
+
+`macos_seatbelt` 通过 `/usr/bin/sandbox-exec` 动态生成 SBPL profile；如需指定替代路径，可设置 `sandbox.provider_path`。默认不授权全局 `/tmp`，每次执行会分配 private temp，并把 `TMPDIR`/`TMP`/`TEMP`、`HOME`、XDG cache/config/data 和 Python bytecode/cache 路径重定向到该 private temp。functional probe 会验证 workspace 写入、workspace 外写入拒绝、protected root 写入拒绝、symlink escape 写入拒绝、read-only 写 workspace 拒绝，以及 `network_access=false` 下 localhost 连接拒绝。它仍不提供读取隔离和 PID namespace；macOS 宿主 e2e 未通过前，不能宣称该平台已验收。
+
+`windows_acl` 依赖 `newman-sandbox-win.exe` helper。helper 缺失、probe 失败或 policy 要求 unsupported isolation 时，Newman 会 fail closed，不会执行原始命令。
 
 ### 飞书接入
 

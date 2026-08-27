@@ -28,6 +28,9 @@ runtime:
   provider_min_interval_seconds: 0.0
 
 sandbox:
+  # Docker image defaults to disabled native sandbox because many container
+  # hosts do not expose unprivileged user namespaces/bwrap. /healthz reports
+  # this as unavailable; enable only after validating bwrap functional probe.
   enabled: false
   backend: "linux_bwrap"
   mode: "workspace-write"
@@ -35,6 +38,25 @@ sandbox:
   writable_roots: []
   timeout: 30
   output_limit_bytes: 10240
+  probe_timeout_ms: 5000
+  allow_partial_enforcement: false
+  require_network_isolation: true
+  require_process_isolation: true
+  provider_path: null
+  env_allowlist:
+    - "PATH"
+    - "HOME"
+    - "LANG"
+    - "LC_*"
+    - "TMPDIR"
+    - "TMP"
+    - "TEMP"
+    - "NEWMAN_RUNTIME_WORKSPACE"
+    - "NEWMAN_PLUGIN_ROOT"
+    - "NEWMAN_PLUGIN_NAME"
+    - "NEWMAN_LARK_DEFAULT_IM_USER_ID"
+    - "NEWMAN_LARK_DEFAULT_IM_IDENTITY"
+  allow_automatic_full_access: false
 
 approval:
   level1_blacklist:

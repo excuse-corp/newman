@@ -17,6 +17,8 @@ INTEGRATION_ENV_KEYS = ("ANYSEARCH_API_KEY",)
 LOGGER = logging.getLogger("newman.config")
 DISPLAY_LOGGER = logging.getLogger("uvicorn.error")
 SENSITIVE_MARKERS = {"api_key", "token", "secret", "password"}
+DEPLOY_PROFILE_ENV_KEYS = ("NEWMAN_DEPLOY_PROFILE", "NEWMAN_DEPLOYMENT_PROFILE")
+DEPLOYMENT_PROFILES = {"none", "linux_source_default", "macos_source_online"}
 _LAST_SETTINGS_REPORT: "ConfigLoadReport | None" = None
 _MANAGED_INTEGRATION_ENV: dict[str, str] = {}
 PROJECT_CONFIG_TEMPLATE = """# Newman project config
@@ -24,6 +26,10 @@ PROJECT_CONFIG_TEMPLATE = """# Newman project config
 # backend/config/defaults.yaml provides the built-in baseline template and fallback values.
 # Keep actual project settings here.
 # Model settings and secrets can still be overridden through NEWMAN_* values in .env when needed.
+
+# Optional deployment profile. Leave as "none" for fully manual config, or set
+# NEWMAN_DEPLOY_PROFILE in .env / system env to select a host-specific profile.
+deployment_profile: "none"
 
 server:
   host: "0.0.0.0"
@@ -80,6 +86,25 @@ sandbox:
   writable_roots: []
   timeout: 30
   output_limit_bytes: 10240
+  probe_timeout_ms: 5000
+  allow_partial_enforcement: false
+  require_network_isolation: true
+  require_process_isolation: true
+  provider_path: null
+  env_allowlist:
+    - "PATH"
+    - "HOME"
+    - "LANG"
+    - "LC_*"
+    - "TMPDIR"
+    - "TMP"
+    - "TEMP"
+    - "NEWMAN_RUNTIME_WORKSPACE"
+    - "NEWMAN_PLUGIN_ROOT"
+    - "NEWMAN_PLUGIN_NAME"
+    - "NEWMAN_LARK_DEFAULT_IM_USER_ID"
+    - "NEWMAN_LARK_DEFAULT_IM_IDENTITY"
+  allow_automatic_full_access: false
 
 approval:
   level1_blacklist:
@@ -376,6 +401,8 @@ def _env_to_nested(defaults: dict[str, Any], dotenv_values: dict[str, str] | Non
             continue
         raw_path = key[len(CONFIG_ENV_PREFIX) :].lower()
         path = env_path_map.get(raw_path)
+        if path is None and raw_path == "deploy_profile":
+            path = ("deployment_profile",)
         if path is None and raw_path.startswith("provider_"):
             path = ("models", "primary", raw_path[len("provider_") :])
         if path is None and "__" in raw_path:
@@ -385,6 +412,32 @@ def _env_to_nested(defaults: dict[str, Any], dotenv_values: dict[str, str] | Non
         expected = _get_nested_default(defaults, path)
         _assign_nested(nested, path, _coerce_env_value(raw_value, expected))
     return nested
+
+
+def _selected_deployment_profile(merged: dict[str, Any], dotenv_values: dict[str, str]) -> str:
+    env_values = dict(dotenv_values)
+    env_values.update(os.environ)
+    for key in DEPLOY_PROFILE_ENV_KEYS:
+        raw_value = env_values.get(key)
+        if raw_value is not None and raw_value.strip():
+            return raw_value.strip()
+    raw_config_value = merged.get("deployment_profile", "none")
+    if raw_config_value is None:
+        return "none"
+    return str(raw_config_value).strip() or "none"
+
+
+def _load_deployment_profile(root: Path, profile_name: str) -> dict[str, Any]:
+    if profile_name not in DEPLOYMENT_PROFILES:
+        allowed = ", ".join(sorted(DEPLOYMENT_PROFILES))
+        raise ValueError(f"Unknown Newman deployment profile: {profile_name}. Allowed profiles: {allowed}")
+    if profile_name == "none":
+        return {}
+    profile_path = root / "backend" / "config" / "profiles" / f"{profile_name}.yaml"
+    profile = _read_yaml(profile_path)
+    if not profile:
+        raise ValueError(f"Deployment profile is empty or missing: {profile_path}")
+    return profile
 
 
 def _resolve_paths(config: AppConfig, project_root: Path) -> AppConfig:
@@ -435,6 +488,13 @@ def _load_settings_uncached(
     _assign_source_map(source_map, project, "newman.yaml")
     merged = _deep_merge(merged, user)
     _assign_source_map(source_map, user, "~/.newman/config.yaml")
+
+    deployment_profile = _selected_deployment_profile(merged, dotenv_values)
+    profile_values = _load_deployment_profile(root, deployment_profile)
+    if profile_values:
+        merged = _deep_merge(merged, profile_values)
+        _assign_source_map(source_map, profile_values, f"deployment_profile:{deployment_profile}")
+
     env_values = _env_to_nested(merged, dotenv_values)
     merged = _deep_merge(merged, env_values)
     _assign_source_map(source_map, env_values, "environment")

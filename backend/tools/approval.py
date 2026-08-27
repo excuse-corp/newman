@@ -18,6 +18,7 @@ class ApprovalRequest:
     tool_name: str
     arguments: dict[str, Any]
     reason: str
+    metadata: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time)
     future: asyncio.Future[bool] | None = None
 
@@ -41,6 +42,7 @@ class ApprovalManager:
         arguments: dict[str, Any],
         reason: str,
         turn_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> ApprovalRequest:
         request = ApprovalRequest(
             approval_request_id=uuid4().hex,
@@ -49,6 +51,7 @@ class ApprovalManager:
             tool_name=tool_name,
             arguments=arguments,
             reason=reason,
+            metadata=dict(metadata or {}),
             future=asyncio.get_running_loop().create_future(),
         )
         self._pending[request.approval_request_id] = request

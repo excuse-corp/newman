@@ -1,0 +1,13 @@
+# Newman source deployment profile for macOS hosts.
+# Seatbelt is a partial provider: file write control + process-group cleanup;
+# this profile intentionally allows network access inside sandboxed commands.
+
+sandbox:
+  enabled: true
+  backend: "macos_seatbelt"
+  mode: "workspace-write"
+  network_access: true
+  require_network_isolation: false
+  require_process_isolation: false
+  allow_partial_enforcement: true
+  provider_path: null

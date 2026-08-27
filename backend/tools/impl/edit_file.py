@@ -9,6 +9,7 @@ from backend.tools.discovery import BuiltinToolContext
 from backend.tools.result import ToolExecutionResult
 from backend.tools.workspace_fs import (
     PathAccessPolicy,
+    PathPolicyError,
     coerce_path_access_policy,
     display_path,
     ensure_writable_path,
@@ -69,7 +70,7 @@ class EditFileTool(BaseTool):
         try:
             target = ensure_writable_path(self.policy, arguments.get("path"))
         except ValueError as exc:
-            return ToolExecutionResult(False, self.meta.name, "edit", "permission_error", summary=str(exc))
+            return _permission_result(self.meta.name, "edit", exc)
 
         if not target.exists():
             return ToolExecutionResult(False, self.meta.name, "edit", "validation_error", summary=f"文件不存在: {target}")
@@ -149,3 +150,20 @@ class EditFileTool(BaseTool):
 
 def build_tools(context: BuiltinToolContext) -> list[BaseTool]:
     return [EditFileTool(context.path_policy)]
+
+
+def _permission_result(tool: str, action: str, exc: ValueError) -> ToolExecutionResult:
+    error_code = exc.error_code if isinstance(exc, PathPolicyError) else ""
+    metadata = {}
+    if isinstance(exc, PathPolicyError) and exc.sandbox_denied:
+        metadata = {"sandbox_denied": True, "sandbox_error_code": error_code}
+    return ToolExecutionResult(
+        False,
+        tool,
+        action,
+        "permission_error",
+        error_code=error_code,
+        summary=str(exc),
+        retryable=False,
+        metadata=metadata,
+    )

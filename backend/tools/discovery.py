@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from backend.plugin_runtime.draft_service import PluginDraftService
     from backend.providers.multimodal import MultimodalAnalyzer
     from backend.sandbox.native_sandbox import NativeSandbox
+    from backend.sandbox.process import SandboxProcessRunner
     from backend.scheduler.scheduler_engine import SchedulerEngine
     from backend.scheduler.task_store import TaskStore
     from backend.sessions.session_store import SessionStore
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 class BuiltinToolContext:
     path_policy: "PathAccessPolicy"
     sandbox: "NativeSandbox"
+    sandbox_runner: "SandboxProcessRunner | None" = None
     session_store: "SessionStore | None" = None
     multimodal_analyzer: "MultimodalAnalyzer | None" = None
     scheduler_store: "TaskStore | None" = None
