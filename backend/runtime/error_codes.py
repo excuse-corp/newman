@@ -243,6 +243,14 @@ PROVIDER_ERROR_MAP = {
         "recoverable",
         "Retry after a short delay; if it repeats, inspect the provider stream, gateway buffering, and connection close path.",
     ),
+    "reasoning_loop": ErrorDescriptor(
+        "NEWMAN-PROVIDER-011",
+        "warning",
+        "medium",
+        "主模型思考重复",
+        "fatal",
+        "Stop this turn; retry with a shorter prompt, fewer tool schemas, or a different model if the loop repeats.",
+    ),
 }
 
 DEFAULT_PROVIDER_ERROR = ErrorDescriptor(

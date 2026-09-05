@@ -18,7 +18,62 @@ from backend.usage.recorder import ModelRequestContext, record_model_usage
 from backend.usage.store import PostgresModelUsageStore
 
 
-ALLOWED_UPLOAD_SUFFIXES = {".md", ".py", ".jpg", ".jpeg", ".png"}
+ALLOWED_UPLOAD_SUFFIXES = {
+    ".cjs",
+    ".css",
+    ".csv",
+    ".gif",
+    ".htm",
+    ".html",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".json",
+    ".jsx",
+    ".markdown",
+    ".md",
+    ".mjs",
+    ".png",
+    ".py",
+    ".pyi",
+    ".svg",
+    ".toml",
+    ".ts",
+    ".tsv",
+    ".tsx",
+    ".txt",
+    ".webp",
+    ".yaml",
+    ".yml",
+}
+ALLOWED_EXTENSIONLESS_UPLOAD_NAMES = {
+    "authors",
+    "changelog",
+    "contributors",
+    "copying",
+    "license",
+    "notice",
+    "readme",
+}
+IGNORED_UPLOAD_DIRECTORY_NAMES = {
+    ".cache",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".next",
+    ".nuxt",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+}
+IGNORED_UPLOAD_FILENAMES = {".ds_store", ".gitignore", "thumbs.db"}
 MAX_UPLOAD_FILES = 200
 MAX_UPLOAD_FILE_BYTES = 20 * 1024 * 1024
 MAX_UPLOAD_TOTAL_BYTES = 80 * 1024 * 1024
@@ -97,31 +152,38 @@ class SkillImportLoader:
         upload_root.mkdir(parents=True, exist_ok=True)
         normalized_parent.mkdir(parents=True, exist_ok=True)
 
-        report.source_files = _write_upload_files(files, upload_root)
+        report.source_files = _write_upload_files(files, upload_root, report)
         input_root = _select_input_root(upload_root)
         skill_content, metadata, source_skill_path = _build_skill_content(input_root, requested_name, report)
+        package_mode = source_skill_path is not None and source_skill_path.name.lower() == "skill.md"
         skill_name = _normalize_skill_name(requested_name or metadata.get("name") or input_root.name)
         metadata["name"] = skill_name
         normalized_root = normalized_parent / skill_name
         normalized_root.mkdir(parents=True, exist_ok=True)
 
-        copied_files = _copy_resources(input_root, normalized_root, source_skill_path, report)
-        skill_content = _render_skill_markdown(
-            content=skill_content,
-            metadata=metadata,
-            copied_files=copied_files,
-            report=report,
-        )
-        skill_content, optimizer = await self._maybe_optimize_skill_markdown(
-            skill_content,
-            copied_files,
-            report,
-            optimize_with_llm=optimize_with_llm,
-        )
-        report.optimizer = optimizer
+        copied_files = _copy_resources(input_root, normalized_root, source_skill_path, report, preserve_structure=package_mode)
+        if package_mode:
+            skill_content = _render_preserved_skill_markdown(content=skill_content, metadata=metadata)
+            report.optimizer = "preserved"
+            if optimize_with_llm:
+                report.warnings.append("检测到 SKILL.md，已按完整 Skill 包保留目录结构并跳过 LLM 优化。")
+        else:
+            skill_content = _render_skill_markdown(
+                content=skill_content,
+                metadata=metadata,
+                copied_files=copied_files,
+                report=report,
+            )
+            skill_content, optimizer = await self._maybe_optimize_skill_markdown(
+                skill_content,
+                copied_files,
+                report,
+                optimize_with_llm=optimize_with_llm,
+            )
+            report.optimizer = optimizer
 
         script_paths = sorted(path for path in normalized_root.rglob("*.py") if path.is_file())
-        if script_paths:
+        if script_paths and not package_mode:
             wrapper_path = _write_python_runtime_files(normalized_root, script_paths, report)
             skill_content = _ensure_python_runtime_section(skill_content, wrapper_path)
 
@@ -214,7 +276,7 @@ class SkillImportLoader:
             return content, "deterministic"
 
 
-def _write_upload_files(files: list[UploadedSkillFile], upload_root: Path) -> list[str]:
+def _write_upload_files(files: list[UploadedSkillFile], upload_root: Path, report: SkillImportReport) -> list[str]:
     if not files:
         raise ValueError("请至少上传一个 Skill 文件")
     if len(files) > MAX_UPLOAD_FILES:
@@ -224,11 +286,14 @@ def _write_upload_files(files: list[UploadedSkillFile], upload_root: Path) -> li
     seen: set[str] = set()
     written: list[str] = []
     rejected: list[str] = []
+    skipped: list[str] = []
 
     for item in files:
         relative_path = _safe_upload_relative_path(item.filename)
-        suffix = Path(relative_path.name).suffix.lower()
-        if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        if _should_skip_upload_path(relative_path):
+            skipped.append(relative_path.as_posix())
+            continue
+        if not _is_allowed_upload_file(relative_path):
             rejected.append(str(relative_path))
             continue
         if len(item.content) == 0:
@@ -249,12 +314,40 @@ def _write_upload_files(files: list[UploadedSkillFile], upload_root: Path) -> li
         target.write_bytes(item.content)
         written.append(relative_path.as_posix())
 
+    if skipped:
+        report.warnings.append(f"已跳过 {len(skipped)} 个缓存、依赖或隐藏元数据文件：{_format_path_list(skipped)}")
     if rejected:
-        allowed = ", ".join(sorted(ALLOWED_UPLOAD_SUFFIXES))
+        allowed = _format_allowed_upload_types()
         raise ValueError(f"不支持的 Skill 上传文件：{', '.join(rejected)}；仅支持 {allowed}")
     if not written:
         raise ValueError("没有可导入的 Skill 文件")
     return written
+
+
+def _should_skip_upload_path(relative_path: PurePosixPath) -> bool:
+    lowered_parts = [part.lower() for part in relative_path.parts]
+    if any(part in IGNORED_UPLOAD_DIRECTORY_NAMES for part in lowered_parts[:-1]):
+        return True
+    return bool(lowered_parts and lowered_parts[-1] in IGNORED_UPLOAD_FILENAMES)
+
+
+def _is_allowed_upload_file(relative_path: PurePosixPath) -> bool:
+    suffix = Path(relative_path.name).suffix.lower()
+    if suffix in ALLOWED_UPLOAD_SUFFIXES:
+        return True
+    return relative_path.name.lower() in ALLOWED_EXTENSIONLESS_UPLOAD_NAMES
+
+
+def _format_allowed_upload_types() -> str:
+    suffixes = ", ".join(sorted(ALLOWED_UPLOAD_SUFFIXES))
+    names = ", ".join(sorted(ALLOWED_EXTENSIONLESS_UPLOAD_NAMES))
+    return f"{suffixes}；以及无后缀文档：{names}"
+
+
+def _format_path_list(paths: list[str], *, limit: int = 8) -> str:
+    visible = paths[:limit]
+    suffix = f" 等 {len(paths)} 个" if len(paths) > limit else ""
+    return ", ".join(visible) + suffix
 
 
 def _safe_upload_relative_path(filename: str) -> PurePosixPath:
@@ -323,6 +416,8 @@ def _copy_resources(
     normalized_root: Path,
     source_skill_path: Path | None,
     report: SkillImportReport,
+    *,
+    preserve_structure: bool = False,
 ) -> list[Path]:
     copied: list[Path] = []
     for source in sorted(path for path in input_root.rglob("*") if path.is_file()):
@@ -330,12 +425,20 @@ def _copy_resources(
             continue
         suffix = source.suffix.lower()
         relative = source.relative_to(input_root)
-        if suffix == ".md":
+        if preserve_structure:
+            target_relative = relative
+        elif suffix in {".md", ".markdown", ".txt"} or source.name.lower() in ALLOWED_EXTENSIONLESS_UPLOAD_NAMES:
             target_relative = _resource_relative_path(relative, "references", preserve_roots={"references", "templates"})
-        elif suffix == ".py":
+        elif suffix in {".py", ".pyi"}:
             target_relative = _resource_relative_path(relative, "scripts", preserve_roots={"scripts"})
-        elif suffix in {".jpg", ".jpeg", ".png"}:
+        elif suffix in {".gif", ".ico", ".jpg", ".jpeg", ".png", ".svg", ".webp"}:
             target_relative = _resource_relative_path(relative, "assets", preserve_roots={"assets"})
+        elif suffix in {".cjs", ".css", ".csv", ".htm", ".html", ".js", ".json", ".jsx", ".mjs", ".toml", ".ts", ".tsv", ".tsx", ".yaml", ".yml"}:
+            target_relative = _resource_relative_path(
+                relative,
+                "resources",
+                preserve_roots={"agents", "data", "docs", "examples", "resources", "scripts", "templates"},
+            )
         else:
             continue
 
@@ -382,6 +485,21 @@ def _render_skill_markdown(
     body = _ensure_core_sections(body)
     body = _ensure_resource_inventory_section(body, copied_files)
     report.warnings.extend(_compatibility_warnings(body, copied_files))
+    return _compose_skill_markdown(
+        {
+            "name": name,
+            "description": description,
+            "when_to_use": when_to_use,
+        },
+        body,
+    )
+
+
+def _render_preserved_skill_markdown(*, content: str, metadata: dict[str, str]) -> str:
+    name = _normalize_skill_name(metadata.get("name") or "imported-skill")
+    description = str(metadata.get("description") or f"Imported Newman skill for {name}.").strip()
+    when_to_use = str(metadata.get("when_to_use") or _default_when_to_use(name)).strip()
+    body = content.strip() or "# Workflow\n\n- Inspect the bundled resources before acting."
     return _compose_skill_markdown(
         {
             "name": name,

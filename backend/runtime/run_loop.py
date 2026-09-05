@@ -358,6 +358,13 @@ TOOL_ARGUMENT_PROGRESS_EMIT_BYTES = 2_048
 TOOL_EVENT_OUTPUT_PREVIEW_MAX_CHARS = 8_000
 STRUCTURED_TOOL_PREAMBLE_RE = re.compile(r"(^|\n)\s*(?:#{1,6}\s+|\d+[.、]\s+|[-*]\s+)")
 HASH_PATH_SEGMENT_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
+REASONING_LOOP_MIN_CHARS = 12_000
+REASONING_LOOP_TAIL_CHARS = 4_096
+REASONING_LOOP_CHECK_INTERVAL_CHARS = 1_024
+REASONING_LOOP_MIN_NGRAM_REPEATS = 24
+REASONING_LOOP_MIN_NGRAM_COVERAGE = 0.35
+REASONING_ONLY_MAX_CHARS = 120_000
+REASONING_TOKEN_RE = re.compile(r"\S+")
 PSEUDO_TOOL_NAMES = frozenset({"commentary", "thinking", "think"})
 PLAN_TOOL_NAMES = frozenset({"enter_plan_mode", "update_plan"})
 MAX_INVALID_TOOL_CALL_RECOVERY_ATTEMPTS = 1
@@ -419,6 +426,47 @@ def _build_tool_event_output_preview(result: ToolExecutionResult) -> str:
         if candidate and candidate.strip():
             return _compact_tool_event_output_preview(candidate)
     return ""
+
+
+def _normalize_reasoning_token(value: str) -> str:
+    return value.strip("\"'`.,;:!?，。；：！？、()[]{}<>").lower()
+
+
+def _detect_repetitive_reasoning_tail(text: str) -> str | None:
+    normalized = " ".join(text.split())
+    if len(normalized) < REASONING_LOOP_MIN_CHARS:
+        return None
+
+    tail = normalized[-REASONING_LOOP_TAIL_CHARS:]
+    tokens = [
+        token
+        for token in (_normalize_reasoning_token(match.group(0)) for match in REASONING_TOKEN_RE.finditer(tail))
+        if token
+    ]
+    if len(tokens) < 100:
+        return None
+
+    for width in range(3, 8):
+        if len(tokens) < width:
+            continue
+        counts: dict[tuple[str, ...], int] = {}
+        best: tuple[str, ...] | None = None
+        best_count = 0
+        for index in range(0, len(tokens) - width + 1):
+            gram = tuple(tokens[index : index + width])
+            if len(set(gram)) <= 1:
+                continue
+            count = counts.get(gram, 0) + 1
+            counts[gram] = count
+            if count > best_count:
+                best = gram
+                best_count = count
+        if best is None:
+            continue
+        coverage = (best_count * width) / max(len(tokens), 1)
+        if best_count >= REASONING_LOOP_MIN_NGRAM_REPEATS and coverage >= REASONING_LOOP_MIN_NGRAM_COVERAGE:
+            return " ".join(best)
+    return None
 
 
 def _format_compact_bytes(value: int) -> str:
@@ -1768,6 +1816,8 @@ class NewmanRuntime:
         finish_reason = "stop"
         usage = TokenUsage()
         parser = ThinkTagStreamParser()
+        thinking_content_length = 0
+        next_reasoning_guard_check_length = REASONING_LOOP_MIN_CHARS
         commentary_visible = False
         commentary_complete_pending = False
         thinking_complete_emitted = False
@@ -1853,13 +1903,41 @@ class NewmanRuntime:
             )
 
         async def emit_thinking_delta(delta: str) -> None:
-            nonlocal thinking_complete_emitted
+            nonlocal thinking_complete_emitted, thinking_content_length, next_reasoning_guard_check_length
             thinking_parts.append(delta)
+            thinking_content_length += len(delta)
             thinking_complete_emitted = False
+            if not answer_visible and not tool_signal_seen and not commentary_visible and not tool_calls and not invalid_tool_calls:
+                repeated_phrase = None
+                if thinking_content_length >= next_reasoning_guard_check_length:
+                    next_reasoning_guard_check_length = thinking_content_length + REASONING_LOOP_CHECK_INTERVAL_CHARS
+                    repeated_phrase = _detect_repetitive_reasoning_tail("".join(thinking_parts))
+                if repeated_phrase:
+                    raise ProviderError(
+                        self.settings.provider.type,
+                        "reasoning_loop",
+                        "主模型在内部思考流中重复输出，疑似陷入生成循环，已主动停止本轮以避免继续卡住",
+                        False,
+                        details={
+                            "reasoning_guard": "repetitive_tail",
+                            "reasoning_loop_phrase": repeated_phrase,
+                            "thinking_length": thinking_content_length,
+                        },
+                    )
+                if thinking_content_length >= REASONING_ONLY_MAX_CHARS:
+                    raise ProviderError(
+                        self.settings.provider.type,
+                        "reasoning_loop",
+                        "主模型长时间只输出内部思考，没有返回正文或工具调用，已主动停止本轮以避免继续卡住",
+                        False,
+                        details={
+                            "reasoning_guard": "thinking_only_limit",
+                            "thinking_length": thinking_content_length,
+                        },
+                    )
             await emit(
                 "thinking_delta",
                 {
-                    "content": "".join(thinking_parts),
                     "delta": delta,
                     "model": self.settings.provider.model,
                 },
@@ -3369,6 +3447,8 @@ class NewmanRuntime:
     ) -> str:
         if result.category == "empty_response":
             headline = "主模型本次响应异常，未返回任何内容，当前无法继续。"
+        elif result.category == "reasoning_loop":
+            headline = "主模型疑似陷入重复思考，已主动停止本轮。"
         elif result.category in {"timeout_error", "network_error", "upstream_error"}:
             headline = "主模型连接失败，当前无法继续。"
         elif result.category == "response_parse_error":
@@ -3395,7 +3475,7 @@ class NewmanRuntime:
 
         reason = (result.frontend_message or "").strip()
         summary = result.summary.strip()
-        if result.category != "empty_response":
+        if result.category not in {"empty_response", "reasoning_loop"}:
             if reason:
                 lines.append(f"原因：{reason}")
             if summary and summary != reason:
@@ -3403,6 +3483,9 @@ class NewmanRuntime:
 
         if result.category == "empty_response":
             lines.append("建议：稍后重试；如果持续出现，请检查网关日志、流式转发链路，确认响应没有被提前截断。")
+        elif result.category == "reasoning_loop":
+            lines.append("原因：模型持续输出重复的内部思考片段，没有进入工具调用或最终回答。")
+            lines.append("建议：重新发送本轮请求；如果持续出现，请缩短提示词、减少可用工具 schema，或切换到更稳定的模型。")
         elif result.category in {"timeout_error", "network_error", "upstream_error"}:
             lines.append("建议：稍后重试；如果持续失败，请检查主模型服务状态、网关和网络连通性。")
         elif result.category == "auth_error":
@@ -3934,6 +4017,9 @@ class NewmanRuntime:
             "provider_first_chunk_ms",
             "provider_last_chunk_ms",
             "provider_zero_arg_tool_delta_count",
+            "partial_thinking_length",
+            "reasoning_guard",
+            "reasoning_loop_phrase",
             "retry_suppressed_reason",
             "retry_suppressed_message",
             "transport_fallback_attempted",
@@ -3993,6 +4079,15 @@ class NewmanRuntime:
         partial_tool_arguments_visible = result.metadata.get("partial_tool_arguments_visible")
         if isinstance(partial_tool_arguments_visible, bool):
             payload["partial_tool_arguments_visible"] = partial_tool_arguments_visible
+        partial_thinking_length = result.metadata.get("partial_thinking_length")
+        if isinstance(partial_thinking_length, int | float):
+            payload["partial_thinking_length"] = int(partial_thinking_length)
+        reasoning_guard = result.metadata.get("reasoning_guard")
+        if isinstance(reasoning_guard, str):
+            payload["reasoning_guard"] = reasoning_guard
+        reasoning_loop_phrase = result.metadata.get("reasoning_loop_phrase")
+        if isinstance(reasoning_loop_phrase, str):
+            payload["reasoning_loop_phrase"] = reasoning_loop_phrase
         retry_suppressed_reason = result.metadata.get("retry_suppressed_reason")
         if isinstance(retry_suppressed_reason, str):
             payload["retry_suppressed_reason"] = retry_suppressed_reason

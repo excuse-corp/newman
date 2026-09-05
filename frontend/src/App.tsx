@@ -1,4 +1,5 @@
 import {
+  startTransition,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -21,11 +22,12 @@ import MessageContent, { type ChatAttachment, type HtmlPreviewPayload } from "./
 import { highlightCode, inferLanguageFromPath } from "./chat/codeHighlight";
 import AutomationsPage from "./pages/AutomationsPage";
 import EvolutionPage from "./pages/EvolutionPage";
+import McpSettingsPanel from "./pages/McpSettingsPanel";
 import UsageDashboard from "./pages/UsageDashboard";
 import "./styles.css";
 
 type WorkspacePage = "chat" | "automations" | "memory" | "skills" | "evolution" | "settings";
-type SettingsTab = "system" | "config" | "usage";
+type SettingsTab = "system" | "config" | "mcp" | "usage";
 type MemoryKey = "memory" | "user";
 type TurnApprovalMode = "manual" | "auto_allow";
 type CollaborationModeName = "default" | "plan" | "subagent";
@@ -543,6 +545,8 @@ type TimelineNode = {
   primaryText: string;
   secondaryItems: TimelineSecondaryItem[];
   thinkingContent?: string | null;
+  thinkingPreview?: string | null;
+  thinkingContentLength?: number | null;
   approval?: ApprovalNodePayload | null;
   detail: TraceEntry;
 };
@@ -618,7 +622,10 @@ type LiveAnswerQueueItem =
     };
 
 const LIVE_ANSWER_MAX_CHARS_PER_FRAME = 28;
+const LIVE_SESSION_EVENT_FLUSH_MS = 125;
 const LIVE_STREAM_BROWSER_YIELD_EVERY_EVENTS = 4;
+const THINKING_PREVIEW_TAIL_CHARS = 1_600;
+const THINKING_PREVIEW_MAX_CHARS = 900;
 const UNASSIGNED_COMPOSER_DRAFT_KEY = "__new_session__";
 
 type PendingFinalAnswer = {
@@ -957,6 +964,8 @@ const approvalModeMeta: Record<
 
 const MAX_COMPOSER_ATTACHMENTS = 10;
 const MAX_COMPOSER_ATTACHMENT_BYTES = 200 * 1024 * 1024;
+const SESSION_EVENTS_COMPACT_LIMIT = 2_000;
+const SESSION_AUDIT_FALLBACK_LIMIT = 500;
 const COMPOSER_ATTACHMENT_ACCEPT =
   "image/png,image/jpeg,image/webp,.doc,.docx,.xls,.xlsx,.pdf,.ppt,.pptx,.md,.txt,.json,.html,.htm";
 const COMPOSER_ATTACHMENT_EXTENSIONS = new Set([
@@ -978,8 +987,65 @@ const COMPOSER_ATTACHMENT_EXTENSIONS = new Set([
   ".htm",
 ]);
 const IMAGE_ATTACHMENT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
-const SKILL_UPLOAD_ACCEPT = ".md,.py,.jpg,.jpeg,.png";
-const SKILL_UPLOAD_EXTENSIONS = new Set([".md", ".py", ".jpg", ".jpeg", ".png"]);
+const SKILL_UPLOAD_EXTENSION_LIST = [
+  ".cjs",
+  ".css",
+  ".csv",
+  ".gif",
+  ".htm",
+  ".html",
+  ".ico",
+  ".jpeg",
+  ".jpg",
+  ".js",
+  ".json",
+  ".jsx",
+  ".markdown",
+  ".md",
+  ".mjs",
+  ".png",
+  ".py",
+  ".pyi",
+  ".svg",
+  ".toml",
+  ".ts",
+  ".tsv",
+  ".tsx",
+  ".txt",
+  ".webp",
+  ".yaml",
+  ".yml"
+];
+const SKILL_UPLOAD_ACCEPT = SKILL_UPLOAD_EXTENSION_LIST.join(",");
+const SKILL_UPLOAD_EXTENSIONS = new Set(SKILL_UPLOAD_EXTENSION_LIST);
+const SKILL_UPLOAD_EXTENSIONLESS_FILENAMES = new Set([
+  "authors",
+  "changelog",
+  "contributors",
+  "copying",
+  "license",
+  "notice",
+  "readme"
+]);
+const SKILL_UPLOAD_IGNORED_DIRECTORY_NAMES = new Set([
+  ".cache",
+  ".git",
+  ".hg",
+  ".mypy_cache",
+  ".next",
+  ".nuxt",
+  ".pytest_cache",
+  ".ruff_cache",
+  ".svn",
+  ".venv",
+  "__pycache__",
+  "build",
+  "dist",
+  "node_modules",
+  "venv"
+]);
+const SKILL_UPLOAD_IGNORED_FILENAMES = new Set([".ds_store", ".gitignore", "thumbs.db"]);
+const SKILL_UPLOAD_TYPES_LABEL = "MD / Python / HTML / JS / JSON / YAML / CSS / images";
 const MAX_SKILL_UPLOAD_FILES = 200;
 const MAX_SKILL_UPLOAD_TOTAL_BYTES = 80 * 1024 * 1024;
 
@@ -1048,6 +1114,11 @@ const settingsTabOptions: Array<{
     description: "编辑 newman.yaml 与 .env，并 reload 生效。"
   },
   {
+    id: "mcp",
+    label: "MCP",
+    description: "管理远程和本地 MCP server。"
+  },
+  {
     id: "usage",
     label: "Token Dashboard",
     description: "查看真实模型 usage 聚合。"
@@ -1103,7 +1174,7 @@ function isTurnApprovalMode(value: string | null): value is TurnApprovalMode {
 }
 
 function isSettingsTab(value: string | null): value is SettingsTab {
-  return value === "system" || value === "config" || value === "usage";
+  return value === "system" || value === "config" || value === "mcp" || value === "usage";
 }
 
 function localTimezone() {
@@ -1916,6 +1987,26 @@ function getSkillDirectoryPath(skillPath: string) {
 function getSkillUploadRelativePath(file: File) {
   const maybeDirectoryFile = file as File & { webkitRelativePath?: string };
   return maybeDirectoryFile.webkitRelativePath || file.name;
+}
+
+function getPathParts(path: string) {
+  return path.split(/[\\/]/).filter(Boolean);
+}
+
+function shouldIgnoreSkillUploadPath(relativePath: string) {
+  const parts = getPathParts(relativePath).map((part) => part.toLowerCase());
+  const fileName = parts[parts.length - 1] ?? "";
+  return (
+    parts.slice(0, -1).some((part) => SKILL_UPLOAD_IGNORED_DIRECTORY_NAMES.has(part)) ||
+    SKILL_UPLOAD_IGNORED_FILENAMES.has(fileName)
+  );
+}
+
+function isSkillUploadFileSupported(relativePath: string) {
+  const parts = getPathParts(relativePath);
+  const fileName = parts[parts.length - 1]?.toLowerCase() ?? "";
+  const extension = getAttachmentExtension(relativePath).toLowerCase();
+  return SKILL_UPLOAD_EXTENSIONS.has(extension) || SKILL_UPLOAD_EXTENSIONLESS_FILENAMES.has(fileName);
 }
 
 function summarizeSkillUploadFiles(files: SkillUploadItem[]) {
@@ -3574,6 +3665,44 @@ function mergeScopedSingletonSessionEvent(previous: SessionEventPayload, next: S
   return merged;
 }
 
+function sessionEventKeyPart(value: unknown) {
+  if (typeof value === "string") {
+    return `${value.length}:${value.slice(0, 32)}:${value.slice(-32)}`;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
+}
+
+function buildLightweightSessionEventKey(event: SessionEventPayload) {
+  const fields = [
+    "turn_id",
+    "group_id",
+    "tool_call_id",
+    "approval_request_id",
+    "request_id",
+    "delta",
+    "content",
+    "content_tail",
+    "content_length",
+    "message",
+    "summary",
+    "tool",
+    "reset",
+    "success",
+    "approved"
+  ];
+  const dataParts = fields
+    .map((field) => {
+      const part = sessionEventKeyPart(event.data[field]);
+      return part ? `${field}=${part}` : "";
+    })
+    .filter(Boolean)
+    .join("|");
+  return `${event.ts}:${event.request_id ?? ""}:${event.event}:${dataParts}`;
+}
+
 function dedupeSessionEvents(events: SessionEventPayload[]) {
   const seen = new Set<string>();
   const deduped: SessionEventPayload[] = [];
@@ -3583,7 +3712,7 @@ function dedupeSessionEvents(events: SessionEventPayload[]) {
       deduped[scopedDuplicateIndex] = mergeScopedSingletonSessionEvent(deduped[scopedDuplicateIndex], event);
       return;
     }
-    const key = `${event.ts}:${event.request_id ?? ""}:${event.event}:${JSON.stringify(event.data)}`;
+    const key = buildLightweightSessionEventKey(event);
     if (seen.has(key)) {
       return;
     }
@@ -3598,6 +3727,11 @@ function readLiveEventText(event: SessionEventPayload, key: string) {
   return typeof value === "string" ? value : "";
 }
 
+function readLiveEventNumber(event: SessionEventPayload, key: string) {
+  const value = event.data[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function hasLiveEventText(event: SessionEventPayload, key: string) {
   return Boolean(readLiveEventText(event, key));
 }
@@ -3607,6 +3741,34 @@ function sameLiveEventScope(left: SessionEventPayload, right: SessionEventPayloa
     return false;
   }
   return keys.every((key) => readLiveEventText(left, key) === readLiveEventText(right, key));
+}
+
+function mergeLiveThinkingDeltaEvent(previous: SessionEventPayload, next: SessionEventPayload) {
+  const previousTail =
+    readLiveEventText(previous, "content_tail") ||
+    readLiveEventText(previous, "content") ||
+    readLiveEventText(previous, "delta");
+  const previousLength = readLiveEventNumber(previous, "content_length") ?? previousTail.length;
+  const nextDelta = readLiveEventText(next, "delta");
+  const nextSnapshot = readLiveEventText(next, "content");
+  const nextTail = nextDelta
+    ? `${previousTail}${nextDelta}`.slice(-THINKING_PREVIEW_TAIL_CHARS)
+    : nextSnapshot
+      ? nextSnapshot.slice(-THINKING_PREVIEW_TAIL_CHARS)
+      : previousTail;
+  const nextLength = nextDelta.length > 0 ? previousLength + nextDelta.length : nextSnapshot ? nextSnapshot.length : previousLength;
+  const data: Record<string, unknown> = {
+    ...previous.data,
+    ...next.data,
+    content_tail: nextTail,
+    content_length: nextLength,
+  };
+  delete data.content;
+  delete data.delta;
+  return {
+    ...next,
+    data,
+  };
 }
 
 function mergeLiveSessionEvent(previous: SessionEventPayload, next: SessionEventPayload) {
@@ -3634,7 +3796,15 @@ function mergeLiveSessionEvent(previous: SessionEventPayload, next: SessionEvent
   }
 
   if (
-    (next.event === "thinking_delta" || next.event === "commentary_delta") &&
+    next.event === "thinking_delta" &&
+    (hasLiveEventText(next, "turn_id") || hasLiveEventText(next, "group_id")) &&
+    sameLiveEventScope(previous, next, ["turn_id", "group_id"])
+  ) {
+    return mergeLiveThinkingDeltaEvent(previous, next);
+  }
+
+  if (
+    next.event === "commentary_delta" &&
     (hasLiveEventText(next, "turn_id") || hasLiveEventText(next, "group_id")) &&
     sameLiveEventScope(previous, next, ["turn_id", "group_id"])
   ) {
@@ -4334,8 +4504,15 @@ function summarizeCommentaryContent(content: string | null | undefined, fallback
   return compactString(normalized, TIMELINE_PRIMARY_TEXT_MAX_CHARS);
 }
 
+function normalizeThinkingPreviewText(content: string | null | undefined, limit = THINKING_PREVIEW_MAX_CHARS) {
+  const raw = content ?? "";
+  const tail = raw.length > THINKING_PREVIEW_TAIL_CHARS ? raw.slice(-THINKING_PREVIEW_TAIL_CHARS) : raw;
+  const normalized = tail.replace(/\s+/g, " ").trim();
+  return normalized.length > limit ? normalized.slice(-limit).trimStart() : normalized;
+}
+
 function summarizeThinkingContent(content: string | null | undefined, state: TimelineNodeState) {
-  const normalized = (content ?? "").replace(/\s+/g, " ").trim();
+  const normalized = normalizeThinkingPreviewText(content, 260);
   if (!normalized) {
     return state === "completed" ? "思路整理完成" : "我先理一下思路";
   }
@@ -4348,6 +4525,31 @@ function readTimelineThinkingContent(node: TimelineNode) {
   return typeof content === "string" ? content.trim() : "";
 }
 
+function readTimelineThinkingPreview(node: TimelineNode) {
+  if (typeof node.thinkingPreview === "string" && node.thinkingPreview.trim()) {
+    return node.thinkingPreview.trim();
+  }
+  return normalizeThinkingPreviewText(readTimelineThinkingContent(node));
+}
+
+function splitTimelinePrimaryTextForInlineToggle(text: string) {
+  const chars = Array.from(text);
+  if (chars.length <= 8) {
+    return { leadingText: "", trailingText: text };
+  }
+  const whitespaceTail = text.match(/\s+\S{1,18}$/u)?.[0];
+  if (whitespaceTail && whitespaceTail.length < text.length) {
+    return {
+      leadingText: text.slice(0, -whitespaceTail.length),
+      trailingText: whitespaceTail,
+    };
+  }
+  return {
+    leadingText: chars.slice(0, -8).join(""),
+    trailingText: chars.slice(-8).join(""),
+  };
+}
+
 function mergeThinkingContentIntoNode(targetNode: TimelineNode, content: string | null | undefined) {
   const normalizedContent = typeof content === "string" ? content.trim() : "";
   if (!normalizedContent) {
@@ -4356,38 +4558,31 @@ function mergeThinkingContentIntoNode(targetNode: TimelineNode, content: string 
   const existingContent = typeof targetNode.thinkingContent === "string" ? targetNode.thinkingContent.trim() : "";
   if (!existingContent || normalizedContent.startsWith(existingContent)) {
     targetNode.thinkingContent = normalizedContent;
+    targetNode.thinkingPreview = normalizeThinkingPreviewText(normalizedContent) || null;
+    targetNode.thinkingContentLength = normalizedContent.length;
     return;
   }
   if (existingContent.includes(normalizedContent)) {
     return;
   }
-  targetNode.thinkingContent = `${existingContent}\n\n${normalizedContent}`;
-}
-
-function buildThinkingPreviewLines(content: string, maxLines = 3) {
-  const lines: string[] = [];
-  const sourceLines = content.replace(/\r\n/g, "\n").split("\n");
-  sourceLines.forEach((line) => {
-    const normalized = line.replace(/\s+/g, " ").trim();
-    if (!normalized) {
-      return;
-    }
-    for (let index = 0; index < normalized.length; index += 72) {
-      lines.push(normalized.slice(index, index + 72));
-    }
-  });
-  return lines.slice(-maxLines);
+  const nextContent = `${existingContent}\n\n${normalizedContent}`;
+  targetNode.thinkingContent = nextContent;
+  targetNode.thinkingPreview = normalizeThinkingPreviewText(nextContent) || null;
+  targetNode.thinkingContentLength = nextContent.length;
 }
 
 function buildThinkingNode(
   ts: number,
   content: string | null = null,
   state: TimelineNodeState = "running",
-  detailTitle = "Thinking"
+  detailTitle = "Thinking",
+  contentLength?: number | null
 ): TimelineNode {
   const time = formatEventTime(ts);
   const nodeId = `node:thinking:${ts}`;
   const primaryText = summarizeThinkingContent(content, state);
+  const thinkingPreview = normalizeThinkingPreviewText(content);
+  const resolvedContentLength = contentLength ?? (typeof content === "string" ? content.length : 0);
   return {
     id: nodeId,
     kind: "thinking",
@@ -4395,6 +4590,9 @@ function buildThinkingNode(
     time,
     primaryText,
     secondaryItems: [],
+    thinkingContent: content,
+    thinkingPreview: thinkingPreview || null,
+    thinkingContentLength: resolvedContentLength,
     detail: {
       id: nodeId,
       type: "trace",
@@ -4787,6 +4985,8 @@ function preserveNodeIdentity(existingNode: TimelineNode, nextNode: TimelineNode
     id: existingNode.id,
     approval: nextNode.approval ?? existingNode.approval ?? null,
     thinkingContent: nextNode.thinkingContent ?? existingNode.thinkingContent ?? null,
+    thinkingPreview: nextNode.thinkingPreview ?? existingNode.thinkingPreview ?? null,
+    thinkingContentLength: nextNode.thinkingContentLength ?? existingNode.thinkingContentLength ?? null,
     detail: {
       ...nextNode.detail,
       id: existingNode.id
@@ -4833,6 +5033,8 @@ function buildTimelineNodes(
   const toolOutputByCallId = new Map<string, string>();
   const commentaryByGroupId = new Map<string, string>();
   let thinkingNodeId: string | null = null;
+  let thinkingContent = "";
+  let thinkingContentLength = 0;
   let answerStartNodeId: string | null = null;
 
   toolMessages.forEach((message) => {
@@ -4943,15 +5145,32 @@ function buildTimelineNodes(
     }
 
     if (event.event === "thinking_delta" || event.event === "thinking_complete") {
-      const content = typeof eventData.content === "string" ? eventData.content : typeof eventData.delta === "string" ? eventData.delta : "";
-      if (!content && event.event === "thinking_complete") {
+      const snapshotContent = typeof eventData.content === "string" ? eventData.content : "";
+      const tailContent = typeof eventData.content_tail === "string" ? eventData.content_tail : "";
+      const eventContentLength =
+        typeof eventData.content_length === "number" && Number.isFinite(eventData.content_length)
+          ? eventData.content_length
+          : null;
+      const delta = typeof eventData.delta === "string" ? eventData.delta : "";
+      if (event.event === "thinking_delta" && delta) {
+        thinkingContent += delta;
+        thinkingContentLength += delta.length;
+      } else if (snapshotContent) {
+        thinkingContent = snapshotContent;
+        thinkingContentLength = eventContentLength ?? snapshotContent.length;
+      } else if (tailContent) {
+        thinkingContent = tailContent;
+        thinkingContentLength = eventContentLength ?? tailContent.length;
+      }
+      if (!thinkingContent && event.event === "thinking_complete") {
         return;
       }
       const nextNode = buildThinkingNode(
         event.ts,
-        content,
+        thinkingContent || null,
         event.event === "thinking_complete" ? "completed" : "running",
-        "当前思路"
+        "当前思路",
+        thinkingContentLength
       );
       const existingNodeId =
         thinkingNodeId ?? [...nodes].reverse().find((node) => node.kind === "thinking")?.id ?? null;
@@ -6223,6 +6442,20 @@ function buildAwaitingOptionReply(request: AwaitingUserInputPayload, option: Awa
   return option.label;
 }
 
+function normalizeSessionEventData(event: string, data: Record<string, unknown>) {
+  const normalized = { ...data };
+  if (
+    event === "thinking_delta" &&
+    typeof normalized.delta === "string" &&
+    normalized.delta.length > 0 &&
+    typeof normalized.content === "string" &&
+    normalized.content.length > normalized.delta.length
+  ) {
+    delete normalized.content;
+  }
+  return normalized;
+}
+
 function normalizeSessionEventPayload(payload: unknown): SessionEventPayload | null {
   if (typeof payload === "string") {
     try {
@@ -6246,7 +6479,7 @@ function normalizeSessionEventPayload(payload: unknown): SessionEventPayload | n
 
   return {
     event,
-    data: data as Record<string, unknown>,
+    data: normalizeSessionEventData(event, data as Record<string, unknown>),
     request_id: requestId,
     ts
   };
@@ -6907,9 +7140,9 @@ function App({ onLogout }: AppProps) {
     if (stream.frame !== null) {
       return;
     }
-    stream.frame = window.requestAnimationFrame(() => {
+    stream.frame = window.setTimeout(() => {
       flushLiveSessionEventQueue(sessionId);
-    });
+    }, LIVE_SESSION_EVENT_FLUSH_MS);
   };
 
   const enqueueLiveSessionEvent = (sessionId: string, payload: SessionEventPayload) => {
@@ -6920,7 +7153,7 @@ function App({ onLogout }: AppProps) {
   const resetLiveSessionEventQueue = (sessionId?: string) => {
     const resetStream = (stream: LiveSessionEventStreamState) => {
       if (stream.frame !== null) {
-        window.cancelAnimationFrame(stream.frame);
+        window.clearTimeout(stream.frame);
         stream.frame = null;
       }
       stream.queue = [];
@@ -7097,6 +7330,11 @@ function App({ onLogout }: AppProps) {
         saveStatus: "saving",
         content: "",
         title: fallbackTitle,
+        initialView: "preview",
+        language: "html",
+        kind: "html",
+        contentType: "text/html",
+        previewMode: "html",
       }));
       return;
     }
@@ -7123,6 +7361,11 @@ function App({ onLogout }: AppProps) {
           saveStatus: "saving",
           content,
           title: buildHtmlPreviewTitleFromMarkup(content, fallbackTitle),
+          initialView: "preview",
+          language: "html",
+          kind: "html",
+          contentType: "text/html",
+          previewMode: "html",
         };
       });
       return;
@@ -7159,6 +7402,11 @@ function App({ onLogout }: AppProps) {
           streaming: false,
           saveStatus: success ? "saved" : "failed",
           title,
+          initialView: "preview",
+          language: "html",
+          kind: "html",
+          contentType: "text/html",
+          previewMode: "html",
         };
       });
     }
@@ -7709,53 +7957,13 @@ function App({ onLogout }: AppProps) {
     try {
       const detail = await fetchJson<SessionDetailResponse>(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}`, { signal });
 
-      let nextEvents: SessionEventPayload[] = [];
-      try {
-        const eventsUrl = new URL(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/events`);
-        const events = await fetchJson<SessionEventsResponse>(eventsUrl.toString(), { signal });
-        nextEvents = events.events
-          .map((event) => normalizeSessionEventPayload(event))
-          .filter((event): event is SessionEventPayload => event !== null);
-      } catch (eventsError) {
-        if (signal?.aborted) {
-          return;
-        }
-        try {
-          const audit = await fetchJson<SessionAuditResponse>(`${apiBase}/api/audit/${encodeURIComponent(sessionId)}`, { signal });
-          nextEvents = audit.events
-            .map((event) => normalizeSessionEventPayload(event))
-            .filter((event): event is SessionEventPayload => event !== null);
-        } catch (auditError) {
-          console.warn("Failed to load session events", { sessionId, eventsError, auditError });
-        }
-      }
-
-      let nextTurnUsageById: Record<string, TurnUsageSummary> = {};
-      try {
-        const usageUrl = new URL(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/usage`);
-        usageUrl.searchParams.set("limit", "500");
-        const usage = await fetchJson<SessionUsageResponse>(usageUrl.toString(), { signal });
-        if (usage.available) {
-          nextTurnUsageById = buildTurnUsageSummaries(usage.records);
-        }
-      } catch (usageError) {
-        if (signal?.aborted) {
-          return;
-        }
-        console.warn("Failed to load session usage", { sessionId, usageError });
-      }
-
-      await loadSessionMultiagentRuns(sessionId, signal, { silent: true });
-      await loadSessionMultiagentApprovals(sessionId, signal, { silent: true });
-
       if (signal?.aborted || activeSessionIdRef.current !== sessionId) {
         return false;
       }
 
-      const dedupedEvents = dedupeSessionEvents(nextEvents);
       setSessionRunning(sessionId, Boolean(detail.active_run));
       setActiveSessionDetail(detail.session);
-      setActivePlan(closePlanIfTaskCompletedSeen(detail.plan ?? null, dedupedEvents));
+      setActivePlan(detail.plan ?? null);
       setActiveCollaborationMode(detail.collaboration_mode ?? null);
       setActiveContextUsage(detail.context_usage ?? null);
       const nextAwaiting = parseAwaitingUserInputPayload(detail.awaiting_user_input);
@@ -7767,8 +7975,6 @@ function App({ onLogout }: AppProps) {
         const nextSelection = currentSelections[nextAwaiting.requestId];
         return nextSelection ? { [nextAwaiting.requestId]: nextSelection } : {};
       });
-      setSessionEvents(dedupedEvents);
-      setActiveTurnUsageById(nextTurnUsageById);
       setChatSessions((currentSessions) =>
         currentSessions.map((session) =>
           session.id === sessionId
@@ -7783,6 +7989,74 @@ function App({ onLogout }: AppProps) {
         )
       );
       setOptimisticEmptySessionId((currentId) => (currentId === sessionId ? null : currentId));
+      if (!silent) {
+        setChatLoading(false);
+      }
+
+      let nextEvents: SessionEventPayload[] = [];
+      try {
+        const eventsUrl = new URL(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/events`);
+        eventsUrl.searchParams.set("compact", "true");
+        eventsUrl.searchParams.set("limit", String(SESSION_EVENTS_COMPACT_LIMIT));
+        const events = await fetchJson<SessionEventsResponse>(eventsUrl.toString(), { signal });
+        nextEvents = events.events
+          .map((event) => normalizeSessionEventPayload(event))
+          .filter((event): event is SessionEventPayload => event !== null);
+      } catch (eventsError) {
+        if (signal?.aborted) {
+          return false;
+        }
+        try {
+          const auditUrl = new URL(`${apiBase}/api/audit/${encodeURIComponent(sessionId)}`);
+          auditUrl.searchParams.set("limit", String(SESSION_AUDIT_FALLBACK_LIMIT));
+          const audit = await fetchJson<SessionAuditResponse>(auditUrl.toString(), { signal });
+          nextEvents = audit.events
+            .map((event) => normalizeSessionEventPayload(event))
+            .filter((event): event is SessionEventPayload => event !== null);
+        } catch (auditError) {
+          console.warn("Failed to load session events", { sessionId, eventsError, auditError });
+        }
+      }
+
+      if (signal?.aborted || activeSessionIdRef.current !== sessionId) {
+        return false;
+      }
+
+      const dedupedEvents = dedupeSessionEvents(nextEvents);
+      startTransition(() => {
+        setActivePlan(closePlanIfTaskCompletedSeen(detail.plan ?? null, dedupedEvents));
+        setSessionEvents(dedupedEvents);
+      });
+
+      const usagePromise = (async () => {
+        try {
+          const usageUrl = new URL(`${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/usage`);
+          usageUrl.searchParams.set("limit", "500");
+          const usage = await fetchJson<SessionUsageResponse>(usageUrl.toString(), { signal });
+          return usage.available ? buildTurnUsageSummaries(usage.records) : {};
+        } catch (usageError) {
+          if (!signal?.aborted) {
+            console.warn("Failed to load session usage", { sessionId, usageError });
+          }
+          return {};
+        }
+      })();
+      const multiagentRunsPromise = loadSessionMultiagentRuns(sessionId, signal, { silent: true });
+      const multiagentApprovalsPromise = loadSessionMultiagentApprovals(sessionId, signal, { silent: true });
+
+      const [nextTurnUsageById] = await Promise.all([
+        usagePromise,
+        multiagentRunsPromise.then(() => null),
+        multiagentApprovalsPromise.then(() => null)
+      ]);
+
+      if (signal?.aborted || activeSessionIdRef.current !== sessionId) {
+        return false;
+      }
+
+      startTransition(() => {
+        setActiveTurnUsageById(nextTurnUsageById);
+      });
       return true;
     } catch (error) {
       if (signal?.aborted) {
@@ -9169,9 +9443,11 @@ function App({ onLogout }: AppProps) {
 
     files.forEach((file) => {
       const relativePath = getSkillUploadRelativePath(file);
-      const extension = getAttachmentExtension(relativePath).toLowerCase();
-      if (!SKILL_UPLOAD_EXTENSIONS.has(extension)) {
-        nextError ??= `《${relativePath}》格式不支持，仅支持 MD、Python、JPG、PNG`;
+      if (shouldIgnoreSkillUploadPath(relativePath)) {
+        return;
+      }
+      if (!isSkillUploadFileSupported(relativePath)) {
+        nextError ??= `《${relativePath}》格式不支持，仅支持 ${SKILL_UPLOAD_TYPES_LABEL}`;
         return;
       }
       if (file.size === 0) {
@@ -10073,12 +10349,29 @@ function App({ onLogout }: AppProps) {
     );
   };
 
-  const renderTimelinePrimaryTitle = (node: TimelineNode, primaryText = node.primaryText) => (
-    <div className="timeline-primary-title-row">
-      <p className="timeline-primary-text">{primaryText}</p>
-      {renderTimelineThinkingToggle(node)}
-    </div>
-  );
+  const renderTimelinePrimaryTitle = (node: TimelineNode, primaryText = node.primaryText) => {
+    const toggle = renderTimelineThinkingToggle(node);
+    if (!toggle) {
+      return (
+        <div className="timeline-primary-title-row">
+          <p className="timeline-primary-text">{primaryText}</p>
+        </div>
+      );
+    }
+
+    const { leadingText, trailingText } = splitTimelinePrimaryTextForInlineToggle(primaryText);
+    return (
+      <div className="timeline-primary-title-row">
+        <p className="timeline-primary-text">
+          {leadingText}
+          <span className="timeline-primary-text-tail">
+            {trailingText}
+            {toggle}
+          </span>
+        </p>
+      </div>
+    );
+  };
 
   const renderTimelineThinkingDetail = (node: TimelineNode) => {
     const thinkingContent = readTimelineThinkingContent(node);
@@ -10103,10 +10396,7 @@ function App({ onLogout }: AppProps) {
     const title = node.state === "failed" ? node.primaryText : "思考已完成";
     return (
       <div className="standalone-thinking-summary">
-        <div className="timeline-primary-title-row">
-          <p className="timeline-primary-text">{title}</p>
-          {renderTimelineThinkingToggle(node)}
-        </div>
+        {renderTimelinePrimaryTitle(node, title)}
         {renderTimelineThinkingDetail(node)}
       </div>
     );
@@ -12004,8 +12294,7 @@ function App({ onLogout }: AppProps) {
 
                                   {visibleThinkingNode
                                     ? (() => {
-                                        const thinkingContent = readTimelineThinkingContent(visibleThinkingNode);
-                                        const previewLines = buildThinkingPreviewLines(thinkingContent);
+                                        const thinkingPreview = readTimelineThinkingPreview(visibleThinkingNode);
                                         const isLiveThinkingPreview = !showAnswerBubble && turn.isLive;
                                         const isPreparingNextSignal = isLiveThinkingPreview && visibleThinkingNode.state === "completed";
                                         const thinkingStatusWord = isPreparingNextSignal ? "preparing" : "thinking";
@@ -12034,14 +12323,10 @@ function App({ onLogout }: AppProps) {
                                                       </span>
                                                     </div>
                                                   </div>
-                                                  {previewLines.length > 0 ? (
-                                                    <div className="timeline-thinking-preview" aria-live="polite">
-                                                      {previewLines.map((line, lineIndex) => (
-                                                        <span key={`${visibleThinkingNode.id}:preview:${lineIndex}`} className="timeline-thinking-preview-line">
-                                                          {line}
-                                                        </span>
-                                                      ))}
-                                                    </div>
+                                                  {thinkingPreview ? (
+                                                    <p className="timeline-thinking-preview" aria-live="off">
+                                                      {thinkingPreview}
+                                                    </p>
                                                   ) : null}
                                                 </>
                                               ) : (
@@ -12224,7 +12509,7 @@ function App({ onLogout }: AppProps) {
                           <div className="skill-upload-dropzone">
                             <div className="skill-upload-dropzone-copy">
                               <strong>{skillUploadSummary}</strong>
-                              <span>MD / Python / JPG / PNG</span>
+                              <span>{SKILL_UPLOAD_TYPES_LABEL}</span>
                             </div>
                             <div className="skill-upload-actions">
                               <button
@@ -13316,6 +13601,8 @@ function App({ onLogout }: AppProps) {
                   </div>
                 </>
               ) : null}
+
+              {activeSettingsTab === "mcp" ? <McpSettingsPanel apiBase={apiBase} /> : null}
 
               {activeSettingsTab === "usage" ? <UsageDashboard apiBase={apiBase} embedded /> : null}
             </div>

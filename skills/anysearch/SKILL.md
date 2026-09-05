@@ -28,12 +28,24 @@ Do not run `doc` for routine requests. Use it only when command arguments are un
 # General search
 python3 /root/newman/skills/anysearch/scripts/anysearch_cli.py search "query" --max_results 5
 
-# Two to five independent queries
-python3 /root/newman/skills/anysearch/scripts/anysearch_cli.py batch_search --queries '[{"query":"q1","max_results":5},{"query":"q2","max_results":5}]'
+# Preferred for two to five independent queries: run separate search commands in parallel
+python3 /root/newman/skills/anysearch/scripts/anysearch_cli.py search "q1" --max_results 5
+python3 /root/newman/skills/anysearch/scripts/anysearch_cli.py search "q2" --max_results 5
+
+# If batch_search is required, write a JSON file first and pass it with @
+python3 /root/newman/skills/anysearch/scripts/anysearch_cli.py batch_search --queries @queries.json
 
 # Fetch the body of a URL already identified by the user or search results
 python3 /root/newman/skills/anysearch/scripts/anysearch_cli.py extract --url "https://example.com/page"
 ```
+
+## CLI Usage Notes
+
+- For multiple independent queries, prefer several `search` calls over `batch_search` with inline JSON. In terminal environments, long or Chinese JSON arguments can be misparsed as file paths and trigger `File name too long`.
+- Do not inline complex `--queries` JSON in a terminal command, especially when it contains Chinese text, nested quotes, commas, or many query objects.
+- If batch search is necessary, first write `queries.json` in a writable working directory (not `/tmp`; use the current workspace or `test_runtimespace` when available). The file must contain a UTF-8 JSON array of 1-5 query objects. Then run `batch_search --queries @queries.json`.
+- If `@queries.json` is unsupported or fails, fall back to separate `search` calls instead of retrying the same inline JSON command.
+- Keep vertical search discovery (`get_sub_domains`) separate from query execution; cache results within the session.
 
 ## Vertical Search
 
@@ -43,7 +55,7 @@ For requests that clearly belong to finance, academic, travel, health, legal, se
 python3 /root/newman/skills/anysearch/scripts/anysearch_cli.py get_sub_domains --domain <domain>
 ```
 
-Include every required parameter returned by `get_sub_domains`; use an empty string only when a required value is inapplicable. When the domain is uncertain, use general search first or run a general and vertical query with `batch_search`.
+Include every required parameter returned by `get_sub_domains`; use an empty string only when a required value is inapplicable. When the domain is uncertain, use general search first or run general and vertical queries as separate `search` calls. If `batch_search` is used, pass query objects through `@queries.json` rather than inline JSON.
 
 ## Credentials And Failures
 

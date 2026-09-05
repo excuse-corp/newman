@@ -32,7 +32,7 @@ class MCPResourceRecord(MCPResourceSpec):
 
 class MCPServerConfig(BaseModel):
     name: str
-    transport: Literal["inline", "http_json", "http_sse", "stdio"] = "inline"
+    transport: Literal["inline", "http_json", "http_sse", "mcp_http", "mcp_sse", "stdio"] = "inline"
     url: str | None = None
     command: list[str] = Field(default_factory=list)
     args: list[str] = Field(default_factory=list)
@@ -58,7 +58,7 @@ class MCPServerConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_transport_requirements(self) -> "MCPServerConfig":
-        if self.transport in {"http_json", "http_sse"} and not self.url:
+        if self.transport in {"http_json", "http_sse", "mcp_http", "mcp_sse"} and not self.url:
             raise ValueError(f"MCP server {self.name} missing url")
         if self.transport == "stdio" and not self.command:
             raise ValueError(f"MCP server {self.name} missing command")

@@ -386,7 +386,7 @@ function findCompanionHtmlPreview(attachment: ChatAttachment, attachments: ChatA
 }
 
 function shouldFetchAttachmentTextForPreview(previewMode: string) {
-  return previewMode === "html" || previewMode === "code" || previewMode === "markdown" || previewMode === "text";
+  return previewMode === "code" || previewMode === "markdown" || previewMode === "text";
 }
 
 function inferAttachmentPreviewLanguage(attachment: ChatAttachment) {

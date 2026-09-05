@@ -12,12 +12,16 @@ router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 async def list_servers(request: Request):
     runtime = request.app.state.runtime
     runtime.reload_ecosystem()
-    servers: dict[str, MCPServerConfig] = {item.name: item for item in runtime.mcp_registry.list_servers()}
+    stored_servers = runtime.mcp_registry.list_servers()
+    servers: dict[str, MCPServerConfig] = {item.name: item for item in stored_servers}
+    server_sources: dict[str, str] = {item.name: "project" for item in stored_servers}
     for item in runtime.plugin_service.mcp_server_configs():
         server = MCPServerConfig.model_validate(item)
         servers[server.name] = server
+        server_sources[server.name] = "project+plugin" if server.name in server_sources else "plugin"
     return {
         "servers": [item.model_dump(mode="json") for item in servers.values()],
+        "server_sources": server_sources,
         "statuses": [item.model_dump(mode="json") for item in runtime.mcp_registry.list_statuses()],
     }
 

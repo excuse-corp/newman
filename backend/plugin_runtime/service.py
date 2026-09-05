@@ -25,6 +25,25 @@ from backend.plugin_runtime.skill_parser import parse_skill_file
 from backend.config.loader import _read_dotenv
 
 
+IGNORED_SKILL_IMPORT_NAMES = {
+    ".cache",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".next",
+    ".nuxt",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+}
+
+
 class PluginService:
     def __init__(self, plugins_dir: Path, skills_dir: Path, state_path: Path, *, project_root: Path | None = None):
         self.plugins_dir = plugins_dir
@@ -244,7 +263,7 @@ class PluginService:
         if source_dir == target_dir:
             raise FileExistsError(f"Skill 已位于工作区：{source_dir.name}")
 
-        shutil.copytree(source_dir, target_dir)
+        shutil.copytree(source_dir, target_dir, ignore=_ignore_skill_import_entries)
         self.reload()
         return self.get_skill_by_path(target_dir / "SKILL.md")
 
@@ -518,6 +537,10 @@ def _check_readable_path(path: Path) -> tuple[bool, str]:
     if os.access(path, os.R_OK):
         return True, "path readable"
     return False, "path is not readable"
+
+
+def _ignore_skill_import_entries(directory: str, names: list[str]) -> set[str]:
+    return {name for name in names if name.lower() in IGNORED_SKILL_IMPORT_NAMES}
 
 
 def _dedupe_paths(paths: Iterable[Path]) -> list[Path]:

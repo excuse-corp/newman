@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import Literal
 
 from fastapi import APIRouter, Request
@@ -8,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from uuid import uuid4
 
+from backend.api.audit_events import read_audit_events
 from backend.api.routes.messages import active_session_run_payload
 from backend.api.routes.subagents import list_multiagent_runs_payload
 from backend.api.sse.event_emitter import format_sse
@@ -180,7 +180,12 @@ async def list_session_multiagent_runs(session_id: str, request: Request, turn_i
 
 
 @router.get("/{session_id}/events")
-async def get_session_events(session_id: str, request: Request, limit: int | None = None):
+async def get_session_events(
+    session_id: str,
+    request: Request,
+    limit: int | None = None,
+    compact: bool = False,
+):
     if limit is not None and limit <= 0:
         raise ValueError("limit 必须大于 0")
 
@@ -188,23 +193,7 @@ async def get_session_events(session_id: str, request: Request, limit: int | Non
     if not audit_path.exists():
         return {"session_id": session_id, "events": []}
 
-    raw_lines = audit_path.read_text(encoding="utf-8").splitlines()
-    payloads: list[dict] = []
-    for line in raw_lines:
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        if "event" not in payload or "data" not in payload:
-            continue
-        payload.setdefault("ts", 0)
-        payloads.append(payload)
-
-    if limit is not None:
-        payloads = payloads[-limit:]
-    return {"session_id": session_id, "events": payloads}
+    return {"session_id": session_id, "events": read_audit_events(audit_path, limit=limit, compact=compact)}
 
 
 @router.post("/{session_id}/compress")

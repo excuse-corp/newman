@@ -174,12 +174,14 @@ function renderArtifactFallback(artifact: Artifact) {
 
 function renderArtifactPreview(artifact: Artifact, normalizedHtmlContent: string) {
   if (artifact.previewMode === "html" || (artifact.content && artifact.kind === "html")) {
+    const htmlPreviewUrl = !normalizedHtmlContent && !artifact.streaming ? artifact.previewUrl : null;
     return (
       <iframe
         key={`${artifact.id}:${artifact.streaming ? "streaming" : "complete"}`}
         className="html-preview-iframe"
         title={artifact.title}
-        srcDoc={normalizedHtmlContent}
+        src={htmlPreviewUrl ?? undefined}
+        srcDoc={normalizedHtmlContent || undefined}
         sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
         referrerPolicy="no-referrer"
       />
